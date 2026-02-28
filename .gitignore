@@ -1,0 +1,62 @@
+# Build outputs
+build/
+*.o
+*.a
+*.so
+*.d
+
+# Model weights (large files, stored externally)
+models/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python (helper scripts, not part of core)
+*.py
+*.pyc
+__pycache__/
+.venv/
+*.egg-info/
+dist/
+
+# Shell scripts (dev-only)
+*.sh
+
+# System
+.DS_Store
+Thumbs.db
+
+# Temporary / runtime
+/tmp/
+*.log
+*.prof
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+
+# SSD Cache (runtime data)
+/tmp/qwen_kv_cache/
+
+# Results (ephemeral benchmark data)
+results/
+
+# POSIX shared memory
+/dev/shm/qwen_thor_*
+
+# Research / experiments
+_research/
+
+# Compiled CUDA binaries (standalone tests)
+gemv_bench
+test_gemm_layout
+test_gemm_layout.cu
+
+# Copyrighted reference documents (PDFs)
+docs/references/*.pdf
+
+# Third-party source (submodules)
+# third_party/
