@@ -53,6 +53,7 @@ struct InferRequest {
     float       temperature     = 1.0f;
     float       top_p           = 0.95f;
     int         top_k           = 20;
+    float       min_p           = 0.1f;   // min-p 过滤 (移除 prob < min_p*max_prob 的 token)
     float       repeat_penalty  = 1.0f;   // 重复惩罚 (1.0=无惩罚, >1.0 抑制重复)
     float       frequency_penalty = 0.0f; // 频率惩罚 (OpenAI 风格, 0.0=无惩罚)
     float       presence_penalty  = 0.0f; // 存在性惩罚 (OpenAI 风格, 0.0=无惩罚)
@@ -127,7 +128,7 @@ public:
 
     // 提交推理请求 (线程安全, 非阻塞)
     // 返回 true 表示成功入队, false 表示队列已满
-    bool submit(const InferRequest& request);
+    bool submit(InferRequest& request);  // non-const: moves images/videos out
 
     // 轮询生成结果 (线程安全, 非阻塞)
     // 返回 true 表示成功取出一个 response, false 表示当前无可用结果

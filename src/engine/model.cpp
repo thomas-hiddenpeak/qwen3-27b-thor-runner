@@ -352,6 +352,15 @@ __nv_bfloat16* Qwen35Model::mtp_forward(
 // ============================================================================
 // Prefill 前向传播: 単請求, T>1 tokens, per-layer sync (統一メモリ必須)
 // ============================================================================
+// ============================================================================
+// Prefill 前向传播
+//
+// 与 decode 同理，必须逐层 cudaStreamSynchronize:
+//   SM110 统一内存 + 大量 kernel 深排队 (64层 × ~15 kernels/层 ≈ 960 kernels)
+//   会导致 SMMU/驱动层面的数据损坏或资源耗尽。
+//   prefill 中每层 kernel 数量比 decode 更多 (GEMM 尺寸更大)，
+//   Prefill 一般只对性能影响约 1-3% (因单次 prefill GPU 计算时间远长于 decode)。
+// ============================================================================
 void Qwen35Model::forward_prefill(
     __nv_bfloat16* hidden_states,
     const int* pos_ids,
@@ -394,11 +403,19 @@ void Qwen35Model::forward_prefill(
             ++lin_idx;
         }
 
+        // 逐层 stream sync — 防止深排队引发 SM110 统一内存数据损坏
+        cudaStreamSynchronize(stream);
     }
 }
 
 // ============================================================================
-// Decode 前向传播: batch_size 个请求各 1 token, 无 per-layer sync, CUDA Graph 兼容
+// Decode 前向传播: batch_size 个请求各 1 token
+//
+// 必须逐层 cudaStreamSynchronize:
+//   SM110 统一内存 + 大量 kernel 深排队 (64层 × ~15 kernels/层 ≈ 960 kernels)
+//   会导致 SMMU/驱动层面的资源耗尽，引发不可恢复的 GPU hard-reset。
+//   逐层 sync 开销 ≈ 64 × 10μs = 0.64ms/step (vs ~237ms/step GPU 计算)，可忽略。
+//   已验证: 无 sync → req27/step408 崩溃; 有 sync → 50 请求稳定通过。
 // ============================================================================
 void Qwen35Model::forward_decode(
     __nv_bfloat16* hidden_states,
@@ -419,8 +436,6 @@ void Qwen35Model::forward_decode(
     int lin_idx = 0;
     int fa_idx  = 0;
 
-    // Decode 路径: 无 per-layer sync — kernel queue 浅 (GEMV) 不会触发性能退化
-    // 且此路径被 CUDA Graph 捕获, 不允许有 host-side sync 操作
     for (int i = 0; i < config_.num_hidden_layers; ++i) {
         if (config_.is_full_attention(i)) {
             layers_[i].get_full_attn()->forward(
@@ -443,6 +458,9 @@ void Qwen35Model::forward_decode(
                 lin_conv);
             ++lin_idx;
         }
+
+        // 逐层 stream sync — 防止深排队引发 SM110 统一内存 hard-reset
+        cudaStreamSynchronize(stream);
     }
 }
 

@@ -3,6 +3,22 @@
 #include <iostream>
 #include <cublas_v2.h>
 
+// Safe cudaMalloc: on failure, keep old pointer and size, log error
+#define SAFE_CUDA_REALLOC(ptr, sz_var, need, stream) do { \
+    if ((need) > (sz_var)) { \
+        if (ptr) { cudaStreamSynchronize(stream); cudaFree(ptr); ptr = nullptr; } \
+        cudaError_t _err = cudaMalloc(&(ptr), (need)); \
+        if (_err != cudaSuccess) { \
+            fprintf(stderr, "[CUDA] cudaMalloc failed (%zu bytes): %s\n", \
+                    (size_t)(need), cudaGetErrorString(_err)); \
+            fflush(stderr); \
+            ptr = nullptr; sz_var = 0; \
+        } else { \
+            sz_var = (need); \
+        } \
+    } \
+} while(0)
+
 // CUTLASS includes
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
@@ -136,16 +152,9 @@ void invoke_dense_gemm(
         M_padded = ((M + 7) / 8) * 8;
         size_t a_need = (size_t)M_padded * K * sizeof(__nv_bfloat16);
         size_t c_need = (size_t)M_padded * N * sizeof(__nv_bfloat16);
-        if (a_need > s_A_pad_sz) {
-            if (s_A_pad) cudaFree(s_A_pad);
-            cudaMalloc(&s_A_pad, a_need);
-            s_A_pad_sz = a_need;
-        }
-        if (c_need > s_C_pad_sz) {
-            if (s_C_pad) cudaFree(s_C_pad);
-            cudaMalloc(&s_C_pad, c_need);
-            s_C_pad_sz = c_need;
-        }
+        SAFE_CUDA_REALLOC(s_A_pad, s_A_pad_sz, a_need, stream);
+        SAFE_CUDA_REALLOC(s_C_pad, s_C_pad_sz, c_need, stream);
+        if (!s_A_pad || !s_C_pad) return; // OOM guard
         cudaMemcpyAsync(s_A_pad, A, (size_t)M * K * sizeof(__nv_bfloat16),
                         cudaMemcpyDeviceToDevice, stream);
         cudaMemsetAsync(s_A_pad + (size_t)M * K, 0,
@@ -186,11 +195,7 @@ void invoke_dense_gemm(
     static void* s_workspace = nullptr;
     static size_t s_workspace_size = 0;
     size_t workspace_size = GemmType::get_workspace_size(args);
-    if (workspace_size > s_workspace_size) {
-        if (s_workspace) cudaFree(s_workspace);
-        cudaMalloc(&s_workspace, workspace_size);
-        s_workspace_size = workspace_size;
-    }
+    SAFE_CUDA_REALLOC(s_workspace, s_workspace_size, workspace_size, stream);
 
     auto status = gemm.can_implement(args);
     if (status != cutlass::Status::kSuccess) {
@@ -278,16 +283,9 @@ void invoke_dense_gemm_add(
         M_padded = ((M + 7) / 8) * 8;
         size_t a_need = (size_t)M_padded * K * sizeof(__nv_bfloat16);
         size_t d_need = (size_t)M_padded * N * sizeof(__nv_bfloat16);
-        if (a_need > s_A_pad2_sz) {
-            if (s_A_pad2) cudaFree(s_A_pad2);
-            cudaMalloc(&s_A_pad2, a_need);
-            s_A_pad2_sz = a_need;
-        }
-        if (d_need > s_D_pad2_sz) {
-            if (s_D_pad2) cudaFree(s_D_pad2);
-            cudaMalloc(&s_D_pad2, d_need);
-            s_D_pad2_sz = d_need;
-        }
+        SAFE_CUDA_REALLOC(s_A_pad2, s_A_pad2_sz, a_need, stream);
+        SAFE_CUDA_REALLOC(s_D_pad2, s_D_pad2_sz, d_need, stream);
+        if (!s_A_pad2 || !s_D_pad2) return; // OOM guard
         cudaMemcpyAsync(s_A_pad2, A, (size_t)M * K * sizeof(__nv_bfloat16),
                         cudaMemcpyDeviceToDevice, stream);
         cudaMemsetAsync(s_A_pad2 + (size_t)M * K, 0,
@@ -336,11 +334,7 @@ void invoke_dense_gemm_add(
     static void* s_workspace2 = nullptr;
     static size_t s_workspace2_size = 0;
     size_t workspace_size = GemmType::get_workspace_size(args);
-    if (workspace_size > s_workspace2_size) {
-        if (s_workspace2) cudaFree(s_workspace2);
-        cudaMalloc(&s_workspace2, workspace_size);
-        s_workspace2_size = workspace_size;
-    }
+    SAFE_CUDA_REALLOC(s_workspace2, s_workspace2_size, workspace_size, stream);
 
     auto status = gemm.can_implement(args);
     if (status != cutlass::Status::kSuccess) {

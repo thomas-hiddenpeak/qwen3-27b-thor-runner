@@ -219,6 +219,14 @@ void PerfProfiler::begin(const std::string& phase, cudaStream_t stream) {
         phase_order_.push_back(phase);
         it = phases_.emplace(phase, PhaseCtx{}).first;
     }
+    // Flush previous cycle's timing data lazily.
+    // By the time begin() is called again, the GPU has long finished the
+    // previous stop event, so elapsed_ms() returns immediately (no spin).
+    if (it->second.pending) {
+        float ms = it->second.timer.elapsed_ms();
+        it->second.stat.record(ms);
+        it->second.pending = false;
+    }
     it->second.timer.start(stream);
 }
 
@@ -226,9 +234,10 @@ void PerfProfiler::end(const std::string& phase, cudaStream_t stream) {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = phases_.find(phase);
     if (it == phases_.end()) return;
+    // Only record the stop marker — NON-BLOCKING.
+    // elapsed_ms() will be called lazily in the next begin() for this phase.
     it->second.timer.stop(stream);
-    float ms = it->second.timer.elapsed_ms();
-    it->second.stat.record(ms);
+    it->second.pending = true;
 }
 
 void PerfProfiler::request_start() {
@@ -256,6 +265,19 @@ SystemSnapshot PerfProfiler::snapshot() {
 
 void PerfProfiler::print_step_report(int step_num) {
     auto snap = snapshot();
+
+    // Flush any pending phase timers before reading stats.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto& name : phase_order_) {
+            auto& ctx = phases_[name];
+            if (ctx.pending) {
+                float ms = ctx.timer.elapsed_ms();
+                ctx.stat.record(ms);
+                ctx.pending = false;
+            }
+        }
+    }
 
     // 收集本 step 的各阶段耗时
     float total_step_ms = 0.0f;
@@ -296,6 +318,19 @@ void PerfProfiler::print_request_summary() {
         decode_steps_, decode_s * 1000.0, tps,
         total_s * 1000.0);
 
+    // Flush any pending timers before printing.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto& name : phase_order_) {
+            auto& ctx = phases_[name];
+            if (ctx.pending) {
+                float ms = ctx.timer.elapsed_ms();
+                ctx.stat.record(ms);
+                ctx.pending = false;
+            }
+        }
+    }
+
     // 阶段细分
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -331,6 +366,15 @@ void PerfProfiler::print_phase_summary() {
             "────────────────────────", "──────────", "──────────", "──────────", "──────────", "──────");
     {
         std::lock_guard<std::mutex> lk(mu_);
+        // Flush any pending timers before printing.
+        for (auto& name : phase_order_) {
+            auto& ctx = phases_[name];
+            if (ctx.pending) {
+                float ms = ctx.timer.elapsed_ms();
+                ctx.stat.record(ms);
+                ctx.pending = false;
+            }
+        }
         for (auto& name : phase_order_) {
             auto& s = phases_[name].stat;
             fprintf(stderr, "  %-24s %9.1fms %9.2fms %9.2fms %9.2fms %6d\n",

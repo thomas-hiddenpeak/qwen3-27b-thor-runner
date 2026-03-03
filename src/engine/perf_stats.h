@@ -170,10 +170,11 @@ public:
     void reset();
 
 private:
-    // 阶段 -> (CudaTimer, PhaseStat) 
+    // 阶段 -> (CudaTimer, PhaseStat)
     struct PhaseCtx {
         CudaTimer timer;
         PhaseStat stat;
+        bool pending = false;  // stop event recorded but not yet read
     };
     std::unordered_map<std::string, PhaseCtx> phases_;
     std::mutex mu_;  // 保护 phases_ 的并发插入

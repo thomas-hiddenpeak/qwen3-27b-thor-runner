@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <thread>
 #include <random>
+#include <cctype>
 
 // stb_image for decoding JPEG/PNG
 #define STB_IMAGE_IMPLEMENTATION
@@ -26,6 +27,7 @@
 #define STBI_NO_LINEAR
 #include "../../third_party/stb/stb_image.h"
 
+// malloc_trim removed — glibc global arena lock risks systemd WDT timeout
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -106,6 +108,16 @@ static int json_get_int(const std::string& json, const std::string& key, int def
     return (int)json_get_number(json, key, def);
 }
 
+static int clamp_max_output_tokens(int requested, int cap) {
+    int safe_cap = std::max(1, cap);
+    if (requested <= 0) return safe_cap;
+    return std::min(requested, safe_cap);
+}
+
+// 默认 system prompt — 使用模型官方推荐, 双语确保中英文都能正常工作
+static const char* DEFAULT_SYSTEM_PROMPT =
+    "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+
 // Unescape JSON string value (handles \", \\, \n, \t, \r, \/)
 static std::string json_unescape(const std::string& s) {
     std::string out;
@@ -157,6 +169,70 @@ static std::string extract_json_object(const std::string& s, size_t& pos) {
     return s.substr(start, pos - start);
 }
 
+static std::string extract_json_array(const std::string& s, size_t& pos) {
+    if (pos >= s.size() || s[pos] != '[') return "";
+    size_t start = pos;
+    int depth = 1;
+    pos++;
+    while (pos < s.size() && depth > 0) {
+        if (s[pos] == '[') depth++;
+        else if (s[pos] == ']') depth--;
+        else if (s[pos] == '"') {
+            pos++;
+            while (pos < s.size()) {
+                if (s[pos] == '"') {
+                    int bs = 0;
+                    size_t bp = pos;
+                    while (bp > start && s[bp - 1] == '\\') { bs++; bp--; }
+                    if (bs % 2 == 0) break;
+                }
+                pos++;
+            }
+        }
+        pos++;
+    }
+    return s.substr(start, pos - start);
+}
+
+static std::string extract_json_raw_value(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    auto pos = json.find(search);
+    if (pos == std::string::npos) return "";
+
+    pos = json.find(':', pos + search.size());
+    if (pos == std::string::npos) return "";
+    pos++;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r')) pos++;
+    if (pos >= json.size()) return "";
+
+    if (json[pos] == '{') {
+        size_t p = pos;
+        return extract_json_object(json, p);
+    }
+    if (json[pos] == '[') {
+        size_t p = pos;
+        return extract_json_array(json, p);
+    }
+    if (json[pos] == '"') {
+        size_t p = pos + 1;
+        while (p < json.size()) {
+            if (json[p] == '"') {
+                int bs = 0;
+                size_t bp = p;
+                while (bp > pos && json[bp - 1] == '\\') { bs++; bp--; }
+                if (bs % 2 == 0) break;
+            }
+            p++;
+        }
+        if (p < json.size()) return json.substr(pos, p - pos + 1);
+        return "";
+    }
+
+    size_t end = pos;
+    while (end < json.size() && json[end] != ',' && json[end] != '}' && json[end] != ']') end++;
+    return json.substr(pos, end - pos);
+}
+
 // Extract "tools" array from request body as raw JSON string
 static std::string extract_tools_json(const std::string& body) {
     auto pos = body.find("\"tools\"");
@@ -191,7 +267,6 @@ static std::string extract_tools_json(const std::string& body) {
 static std::string build_tool_system_prompt(const std::string& tools_json) {
     if (tools_json.empty()) return "";
 
-    // Extract individual tool objects from the array and put each on its own line
     std::string tool_lines;
     size_t p = 1; // skip [
     while (p < tools_json.size()) {
@@ -263,32 +338,115 @@ static std::vector<uint8_t> base64_decode(const std::string& input) {
 
 // Decode image from base64 data URI or raw base64 string
 // Returns ImageData with RGB pixels, or empty on failure
+// In-place base64 decode: operates directly from data_uri offset, avoiding 15MB substr copy
+static std::vector<uint8_t> base64_decode_from(const std::string& input, size_t offset) {
+    std::vector<uint8_t> out;
+    out.reserve((input.size() - offset) * 3 / 4);
+    uint32_t accum = 0;
+    int bits = 0;
+    for (size_t i = offset; i < input.size(); ++i) {
+        char c = input[i];
+        if (c == '\n' || c == '\r' || c == ' ') continue;
+        if (c == '=') break;
+        uint8_t val = b64_table[(uint8_t)c];
+        if (val >= 64) continue;
+        accum = (accum << 6) | val;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((uint8_t)((accum >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
 static ImageData decode_image_base64(const std::string& data_uri) {
     ImageData result;
-    std::string b64;
 
-    // Strip "data:image/...;base64," prefix if present
+    // Decode directly from offset, no substr copy
+    size_t decode_offset = 0;
     auto comma_pos = data_uri.find(',');
     if (comma_pos != std::string::npos) {
-        b64 = data_uri.substr(comma_pos + 1);
-    } else {
-        b64 = data_uri;
+        decode_offset = comma_pos + 1;
     }
 
-    auto raw = base64_decode(b64);
+    auto raw = base64_decode_from(data_uri, decode_offset);
     if (raw.empty()) return result;
+
+    // Pre-flight: read image dimensions from header (no decode) to reject absurdly large images
+    int info_w, info_h, info_c;
+    if (stbi_info_from_memory(raw.data(), (int)raw.size(), &info_w, &info_h, &info_c)) {
+        long long total_pixels = (long long)info_w * info_h;
+        fprintf(stderr, "[Serve] Image header: %dx%d (%lld pixels, ~%.1f MB RGB)\n",
+                info_w, info_h, total_pixels, total_pixels * 3.0 / 1048576.0);
+        // Reject images that would need >256 MB for stbi decode (>85M pixels)
+        if (total_pixels > 85000000LL) {
+            fprintf(stderr, "[Serve] Image too large (%lld pixels), max 85M. Rejected.\n", total_pixels);
+            return result;
+        }
+    }
 
     int w, h, channels;
     uint8_t* img = stbi_load_from_memory(raw.data(), (int)raw.size(), &w, &h, &channels, 3);
+    // Release raw immediately after stbi load
+    { std::vector<uint8_t>().swap(raw); }
     if (!img) {
         std::cerr << "[Serve] Failed to decode image: " << stbi_failure_reason() << std::endl;
         return result;
     }
 
-    result.width = w;
-    result.height = h;
-    result.pixels.assign(img, img + w * h * 3);
-    stbi_image_free(img);
+    // Pre-downscale large images to avoid carrying 100+ MB through the entire pipeline.
+    // The ViT smart_resize will shrink to max_pixels anyway; doing it here saves massive
+    // memory (e.g., 7749x5812 = 129 MB RGB → 576x416 = 720 KB).
+    const int MAX_PIXELS = 262144;  // matches VisionConfig.max_pixels
+    if ((long long)w * h > MAX_PIXELS * 4) {
+        // Compute smart_resize target dimensions
+        int factor = 32;
+        int h_bar = std::max(factor, (int)(std::round((double)h / factor) * factor));
+        int w_bar = std::max(factor, (int)(std::round((double)w / factor) * factor));
+        if ((long long)h_bar * w_bar > MAX_PIXELS) {
+            double beta = std::sqrt((double)h * w / MAX_PIXELS);
+            h_bar = std::max(factor, (int)(std::floor((double)h / beta / factor) * factor));
+            w_bar = std::max(factor, (int)(std::floor((double)w / beta / factor) * factor));
+        } else if ((long long)h_bar * w_bar < 256) {  // min_pixels
+            double beta = std::sqrt(256.0 / ((double)h * w));
+            h_bar = std::max(factor, (int)(std::ceil((double)h * beta / factor) * factor));
+            w_bar = std::max(factor, (int)(std::ceil((double)w * beta / factor) * factor));
+        }
+
+        fprintf(stderr, "[Serve] Pre-downscale: %dx%d (%.1f MB) -> %dx%d (%.1f KB)\n",
+                w, h, (double)w * h * 3 / 1048576.0, w_bar, h_bar,
+                (double)w_bar * h_bar * 3 / 1024.0);
+
+        // Bilinear downscale (uint8 RGB → uint8 RGB)
+        std::vector<uint8_t> resized(w_bar * h_bar * 3);
+        for (int y = 0; y < h_bar; y++) {
+            float sy = (float)y * (h - 1) / std::max(h_bar - 1, 1);
+            int y0 = (int)sy, y1 = std::min(y0 + 1, h - 1);
+            float fy = sy - y0;
+            for (int x = 0; x < w_bar; x++) {
+                float sx = (float)x * (w - 1) / std::max(w_bar - 1, 1);
+                int x0 = (int)sx, x1 = std::min(x0 + 1, w - 1);
+                float fx = sx - x0;
+                for (int c = 0; c < 3; c++) {
+                    float val = (1 - fy) * ((1 - fx) * img[(y0 * w + x0) * 3 + c]
+                                          + fx * img[(y0 * w + x1) * 3 + c])
+                              + fy * ((1 - fx) * img[(y1 * w + x0) * 3 + c]
+                                    + fx * img[(y1 * w + x1) * 3 + c]);
+                    resized[(y * w_bar + x) * 3 + c] = (uint8_t)(val + 0.5f);
+                }
+            }
+        }
+        stbi_image_free(img);
+        result.width  = w_bar;
+        result.height = h_bar;
+        result.pixels = std::move(resized);
+    } else {
+        result.width = w;
+        result.height = h;
+        result.pixels.assign(img, img + w * h * 3);
+        stbi_image_free(img);
+    }
     return result;
 }
 
@@ -304,6 +462,28 @@ struct MultimodalContent {
 
 static MultimodalContent parse_multimodal_content(const std::string& content_json) {
     MultimodalContent result;
+
+    auto extract_media_url = [](const std::string& obj,
+                                const std::string& key,
+                                const std::string& fallback_key = "url") -> std::string {
+        // 兼容两种格式:
+        //   1) "image_url": "data:..."
+        //   2) "image_url": {"url":"data:..."}
+        auto key_pos = obj.find("\"" + key + "\"");
+        if (key_pos != std::string::npos) {
+            size_t brace = obj.find('{', key_pos + key.size() + 2);
+            size_t colon = obj.find(':', key_pos + key.size() + 2);
+            if (brace != std::string::npos && (colon == std::string::npos || brace > colon)) {
+                std::string nested = extract_json_object(obj, brace);
+                std::string nested_url = json_get_string(nested, fallback_key);
+                if (!nested_url.empty()) return nested_url;
+            }
+        }
+
+        std::string direct = json_get_string(obj, key);
+        if (!direct.empty()) return direct;
+        return "";
+    };
 
     // Check if content starts with [ (array) vs " (string)
     size_t start = 0;
@@ -328,33 +508,32 @@ static MultimodalContent parse_multimodal_content(const std::string& content_jso
             std::string obj = extract_json_object(content_json, pos);
             std::string type = json_get_string(obj, "type");
 
-            if (type == "text") {
+            if (type == "text" || type == "input_text") {
                 std::string text = json_get_string(obj, "text");
                 result.text += text;
-            } else if (type == "image_url") {
-                // Extract nested image_url object
-                auto iu_pos = obj.find("\"image_url\"");
-                if (iu_pos != std::string::npos) {
-                    size_t fp = obj.find('{', iu_pos + 11);
-                    if (fp != std::string::npos) {
-                        std::string iu_obj = extract_json_object(obj, fp);
-                        std::string url = json_get_string(iu_obj, "url");
-                        if (!url.empty()) {
-                            auto img = decode_image_base64(url);
-                            if (img.width > 0) {
-                                result.images.push_back(std::move(img));
-                                // Insert image placeholder text
-                                // The actual tokens will be handled during tokenization
-                                result.text += "<|vision_start|><|image_pad|><|vision_end|>";
-                            }
-                        }
+            } else if (type == "image_url" || type == "input_image" || type == "image") {
+                std::string url = extract_media_url(obj, "image_url");
+                if (url.empty()) {
+                    url = extract_media_url(obj, "image");
+                }
+                if (url.empty()) {
+                    url = json_get_string(obj, "url");
+                }
+                if (!url.empty()) {
+                    auto img = decode_image_base64(url);
+                    if (img.width > 0) {
+                        result.images.push_back(std::move(img));
+                        result.text += "<|vision_start|><|image_pad|><|vision_end|>";
                     }
                 }
-            } else if (type == "video") {
+            } else if (type == "video" || type == "input_video") {
                 // Parse video as array of base64-encoded frames:
                 //   {"type":"video", "video":["base64_frame1","base64_frame2",...], "fps":24}
                 float fps = (float)json_get_number(obj, "fps", 24.0);
                 auto vid_pos = obj.find("\"video\"");
+                if (vid_pos == std::string::npos) {
+                    vid_pos = obj.find("\"frames\"");
+                }
                 if (vid_pos != std::string::npos) {
                     auto vid_arr = obj.find('[', vid_pos);
                     if (vid_arr != std::string::npos) {
@@ -423,18 +602,13 @@ static MultimodalContent parse_multimodal_content(const std::string& content_jso
                         }
                     }
                 }
-            } else if (type == "video_url") {
+            } else if (type == "video_url" || type == "input_video_url") {
                 // Parse video_url: {"type":"video_url","video_url":{"url":"data:video/mp4;base64,..."}}
                 // Decode video file, extract frames with ffmpeg, build VideoData
                 std::cout << "[Serve] video_url type detected, obj.size()=" << obj.size() << std::endl;
-                auto vu_pos = obj.find("\"video_url\"");
-                if (vu_pos != std::string::npos) {
-                    size_t fp = obj.find('{', vu_pos + 11);
-                    if (fp != std::string::npos) {
-                        std::string vu_obj = extract_json_object(obj, fp);
-                        std::string url = json_get_string(vu_obj, "url");
+                std::string url = extract_media_url(obj, "video_url");
+                if (!url.empty()) {
                         std::cout << "[Serve] url.size()=" << url.size() << std::endl;
-                        if (!url.empty()) {
                             // Strip data URI prefix to get raw base64
                             std::string b64_data;
                             auto comma = url.find(',');
@@ -530,8 +704,6 @@ static MultimodalContent parse_multimodal_content(const std::string& content_jso
                                     result.videos.push_back(std::move(vd));
                                 }
                             }
-                        }
-                    }
                 }
             }
         } else {
@@ -544,55 +716,96 @@ static MultimodalContent parse_multimodal_content(const std::string& content_jso
 
 // Expand image placeholders in token sequence:
 // Replace single <|image_pad|> with N_output copies based on image dimensions
+// Multi-turn alignment: the LAST images.size() vision groups get expanded;
+// earlier groups (history images not re-submitted) are collapsed to 0 pads.
+// This ensures feature vectors align with the CORRECT positions in the prompt.
 static void expand_image_placeholders(std::vector<int>& tokens,
                                        const std::vector<ImageData>& images,
                                        const Tokenizer& tokenizer) {
     // Token IDs for vision special tokens
-    int vision_start_id = -1, image_pad_id = -1, vision_end_id = -1;
-    // Look up from tokenizer's special tokens
-    // These are standard Qwen3.5 token IDs
-    vision_start_id = 248053;
-    image_pad_id    = 248056;
-    vision_end_id   = 248054;
+    int vision_start_id = 248053;
+    int image_pad_id    = 248056;
+    int vision_end_id   = 248054;
+
+    // Count total vision groups in the token sequence
+    int total_vision_groups = 0;
+    for (int t : tokens) if (t == vision_start_id) total_vision_groups++;
+
+    // Number of leading groups to collapse (history images not in images[])
+    int skip_groups = std::max(0, total_vision_groups - (int)images.size());
 
     core::VisionConfig vcfg;
-    int img_idx = 0;
+    int group_idx = 0;  // increments each vision_start encountered
+    int img_idx   = 0;  // increments only when a group is expanded
 
     std::vector<int> expanded;
     expanded.reserve(tokens.size() + images.size() * 256);
 
     for (size_t i = 0; i < tokens.size(); i++) {
-        if (tokens[i] == vision_start_id && img_idx < (int)images.size()) {
+        if (tokens[i] == vision_start_id) {
             expanded.push_back(vision_start_id);
 
-            // Find the matching vision_end and count existing image_pad tokens
-            // Then replace with the correct number
+            // Skip existing image_pad tokens and vision_end in source
             size_t j = i + 1;
             while (j < tokens.size() && tokens[j] == image_pad_id) j++;
-            // Skip past vision_end
             if (j < tokens.size() && tokens[j] == vision_end_id) j++;
 
-            // Calculate actual number of output tokens for this image
-            auto& img = images[img_idx];
-            core::ImageInput input;
-            input.width = img.width;
-            input.height = img.height;
-            input.pixels = img.pixels; // We need full pixels for preprocess
-            auto processed = core::VisionEncoder::preprocess_image(input, vcfg);
-            int n_tokens = processed.num_output_tokens();
-
-            // Insert n_tokens copies of image_pad
-            for (int k = 0; k < n_tokens; k++) {
-                expanded.push_back(image_pad_id);
+            if (group_idx < skip_groups) {
+                // Collapse: history group with no image data available
+                // Emit 0 image_pads — just vision_start + vision_end
+                std::cout << "[Serve] Vision group " << group_idx
+                          << " collapsed (no matching image in request)" << std::endl;
+                expanded.push_back(vision_end_id);
+            } else if (img_idx < (int)images.size()) {
+                // Expand with the corresponding image
+                // Pure arithmetic: compute n_tokens without any pixel data
+                // smart_resize → grid_h/w → num_output_tokens
+                auto& img = images[img_idx];
+                int factor = vcfg.factor();  // 32
+                int h_bar = std::max(factor, (int)(std::round((double)img.height / factor) * factor));
+                int w_bar = std::max(factor, (int)(std::round((double)img.width  / factor) * factor));
+                if ((long long)h_bar * w_bar > vcfg.max_pixels) {
+                    double beta = std::sqrt((double)img.height * img.width / vcfg.max_pixels);
+                    h_bar = std::max(factor, (int)(std::floor((double)img.height / beta / factor) * factor));
+                    w_bar = std::max(factor, (int)(std::floor((double)img.width  / beta / factor) * factor));
+                } else if ((long long)h_bar * w_bar < vcfg.min_pixels) {
+                    double beta = std::sqrt((double)vcfg.min_pixels / ((double)img.height * img.width));
+                    h_bar = std::max(factor, (int)(std::ceil((double)img.height * beta / factor) * factor));
+                    w_bar = std::max(factor, (int)(std::ceil((double)img.width  * beta / factor) * factor));
+                }
+                int grid_h = h_bar / vcfg.patch_size;   // patch_size=16
+                int grid_w = w_bar / vcfg.patch_size;
+                int n_tokens = 1 * (grid_h / 2) * (grid_w / 2);  // grid_t=1, spatial_merge_size=2
+                std::cout << "[Serve] Vision group " << group_idx
+                          << " expanded to " << n_tokens << " image_pad tokens" << std::endl;
+                for (int k = 0; k < n_tokens; k++)
+                    expanded.push_back(image_pad_id);
+                expanded.push_back(vision_end_id);
+                img_idx++;
+            } else {
+                // Defensive: no image left, collapse
+                expanded.push_back(vision_end_id);
             }
-            expanded.push_back(vision_end_id);
 
+            group_idx++;
             i = j - 1;  // -1 because loop will increment
-            img_idx++;
         } else {
             expanded.push_back(tokens[i]);
         }
     }
+
+    if (img_idx != (int)images.size()) {
+        std::cerr << "[Serve] Warning: expand_image_placeholders consumed " << img_idx
+                  << " of " << images.size() << " images" << std::endl;
+    }
+
+    // Count resulting image_pad tokens for verification
+    int final_pad_count = 0;
+    for (int t : expanded) if (t == image_pad_id) final_pad_count++;
+    std::cout << "[Serve] expand_image_placeholders: total_groups=" << total_vision_groups
+              << " images=" << images.size() << " skip=" << skip_groups
+              << " final_pad_count=" << final_pad_count << std::endl;
+    std::cout.flush();
 
     tokens = std::move(expanded);
 }
@@ -892,6 +1105,7 @@ ServeConfig ServeConfig::merge_args(const ServeConfig& base, int argc, char** ar
         else if (arg == "--max-conns" && i + 1 < argc) cfg.max_conns = std::stoi(argv[++i]);
         else if (arg == "--model-name" && i + 1 < argc) cfg.model_name = argv[++i];
         else if (arg == "--timeout" && i + 1 < argc) cfg.timeout_s = std::stoi(argv[++i]);
+        else if (arg == "--max-output-tokens" && i + 1 < argc) cfg.max_output_tokens_cap = std::stoi(argv[++i]);
     }
     return cfg;
 }
@@ -919,6 +1133,7 @@ ServeConfig ServeConfig::from_file(const std::string& path) {
         else if (key == "max_conns")  cfg.max_conns = std::stoi(val);
         else if (key == "model_name") cfg.model_name = val;
         else if (key == "timeout")    cfg.timeout_s = std::stoi(val);
+        else if (key == "max_output_tokens") cfg.max_output_tokens_cap = std::stoi(val);
     }
     return cfg;
 }
@@ -933,6 +1148,7 @@ void ServeConfig::print() const {
     printf("│  Max Conns:     %-6d                       │\n", max_conns);
     printf("│  Model Name:    %-26s │\n", model_name.c_str());
     printf("│  Timeout:       %-6d s                     │\n", timeout_s);
+    printf("│  Max Output:    %-6d tok                   │\n", max_output_tokens_cap);
     printf("└─────────────────────────────────────────────┘\n");
 }
 
@@ -1027,6 +1243,7 @@ void ServeApp::run() {
     printf("  GET  /api/version           — Version info\n");
     printf("  GET  /health                — Health check\n");
     printf("\n[Serve] OpenAI API on http://%s:%d\n", config_.host.c_str(), config_.openai_port);
+    printf("  POST /v1/responses          — OpenAI Responses API (minimal)\n");
     printf("  POST /v1/chat/completions   — OpenAI Chat API\n");
     printf("  POST /v1/completions        — OpenAI Completions API\n");
     printf("  GET  /v1/models             — Model list\n");
@@ -1076,6 +1293,9 @@ void ServeApp::accept_loop() {
             int client_fd = accept(pfds[i].fd, (struct sockaddr*)&client_addr, &client_len);
             if (client_fd < 0) continue;
 
+            fprintf(stderr, "[Serve] accept() fd=%d protocol=%s\n",
+                    client_fd, i == 0 ? "ollama" : "openai");
+
             // 检查并发限制
             if (active_workers_.load() >= config_.max_conns) {
                 const char* busy = "HTTP/1.1 503 Service Unavailable\r\n"
@@ -1088,18 +1308,24 @@ void ServeApp::accept_loop() {
 
             int protocol = i;  // 0 = Ollama, 1 = OpenAI
             active_workers_.fetch_add(1);
+            fprintf(stderr, "[Serve] spawning thread for fd=%d...\n", client_fd);
             std::thread([this, client_fd, protocol]() {
                 handle_connection(client_fd, protocol);
                 active_workers_.fetch_sub(1);
             }).detach();
+            fprintf(stderr, "[Serve] thread spawned for fd=%d\n", client_fd);
         }
     }
 }
 
 void ServeApp::handle_connection(int client_fd, int protocol) {
+    // Print BEFORE body receive so we know this connection arrived even if crash follows
+    fprintf(stderr, "[Serve] Incoming connection fd=%d\n", client_fd);
+    fflush(stderr);
     auto req = parse_request(client_fd);
-    std::cout << "[Serve] " << req.method << " " << req.path
-              << " body=" << req.body.size() << " bytes" << std::endl;
+    fprintf(stderr, "[Serve] %s %s body=%zu bytes\n",
+            req.method.c_str(), req.path.c_str(), req.body.size());
+    fflush(stderr);
 
     // CORS preflight 两个端口都处理
     if (req.method == "OPTIONS") {
@@ -1143,6 +1369,8 @@ void ServeApp::handle_connection(int client_fd, int protocol) {
         } else if (req.path.rfind("/v1/models/", 0) == 0 && req.method == "GET") {
             // GET /v1/models/{model} — retrieve individual model
             handle_model_retrieve(req, client_fd);
+        } else if (req.path == "/v1/responses" && req.method == "POST") {
+            handle_openai_responses(req, client_fd);
         } else if (req.path == "/v1/chat/completions" && req.method == "POST") {
             handle_openai_chat(req, client_fd);
         } else if (req.path == "/v1/completions" && req.method == "POST") {
@@ -1163,6 +1391,8 @@ HttpRequest ServeApp::parse_request(int client_fd) {
     HttpRequest req;
     req.client_fd = client_fd;
 
+    fprintf(stderr, "[Serve] parse_request fd=%d: reading headers...\n", client_fd);
+
     // 读取 HTTP 头部
     std::string raw;
     char buf[4096];
@@ -1172,6 +1402,8 @@ HttpRequest ServeApp::parse_request(int client_fd) {
         raw.append(buf, n);
         if (raw.find("\r\n\r\n") != std::string::npos) break;
     }
+
+    fprintf(stderr, "[Serve] parse_request fd=%d: headers received, raw=%zu bytes\n", client_fd, raw.size());
 
     // 解析请求行
     auto first_line_end = raw.find("\r\n");
@@ -1206,18 +1438,35 @@ HttpRequest ServeApp::parse_request(int client_fd) {
             pos = line_end + 2;
         }
 
-        // Body
-        req.body = raw.substr(header_end + 4);
-
-        // 如果 Content-Length 指示更长的 body, 继续读取
+        // Body: 直接分配完整大小, 避免多次 realloc
         auto cl_it = req.headers.find("content-length");
         if (cl_it != req.headers.end()) {
             size_t content_len = std::stoull(cl_it->second);
-            while (req.body.size() < content_len) {
-                ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
-                if (n <= 0) break;
-                req.body.append(buf, n);
+            size_t body_in_raw = raw.size() - (header_end + 4);
+            if (body_in_raw > content_len) body_in_raw = content_len;
+
+            // 一次性分配完整 body 缓冲区
+            req.body.resize(content_len);
+            // 复制已在 header 读取中收到的 body 部分
+            if (body_in_raw > 0) {
+                memcpy(&req.body[0], raw.data() + header_end + 4, body_in_raw);
             }
+
+            fprintf(stderr, "[Serve] parse_request fd=%d: body %zu/%zu bytes (Content-Length=%zu)\n",
+                    client_fd, body_in_raw, content_len, content_len);
+
+            // 直接 recv 到 body 缓冲区, 无中间复制
+            size_t received = body_in_raw;
+            while (received < content_len) {
+                ssize_t n = recv(client_fd, &req.body[received], content_len - received, 0);
+                if (n <= 0) break;
+                received += n;
+            }
+            req.body.resize(received);  // 处理短读
+            fprintf(stderr, "[Serve] parse_request fd=%d: body complete %zu bytes\n", client_fd, received);
+        } else {
+            // 无 Content-Length, 取 header 后的所有数据
+            req.body = raw.substr(header_end + 4);
         }
     }
 
@@ -1237,9 +1486,9 @@ void ServeApp::send_response(int client_fd, const HttpResponse& resp) {
     send(client_fd, str.c_str(), str.size(), 0);
 }
 
-void ServeApp::send_sse_event(int client_fd, const std::string& data) {
+bool ServeApp::send_sse_event(int client_fd, const std::string& data) {
     std::string event = "data: " + data + "\n\n";
-    send(client_fd, event.c_str(), event.size(), MSG_NOSIGNAL);
+    return ::send(client_fd, event.c_str(), event.size(), MSG_NOSIGNAL) >= 0;
 }
 
 void ServeApp::send_sse_done(int client_fd) {
@@ -1247,12 +1496,12 @@ void ServeApp::send_sse_done(int client_fd) {
     send(client_fd, done.c_str(), done.size(), MSG_NOSIGNAL);
 }
 
-void ServeApp::send_ndjson_chunk(int client_fd, const std::string& json_line) {
+bool ServeApp::send_ndjson_chunk(int client_fd, const std::string& json_line) {
     std::string data = json_line + "\n";
     std::ostringstream oss;
     oss << std::hex << data.size() << "\r\n" << data << "\r\n";
     auto chunk = oss.str();
-    send(client_fd, chunk.c_str(), chunk.size(), MSG_NOSIGNAL);
+    return ::send(client_fd, chunk.c_str(), chunk.size(), MSG_NOSIGNAL) >= 0;
 }
 
 void ServeApp::send_chunked_end(int client_fd) {
@@ -1329,7 +1578,8 @@ int ServeApp::poll_tokens(uint64_t request_id,
                           const std::vector<std::string>& stop_seqs,
                           const std::function<void(const std::string&)>& on_reasoning,
                           const std::function<void(const ToolCallInfo&)>& on_tool_call,
-                          std::string* out_finish_reason) {
+                          std::string* out_finish_reason,
+                          std::atomic<bool>* abort_flag) {
     const auto& tok = backend_.tokenizer();
     int count = 0;
     // enable_thinking=true 时, prompt 已以 <think>\n 结尾,
@@ -1351,6 +1601,9 @@ int ServeApp::poll_tokens(uint64_t request_id,
     // per-request 队列已在 submit 前注册 (避免竞态)
 
     while (true) {
+        // 客户端已断开时立即退出
+        if (abort_flag && abort_flag->load(std::memory_order_relaxed)) break;
+
         InferResponse resp;
         if (poll_request(request_id, resp, 100)) {
             if (resp.error_code != 0 || resp.is_finished) break;
@@ -1495,10 +1748,14 @@ void ServeApp::handle_health(const HttpRequest& /*req*/, int client_fd) {
 void ServeApp::handle_models(const HttpRequest& /*req*/, int client_fd) {
     auto now = std::time(nullptr);
     HttpResponse resp;
-    resp.body = "{\"object\":\"list\",\"data\":[{\"id\":\"" + config_.model_name +
+    resp.body = std::string("{\"object\":\"list\",\"data\":[{\"id\":\"") + config_.model_name +
                 "\",\"object\":\"model\",\"created\":" + std::to_string(now) +
                 ",\"owned_by\":\"local\""
-                ",\"capabilities\":{\"reasoning\":true,\"tool_calling\":true,\"multimodal\":true}"
+                ",\"permission\":[]"
+                ",\"capabilities\":{\"reasoning\":true,\"tool_calling\":true,\"multimodal\":true,\"vision\":true,\"video\":true}"
+                ",\"input_modalities\":[\"text\",\"image\",\"video\"]"
+                ",\"output_modalities\":[\"text\"]"
+                ",\"modalities\":[\"text\",\"image\",\"video\"]"
                 "}]}";
     send_response(client_fd, resp);
 }
@@ -1526,7 +1783,11 @@ void ServeApp::handle_model_retrieve(const HttpRequest& req, int client_fd) {
     }
 
     // Check if the requested model matches our loaded model
-    if (decoded != config_.model_name && decoded != config_.model_name + ":latest") {
+    bool model_ok =
+        decoded == config_.model_name ||
+        decoded == config_.model_name + ":latest";
+
+    if (!model_ok) {
         HttpResponse resp;
         resp.status_code = 404;
         resp.status_text = "Not Found";
@@ -1541,7 +1802,11 @@ void ServeApp::handle_model_retrieve(const HttpRequest& req, int client_fd) {
     resp.body = "{\"id\":\"" + config_.model_name +
                 "\",\"object\":\"model\",\"created\":" + std::to_string(now) +
                 ",\"owned_by\":\"local\""
-                ",\"capabilities\":{\"reasoning\":true,\"tool_calling\":true,\"multimodal\":true}"
+                ",\"permission\":[]"
+                ",\"capabilities\":{\"reasoning\":true,\"tool_calling\":true,\"multimodal\":true,\"vision\":true,\"video\":true}"
+                ",\"input_modalities\":[\"text\",\"image\",\"video\"]"
+                ",\"output_modalities\":[\"text\"]"
+                ",\"modalities\":[\"text\",\"image\",\"video\"]"
                 "}";
     send_response(client_fd, resp);
 }
@@ -1563,7 +1828,7 @@ void ServeApp::handle_ollama_tags(const HttpRequest& /*req*/, int client_fd) {
             "\"parameter_size\":\"27B\","
             "\"quantization_level\":\"BF16\""
         "},"
-        "\"capabilities\":[\"completion\",\"vision\",\"tools\",\"thinking\"]"
+        "\"capabilities\":[\"completion\",\"vision\",\"video\",\"tools\",\"thinking\"]"
     "}]}";
     send_response(client_fd, resp);
 }
@@ -1595,7 +1860,7 @@ void ServeApp::handle_ollama_show(const HttpRequest& req, int client_fd) {
             "\"qwen3.vision.patch_size\":16,"
             "\"qwen3.vision.num_layers\":27"
         "},"
-        "\"capabilities\":[\"completion\",\"vision\",\"tools\",\"thinking\"],"
+        "\"capabilities\":[\"completion\",\"vision\",\"video\",\"tools\",\"thinking\"],"
         "\"modified_at\":\"2025-05-10T00:00:00Z\""
     "}";
     send_response(client_fd, resp);
@@ -1643,20 +1908,24 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
 
     std::vector<ImageData> images;
     std::vector<VideoData> videos;
-    std::cout << "[Serve] calling parse_messages..." << std::endl;
+    fprintf(stderr, "[Serve] calling parse_messages (body=%zu)...\n", req.body.size());
+    fflush(stderr);
     auto messages = parse_messages(req.body, &images, &videos);
-    std::cout << "[Serve] parse_messages done: " << messages.size() << " msgs, "
-              << images.size() << " imgs, " << videos.size() << " vids" << std::endl;
+    fprintf(stderr, "[Serve] parse_messages done: %zu msgs, %zu imgs, %zu vids\n",
+            messages.size(), images.size(), videos.size());
+    fflush(stderr);
+
     bool stream = json_get_bool(req.body, "stream", false);
     int max_tokens = json_get_int(req.body, "max_tokens", 4096);
     // 支持 max_completion_tokens (新标准命名)
     if (req.body.find("\"max_completion_tokens\"") != std::string::npos)
         max_tokens = json_get_int(req.body, "max_completion_tokens", max_tokens);
+    max_tokens = clamp_max_output_tokens(max_tokens, config_.max_output_tokens_cap);
 
     // ---- Thinking mode 控制 ----
     // 支持多种参数名: "think", "enable_thinking" (vLLM/SGLang chat_template_kwargs)
     // 以及 OpenAI 标准 "reasoning_effort" (none=禁用, low/medium/high=启用)
-    bool enable_thinking = true;
+    bool enable_thinking = false;
     if (req.body.find("\"think\"") != std::string::npos)
         enable_thinking = json_get_bool(req.body, "think", true);
     else if (req.body.find("\"enable_thinking\"") != std::string::npos)
@@ -1717,7 +1986,7 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
         }
         if (!found_system) {
             messages.insert(messages.begin(),
-                {"system", "You are Qwen, created by Alibaba Cloud. You are a helpful assistant." + tool_prompt});
+                {"system", std::string(DEFAULT_SYSTEM_PROMPT) + tool_prompt});
         }
     }
 
@@ -1735,8 +2004,9 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
 
     int64_t seed = (int64_t)json_get_number(req.body, "seed", -1);
     float frequency_penalty = (float)json_get_number(req.body, "frequency_penalty", 0.0);
-    float presence_penalty  = (float)json_get_number(req.body, "presence_penalty", 0.0);
-    float repeat_penalty    = (float)json_get_number(req.body, "repeat_penalty", 1.0);  // 非标准但广泛支持
+    float presence_penalty  = (float)json_get_number(req.body, "presence_penalty", 1.5);
+    float repeat_penalty    = (float)json_get_number(req.body, "repeat_penalty", 1.0);
+    float min_p             = (float)json_get_number(req.body, "min_p", 0.0);
     std::string model = json_get_string(req.body, "model");
     if (model.empty()) model = config_.model_name;
     std::string req_id = generate_id("chatcmpl");
@@ -1751,6 +2021,17 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
     }
 
     // Tokenize via chat template
+    // 确保有 system prompt — Qwen3.5 在无 system prompt 时行为显著下降
+    {
+        bool has_system = false;
+        for (auto& [role, content] : messages) {
+            if (role == "system") { has_system = true; break; }
+        }
+        if (!has_system) {
+            messages.insert(messages.begin(),
+                {"system", DEFAULT_SYSTEM_PROMPT});
+        }
+    }
     auto prompt_tokens = tok.apply_chat_template(messages, true, enable_thinking);
 
     // Expand image placeholders if multimodal content was found
@@ -1762,6 +2043,17 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
         expand_video_placeholders(prompt_tokens, videos, tok);
     }
     int prompt_count = (int)prompt_tokens.size();
+    {
+        int n_img_pad = 0, n_vid_pad = 0;
+        for (int t : prompt_tokens) {
+            if (t == 248056) n_img_pad++;
+            else if (t == 248057) n_vid_pad++;
+        }
+        std::cout << "[Serve] Final prompt: tokens=" << prompt_count
+                  << " image_pad=" << n_img_pad << " video_pad=" << n_vid_pad
+                  << " images_to_encode=" << images.size() << std::endl;
+        std::cout.flush();
+    }
 
     // Submit inference request
     InferRequest infer_req;
@@ -1771,6 +2063,7 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
     infer_req.temperature    = temperature;
     infer_req.top_p          = top_p;
     infer_req.top_k          = top_k;
+    infer_req.min_p          = min_p;
     infer_req.repeat_penalty = repeat_penalty;
     infer_req.frequency_penalty = frequency_penalty;
     infer_req.presence_penalty  = presence_penalty;
@@ -1813,24 +2106,38 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
         // Stream tokens with reasoning + tool call support
         std::string finish_reason;
         int tool_call_idx = 0;
+        std::atomic<bool> client_disconnected{false};
 
         int comp_toks = poll_tokens(infer_req.request_id,
             // on_token (content)
             [&](const std::string& piece) {
-                send_sse_event(client_fd, make_chat_chunk(model, piece, "", req_id, now_t));
+                if (client_disconnected.load(std::memory_order_relaxed)) return;
+                if (!send_sse_event(client_fd, make_chat_chunk(model, piece, "", req_id, now_t))) {
+                    client_disconnected.store(true, std::memory_order_relaxed);
+                    backend_.cancel(infer_req.request_id);
+                }
             },
             config_.timeout_s,
             enable_thinking,
             stop_seqs,
             // on_reasoning
             [&](const std::string& piece) {
-                send_sse_event(client_fd, make_chat_reasoning_chunk(model, piece, req_id, now_t));
+                if (client_disconnected.load(std::memory_order_relaxed)) return;
+                if (!send_sse_event(client_fd, make_chat_reasoning_chunk(model, piece, req_id, now_t))) {
+                    client_disconnected.store(true, std::memory_order_relaxed);
+                    backend_.cancel(infer_req.request_id);
+                }
             },
             // on_tool_call
             [&](const ToolCallInfo& tc) {
-                send_sse_event(client_fd, make_chat_tool_call_chunk(model, tc, tool_call_idx++, req_id, now_t));
+                if (client_disconnected.load(std::memory_order_relaxed)) return;
+                if (!send_sse_event(client_fd, make_chat_tool_call_chunk(model, tc, tool_call_idx++, req_id, now_t))) {
+                    client_disconnected.store(true, std::memory_order_relaxed);
+                    backend_.cancel(infer_req.request_id);
+                }
             },
-            &finish_reason
+            &finish_reason,
+            &client_disconnected
         );
 
         // Finish chunk
@@ -1911,6 +2218,94 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
     }
 }
 
+void ServeApp::handle_openai_responses(const HttpRequest& req, int client_fd) {
+    // 最小兼容层: 将 /v1/responses 请求转换为 /v1/chat/completions 处理。
+    // 支持:
+    //  1) input 为字符串
+    //  2) input 为 messages 数组
+    //  3) input 为 content parts 数组 (input_text/input_image/input_video)
+
+    std::string model = json_get_string(req.body, "model");
+    if (model.empty()) model = config_.model_name;
+
+    bool stream = json_get_bool(req.body, "stream", false);
+    int max_tokens = json_get_int(req.body, "max_output_tokens", -1);
+    if (max_tokens <= 0) max_tokens = json_get_int(req.body, "max_tokens", 4096);
+    max_tokens = clamp_max_output_tokens(max_tokens, config_.max_output_tokens_cap);
+
+    std::string messages_json;
+    std::string direct_messages = extract_json_raw_value(req.body, "messages");
+    if (!direct_messages.empty() && direct_messages[0] == '[') {
+        messages_json = direct_messages;
+    } else {
+        std::string input_raw = extract_json_raw_value(req.body, "input");
+        if (input_raw.empty()) {
+            HttpResponse resp;
+            resp.status_code = 400;
+            resp.status_text = "Bad Request";
+            resp.body = R"({"error":{"message":"No input provided","type":"invalid_request_error"}})";
+            send_response(client_fd, resp);
+            return;
+        }
+
+        if (input_raw[0] == '"') {
+            std::string input_text = json_get_string(req.body, "input");
+            messages_json = "[{\"role\":\"user\",\"content\":\"" + json_escape(input_text) + "\"}]";
+        } else if (input_raw[0] == '[') {
+            if (input_raw.find("\"role\"") != std::string::npos) {
+                messages_json = input_raw;
+            } else {
+                messages_json = "[{\"role\":\"user\",\"content\":" + input_raw + "}]";
+            }
+        } else if (input_raw[0] == '{') {
+            if (input_raw.find("\"role\"") != std::string::npos) {
+                messages_json = "[" + input_raw + "]";
+            } else {
+                messages_json = "[{\"role\":\"user\",\"content\":[" + input_raw + "]}]";
+            }
+        } else {
+            HttpResponse resp;
+            resp.status_code = 400;
+            resp.status_text = "Bad Request";
+            resp.body = R"({"error":{"message":"Unsupported input format","type":"invalid_request_error"}})";
+            send_response(client_fd, resp);
+            return;
+        }
+    }
+
+    std::string chat_body = "{";
+    chat_body += "\"model\":\"" + json_escape(model) + "\"";
+    chat_body += ",\"stream\":" + std::string(stream ? "true" : "false");
+    chat_body += ",\"max_tokens\":" + std::to_string(max_tokens);
+    chat_body += ",\"messages\":" + messages_json;
+
+    auto append_raw = [&](const std::string& src_key, const std::string& dst_key = "") {
+        std::string raw = extract_json_raw_value(req.body, src_key);
+        if (!raw.empty()) {
+            chat_body += ",\"" + (dst_key.empty() ? src_key : dst_key) + "\":" + raw;
+        }
+    };
+
+    append_raw("temperature");
+    append_raw("top_p");
+    append_raw("top_k");
+    append_raw("seed");
+    append_raw("frequency_penalty");
+    append_raw("presence_penalty");
+    append_raw("repeat_penalty");
+    append_raw("min_p");
+    append_raw("stop");
+    append_raw("tools");
+    append_raw("reasoning_effort");
+    append_raw("think");
+    append_raw("enable_thinking");
+    chat_body += "}";
+
+    HttpRequest chat_req = req;
+    chat_req.body = std::move(chat_body);
+    handle_openai_chat(chat_req, client_fd);
+}
+
 void ServeApp::handle_openai_completions(const HttpRequest& req, int client_fd) {
     const auto& tok = backend_.tokenizer();
     if (!tok.is_loaded()) {
@@ -1925,12 +2320,14 @@ void ServeApp::handle_openai_completions(const HttpRequest& req, int client_fd) 
     std::string prompt = json_get_string(req.body, "prompt");
     bool stream = json_get_bool(req.body, "stream", false);
     int max_tokens = json_get_int(req.body, "max_tokens", 4096);
+    max_tokens = clamp_max_output_tokens(max_tokens, config_.max_output_tokens_cap);
     float temperature = (float)json_get_number(req.body, "temperature", 1.0);
     float top_p = (float)json_get_number(req.body, "top_p", 0.95);
     int top_k = json_get_int(req.body, "top_k", 20);
     float repeat_penalty = (float)json_get_number(req.body, "repeat_penalty", 1.0);
+    float min_p = (float)json_get_number(req.body, "min_p", 0.0);
     float frequency_penalty = (float)json_get_number(req.body, "frequency_penalty", 0.0);
-    float presence_penalty = (float)json_get_number(req.body, "presence_penalty", 0.0);
+    float presence_penalty = (float)json_get_number(req.body, "presence_penalty", 1.5);
     int64_t seed = (int64_t)json_get_number(req.body, "seed", -1);
     bool enable_thinking = false;  // raw completions 不使用 chat template
     // 解析 stop 序列 (支持单字符串和数组)
@@ -1976,6 +2373,7 @@ void ServeApp::handle_openai_completions(const HttpRequest& req, int client_fd) 
     infer_req.temperature       = temperature;
     infer_req.top_p             = top_p;
     infer_req.top_k             = top_k;
+    infer_req.min_p             = min_p;
     infer_req.repeat_penalty    = repeat_penalty;
     infer_req.frequency_penalty = frequency_penalty;
     infer_req.presence_penalty  = presence_penalty;
@@ -2004,9 +2402,14 @@ void ServeApp::handle_openai_completions(const HttpRequest& req, int client_fd) 
         send(client_fd, header.c_str(), header.size(), MSG_NOSIGNAL);
 
         auto now_t = (int64_t)std::time(nullptr);
+        std::atomic<bool> client_disconnected{false};
         int comp_toks = poll_tokens(infer_req.request_id, [&](const std::string& piece) {
-            send_sse_event(client_fd, make_completion_chunk(model, piece, "", req_id, now_t));
-        }, config_.timeout_s, enable_thinking, stop_seqs);
+            if (client_disconnected.load(std::memory_order_relaxed)) return;
+            if (!send_sse_event(client_fd, make_completion_chunk(model, piece, "", req_id, now_t))) {
+                client_disconnected.store(true, std::memory_order_relaxed);
+                backend_.cancel(infer_req.request_id);
+            }
+        }, config_.timeout_s, enable_thinking, stop_seqs, {}, {}, nullptr, &client_disconnected);
 
         send_sse_event(client_fd, make_completion_chunk(model, "", "stop", req_id, now_t));
         send_sse_done(client_fd);
@@ -2046,15 +2449,17 @@ void ServeApp::handle_ollama_generate(const HttpRequest& req, int client_fd) {
     std::string system = json_get_string(req.body, "system");
     bool stream = json_get_bool(req.body, "stream", true);  // Ollama 默认流式
     int max_tokens = json_get_int(req.body, "num_predict", 4096);
-    bool enable_thinking = json_get_bool(req.body, "think", true);
+    max_tokens = clamp_max_output_tokens(max_tokens, config_.max_output_tokens_cap);
+    bool enable_thinking = json_get_bool(req.body, "think", false);
     float def_temp = enable_thinking ? 1.0f : 0.7f;
     float def_top_p = enable_thinking ? 0.95f : 0.8f;
     float temperature = (float)json_get_number(req.body, "temperature", def_temp);
     float top_p = (float)json_get_number(req.body, "top_p", def_top_p);
     int top_k = json_get_int(req.body, "top_k", 20);
     float repeat_penalty = (float)json_get_number(req.body, "repeat_penalty", 1.0);
+    float min_p = (float)json_get_number(req.body, "min_p", 0.0);
     float frequency_penalty = (float)json_get_number(req.body, "frequency_penalty", 0.0);
-    float presence_penalty = (float)json_get_number(req.body, "presence_penalty", 0.0);
+    float presence_penalty = (float)json_get_number(req.body, "presence_penalty", 1.5);
     int64_t seed = (int64_t)json_get_number(req.body, "seed", -1);
     std::string model = json_get_string(req.body, "model");
     if (model.empty()) model = config_.model_name;
@@ -2080,6 +2485,8 @@ void ServeApp::handle_ollama_generate(const HttpRequest& req, int client_fd) {
                         top_k = json_get_int(opts_str, "top_k", top_k);
                     if (opts_str.find("\"repeat_penalty\"") != std::string::npos)
                         repeat_penalty = (float)json_get_number(opts_str, "repeat_penalty", repeat_penalty);
+                    if (opts_str.find("\"min_p\"") != std::string::npos)
+                        min_p = (float)json_get_number(opts_str, "min_p", min_p);
                     if (opts_str.find("\"frequency_penalty\"") != std::string::npos)
                         frequency_penalty = (float)json_get_number(opts_str, "frequency_penalty", frequency_penalty);
                     if (opts_str.find("\"presence_penalty\"") != std::string::npos)
@@ -2113,6 +2520,7 @@ void ServeApp::handle_ollama_generate(const HttpRequest& req, int client_fd) {
             }
         }
     }
+    max_tokens = clamp_max_output_tokens(max_tokens, config_.max_output_tokens_cap);
     // 顶级 stop 参数
     {
         std::string single_stop = json_get_string(req.body, "stop");
@@ -2153,26 +2561,127 @@ void ServeApp::handle_ollama_generate(const HttpRequest& req, int client_fd) {
         }
     }
 
+    // Parse Ollama-format videos: top-level "videos": [{"video":["base64_frame",...],"fps":24}, ...]
+    std::vector<VideoData> videos;
+    {
+        auto vids_pos = req.body.find("\"videos\"");
+        if (vids_pos != std::string::npos) {
+            auto vids_arr = req.body.find('[', vids_pos);
+            if (vids_arr != std::string::npos) {
+                size_t vp = vids_arr + 1;
+                while (vp < req.body.size() && req.body[vp] != ']') {
+                    while (vp < req.body.size() && (req.body[vp] == ' ' || req.body[vp] == ','
+                           || req.body[vp] == '\n' || req.body[vp] == '\r' || req.body[vp] == '\t'))
+                        vp++;
+                    if (vp >= req.body.size() || req.body[vp] == ']') break;
+
+                    if (req.body[vp] == '{') {
+                        std::string vobj = extract_json_object(req.body, vp);
+                        VideoData vd;
+                        vd.source_fps = (float)json_get_number(vobj, "fps", 24.0);
+
+                        auto video_pos = vobj.find("\"video\"");
+                        if (video_pos == std::string::npos) {
+                            video_pos = vobj.find("\"frames\"");
+                        }
+
+                        if (video_pos != std::string::npos) {
+                            auto frame_arr = vobj.find('[', video_pos);
+                            if (frame_arr != std::string::npos) {
+                                size_t fp = frame_arr + 1;
+                                while (fp < vobj.size() && vobj[fp] != ']') {
+                                    while (fp < vobj.size() && (vobj[fp] == ' ' || vobj[fp] == ','
+                                           || vobj[fp] == '\n' || vobj[fp] == '\r' || vobj[fp] == '\t'))
+                                        fp++;
+                                    if (fp >= vobj.size() || vobj[fp] == ']') break;
+
+                                    if (vobj[fp] == '"') {
+                                        size_t start_q = fp + 1;
+                                        fp = start_q;
+                                        while (fp < vobj.size() && vobj[fp] != '"') {
+                                            if (vobj[fp] == '\\') fp++;
+                                            fp++;
+                                        }
+                                        std::string b64_frame = vobj.substr(start_q, fp - start_q);
+                                        fp++; // skip closing quote
+
+                                        auto frame_img = decode_image_base64(b64_frame);
+                                        if (frame_img.width > 0) {
+                                            if (vd.width == 0) {
+                                                vd.width = frame_img.width;
+                                                vd.height = frame_img.height;
+                                            }
+                                            vd.frames.push_back(std::move(frame_img.pixels));
+                                        }
+                                    } else {
+                                        fp++;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!vd.frames.empty()) {
+                            videos.push_back(std::move(vd));
+                        }
+                    } else {
+                        vp++;
+                    }
+                }
+            }
+        }
+    }
+
     // Tokenize: if system provided, use chat template; otherwise raw encode
     std::vector<int> prompt_tokens;
-    if (!system.empty() || !images.empty()) {
+    if (!system.empty() || !images.empty() || !videos.empty()) {
         // Use chat template for image support (need special tokens)
         std::vector<std::pair<std::string, std::string>> messages;
         if (!system.empty())
             messages.emplace_back("system", system);
+        else
+            messages.emplace_back("system", DEFAULT_SYSTEM_PROMPT);
         std::string user_content;
         for (size_t i = 0; i < images.size(); i++)
             user_content += "<|vision_start|><|image_pad|><|vision_end|>";
+        for (auto& vid : videos) {
+            core::VisionConfig vcfg;
+            int num_frames = (int)vid.frames.size();
+            int target_frames = num_frames;
+            float target_fps = 2.0f;
+            if (vid.source_fps > 0)
+                target_frames = (int)(num_frames / vid.source_fps * target_fps);
+            target_frames = std::max(4, std::min(target_frames, 768));
+            target_frames = std::min(target_frames, num_frames);
+            auto [grid_t, grid_h, grid_w] = core::VisionEncoder::compute_video_grid(
+                target_frames, vid.height, vid.width, vcfg);
+
+            for (int gt = 0; gt < grid_t; gt++) {
+                int f0 = gt * 2, f1 = gt * 2 + 1;
+                float t0 = (f0 < target_frames && vid.source_fps > 0) ? (float)f0 / target_fps : 0;
+                float t1 = (f1 < target_frames && vid.source_fps > 0) ? (float)f1 / target_fps : t0;
+                char buf[32];
+                snprintf(buf, sizeof(buf), "<%.1f seconds>", (t0 + t1) / 2.0f);
+                user_content += buf;
+                user_content += "<|vision_start|><|video_pad|><|vision_end|>";
+            }
+        }
         user_content += prompt;
         messages.emplace_back("user", user_content);
         prompt_tokens = tok.apply_chat_template(messages, true, enable_thinking);
     } else {
-        prompt_tokens = tok.encode(prompt);
+        // 纯文本也走 chat template — 确保有 system prompt
+        std::vector<std::pair<std::string, std::string>> messages;
+        messages.emplace_back("system", DEFAULT_SYSTEM_PROMPT);
+        messages.emplace_back("user", prompt);
+        prompt_tokens = tok.apply_chat_template(messages, true, enable_thinking);
     }
 
     // Expand image placeholders
     if (!images.empty()) {
         expand_image_placeholders(prompt_tokens, images, tok);
+    }
+    if (!videos.empty()) {
+        expand_video_placeholders(prompt_tokens, videos, tok);
     }
 
     InferRequest infer_req;
@@ -2182,12 +2691,14 @@ void ServeApp::handle_ollama_generate(const HttpRequest& req, int client_fd) {
     infer_req.temperature       = temperature;
     infer_req.top_p             = top_p;
     infer_req.top_k             = top_k;
+    infer_req.min_p             = min_p;
     infer_req.repeat_penalty    = repeat_penalty;
     infer_req.frequency_penalty = frequency_penalty;
     infer_req.presence_penalty  = presence_penalty;
     infer_req.seed              = seed;
     infer_req.stream            = true;
     infer_req.images            = std::move(images);
+    infer_req.videos            = std::move(videos);
 
     // 先注册队列,再提交请求
     register_request(infer_req.request_id);
@@ -2210,13 +2721,18 @@ void ServeApp::handle_ollama_generate(const HttpRequest& req, int client_fd) {
 
         auto t0 = std::chrono::steady_clock::now();
         std::string finish_reason;
+        std::atomic<bool> client_disconnected{false};
         int comp_toks = poll_tokens(infer_req.request_id, [&](const std::string& piece) {
+            if (client_disconnected.load(std::memory_order_relaxed)) return;
             std::string line = "{\"model\":\"" + json_escape(model) +
                 "\",\"created_at\":\"" + iso8601_now() +
                 "\",\"response\":\"" + json_escape(piece) +
                 "\",\"done\":false}";
-            send_ndjson_chunk(client_fd, line);
-        }, config_.timeout_s, enable_thinking, stop_seqs, {}, {}, &finish_reason);
+            if (!send_ndjson_chunk(client_fd, line)) {
+                client_disconnected.store(true, std::memory_order_relaxed);
+                backend_.cancel(infer_req.request_id);
+            }
+        }, config_.timeout_s, enable_thinking, stop_seqs, {}, {}, &finish_reason, &client_disconnected);
 
         auto elapsed = std::chrono::steady_clock::now() - t0;
         auto dur_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
@@ -2265,17 +2781,20 @@ void ServeApp::handle_ollama_chat(const HttpRequest& req, int client_fd) {
     std::vector<ImageData> images;
     std::vector<VideoData> videos;
     auto messages = parse_messages(req.body, &images, &videos);
+
     bool stream = json_get_bool(req.body, "stream", true);
     int max_tokens = json_get_int(req.body, "num_predict", 4096);
-    bool enable_thinking = json_get_bool(req.body, "think", true);
+    max_tokens = clamp_max_output_tokens(max_tokens, config_.max_output_tokens_cap);
+    bool enable_thinking = json_get_bool(req.body, "think", false);
     float def_temp = enable_thinking ? 1.0f : 0.7f;
     float def_top_p = enable_thinking ? 0.95f : 0.8f;
     float temperature = (float)json_get_number(req.body, "temperature", def_temp);
     float top_p = (float)json_get_number(req.body, "top_p", def_top_p);
     int top_k = json_get_int(req.body, "top_k", 20);
     float repeat_penalty = (float)json_get_number(req.body, "repeat_penalty", 1.0);
+    float min_p = (float)json_get_number(req.body, "min_p", 0.0);
     float frequency_penalty = (float)json_get_number(req.body, "frequency_penalty", 0.0);
-    float presence_penalty  = (float)json_get_number(req.body, "presence_penalty", 0.0);
+    float presence_penalty  = (float)json_get_number(req.body, "presence_penalty", 1.5);
     int64_t seed = (int64_t)json_get_number(req.body, "seed", -1);
 
     // Ollama 标准: 采样参数也可以在 "options" 子对象中
@@ -2296,6 +2815,8 @@ void ServeApp::handle_ollama_chat(const HttpRequest& req, int client_fd) {
                     top_k = json_get_int(opts, "top_k", top_k);
                 if (opts.find("\"repeat_penalty\"") != std::string::npos)
                     repeat_penalty = (float)json_get_number(opts, "repeat_penalty", repeat_penalty);
+                if (opts.find("\"min_p\"") != std::string::npos)
+                    min_p = (float)json_get_number(opts, "min_p", min_p);
                 if (opts.find("\"frequency_penalty\"") != std::string::npos)
                     frequency_penalty = (float)json_get_number(opts, "frequency_penalty", frequency_penalty);
                 if (opts.find("\"presence_penalty\"") != std::string::npos)
@@ -2329,6 +2850,7 @@ void ServeApp::handle_ollama_chat(const HttpRequest& req, int client_fd) {
             }
         }
     }
+    max_tokens = clamp_max_output_tokens(max_tokens, config_.max_output_tokens_cap);
     // 顶级 stop 参数
     {
         std::string single_stop = json_get_string(req.body, "stop");
@@ -2353,7 +2875,7 @@ void ServeApp::handle_ollama_chat(const HttpRequest& req, int client_fd) {
         }
         if (!found_system) {
             messages.insert(messages.begin(),
-                {"system", "You are Qwen, created by Alibaba Cloud. You are a helpful assistant." + tool_prompt});
+                {"system", std::string(DEFAULT_SYSTEM_PROMPT) + tool_prompt});
         }
     }
 
@@ -2364,6 +2886,18 @@ void ServeApp::handle_ollama_chat(const HttpRequest& req, int client_fd) {
         resp.body = R"({"error":"No messages provided"})";
         send_response(client_fd, resp);
         return;
+    }
+
+    // 确保有 system prompt — Qwen3.5 在无 system prompt 时行为显著下降
+    {
+        bool has_system = false;
+        for (auto& [role, content] : messages) {
+            if (role == "system") { has_system = true; break; }
+        }
+        if (!has_system) {
+            messages.insert(messages.begin(),
+                {"system", DEFAULT_SYSTEM_PROMPT});
+        }
     }
 
     auto prompt_tokens = tok.apply_chat_template(messages, true, enable_thinking);
@@ -2384,6 +2918,7 @@ void ServeApp::handle_ollama_chat(const HttpRequest& req, int client_fd) {
     infer_req.temperature       = temperature;
     infer_req.top_p             = top_p;
     infer_req.top_k             = top_k;
+    infer_req.min_p             = min_p;
     infer_req.repeat_penalty    = repeat_penalty;
     infer_req.frequency_penalty = frequency_penalty;
     infer_req.presence_penalty  = presence_penalty;
@@ -2414,39 +2949,53 @@ void ServeApp::handle_ollama_chat(const HttpRequest& req, int client_fd) {
         auto t0 = std::chrono::steady_clock::now();
         std::string finish_reason;
         int tool_call_idx = 0;
+        std::atomic<bool> client_disconnected{false};
 
         int comp_toks = poll_tokens(infer_req.request_id,
             // on_token (content)
             [&](const std::string& piece) {
+                if (client_disconnected.load(std::memory_order_relaxed)) return;
                 std::string line = "{\"model\":\"" + json_escape(model) +
                     "\",\"created_at\":\"" + iso8601_now() +
                     "\",\"message\":{\"role\":\"assistant\","
                     "\"content\":\"" + json_escape(piece) + "\"},\"done\":false}";
-                send_ndjson_chunk(client_fd, line);
+                if (!send_ndjson_chunk(client_fd, line)) {
+                    client_disconnected.store(true, std::memory_order_relaxed);
+                    backend_.cancel(infer_req.request_id);
+                }
             },
             config_.timeout_s,
             enable_thinking,
             stop_seqs,
             // on_reasoning (thinking content)
             [&](const std::string& piece) {
+                if (client_disconnected.load(std::memory_order_relaxed)) return;
                 std::string line = "{\"model\":\"" + json_escape(model) +
                     "\",\"created_at\":\"" + iso8601_now() +
                     "\",\"message\":{\"role\":\"assistant\","
                     "\"content\":\"\",\"thinking\":\"" + json_escape(piece) + "\"},\"done\":false}";
-                send_ndjson_chunk(client_fd, line);
+                if (!send_ndjson_chunk(client_fd, line)) {
+                    client_disconnected.store(true, std::memory_order_relaxed);
+                    backend_.cancel(infer_req.request_id);
+                }
             },
             // on_tool_call
             [&](const ToolCallInfo& tc) {
+                if (client_disconnected.load(std::memory_order_relaxed)) return;
                 std::string line = "{\"model\":\"" + json_escape(model) +
                     "\",\"created_at\":\"" + iso8601_now() +
                     "\",\"message\":{\"role\":\"assistant\",\"content\":\"\","
                     "\"tool_calls\":[{\"function\":{\"name\":\"" + json_escape(tc.name) +
                     "\",\"arguments\":" + tc.arguments + "}}]},"
                     "\"done\":false}";
-                send_ndjson_chunk(client_fd, line);
+                if (!send_ndjson_chunk(client_fd, line)) {
+                    client_disconnected.store(true, std::memory_order_relaxed);
+                    backend_.cancel(infer_req.request_id);
+                }
                 tool_call_idx++;
             },
-            &finish_reason
+            &finish_reason,
+            &client_disconnected
         );
 
         auto elapsed = std::chrono::steady_clock::now() - t0;

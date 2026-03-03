@@ -49,7 +49,7 @@ struct VisionConfig {
 
     // Preprocessing limits
     int min_pixels = 65536;      // 256²
-    int max_pixels = 1048576;    // 1024²  (conservative for Jetson memory)
+    int max_pixels = 262144;     // 512²  — 1024 patches max, ~0.5s vision fwd on Thor
     int factor() const { return patch_size * spatial_merge_size; }  // 32
 };
 
@@ -295,11 +295,13 @@ void invoke_pos_embed_interp(__nv_bfloat16* out,
 // vision_features: [num_vision_tokens, hidden_size]
 // token_ids: [total_tokens] — original token IDs (on device)
 // image_token_id: token ID for <|image_pad|> (248056)
+// num_vision_tokens: total features available; kernel skips OOB pads (pass 0 to disable check)
 void invoke_replace_image_tokens(__nv_bfloat16* hidden,
                                   const __nv_bfloat16* vision_features,
                                   const int* token_ids, int total_tokens,
                                   int image_token_id, int hidden_size,
                                   int vision_offset,
+                                  int num_vision_tokens,
                                   cudaStream_t stream);
 
 // FP32 → BF16 conversion
@@ -312,10 +314,11 @@ inline void invoke_replace_video_tokens(__nv_bfloat16* hidden,
                                         const __nv_bfloat16* vision_features,
                                         const int* token_ids, int total_tokens,
                                         int hidden_size, int vision_offset,
+                                        int num_vision_tokens,
                                         cudaStream_t stream) {
     invoke_replace_image_tokens(hidden, vision_features, token_ids,
                                 total_tokens, 248057 /* video_pad_id */,
-                                hidden_size, vision_offset, stream);
+                                hidden_size, vision_offset, num_vision_tokens, stream);
 }
 
 } // namespace vision_ops

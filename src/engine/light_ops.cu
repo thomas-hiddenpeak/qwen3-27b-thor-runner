@@ -4,6 +4,22 @@
 #include <algorithm>
 #include <math.h>
 
+// Safe cudaMalloc with error checking
+#define SAFE_CUDA_REALLOC(ptr, sz_var, need, stream) do { \
+    if ((need) > (sz_var)) { \
+        if (ptr) { cudaStreamSynchronize(stream); cudaFree(ptr); ptr = nullptr; } \
+        cudaError_t _err = cudaMalloc(&(ptr), (need)); \
+        if (_err != cudaSuccess) { \
+            fprintf(stderr, "[CUDA] cudaMalloc failed (%zu bytes): %s\n", \
+                    (size_t)(need), cudaGetErrorString(_err)); \
+            fflush(stderr); \
+            ptr = nullptr; sz_var = 0; \
+        } else { \
+            sz_var = (need); \
+        } \
+    } \
+} while(0)
+
 namespace qwen_thor {
 namespace ops {
 
@@ -665,11 +681,8 @@ void invoke_causal_conv1d(__nv_bfloat16* x_io, __nv_bfloat16* conv_state,
         static __nv_bfloat16* s_conv_input_copy = nullptr;
         static size_t s_conv_input_sz = 0;
         size_t need = (size_t)num_tokens * token_stride * sizeof(__nv_bfloat16);
-        if (need > s_conv_input_sz) {
-            if (s_conv_input_copy) cudaFree(s_conv_input_copy);
-            cudaMalloc(&s_conv_input_copy, need);
-            s_conv_input_sz = need;
-        }
+        SAFE_CUDA_REALLOC(s_conv_input_copy, s_conv_input_sz, need, stream);
+        if (!s_conv_input_copy) return; // OOM guard
         // 复制 input
         cudaMemcpyAsync(s_conv_input_copy, x_io, need, cudaMemcpyDeviceToDevice, stream);
 
@@ -960,12 +973,18 @@ void invoke_gated_delta_net(const __nv_bfloat16* q, const __nv_bfloat16* k, cons
         const int vd_pad = vd + 1;
         size_t smem_bytes = (size_t)(kd * vd_pad + 2 * kd + 2) * sizeof(float);
 
-        static bool smem_configured = false;
-        if (!smem_configured) {
-            cudaFuncSetAttribute(gated_delta_net_prefill_kernel,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 (int)smem_bytes);
-            smem_configured = true;
+        // 每次 launch 前都设置 smem 属性 — 不能用 static bool 守护！
+        // 原因: 如果 CUDA context 被看门狗重置后恢复, function attributes 会丢失
+        // 但 static bool 阻止重新配置 → kernel 以默认 48KB smem 启动 → 写越界 → SMMU fault
+        cudaError_t smem_err = cudaFuncSetAttribute(
+            gated_delta_net_prefill_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)smem_bytes);
+        if (smem_err != cudaSuccess) {
+            fprintf(stderr, "[CUDA] cudaFuncSetAttribute failed for DeltaNet prefill: %s (need %zu bytes)\n",
+                    cudaGetErrorString(smem_err), smem_bytes);
+            fflush(stderr);
+            return;  // 跳过 kernel launch, 避免 SMMU fault
         }
 
         gated_delta_net_prefill_kernel<<<grid, threads, smem_bytes, stream>>>(

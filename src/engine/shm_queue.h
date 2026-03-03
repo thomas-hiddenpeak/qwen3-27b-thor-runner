@@ -23,6 +23,7 @@ struct InferenceRequest {
     float temperature;
     float top_p;
     int32_t top_k;
+    float min_p;               // min-p 过滤阈值
     float repeat_penalty;      // 重复惩罚 (1.0=无惩罚)
     float frequency_penalty;   // 频率惩罚 (OpenAI 风格)
     float presence_penalty;    // 存在性惩罚 (OpenAI 风格)

@@ -24,7 +24,7 @@ struct Qwen35Config {
     int num_hidden_layers    = 64;
     int vocab_size           = 248320;
     float rms_norm_eps       = 1e-6f;
-    std::string model_dir    = "/home/rm01/runner/models/Qwen/Qwen3.5-27B";
+    std::string model_dir    = "/home/rm01/models/dev/llm/Qwen/Qwen3.5-27B";
 
     // -- Full Attention (GQA) --
     int num_attention_heads  = 24;     // Q heads

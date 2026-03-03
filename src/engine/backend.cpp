@@ -10,10 +10,19 @@
 #include <chrono>
 #include <filesystem>
 #include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <malloc.h>   // malloc_trim
 
 namespace qwen_thor {
+
+static std::string default_model_dir_from_env() {
+    const char* env_model_dir = std::getenv("QWEN_MODEL_DIR");
+    if (env_model_dir && env_model_dir[0] != '\0') {
+        return std::string(env_model_dir);
+    }
+    return "/home/rm01/models/dev/llm/Qwen/Qwen3.5-27B";
+}
 
 // ============================================================================
 // BackendConfig
@@ -21,6 +30,7 @@ namespace qwen_thor {
 
 BackendConfig BackendConfig::from_args(int argc, char** argv) {
     BackendConfig cfg;
+    cfg.model_dir = default_model_dir_from_env();
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--model-dir" && i + 1 < argc) {
@@ -53,6 +63,7 @@ BackendConfig BackendConfig::from_args(int argc, char** argv) {
 
 BackendConfig BackendConfig::from_file(const std::string& path) {
     BackendConfig cfg;
+    cfg.model_dir = default_model_dir_from_env();
     std::ifstream ifs(path);
     if (!ifs) {
         std::cerr << "[BackendConfig] Cannot open config file: " << path << std::endl;
@@ -143,8 +154,8 @@ static void check_memory_budget(const BackendConfig& config, const core::Qwen35C
     cudaFree(0);
     cudaDeviceSynchronize();
 
-    // 回收 C heap 碎片到 OS (glibc malloc_trim)
-    malloc_trim(0);
+    // 回收 C heap 碎片到 OS — 启动时安全 (推理循环中不安全, 见 WDT 说明)
+    // malloc_trim(0); // DISABLED: glibc arena lock 可能阻塞 systemd watchdog 喂狗
 
     // ---- 1. 读取系统内存 ----
     // /proc/meminfo: MemTotal (物理总量), MemAvailable (当前可用)
@@ -336,15 +347,18 @@ void InferenceBackend::stop() {
     std::cout << "[Backend] Inference engine stopped." << std::endl;
 }
 
-bool InferenceBackend::submit(const InferRequest& request) {
-    // 构建 IPC InferenceRequest 并直接推送到 engine
-    ipc::InferenceRequest ipc_req{};
+bool InferenceBackend::submit(InferRequest& request) {
+    // 构建 IPC InferenceRequest — 堆分配避免 1MB 栈分配
+    auto ipc_req_ptr = std::make_unique<ipc::InferenceRequest>();
+    auto& ipc_req = *ipc_req_ptr;
+    memset(&ipc_req, 0, sizeof(ipc_req));  // 零初始化
     ipc_req.request_id     = request.request_id;
     ipc_req.prompt_len     = static_cast<int32_t>(request.prompt_tokens.size());
     ipc_req.max_new_tokens = request.max_new_tokens;
     ipc_req.temperature    = request.temperature;
     ipc_req.top_p          = request.top_p;
     ipc_req.top_k          = request.top_k;
+    ipc_req.min_p          = request.min_p;
     ipc_req.repeat_penalty = request.repeat_penalty;
     ipc_req.frequency_penalty = request.frequency_penalty;
     ipc_req.presence_penalty  = request.presence_penalty;
@@ -360,10 +374,10 @@ bool InferenceBackend::submit(const InferRequest& request) {
         core::VisionConfig vcfg;  // default config
         std::vector<core::ProcessedImage> all_processed;
 
-        // 处理图像
+        // 处理图像 — move pixels 避免 36MB 复制
         for (auto& img : request.images) {
             core::ImageInput input;
-            input.pixels = img.pixels;
+            input.pixels = std::move(img.pixels);  // move, 不复制
             input.width  = img.width;
             input.height = img.height;
             all_processed.push_back(core::VisionEncoder::preprocess_image(input, vcfg));
@@ -400,12 +414,13 @@ bool InferenceBackend::submit(const InferRequest& request) {
         if (!all_processed.empty()) {
             std::cout << "[Backend] Attaching " << all_processed.size()
                       << " vision items to request " << request.request_id << std::endl;
+            std::cout.flush();
             engine_->attach_images(request.request_id, std::move(all_processed));
         }
     }
 
     // 通过 engine 的直接推送接口提交
-    return engine_->push_request(ipc_req);
+    return engine_->push_request(ipc_req);  // copies into ring buffer, ipc_req_ptr freed on return
 }
 
 bool InferenceBackend::poll(InferResponse& response) {

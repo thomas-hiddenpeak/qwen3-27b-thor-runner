@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -133,6 +134,9 @@ struct BenchConfig {
 
 BenchConfig parse_args(int argc, char** argv) {
     BenchConfig cfg;
+    if (const char* env_model_dir = std::getenv("QWEN_MODEL_DIR"); env_model_dir && env_model_dir[0] != '\0') {
+        cfg.model_dir = env_model_dir;
+    }
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--warmup"     && i + 1 < argc) cfg.warmup_steps = std::atoi(argv[++i]);

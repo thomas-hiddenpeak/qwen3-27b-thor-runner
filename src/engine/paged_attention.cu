@@ -9,6 +9,22 @@
 #include <float.h>
 #include <stdio.h>
 
+// Safe cudaMalloc with error checking
+#define SAFE_CUDA_REALLOC(ptr, sz_var, need, stream) do { \
+    if ((need) > (sz_var)) { \
+        if (ptr) { cudaStreamSynchronize(stream); cudaFree(ptr); ptr = nullptr; } \
+        cudaError_t _err = cudaMalloc(&(ptr), (need)); \
+        if (_err != cudaSuccess) { \
+            fprintf(stderr, "[CUDA] cudaMalloc failed (%zu bytes): %s\n", \
+                    (size_t)(need), cudaGetErrorString(_err)); \
+            fflush(stderr); \
+            ptr = nullptr; sz_var = 0; \
+        } else { \
+            sz_var = (need); \
+        } \
+    } \
+} while(0)
+
 namespace qwen_thor {
 namespace ops {
 
@@ -341,18 +357,23 @@ void invoke_paged_attention(
         size_t out_need = (size_t)num_tokens * num_heads * num_partitions * head_dim * sizeof(float);
         size_t ml_need  = (size_t)num_tokens * num_heads * num_partitions * sizeof(float);
 
-        if (out_need > s_out_cap) {
-            if (s_partial_out) cudaFree(s_partial_out);
-            cudaMalloc(&s_partial_out, out_need);
-            s_out_cap = out_need;
-        }
+        SAFE_CUDA_REALLOC(s_partial_out, s_out_cap, out_need, stream);
         if (ml_need > s_ml_cap) {
-            if (s_partial_m) cudaFree(s_partial_m);
-            if (s_partial_l) cudaFree(s_partial_l);
-            cudaMalloc(&s_partial_m, ml_need);
-            cudaMalloc(&s_partial_l, ml_need);
-            s_ml_cap = ml_need;
+            if (s_partial_m || s_partial_l) { cudaStreamSynchronize(stream); }
+            if (s_partial_m) { cudaFree(s_partial_m); s_partial_m = nullptr; }
+            if (s_partial_l) { cudaFree(s_partial_l); s_partial_l = nullptr; }
+            cudaError_t _e1 = cudaMalloc(&s_partial_m, ml_need);
+            cudaError_t _e2 = cudaMalloc(&s_partial_l, ml_need);
+            if (_e1 != cudaSuccess || _e2 != cudaSuccess) {
+                fprintf(stderr, "[CUDA] split-K cudaMalloc failed: %s / %s\n",
+                        cudaGetErrorString(_e1), cudaGetErrorString(_e2));
+                fflush(stderr);
+                s_ml_cap = 0;
+            } else {
+                s_ml_cap = ml_need;
+            }
         }
+        if (!s_partial_out || !s_partial_m || !s_partial_l) return; // OOM guard
 
         // Phase 1: Split-K partial attention
         dim3 grid(num_tokens, num_heads, num_partitions);

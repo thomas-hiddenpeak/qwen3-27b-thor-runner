@@ -17,6 +17,7 @@
 #include <iostream>
 #include <cassert>
 #include <cstring>
+#include <chrono>
 
 namespace qwen_thor {
 namespace core {
@@ -444,23 +445,31 @@ __global__ void replace_image_tokens_kernel(
     const __nv_bfloat16* __restrict__ vision_features,
     const int* __restrict__ token_ids,
     int total_tokens, int image_token_id, int hidden_size,
-    int vision_offset)
+    int vision_offset, int num_vision_tokens)
 {
     // Grid: (total_tokens), Block: min(hidden_size, 1024)
     int token_idx = blockIdx.x;
     if (token_idx >= total_tokens) return;
     if (token_ids[token_idx] != image_token_id) return;
 
-    // Count how many image tokens are before this one
-    int vision_idx = 0;
+    // Count how many image tokens are before this one in the chunk
+    int pads_before = 0;
     for (int i = 0; i < token_idx; i++) {
-        if (token_ids[i] == image_token_id) vision_idx++;
+        if (token_ids[i] == image_token_id) pads_before++;
     }
-    vision_idx += vision_offset;
 
-    // Replace embedding
+    // Local index into THIS image's feature buffer:
+    //   pads_before includes ALL image_pad tokens (from all images in this chunk)
+    //   vision_offset = number of image_pad tokens belonging to PREVIOUS images
+    //   => local_idx = position within this image's pads = pads_before - vision_offset
+    int local_idx = pads_before - vision_offset;
+
+    // Skip pads that belong to a different image in the same chunk
+    if (local_idx < 0 || local_idx >= num_vision_tokens) return;
+
+    // Replace embedding: hidden[token_idx] = vision_features[local_idx]
     __nv_bfloat16* dst = hidden + token_idx * hidden_size;
-    const __nv_bfloat16* src = vision_features + vision_idx * hidden_size;
+    const __nv_bfloat16* src = vision_features + local_idx * hidden_size;
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
         dst[i] = src[i];
     }
@@ -920,12 +929,13 @@ void invoke_replace_image_tokens(__nv_bfloat16* hidden,
                                   const int* token_ids, int total_tokens,
                                   int image_token_id, int hidden_size,
                                   int vision_offset,
+                                  int num_vision_tokens,
                                   cudaStream_t stream)
 {
     int block = std::min(hidden_size, 1024);
     replace_image_tokens_kernel<<<total_tokens, block, 0, stream>>>(
         hidden, vision_features, token_ids, total_tokens,
-        image_token_id, hidden_size, vision_offset);
+        image_token_id, hidden_size, vision_offset, num_vision_tokens);
 }
 
 void invoke_f32_to_bf16(const float* src, __nv_bfloat16* dst, int n, cudaStream_t stream)
@@ -1490,8 +1500,9 @@ void VisionEncoder::patch_embed_forward(__nv_bfloat16* out, const __nv_bfloat16*
                  out, CUDA_R_16BF, N_dim,          // C: [M, N_dim] row-major → [N_dim, M] col-major
                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
-    // Add bias
-    vision_ops::invoke_add_bias(out, patch_proj_b_, num_patches, config_.hidden_size, stream);
+    // Add bias (guard against null — model may not have patch embed bias)
+    if (patch_proj_b_)
+        vision_ops::invoke_add_bias(out, patch_proj_b_, num_patches, config_.hidden_size, stream);
 }
 
 void VisionEncoder::add_position_embedding(__nv_bfloat16* hidden, int grid_h, int grid_w,
@@ -1571,7 +1582,7 @@ void VisionEncoder::block_forward(int block_idx, __nv_bfloat16* hidden,
     }
 
     // ---- 3. QKV add_bias ----
-    vision_ops::invoke_add_bias(qkv, b.qkv_b, N, 3 * hs, stream);
+    if (b.qkv_b) vision_ops::invoke_add_bias(qkv, b.qkv_b, N, 3 * hs, stream);
 
     // ---- 4. Fused Split QKV + Transpose: [N, 3*H*D] → Q[H,N,D], K[H,N,D], V[H,N,D] ----
     {
@@ -1658,9 +1669,16 @@ void VisionEncoder::block_forward(int block_idx, __nv_bfloat16* hidden,
     }
 
     // ---- 9. Fused: hidden += (proj_out + proj_bias); norm_out = LN(hidden) ----
-    vision_ops::invoke_fused_add_bias_layernorm(norm_out, hidden, norm_out,
-                                                 b.proj_b, b.norm2_w, b.norm2_b,
-                                                 config_.layernorm_eps, N, hs, stream);
+    // If proj_b is null, fall back to separate add + layernorm without bias
+    if (b.proj_b) {
+        vision_ops::invoke_fused_add_bias_layernorm(norm_out, hidden, norm_out,
+                                                     b.proj_b, b.norm2_w, b.norm2_b,
+                                                     config_.layernorm_eps, N, hs, stream);
+    } else {
+        vision_ops::invoke_fused_add_layernorm(norm_out, hidden, norm_out,
+                                               b.norm2_w, b.norm2_b,
+                                               config_.layernorm_eps, N, hs, stream);
+    }
 
     // ---- 10. FC1: [N, 1152] × [4304, 1152]^T → [N, 4304] ----
     {
@@ -1675,7 +1693,8 @@ void VisionEncoder::block_forward(int block_idx, __nv_bfloat16* hidden,
     }
 
     // ---- 11. Fused bias + GELU(tanh) ----
-    vision_ops::invoke_add_bias_gelu_tanh(mlp_buf, b.fc1_b, N, is, stream);
+    if (b.fc1_b) vision_ops::invoke_add_bias_gelu_tanh(mlp_buf, b.fc1_b, N, is, stream);
+    else          vision_ops::invoke_gelu_tanh(mlp_buf, N * is, stream);
 
     // ---- 12. FC2: [N, 4304] × [1152, 4304]^T → [N, 1152] ----
     {
@@ -1690,7 +1709,8 @@ void VisionEncoder::block_forward(int block_idx, __nv_bfloat16* hidden,
     }
 
     // ---- 13. Fused: hidden += (fc2_out + fc2_bias) ----
-    vision_ops::invoke_add_bias_residual(hidden, norm_out, b.fc2_b, N, hs, stream);
+    if (b.fc2_b) vision_ops::invoke_add_bias_residual(hidden, norm_out, b.fc2_b, N, hs, stream);
+    else          vision_ops::invoke_add(hidden, hidden, norm_out, N * hs, stream);
 }
 
 void VisionEncoder::merger_forward(__nv_bfloat16* out, const __nv_bfloat16* hidden,
@@ -1731,7 +1751,7 @@ void VisionEncoder::merger_forward(__nv_bfloat16* out, const __nv_bfloat16* hidd
                      &beta, fc1_out, CUDA_R_16BF, N_dim,
                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     }
-    vision_ops::invoke_add_bias(fc1_out, merger_fc1_b_, N_out, merger_hs, stream);
+    if (merger_fc1_b_) vision_ops::invoke_add_bias(fc1_out, merger_fc1_b_, N_out, merger_hs, stream);
 
     // Standard GELU (not tanh approximation for merger)
     vision_ops::invoke_gelu(fc1_out, N_out * merger_hs, stream);
@@ -1747,7 +1767,7 @@ void VisionEncoder::merger_forward(__nv_bfloat16* out, const __nv_bfloat16* hidd
                      &beta, out, CUDA_R_16BF, N_dim,
                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     }
-    vision_ops::invoke_add_bias(out, merger_fc2_b_, N_out, out_hs, stream);
+    if (merger_fc2_b_) vision_ops::invoke_add_bias(out, merger_fc2_b_, N_out, out_hs, stream);
 }
 
 __nv_bfloat16* VisionEncoder::forward(const ProcessedImage& image,
@@ -1766,10 +1786,8 @@ __nv_bfloat16* VisionEncoder::forward(const ProcessedImage& image,
         return nullptr;
     }
 
-    // ---- Timing ----
-    cudaEvent_t ev_start, ev_end;
-    cudaEventCreate(&ev_start);
-    cudaEventCreate(&ev_end);
+    // ---- Timing (wall clock, non-blocking) ----
+    auto t_start = std::chrono::steady_clock::now();
 
     // ---- cuBLAS warmup on first call ----
     // First cuBLAS call includes internal workspace allocation + algorithm selection.
@@ -1799,8 +1817,6 @@ __nv_bfloat16* VisionEncoder::forward(const ProcessedImage& image,
         cudaStreamSynchronize(stream);
         cublas_warmed_up_ = true;
     }
-
-    cudaEventRecord(ev_start, stream);
 
     // ---- Workspace allocation ----
     __nv_bfloat16* d_patches = workspace;  // [N, 1536]
@@ -1857,15 +1873,22 @@ __nv_bfloat16* VisionEncoder::forward(const ProcessedImage& image,
     // ---- Merger ----
     merger_forward(output, hidden, block_workspace, N, stream);
 
-    // ---- Report timing ----
-    cudaEventRecord(ev_end, stream);
-    cudaEventSynchronize(ev_end);
-    float elapsed_ms = 0;
-    cudaEventElapsedTime(&elapsed_ms, ev_start, ev_end);
-    printf("[Vision] Forward: %.0f ms (%d patches, chunk=%d, %d output tokens)\n",
+    // ---- Report timing (wall-clock only, no sync) ----
+    // All GPU ops are queued on `stream` and will execute in order.
+    // The caller reads output via a kernel on the same stream, so correct
+    // serialization is guaranteed without any explicit synchronization here.
+    auto t_end = std::chrono::steady_clock::now();
+    float elapsed_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
+    printf("[Vision] Launched: %.0f ms launch overhead (%d patches, chunk=%d, %d output tokens)\n",
            elapsed_ms, N, attn_chunk, N_out);
-    cudaEventDestroy(ev_start);
-    cudaEventDestroy(ev_end);
+
+    // Check for CUDA errors accumulated during vision forward
+    cudaError_t cuda_err = cudaGetLastError();
+    if (cuda_err != cudaSuccess) {
+        std::cerr << "[Vision] CUDA error after forward: "
+                  << cudaGetErrorString(cuda_err) << std::endl;
+        return nullptr;
+    }
 
     return output;
 }

@@ -27,8 +27,56 @@
 #include <unistd.h>
 #include <iomanip>
 #include <unordered_map>
+#include <filesystem>
+#include <cstdlib>
 
 using namespace qwen_thor;
+
+namespace {
+
+std::string g_test_model_dir = "/home/rm01/models/dev/llm/Qwen/Qwen3.5-27B";
+
+std::string get_env_or_empty(const char* key) {
+    const char* val = std::getenv(key);
+    if (val && val[0] != '\0') return std::string(val);
+    return "";
+}
+
+std::string resolve_test_model_dir(int argc, char** argv) {
+    std::string model_dir = get_env_or_empty("QWEN_MODEL_DIR");
+    if (model_dir.empty()) {
+        model_dir = core::Qwen35Config().model_dir;
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--model-dir" && i + 1 < argc) {
+            model_dir = argv[++i];
+        }
+    }
+    return model_dir;
+}
+
+std::string resolve_safetensors_test_path() {
+    std::string explicit_path = get_env_or_empty("QWEN_TEST_SAFETENSORS");
+    if (!explicit_path.empty()) return explicit_path;
+
+    namespace fs = std::filesystem;
+    fs::path model_dir(g_test_model_dir);
+    if (!fs::exists(model_dir) || !fs::is_directory(model_dir)) {
+        return "";
+    }
+
+    for (const auto& entry : fs::directory_iterator(model_dir)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() == ".safetensors") {
+            return entry.path().string();
+        }
+    }
+    return "";
+}
+
+} // namespace
 
 // 前置声明 (test helpers)
 void test_inference_engine_with_cache(const cache::CacheConfig& cache_config);
@@ -101,8 +149,12 @@ void test_unified_allocator() {
 
 void test_safetensors_loader() {
     std::cout << "--- Testing SafetensorsLoader ---" << std::endl;
-    // 使用新下载的 Qwen3.5-35B-A3B 权重文件进行测试
-    std::string real_path = "/home/rm01/runner/models/Qwen/Qwen3.5-35B-A3B/model.safetensors-00001-of-00014.safetensors";
+    std::string real_path = resolve_safetensors_test_path();
+    if (real_path.empty()) {
+        std::cout << "SKIP: no safetensors file found. Set QWEN_TEST_SAFETENSORS or QWEN_MODEL_DIR/--model-dir." << std::endl;
+        std::cout << "SafetensorsLoader test finished.\n" << std::endl;
+        return;
+    }
     std::cout << "Loading from: " << real_path << std::endl;
     
     try {
@@ -877,7 +929,7 @@ void test_concurrent_swap() {
     const float KV_GB         = 0.05f;  // 极小: ~50 blocks
 
     core::Qwen35Config config;
-    std::string model_dir = "/home/rm01/runner/models/Qwen/Qwen3.5-27B";
+    std::string model_dir = g_test_model_dir;
 
     // 配置: 小 KV 预算 + 启用 cache (需要 swap dir)
     cache::CacheConfig cache_cfg;
@@ -1454,7 +1506,7 @@ void test_qwen_model() {
     std::cout << "\n--- Testing Qwen3.5-27B Model Loading ---\n";
     
     core::Qwen35Config config;  // 默认即 27B 参数
-    std::string model_dir = "/home/rm01/runner/models/Qwen/Qwen3.5-27B";
+    std::string model_dir = g_test_model_dir;
     try {
         core::Qwen35Model model(config);
         model.load_weights(model_dir);
@@ -1473,7 +1525,7 @@ void test_inference_engine_with_cache(const cache::CacheConfig& cache_config) {
     
     // Qwen3.5-27B 正确配置
     core::Qwen35Config config;  // 默认构造即为 27B 参数
-    std::string model_dir = "/home/rm01/runner/models/Qwen/Qwen3.5-27B";
+    std::string model_dir = g_test_model_dir;
     
     try {
         core::InferenceEngine engine(config, model_dir, cache_config);
@@ -2404,9 +2456,12 @@ void bench_chunked_prefill() {
 // 测试入口 — 由 main.cpp 中的 cmd_test 调用
 // ============================================================================
 int run_tests(int argc, char** argv) {
+    g_test_model_dir = resolve_test_model_dir(argc, argv);
+
     std::cout << "========================================" << std::endl;
     std::cout << "  Qwen3.5-27B Thor Unit Tests           " << std::endl;
     std::cout << "========================================\n" << std::endl;
+    std::cout << "Model dir: " << g_test_model_dir << "\n" << std::endl;
 
     try {
         test_unified_allocator();

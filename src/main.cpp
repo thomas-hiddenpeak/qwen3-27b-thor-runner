@@ -22,6 +22,28 @@
 #include <csignal>
 #include <thread>
 #include <chrono>
+#include <execinfo.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <cerrno>
+
+// Crash signal handler — writes directly to fd 2 (unbuffered)
+static void crash_handler(int sig) {
+    const char* msg = "\n[CRASH] Signal: ";
+    write(STDERR_FILENO, msg, strlen(msg));
+    char num[16];
+    int len = snprintf(num, sizeof(num), "%d\n", sig);
+    write(STDERR_FILENO, num, len);
+
+    // Print backtrace
+    void* frames[32];
+    int n = backtrace(frames, 32);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+
+    // Re-raise to get default behavior (core dump)
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
 
 static const char* VERSION = "0.2.0";
 static const char* BUILD_DATE = __DATE__;
@@ -219,6 +241,16 @@ static int cmd_test(int argc, char** argv) {
 // ============================================================================
 
 int main(int argc, char** argv) {
+    // Make stdout line-buffered and stderr unbuffered
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+
+    // Install crash handlers
+    signal(SIGSEGV, crash_handler);
+    signal(SIGBUS, crash_handler);
+    signal(SIGFPE, crash_handler);
+    signal(SIGABRT, crash_handler);
+
     if (argc < 2) {
         print_usage();
         return 0;

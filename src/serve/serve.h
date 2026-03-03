@@ -37,6 +37,7 @@ struct ServeConfig {
     int         max_conns = 64;             // 最大并发连接
     std::string model_name = "qwen3.5-27b"; // 模型显示名称
     int         timeout_s  = 300;           // 请求超时 (秒)
+    int         max_output_tokens_cap = 512; // 单请求最大生成 token 上限 (稳定性护栏)
 
     // 从 CLI 参数解析 (全新配置)
     static ServeConfig from_args(int argc, char** argv);
@@ -95,11 +96,11 @@ private:
     void send_response(int client_fd, const HttpResponse& resp);
 
     // 发送 SSE (Server-Sent Events) 事件
-    void send_sse_event(int client_fd, const std::string& data);
+    bool send_sse_event(int client_fd, const std::string& data);
     void send_sse_done(int client_fd);
 
     // NDJSON chunked streaming (Ollama protocol)
-    void send_ndjson_chunk(int client_fd, const std::string& json_line);
+    bool send_ndjson_chunk(int client_fd, const std::string& json_line);
     void send_chunked_end(int client_fd);
 
     // ---- Tool Call 信息结构 ----
@@ -121,7 +122,8 @@ private:
                     const std::vector<std::string>& stop_seqs = {},
                     const std::function<void(const std::string&)>& on_reasoning = {},
                     const std::function<void(const ToolCallInfo&)>& on_tool_call = {},
-                    std::string* out_finish_reason = nullptr);
+                    std::string* out_finish_reason = nullptr,
+                    std::atomic<bool>* abort_flag = nullptr);
 
     // ---- API 路由 ----
     void handle_health(const HttpRequest& req, int client_fd);
@@ -132,6 +134,7 @@ private:
     void handle_ollama_ps(const HttpRequest& req, int client_fd);
     void handle_ollama_version(const HttpRequest& req, int client_fd);
     void handle_openai_chat(const HttpRequest& req, int client_fd);
+    void handle_openai_responses(const HttpRequest& req, int client_fd);
     void handle_openai_completions(const HttpRequest& req, int client_fd);
     void handle_ollama_generate(const HttpRequest& req, int client_fd);
     void handle_ollama_chat(const HttpRequest& req, int client_fd);

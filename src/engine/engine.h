@@ -9,6 +9,7 @@
 #include "kv_swapper.h"
 #include "block_tracker.h"
 #include "vision.h"
+#include "tokenizer.h"
 #include <memory>
 #include <vector>
 #include <thread>
@@ -19,6 +20,9 @@
 
 namespace qwen_thor {
 namespace core {
+
+// SSM/Conv 状态池最大槽位数 (每个活跃请求占一个独立 slot, 互不干扰)
+static constexpr int MAX_SSM_SLOTS = 8;
 
 // 表示一个正在处理的推理请求
 struct RequestContext {
@@ -31,6 +35,7 @@ struct RequestContext {
     float temperature = 1.0f;
     float top_p       = 0.95f;
     int   top_k       = 20;
+    float min_p       = 0.0f;
     float repeat_penalty    = 1.0f;
     float frequency_penalty = 0.0f;
     float presence_penalty  = 0.0f;
@@ -49,6 +54,7 @@ struct RequestContext {
     // conv_states[i]: [nkh*2 * kd * (conv_k-1)] fp16  on device
     std::vector<float*> ssm_states;
     std::vector<__nv_bfloat16*>  conv_states;
+    int ssm_slot = -1;  // 该请求持有的 SSM/Conv 状态池槽位 (-1 = 未分配)
     
     // MTP 投机解码状态
     int draft_token = -1;          // 当前 draft token (-1 = 无 draft)
@@ -109,7 +115,7 @@ private:
     // 采样逻辑
     int sample_argmax(__nv_bfloat16* logits, int vocab_size, cudaStream_t stream);
     int sample_token(__nv_bfloat16* logits, int vocab_size,
-                     float temperature, float top_p, int top_k,
+                     float temperature, float top_p, int top_k, float min_p,
                      float repeat_penalty, float frequency_penalty,
                      float presence_penalty, int64_t seed,
                      const std::vector<int>& generated_tokens,
@@ -120,10 +126,21 @@ private:
     int try_swap_out_victim(std::vector<RequestContext*>& active_requests,
                             int blocks_needed);
 
+    std::string token_to_log_text(int token_id) const;
+
     Qwen35Config config_;
     int num_linear_layers_ = 0;    // 线性注意力层数 (48)
     size_t ssm_size_per_layer_ = 0;
     size_t conv_size_per_layer_ = 0;
+
+    // 预分配的多槽位 SSM/Conv 状态池 (MAX_SSM_SLOTS 个独立 slot, 每个活跃请求占一个)
+    // 避免每次请求 cudaMalloc/cudaFree 导致 Jetson 统一内存页面回收崩溃
+    float* ssm_pool_base_ = nullptr;              // 连续分配 [MAX_SSM_SLOTS * num_linear_layers_ * ssm_size_per_layer_]
+    __nv_bfloat16* conv_pool_base_ = nullptr;      // 连续分配 [MAX_SSM_SLOTS * num_linear_layers_ * conv_size_per_layer_]
+    // pooled_ssm_states_[slot][layer] → 指向 slot 的第 layer 层 SSM buffer
+    std::vector<std::vector<float*>> pooled_ssm_states_;            // [MAX_SSM_SLOTS][num_linear_layers_]
+    std::vector<std::vector<__nv_bfloat16*>> pooled_conv_states_;   // [MAX_SSM_SLOTS][num_linear_layers_]
+    std::vector<int> free_ssm_slots_;  // 可用槽位索引 (LIFO stack)
     std::unique_ptr<Qwen35Model> model_;
     std::unique_ptr<ops::KVCacheManager> kv_manager_;
     std::unique_ptr<cache::CacheEngine> cache_engine_;
@@ -195,6 +212,10 @@ private:
     std::vector<int>   sampling_indices_;
     std::vector<__nv_bfloat16> sampling_logits_bf16_; // host staging for GPU logits
     std::mt19937       sampling_rng_;
+
+    // 调试日志: token_id -> 文本
+    Tokenizer log_tokenizer_;
+    bool log_tokenizer_ready_ = false;
 
     // 性能统计
     perf::PerfProfiler profiler_;

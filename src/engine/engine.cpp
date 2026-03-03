@@ -8,6 +8,42 @@
 #include <algorithm>
 #include <cstdio>
 #include <cmath>
+#include <unistd.h>
+#include <cctype>
+#include <sstream>
+#include <iomanip>
+#include <thread>
+
+// ---------------------------------------------------------------------------
+// GPU sync with timeout — prevents hardware watchdog (Tegra186 WDT, 2min)
+// from hard-resetting the system if a CUDA kernel hangs.
+// Uses cudaStreamQuery polling with 10ms sleep intervals (not spin-wait)
+// so CPU stays responsive and systemd can feed the watchdog.
+// ---------------------------------------------------------------------------
+static bool sync_stream_with_timeout(cudaStream_t stream, int timeout_seconds,
+                                      const char* context = nullptr) {
+    auto start = std::chrono::steady_clock::now();
+    for (;;) {
+        cudaError_t err = cudaStreamQuery(stream);
+        if (err == cudaSuccess) return true;
+        if (err != cudaErrorNotReady) {
+            fprintf(stderr, "[Engine] CUDA error during sync (%s): %s\n",
+                    context ? context : "unknown",
+                    cudaGetErrorString(err));
+            cudaGetLastError(); // clear sticky error
+            return false;
+        }
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= timeout_seconds) {
+            fprintf(stderr, "[Engine] *** GPU SYNC TIMEOUT after %ds (%s) — possible kernel hang! ***\n",
+                    timeout_seconds, context ? context : "unknown");
+            fflush(stderr);
+            return false;
+        }
+        // 10ms sleep: 让 CPU 空闲, systemd 可以喂狗 + 处理其他任务
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
 
 namespace qwen_thor {
 namespace core {
@@ -25,6 +61,12 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
     std::cout << "Initializing Qwen3.5 Model..." << std::endl;
     model_ = std::make_unique<Qwen35Model>(config_);
     model_->load_weights(model_dir);
+
+    log_tokenizer_ready_ = log_tokenizer_.load(model_dir);
+    if (!log_tokenizer_ready_) {
+        std::cerr << "[Engine] Warning: tokenizer load failed for log decoding from "
+                  << model_dir << std::endl;
+    }
 
     // 2. 构建 ModelCacheParams (KV + SSM 参数, 同时给 KV Manager 和 CacheEngine 使用)
     int num_full_attn_layers = config_.num_full_attn_layers();
@@ -109,6 +151,37 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
         int in_qkv_conv = config_.lin_qk_dim() * 2 + config_.lin_v_dim();
         conv_size_per_layer_ = (size_t)in_qkv_conv
                                * (config_.linear_conv_kernel_dim - 1) * sizeof(__nv_bfloat16);
+
+        // 预分配多槽位 SSM/Conv 状态池: 每个活跃请求独占一个 slot, 互不干扰
+        // MAX_SSM_SLOTS 个独立 slot × num_linear_layers_ 层, 2 次连续 cudaMalloc
+        // 预清零触发页面映射, 避免首次请求时的延迟页错引发 Jetson 看门狗
+        size_t total_ssm_bytes = (size_t)MAX_SSM_SLOTS * num_linear_layers_ * ssm_size_per_layer_;
+        size_t total_conv_bytes = (size_t)MAX_SSM_SLOTS * num_linear_layers_ * conv_size_per_layer_;
+        cudaMalloc(&ssm_pool_base_,  total_ssm_bytes);
+        cudaMalloc(&conv_pool_base_, total_conv_bytes);
+        // 设置 [slot][layer] 指针视图
+        pooled_ssm_states_.resize(MAX_SSM_SLOTS);
+        pooled_conv_states_.resize(MAX_SSM_SLOTS);
+        size_t ssm_slot_stride = (size_t)num_linear_layers_ * ssm_size_per_layer_;
+        size_t conv_slot_stride = (size_t)num_linear_layers_ * conv_size_per_layer_;
+        for (int s = 0; s < MAX_SSM_SLOTS; ++s) {
+            pooled_ssm_states_[s].resize(num_linear_layers_);
+            pooled_conv_states_[s].resize(num_linear_layers_);
+            for (int li = 0; li < num_linear_layers_; ++li) {
+                pooled_ssm_states_[s][li]  = (float*)((char*)ssm_pool_base_ + s * ssm_slot_stride + (size_t)li * ssm_size_per_layer_);
+                pooled_conv_states_[s][li] = (__nv_bfloat16*)((char*)conv_pool_base_ + s * conv_slot_stride + (size_t)li * conv_size_per_layer_);
+            }
+        }
+        // 预清零: 触发统一内存页面分配
+        cudaMemset(ssm_pool_base_, 0, total_ssm_bytes);
+        cudaMemset(conv_pool_base_, 0, total_conv_bytes);
+        // 初始化 free slot 栈 (所有 slot 可用)
+        free_ssm_slots_.reserve(MAX_SSM_SLOTS);
+        for (int s = MAX_SSM_SLOTS - 1; s >= 0; --s)
+            free_ssm_slots_.push_back(s);
+        printf("[Engine] SSM/Conv state pool: %d slots × %d layers, SSM=%.1f KB/layer, Conv=%.1f KB/layer, total=%.1f MB\n",
+               MAX_SSM_SLOTS, num_linear_layers_, ssm_size_per_layer_/1024.0, conv_size_per_layer_/1024.0,
+               (total_ssm_bytes + total_conv_bytes) / 1048576.0);
     }
 
     // 7. 初始化 KV Cache Prefix Caching (SSD offload, 复用上面的 mcp)
@@ -238,6 +311,10 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
         printf("[Engine] Vision workspace: %.1f MB (max %d patches from %d max_pixels)\n",
                vision_workspace_bytes_ / 1048576.0, max_patches, vcfg.max_pixels);
     }
+
+    // 确保所有 CUDA 初始化完成 (页面映射、memset 等), 避免首请求时延迟缺页
+    cudaDeviceSynchronize();
+    printf("[Engine] Initialization complete, all CUDA pages settled.\n");
 }
 
 InferenceEngine::~InferenceEngine() {
@@ -267,6 +344,9 @@ InferenceEngine::~InferenceEngine() {
     cudaFree(d_mtp_block_tables_);
     cudaFree(d_mtp_context_lens_);
     cudaFree(d_vision_workspace_);
+    // 释放 SSM/Conv 状态池 (2次连续分配, 进程退出时释放)
+    cudaFree(ssm_pool_base_);
+    cudaFree(conv_pool_base_);
     if (ssd_io_staging_) free(ssd_io_staging_);
     cudaStreamDestroy(compute_stream_);
 }
@@ -300,6 +380,7 @@ void InferenceEngine::inference_loop() {
             ctx->temperature = req.temperature;
             ctx->top_p       = req.top_p;
             ctx->top_k       = req.top_k;
+            ctx->min_p       = req.min_p;
             ctx->repeat_penalty    = req.repeat_penalty;
             ctx->frequency_penalty = req.frequency_penalty;
             ctx->presence_penalty  = req.presence_penalty;
@@ -389,16 +470,54 @@ void InferenceEngine::inference_loop() {
             ctx->block_tracker.init(blocks);
             
             active_requests.push_back(ctx.get());
-            // 为本请求分配 SSM/Conv GPU 状态
+            // 从预分配池分配独立 SSM/Conv slot (无 cudaMalloc, 仅 memset 清零)
+            // 每个活跃请求占一个独立 slot, 互不干扰
+            // CRITICAL: cudaMemsetAsync 在 compute_stream_ 上, 保证与推理 kernel 序列化
+            if (free_ssm_slots_.empty()) {
+                // 无可用 slot → 尝试换出其它请求腾出 slot
+                bool freed_slot = false;
+                for (size_t i = 1; i < active_requests.size(); ++i) {
+                    auto* r = active_requests[i];
+                    if (!r->is_swapped && !r->is_finished && r->ssm_slot >= 0) {
+                        std::cout << "[Engine] No free SSM slot, swapping out request "
+                                  << r->request_id << " (slot " << r->ssm_slot << ")" << std::endl;
+                        try_swap_out_victim(active_requests, 0);
+                        freed_slot = !free_ssm_slots_.empty();
+                        if (freed_slot) break;
+                    }
+                }
+                if (!freed_slot) {
+                    std::cerr << "[Engine] FATAL: No free SSM slots and cannot swap out. "
+                              << "Dropping request " << req.request_id << std::endl;
+                    // 释放已分配的 KV blocks
+                    if (!ctx->block_table.empty()) {
+                        kv_manager_->free_blocks(ctx->block_table);
+                        ctx->block_table.clear();
+                    }
+                    active_requests.pop_back();
+                    ipc::InferenceResponse err_resp{};
+                    err_resp.request_id = req.request_id;
+                    err_resp.token_id = 0;
+                    err_resp.is_finished = true;
+                    err_resp.error_code = -1;
+                    ipc_resp_queue_->push(err_resp);
+                    continue;
+                }
+            }
             {
+                int slot = free_ssm_slots_.back();
+                free_ssm_slots_.pop_back();
+                ctx->ssm_slot = slot;
                 ctx->ssm_states.resize(num_linear_layers_);
                 ctx->conv_states.resize(num_linear_layers_);
                 for (int li = 0; li < num_linear_layers_; ++li) {
-                    cudaMalloc(&ctx->ssm_states[li],  ssm_size_per_layer_);
-                    cudaMemset( ctx->ssm_states[li],  0, ssm_size_per_layer_);
-                    cudaMalloc(&ctx->conv_states[li], conv_size_per_layer_);
-                    cudaMemset( ctx->conv_states[li], 0, conv_size_per_layer_);
+                    ctx->ssm_states[li] = pooled_ssm_states_[slot][li];
+                    ctx->conv_states[li] = pooled_conv_states_[slot][li];
+                    cudaMemsetAsync(ctx->ssm_states[li], 0, ssm_size_per_layer_, compute_stream_);
+                    cudaMemsetAsync(ctx->conv_states[li], 0, conv_size_per_layer_, compute_stream_);
                 }
+                std::cout << "[Engine] Assigned SSM slot " << slot << " to request "
+                          << req.request_id << " (free slots: " << free_ssm_slots_.size() << ")" << std::endl;
             }
             all_requests_.push_back(std::move(ctx));
             
@@ -441,8 +560,25 @@ void InferenceEngine::inference_loop() {
         }
 
         // 3. 清理完成的请求，释放 KV blocks + SSM/Conv 状态
+        // CRITICAL: 必须先等 compute_stream_ 上所有 kernel 完成,
+        // 否则 SSM/Conv pool 的清零 (下一请求的 cudaMemsetAsync) 可能
+        // 与正在运行的 kernel 竞态 → GPU hang.
+        {
+            bool has_finished = false;
+            for (auto* ctx : active_requests)
+                if (ctx->is_finished) { has_finished = true; break; }
+            if (has_finished) {
+                if (!sync_stream_with_timeout(compute_stream_, 90, "cleanup_pre_sync")) {
+                    fprintf(stderr, "[Engine] FATAL: GPU hang detected during cleanup sync! "
+                            "Marking all requests finished to prevent further damage.\\n");
+                    fflush(stderr);
+                    for (auto* ctx : active_requests) ctx->is_finished = true;
+                }
+            }
+        }
         for (auto* ctx : active_requests) {
             if (ctx->is_finished) {
+                fprintf(stderr, "[Engine] Cleanup: req=%lu freeing resources...\n", ctx->request_id);
                 // 释放 GPU-resident KV Cache blocks (跳过已 evict 到 SSD 的 -1 entries)
                 if (!ctx->block_table.empty() && !ctx->is_swapped) {
                     std::vector<int> gpu_blocks;
@@ -462,8 +598,23 @@ void InferenceEngine::inference_loop() {
                     kv_swapper_->remove(ctx->request_id);
                     ctx->is_swapped = false;
                 }
-                for (auto* p : ctx->ssm_states)  cudaFree(p);
-                for (auto* p : ctx->conv_states) cudaFree(p);
+                // 释放 processed_images (ViT 后不再需要 bf16 pixel 数据)
+                if (!ctx->processed_images.empty()) {
+                    size_t img_bytes = 0;
+                    for (auto& img : ctx->processed_images)
+                        img_bytes += img.pixel_values_bf16.size() * sizeof(__nv_bfloat16);
+                    ctx->processed_images.clear();
+                    ctx->processed_images.shrink_to_fit();
+                    fprintf(stderr, "[Engine] Cleanup: req=%lu freed %zu bytes of image data\n",
+                            ctx->request_id, img_bytes);
+                }
+                // 池化: 不 cudaFree, 回收 slot 到 free list, 断开 ctx 指针
+                if (ctx->ssm_slot >= 0) {
+                    free_ssm_slots_.push_back(ctx->ssm_slot);
+                    fprintf(stderr, "[Engine] Cleanup: req=%lu returned SSM slot %d (free slots: %zu)\n",
+                            ctx->request_id, ctx->ssm_slot, free_ssm_slots_.size());
+                    ctx->ssm_slot = -1;
+                }
                 ctx->ssm_states.clear();
                 ctx->conv_states.clear();
                 // 释放 MTP KV Cache blocks
@@ -471,13 +622,44 @@ void InferenceEngine::inference_loop() {
                     mtp_kv_manager_->free_blocks(ctx->mtp_block_table);
                     ctx->mtp_block_table.clear();
                 }
+                // 释放已完成请求持有的 prompt/generated tokens 内存
+                ctx->prompt_tokens.clear();
+                ctx->prompt_tokens.shrink_to_fit();
+                ctx->generated_tokens.clear();
+                ctx->generated_tokens.shrink_to_fit();
+                // 非阻塞检查 GPU 异步错误 (不做 sync, 避免潜在 GPU hang)
+                {
+                    cudaError_t peek = cudaPeekAtLastError();
+                    if (peek != cudaSuccess) {
+                        fprintf(stderr, "[Engine] Cleanup: req=%lu GPU async error: %s\n",
+                                ctx->request_id, cudaGetErrorString(peek));
+                    }
+                }
+                fprintf(stderr, "[Engine] Cleanup: req=%lu fully done\n", ctx->request_id);
+                fflush(stderr);
             }
         }
+
         active_requests.erase(
             std::remove_if(active_requests.begin(), active_requests.end(),
                 [](RequestContext* ctx) { return ctx->is_finished; }),
             active_requests.end()
         );
+        // 从 all_requests_ 中移除已完成的请求, 释放 RequestContext 内存
+        all_requests_.erase(
+            std::remove_if(all_requests_.begin(), all_requests_.end(),
+                [](const std::unique_ptr<RequestContext>& p) { return p->is_finished; }),
+            all_requests_.end()
+        );
+
+        // GPU 冷却间隙 + 全设备同步: 确保 GPU 完全 idle, 统一内存页面安定
+        // 防止跨请求的 GPU 状态残留 (SMMU/IOMMU 页表、compute/copy engine 竞态)
+        if (active_requests.empty()) {
+            // 全设备同步 (带超时, 避免 WDT)
+            sync_stream_with_timeout(compute_stream_, 60, "inter_request_sync");
+            // 200ms idle 间隙: 让统一内存子系统完成页面迁移/回收
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
     }
 }
 
@@ -503,10 +685,33 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             if (freed == 0) break;
         }
 
-        // 重新分配 SSM/Conv GPU 内存
-        for (int li = 0; li < num_linear_layers_; ++li) {
-            cudaMalloc(&ctx->ssm_states[li],  ssm_size_per_layer_);
-            cudaMalloc(&ctx->conv_states[li], conv_size_per_layer_);
+        // 从预分配池分配独立 SSM/Conv slot (swap-in)
+        if (free_ssm_slots_.empty()) {
+            // 尝试换出其它请求腾出 slot
+            for (size_t i = 1; i < active_requests.size(); ++i) {
+                auto* r = active_requests[i];
+                if (!r->is_swapped && !r->is_finished && r->ssm_slot >= 0 && r != ctx) {
+                    try_swap_out_victim(active_requests, 0);
+                    if (!free_ssm_slots_.empty()) break;
+                }
+            }
+        }
+        if (free_ssm_slots_.empty()) {
+            std::cerr << "[Engine] swap_in failed: no free SSM slots for request "
+                      << ctx->request_id << std::endl;
+            ctx->is_finished = true;
+            return;
+        }
+        {
+            int slot = free_ssm_slots_.back();
+            free_ssm_slots_.pop_back();
+            ctx->ssm_slot = slot;
+            for (int li = 0; li < num_linear_layers_; ++li) {
+                ctx->ssm_states[li] = pooled_ssm_states_[slot][li];
+                ctx->conv_states[li] = pooled_conv_states_[slot][li];
+            }
+            std::cout << "[Engine] Swap-in: assigned SSM slot " << slot
+                      << " to request " << ctx->request_id << std::endl;
         }
         auto new_blocks = kv_swapper_->swap_in(
             ctx->request_id, *kv_manager_,
@@ -605,7 +810,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                         to_evict = std::max(to_evict, std::min(256, (int)ctx->block_table.size() - ssd_evict_cursor));
 
                         if (to_evict > 0 && ssd_evict_cursor + to_evict <= (int)ctx->block_table.size()) {
-                            cudaStreamSynchronize(compute_stream_);  // 确保 KV 写入完成
+                            sync_stream_with_timeout(compute_stream_, 60, "ssd_evict_prefill");  // 确保 KV 写入完成
 
                             std::vector<int> evict_logical;
                             std::vector<int> phys_to_free;
@@ -677,32 +882,66 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
 
                 // 1b. Vision: 如果有图像且是第一个 chunk, 运行视觉编码器并替换 image_pad 嵌入
                 if (chunk_idx == 0) {
-                    std::cout << "[Engine] Chunk 0: processed_images=" << ctx->processed_images.size()
-                              << " has_vision=" << model_->has_vision()
-                              << " workspace=" << (d_vision_workspace_ ? "yes" : "no") << std::endl;
+                    fprintf(stderr, "[Engine] Chunk 0: req=%lu processed_images=%zu has_vision=%d workspace=%s\n",
+                            ctx->request_id, ctx->processed_images.size(),
+                            (int)model_->has_vision(), d_vision_workspace_ ? "yes" : "no");
+                    fflush(stderr);
+                    // Count image_pad tokens in this chunk for alignment verification
+                    int pad_count_in_chunk = 0;
+                    for (int ci = 0; ci < chunk_len; ci++) {
+                        if (ctx->prompt_tokens[chunk_start + ci] == 248056 ||
+                            ctx->prompt_tokens[chunk_start + ci] == 248057)
+                            pad_count_in_chunk++;
+                    }
+                    int total_features = 0;
+                    for (auto& img : ctx->processed_images) total_features += img.num_output_tokens();
+                    fprintf(stderr, "[Engine] Chunk 0: pad_tokens=%d total_features=%d prompt_len=%d\n",
+                            pad_count_in_chunk, total_features, (int)ctx->prompt_tokens.size());
+                    fflush(stderr);
                 }
                 if (chunk_idx == 0 && !ctx->processed_images.empty() &&
                     model_->has_vision() && d_vision_workspace_) {
                     profiler_.begin("vision", compute_stream_);
                     auto* venc = model_->get_vision_encoder();
                     int vision_offset = 0;
+                    int img_idx = 0;
                     for (auto& img : ctx->processed_images) {
+                        fprintf(stderr, "[Engine] ViT run: req=%lu img=%d/%zu tokens=%d\n",
+                                ctx->request_id, img_idx,
+                                ctx->processed_images.size(), img.num_output_tokens());
+                        fflush(stderr);
                         // 运行 ViT + Merger
                         __nv_bfloat16* features = venc->forward(
                             img, d_vision_workspace_, vision_workspace_bytes_,
                             compute_stream_);
                         if (features) {
+                            // Sync stream with timeout to surface async CUDA errors
+                            bool vsync_ok = sync_stream_with_timeout(compute_stream_, 60, "vision_forward");
+                            cudaError_t vsync_err = vsync_ok ? cudaSuccess : cudaGetLastError();
+                            if (!vsync_ok || vsync_err != cudaSuccess) {
+                                fprintf(stderr, "[Engine] Vision sync error img=%d: %s\n",
+                                        img_idx, vsync_ok ? cudaGetErrorString(vsync_err) : "TIMEOUT");
+                                fflush(stderr);
+                                // Skip token replacement — LLM will run without this image's features
+                            } else {
                             // 根据 is_video 选择替换 image_pad (248056) 或 video_pad (248057)
                             int token_id = img.is_video ? 248057 : 248056;
+                            int num_vision_tokens = img.num_output_tokens();
+                            fprintf(stderr, "[Engine] replace_image_tokens: offset=%d num=%d token_id=%d\n",
+                                    vision_offset, num_vision_tokens, token_id);
+                            fflush(stderr);
 
                             core::vision_ops::invoke_replace_image_tokens(
                                 d_hidden_states_, features, d_pos_ids_,
                                 chunk_len, token_id,
                                 config_.hidden_size, vision_offset,
+                                num_vision_tokens,
                                 compute_stream_);
 
-                            vision_offset += img.num_output_tokens();
-                        }
+                            vision_offset += num_vision_tokens;
+                            } // end else (no CUDA error)
+                        }     // end if (features)
+                        img_idx++;
                     }
                     profiler_.end("vision", compute_stream_);
                 }
@@ -875,6 +1114,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             profiler_.begin("sample", compute_stream_);
             int next_token = sample_token(logits, vocab_size,
                                           ctx->temperature, ctx->top_p, ctx->top_k,
+                                          ctx->min_p,
                                           ctx->repeat_penalty, ctx->frequency_penalty,
                                           ctx->presence_penalty, ctx->seed,
                                           ctx->generated_tokens,
@@ -898,7 +1138,9 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             }
             
             profiler_.request_prefill_done(num_tokens);
-            std::cout << "Prefill tok=" << next_token << " (" << num_tokens << " tokens)" << std::endl;
+            std::cout << "Prefill tok=" << next_token
+                      << " txt=\"" << token_to_log_text(next_token) << "\""
+                      << " (" << num_tokens << " tokens)" << std::endl;
             profiler_.print_step_report(0);
 
             // ---- LMCache Monitor: 记录请求级指标 ----
@@ -955,9 +1197,6 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
         if (mtp_kv_manager_ && ctx->draft_token >= 0 && !ctx->uses_ssd_blocks) {
             // ============================================================
             // MTP Speculative Decode: T=2 Verify
-            //
-            // 将 [last_emitted, draft] 作为 2-token "chunk" 送入主模型
-            // GEMM 读权重一次服务 2 token → 带宽利用率翻倍
             // ============================================================
             profiler_.begin("embedding", compute_stream_);
 
@@ -1085,7 +1324,9 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                     profiler_.request_done();
                     profiler_.print_request_summary();
                     std::cout << "Decode step " << ctx->generated_tokens.size()
-                              << ". tok=" << ctx->draft_token << " (MTP accept, EOS)" << std::endl;
+                              << ". tok=" << tokens_2[1]
+                              << " txt=\"" << token_to_log_text(tokens_2[1]) << "\""
+                              << " (MTP accept, EOS)" << std::endl;
                     return;
                 }
 
@@ -1147,6 +1388,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                     ? (float)mtp_accept_count_ / mtp_verify_count_ * 100.f : 0.f;
                 std::cout << "Decode step " << step_n
                           << ". tok=" << ctx->draft_token
+                          << " txt=\"" << token_to_log_text(ctx->draft_token) << "\""
                           << " (MTP ACCEPT 2tok, rate=" << accept_rate << "%)" << std::endl;
 
             } else {
@@ -1227,6 +1469,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                     ? (float)mtp_accept_count_ / mtp_verify_count_ * 100.f : 0.f;
                 std::cout << "Decode step " << step_n
                           << ". tok=" << verify_token
+                          << " txt=\"" << token_to_log_text(verify_token) << "\""
                           << " (MTP REJECT 1tok, rate=" << accept_rate << "%)" << std::endl;
             }
 
@@ -1235,6 +1478,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             // 标准 Decode (T=1) — 也作为 MTP bootstrap (首次 decode)
             // ============================================================
             int num_tokens = 1;
+            int step_num = (int)ctx->generated_tokens.size() + 1;
 
             // 1. 准备输入数据 (只有 1 个 token)
             profiler_.begin("embedding", compute_stream_);
@@ -1258,7 +1502,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                     }
                     int to_evict = std::min(64, (int)ctx->block_table.size() - evict_start);
                     if (to_evict > 0) {
-                        cudaStreamSynchronize(compute_stream_);
+                        sync_stream_with_timeout(compute_stream_, 60, "ssd_evict_decode");
                         std::vector<int> evict_logical, phys_to_free;
                         for (int i = evict_start; i < evict_start + to_evict; i++) {
                             if (ctx->block_table[i] >= 0) {
@@ -1375,7 +1619,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                     }
 
                 } else {
-                    // 标准 decode 路径
+                    // 标准 decode 路径 (forward_decode 内含逐层 sync)
                     model_->forward_decode(
                         d_hidden_states_, d_pos_ids_, *kv_manager_,
                         d_block_tables_, d_context_lens_,
@@ -1393,7 +1637,27 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 return;
             }
 
+            // GPU 异步错误检查 (forward_decode 内已逐层 sync, 此处仅确认状态)
+            {
+                cudaError_t gpu_err = cudaGetLastError();
+                if (gpu_err != cudaSuccess) {
+                    fprintf(stderr, "[Engine] CUDA error after decode step %d: %s\n",
+                            (int)ctx->generated_tokens.size(), cudaGetErrorString(gpu_err));
+                    fflush(stderr);
+                    ctx->is_finished = true;
+                    ipc::InferenceResponse resp{};
+                    resp.request_id = ctx->request_id;
+                    resp.token_id = 0;
+                    resp.is_finished = true;
+                    resp.error_code = -3;  // CUDA error
+                    while (!ipc_resp_queue_->push(resp))
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    return;
+                }
+            }
+
             // 5. Final Norm + LM Head + Sample (T=1)
+
             profiler_.begin("final_norm", compute_stream_);
             __nv_bfloat16* norm_out = d_workspace_;
             ops::invoke_rmsnorm(norm_out, d_hidden_states_, model_->get_norm_weight(),
@@ -1409,6 +1673,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             profiler_.begin("sample", compute_stream_);
             int next_token = sample_token(logits, vocab_size,
                                           ctx->temperature, ctx->top_p, ctx->top_k,
+                                          ctx->min_p,
                                           ctx->repeat_penalty, ctx->frequency_penalty,
                                           ctx->presence_penalty, ctx->seed,
                                           ctx->generated_tokens,
@@ -1421,6 +1686,30 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             // 推送响应 token 给 Python 前端
             bool eos = (next_token == 248046 || next_token == 248044);
             bool done = (int)ctx->generated_tokens.size() >= ctx->max_new_tokens || eos;
+
+            // N-gram 重复检测: 检测 4-gram 连续重复 >= 8 次 → 强制终止
+            // 避免模型陷入无限重复循环浪费计算资源
+            if (!done && (int)ctx->generated_tokens.size() >= 32) {
+                const auto& gen = ctx->generated_tokens;
+                int sz = (int)gen.size();
+                // 检查最后 32 个 token 是否为 4-gram 重复
+                bool is_repeating = true;
+                for (int ri = 1; ri < 8 && is_repeating; ri++) {
+                    for (int gi = 0; gi < 4; gi++) {
+                        if (gen[sz - 1 - gi] != gen[sz - 1 - gi - 4 * ri]) {
+                            is_repeating = false;
+                            break;
+                        }
+                    }
+                }
+                if (is_repeating) {
+                    done = true;
+                    eos = true;
+                    std::cout << "[Engine] Repetition detected at step "
+                              << sz << ", force stopping." << std::endl;
+                }
+            }
+
             {
                 ipc::InferenceResponse resp{};
                 resp.request_id  = ctx->request_id;
@@ -1462,10 +1751,9 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                     d_mtp_block_tables_, d_mtp_context_lens_,
                     (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
                     d_workspace_, compute_stream_);
+
                 ctx->draft_token = sample_argmax(mtp_logits, vocab_size, compute_stream_);
                 ctx->mtp_context_len++;
-
-                std::cout << "MTP bootstrap: draft_token=" << ctx->draft_token << std::endl;
             }
 
             profiler_.request_decode_step();
@@ -1473,15 +1761,43 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             if (step_n % 10 == 0) {
                 profiler_.print_step_report(step_n);
             }
-            std::cout << "Decode step " << step_n << ". tok=" << next_token << std::endl;
+            std::cout << "Decode step " << step_n
+                      << ". tok=" << next_token
+                      << " txt=\"" << token_to_log_text(next_token) << "\""
+                      << std::endl;
+            fflush(stdout);
         }
     }
+}
+
+std::string InferenceEngine::token_to_log_text(int token_id) const {
+    if (!log_tokenizer_ready_) return "";
+
+    std::string piece = log_tokenizer_.decode(token_id);
+    if (piece.empty()) return "";
+
+    std::ostringstream oss;
+    for (unsigned char ch : piece) {
+        if (ch == '\n') oss << "\\n";
+        else if (ch == '\r') oss << "\\r";
+        else if (ch == '\t') oss << "\\t";
+        else if (std::isprint(ch)) oss << static_cast<char>(ch);
+        else {
+            oss << "\\x" << std::hex << std::setw(2) << std::setfill('0')
+                << static_cast<int>(ch) << std::dec;
+        }
+    }
+    return oss.str();
 }
 
 int InferenceEngine::sample_argmax(__nv_bfloat16* logits, int vocab_size, cudaStream_t stream) {
     // GPU argmax: 单 block 1024 线程 reduce，结果写到 managed memory
     ops::invoke_argmax(logits, d_argmax_result_, vocab_size, stream);
-    cudaStreamSynchronize(stream);
+    if (!sync_stream_with_timeout(stream, 60, "sample_argmax")) {
+        fprintf(stderr, "[Engine] FATAL: GPU hang detected in sample_argmax, returning EOS\n");
+        fflush(stderr);
+        return 248046; // EOS token — force stop
+    }
     return *d_argmax_result_;
 }
 
@@ -1496,6 +1812,7 @@ int InferenceEngine::sample_argmax(__nv_bfloat16* logits, int vocab_size, cudaSt
 // ---------------------------------------------------------------------------
 int InferenceEngine::sample_token(__nv_bfloat16* logits, int vocab_size,
                                    float temperature, float top_p, int top_k,
+                                   float min_p,
                                    float repeat_penalty, float frequency_penalty,
                                    float presence_penalty, int64_t seed,
                                    const std::vector<int>& generated_tokens,
@@ -1511,7 +1828,11 @@ int InferenceEngine::sample_token(__nv_bfloat16* logits, int vocab_size,
     }
 
     // 1. 等待 GPU 完成, cudaMemcpy logits 到 host staging buffer
-    cudaStreamSynchronize(stream);
+    if (!sync_stream_with_timeout(stream, 60, "sample_token")) {
+        fprintf(stderr, "[Engine] FATAL: GPU hang detected in sample_token, returning EOS\n");
+        fflush(stderr);
+        return 248046; // EOS token — force stop
+    }
     cudaMemcpy(sampling_logits_bf16_.data(), logits,
                vocab_size * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
 
@@ -1593,6 +1914,26 @@ int InferenceEngine::sample_token(__nv_bfloat16* logits, int vocab_size,
         for (int i = 0; i < cutoff; ++i) prob_buf[i] *= inv_sum;
     }
 
+    // 6.5 Min-p 过滤: 移除概率 < min_p * max_prob 的 token
+    // 这有效防止高温度采样时选到极低概率的错误 token
+    if (min_p > 0.0f && cutoff > 1) {
+        float max_prob = prob_buf[0];  // 已按概率降序排列
+        float threshold = min_p * max_prob;
+        int new_cutoff = cutoff;
+        for (int i = cutoff - 1; i >= 1; --i) {
+            if (prob_buf[i] < threshold) new_cutoff = i;
+            else break;
+        }
+        if (new_cutoff < cutoff && new_cutoff >= 1) {
+            cutoff = new_cutoff;
+            // 重新归一化
+            sum = 0.0f;
+            for (int i = 0; i < cutoff; ++i) sum += prob_buf[i];
+            inv_sum = 1.0f / sum;
+            for (int i = 0; i < cutoff; ++i) prob_buf[i] *= inv_sum;
+        }
+    }
+
     // 7. 随机采样
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     float r = dist(sampling_rng_);
@@ -1650,10 +1991,13 @@ int InferenceEngine::try_swap_out_victim(
         conv_size_per_layer_,
         compute_stream_);
 
-    // 释放 GPU 上的 SSM/Conv 内存
-    for (auto* p : victim->ssm_states)  cudaFree(p);
-    for (auto* p : victim->conv_states) cudaFree(p);
-    // 不 clear, 保留 vector 大小以便 swap_in 时重新分配
+    // 池化: 不 cudaFree SSM/Conv, 回收 slot 到 free list, 清空指针
+    if (victim->ssm_slot >= 0) {
+        free_ssm_slots_.push_back(victim->ssm_slot);
+        std::cout << "[Engine] Swap-out: returned SSM slot " << victim->ssm_slot
+                  << " (free slots: " << free_ssm_slots_.size() << ")" << std::endl;
+        victim->ssm_slot = -1;
+    }
     for (auto& p : victim->ssm_states)  p = nullptr;
     for (auto& p : victim->conv_states) p = nullptr;
 
