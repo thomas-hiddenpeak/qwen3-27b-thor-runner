@@ -3,6 +3,26 @@
 #include <iostream>
 #include <cublas_v2.h>
 
+// Warp/Block reduce helpers (for gemv_rmsnorm_kernel)
+template <typename T>
+__inline__ __device__ T gemv_warpReduceSum(T val) {
+    for (int offset = 32 / 2; offset > 0; offset /= 2)
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    return val;
+}
+template <typename T>
+__inline__ __device__ T gemv_blockReduceSum(T val) {
+    static __shared__ T s_reduce[32];
+    int lane = threadIdx.x % 32;
+    int wid  = threadIdx.x / 32;
+    val = gemv_warpReduceSum(val);
+    if (lane == 0) s_reduce[wid] = val;
+    __syncthreads();
+    val = (threadIdx.x < blockDim.x / 32) ? s_reduce[lane] : (T)0;
+    if (wid == 0) val = gemv_warpReduceSum(val);
+    return val;
+}
+
 // Safe cudaMalloc: on failure, keep old pointer and size, log error
 #define SAFE_CUDA_REALLOC(ptr, sz_var, need, stream) do { \
     if ((need) > (sz_var)) { \
@@ -204,7 +224,7 @@ void invoke_dense_gemm(
         // cuBLAS 是 column-major, 利用 C^T = B^T × A^T:
         //   A row-major [M,K] = col-major [K,M], op_N
         //   B col-major [K,N], op_T → [N,K]
-        //   C row-major [M,N] = col-major [N,M]
+        //   C row-major [M_padded,N] = col-major [N,M_padded]
         auto h = get_cublas_handle();
         cublasSetStream(h, stream);
         float alpha = 1.0f, beta_val = 0.0f;
@@ -885,6 +905,110 @@ __global__ void gemv_kernel_scattered_tiled_add(
 
     if (lane_id == 0)
         C[out_idx] = __float2bfloat16(sum + __bfloat162float(residual[out_idx]));
+}
+
+// ----------------------------------------------------------------------------
+// Fused RMSNorm + GEMV: Input RMSNorm 在 SMEM 内完成后直接开始 GEMV
+// 省去 norm_out 的 GMEM write+read + 1 kernel launch
+// RMSNorm 使用 centered weight: out = x * rsqrt(var+eps) * (1+w)
+// 限制: K <= 24576 (smem 48KB limit / 2 bytes) 且 M=1 (T=1 decode only)
+// 线程布局: Grid(ceil(N/8)), Block(256 = 8 warps), Dynamic SMEM = K*sizeof(BF16)
+// ----------------------------------------------------------------------------
+__global__ void gemv_rmsnorm_kernel(
+    const __nv_bfloat16* __restrict__ hidden_states,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    float eps,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    int N, int K)
+{
+    constexpr int WARP_SIZE = 32;
+    constexpr int WARPS_PER_BLOCK = 8;
+
+    extern __shared__ __nv_bfloat16 s_A[];  // [K] will hold normalized hidden states
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x & (WARP_SIZE - 1);
+    int out_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+
+    // Phase 1: Load hidden_states → SMEM + compute sum-of-squares
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        __nv_bfloat16 val = hidden_states[i];
+        s_A[i] = val;
+        float fv = __bfloat162float(val);
+        sum_sq += fv * fv;
+    }
+    sum_sq = gemv_blockReduceSum(sum_sq);
+
+    __shared__ float s_inv_rms;
+    if (threadIdx.x == 0) {
+        s_inv_rms = rsqrtf(sum_sq / (float)K + eps);
+    }
+    __syncthreads();
+
+    // Phase 2: Apply RMSNorm in-place in SMEM
+    float inv_rms = s_inv_rms;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        float v = __bfloat162float(s_A[i]);
+        float w = __bfloat162float(norm_weight[i]);
+        s_A[i] = __float2bfloat16(v * inv_rms * (1.0f + w));
+    }
+    __syncthreads();
+
+    // Phase 3: Standard GEMV from normalized SMEM
+    if (out_idx >= N) return;
+
+    const __nv_bfloat16* b_col = B + (size_t)out_idx * K;
+    float sum = 0.0f;
+
+    int k8 = K / 8;
+    const float4* s_A_v4 = reinterpret_cast<const float4*>(s_A);
+    const float4* b_col_v4 = reinterpret_cast<const float4*>(b_col);
+
+    for (int i = lane_id; i < k8; i += WARP_SIZE) {
+        float4 a4 = s_A_v4[i];
+        float4 b4 = b_col_v4[i];
+        const __nv_bfloat162* a2 = reinterpret_cast<const __nv_bfloat162*>(&a4);
+        const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&b4);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float2 af = __bfloat1622float2(a2[j]);
+            float2 bf = __bfloat1622float2(b2[j]);
+            sum += af.x * bf.x + af.y * bf.y;
+        }
+    }
+
+    int k_tail_start = k8 * 8;
+    for (int k = k_tail_start + lane_id; k < K; k += WARP_SIZE) {
+        sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k]);
+    }
+
+    #pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, mask);
+    }
+
+    if (lane_id == 0) {
+        C[out_idx] = __float2bfloat16(sum);
+    }
+}
+
+void invoke_dense_gemv_with_rmsnorm(
+    const __nv_bfloat16* hidden_states,
+    const __nv_bfloat16* norm_weight,
+    float eps,
+    const __nv_bfloat16* B,
+    __nv_bfloat16* C,
+    int N, int K,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK_THREADS = 256;
+    constexpr int WARPS_PER_BLOCK = BLOCK_THREADS / 32;
+    int blocks = (N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    size_t smem_bytes = K * sizeof(__nv_bfloat16);
+    gemv_rmsnorm_kernel<<<blocks, BLOCK_THREADS, smem_bytes, stream>>>(
+        hidden_states, norm_weight, eps, B, C, N, K);
 }
 
 void invoke_dense_gemv(

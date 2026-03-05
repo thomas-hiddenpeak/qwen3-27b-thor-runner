@@ -107,10 +107,20 @@ public:
         ops::StreamingAttnCtx* streaming_ctx = nullptr  // SSD 流式注意力上下文
     );
 
+    // 设置合并后的 QKV 权重 (T=1 GEMV 优化: 3 launches → 1)
+    // merged 布局: [q_proj_dim + kv_dim*2, hs], 同时更新 q/k/v_proj_w_ 指向子区域
+    void set_merged_qkv(__nv_bfloat16* merged) {
+        qkv_merged_w_ = merged;
+        q_proj_w_ = merged;
+        k_proj_w_ = merged + (size_t)config_.q_proj_dim() * config_.hidden_size;
+        v_proj_w_ = merged + (size_t)(config_.q_proj_dim() + config_.kv_dim()) * config_.hidden_size;
+    }
+
 private:
     Qwen35Config config_;
     int layer_idx_;
 
+    __nv_bfloat16* qkv_merged_w_ = nullptr;  // [q_proj_dim + kv_dim*2, hs] 合并权重
     __nv_bfloat16* q_proj_w_   = nullptr;
     __nv_bfloat16* k_proj_w_   = nullptr;
     __nv_bfloat16* v_proj_w_   = nullptr;
@@ -146,22 +156,37 @@ public:
         __nv_bfloat16* gate_proj_w, __nv_bfloat16* up_proj_w, __nv_bfloat16* down_proj_w,
         __nv_bfloat16* input_norm_w, __nv_bfloat16* post_attn_norm_w);
 
-    // ssm_state:  [nkh, kd, v_per_kh]  float32, device, in-place updated
+    // 设置超级合并权重: QKV+ZAB → 单次 GEMV (T=1 时 2 launches → 1)
+    // merged 布局: [in_qkv + lin_v + nv*2, hs] = [16480, 5120]
+    // 同时更新 qkv/z/a/b 指向子区域 (T>1 GEMM 仍用各子指针)
+    void set_merged_all_proj(__nv_bfloat16* merged) {
+        all_proj_merged_w_ = merged;
+        int in_qkv = config_.lin_qk_dim() * 2 + config_.lin_v_dim();  // 10240
+        int lin_v  = config_.lin_v_dim();    // 6144
+        int nv     = config_.linear_num_value_heads;  // 48
+        int hs     = config_.hidden_size;    // 5120
+        in_proj_qkv_w_ = merged;
+        in_proj_z_w_   = merged + (size_t)in_qkv * hs;
+        in_proj_a_w_   = merged + (size_t)(in_qkv + lin_v) * hs;
+        in_proj_b_w_   = merged + (size_t)(in_qkv + lin_v + nv) * hs;
+    }
+
+    // ssm_state:  [nkh, kd, v_per_kh]  bf16, device, in-place updated
     // conv_state: [nkh*2, kd, conv_k-1] fp16,    device, in-place updated
     // batched decode: ssm_state_ptrs/conv_state_ptrs 是 device 上的指针数组 [batch_size]
     // ssm_state_checkpoint/conv_state_checkpoint: MTP T=2 verify rollback checkpoints
     //   if non-null, save state after processing token[0] (same layout as ssm_state/conv_state)
     void forward(
         __nv_bfloat16* hidden_states,    // [T, hs], in-place
-        float* ssm_state,       // [nkh, kd, v_per_kh] fp32 (batch_size==1)
+        __nv_bfloat16* ssm_state,       // [nkh, kd, v_per_kh] bf16 (batch_size==1)
         __nv_bfloat16*  conv_state,      // [nkh*2, kd, conv_kernel_dim-1] fp16 (batch_size==1)
         int num_tokens,
         __nv_bfloat16* workspace,
         cudaStream_t stream = 0,
         int batch_size = 1,
-        float** ssm_state_ptrs = nullptr,      // [batch_size] device ptr array
+        __nv_bfloat16** ssm_state_ptrs = nullptr,      // [batch_size] device ptr array
         __nv_bfloat16** conv_state_ptrs = nullptr,  // [batch_size] device ptr array
-        float* ssm_state_checkpoint = nullptr,
+        __nv_bfloat16* ssm_state_checkpoint = nullptr,
         __nv_bfloat16* conv_state_checkpoint = nullptr
     );
 
@@ -173,6 +198,7 @@ private:
     __nv_bfloat16* in_proj_z_w_   = nullptr;
     __nv_bfloat16* in_proj_a_w_   = nullptr;
     __nv_bfloat16* in_proj_b_w_   = nullptr;
+    __nv_bfloat16* all_proj_merged_w_ = nullptr;  // [in_qkv+lin_v+nv*2, hs] 超级合并权重
     __nv_bfloat16* out_proj_w_    = nullptr;
     __nv_bfloat16* conv1d_w_      = nullptr;
     float* A_log_f32_    = nullptr;  // F32 pointer (A_log is stored as float32)

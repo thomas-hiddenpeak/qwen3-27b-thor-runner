@@ -13,6 +13,7 @@
 
 #include <string>
 #include <cstddef>
+#include <cuda_bf16.h>
 #include <cstdint>
 #include <iostream>
 #include <fstream>
@@ -181,9 +182,9 @@ struct ModelCacheParams {
     size_t kv_bytes_per_token() const {
         return kv_bytes_per_token_per_layer() * num_full_attn_layers;
     }
-    // SSM 状态每层: 16*128*384*4 = 3 MB
+    // SSM 状态每层: 16*128*384*2 = 1.5 MB (BF16)
     size_t ssm_bytes_per_layer() const {
-        return (size_t)nkh * kd * v_per_kh * sizeof(float);
+        return (size_t)nkh * kd * v_per_kh * sizeof(__nv_bfloat16);
     }
     size_t ssm_bytes_total() const {
         return ssm_bytes_per_layer() * num_linear_attn_layers;
@@ -321,7 +322,7 @@ public:
         }
         printf("║                                                            ║\n");
         printf("║  ── Per-Request Fixed Cost (SSM/Conv) ──                   ║\n");
-        printf("║    SSM State:        %6.1f MB  (48 layers, FP32)           ║\n", r.ssm_per_request_mb);
+        printf("║    SSM State:        %6.1f MB  (48 layers, BF16)           ║\n", r.ssm_per_request_mb);
         printf("║    Conv State:       %6.1f MB  (48 layers, BF16)           ║\n", r.conv_per_request_mb);
         printf("║    Total/Request:    %6.1f MB                              ║\n", r.total_per_request_mb);
         printf("║                                                            ║\n");

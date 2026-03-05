@@ -1092,10 +1092,10 @@ void test_swap_256k_benchmark() {
     const int BLOCK_BYTES = BLOCK_SIZE * NUM_KV_HEADS * HEAD_DIM * (int)sizeof(__nv_bfloat16);  // 32768
     const size_t KV_PER_BLOCK = (size_t)BLOCK_BYTES * NUM_FULL_ATTN_LAYERS * 2;  // 1,048,576 = 1 MB
 
-    const size_t SSM_PER_LAYER = (size_t)16 * 128 * 384 * sizeof(float);         // 3,145,728 = 3 MB
+    const size_t SSM_PER_LAYER = (size_t)16 * 128 * 384 * sizeof(__nv_bfloat16);  // 1,572,864 = 1.5 MB
     const size_t CONV_PER_LAYER = (size_t)10240 * 3 * sizeof(__nv_bfloat16);      // 61,440 = 60 KB
     const size_t SSM_CONV_PER_REQ = SSM_PER_LAYER * NUM_LINEAR_LAYERS
-                                  + CONV_PER_LAYER * NUM_LINEAR_LAYERS;           // ~147 MB
+                                  + CONV_PER_LAYER * NUM_LINEAR_LAYERS;           // ~75 MB
 
     const int GPU_BLOCKS = 4096;       // 4 GB GPU KV
     const int BLOCKS_PER_REQ = 256;    // 4096 tokens/req
@@ -1139,7 +1139,7 @@ void test_swap_256k_benchmark() {
     cudaStreamCreate(&stream);
 
     // ---- Helper lambdas ----
-    auto alloc_ssm = [&](std::vector<float*>& ssm, std::vector<__nv_bfloat16*>& conv, uint8_t fill) {
+    auto alloc_ssm = [&](std::vector<__nv_bfloat16*>& ssm, std::vector<__nv_bfloat16*>& conv, uint8_t fill) {
         ssm.resize(NUM_LINEAR_LAYERS);
         conv.resize(NUM_LINEAR_LAYERS);
         for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
@@ -1149,7 +1149,7 @@ void test_swap_256k_benchmark() {
             cudaMemset(conv[i], fill, CONV_PER_LAYER);
         }
     };
-    auto free_ssm = [&](std::vector<float*>& ssm, std::vector<__nv_bfloat16*>& conv) {
+    auto free_ssm = [&](std::vector<__nv_bfloat16*>& ssm, std::vector<__nv_bfloat16*>& conv) {
         for (auto* p : ssm)  cudaFree(p);
         for (auto* p : conv) cudaFree(p);
         ssm.clear(); conv.clear();
@@ -1204,7 +1204,7 @@ void test_swap_256k_benchmark() {
         fill_kv(blocks, fill);
 
         // Allocate + fill SSM/Conv
-        std::vector<float*> ssm;
+        std::vector<__nv_bfloat16*> ssm;
         std::vector<__nv_bfloat16*> conv;
         alloc_ssm(ssm, conv, fill);
 
@@ -1257,7 +1257,7 @@ void test_swap_256k_benchmark() {
     struct BenchReq {
         uint64_t id;
         std::vector<int> block_table;
-        std::vector<float*> ssm;
+        std::vector<__nv_bfloat16*> ssm;
         std::vector<__nv_bfloat16*> conv;
         bool active = false;
         uint8_t fill_val;
@@ -2401,7 +2401,7 @@ void bench_chunked_prefill() {
     {
         // Qwen3.5-27B real params
         const int NLin = 48;
-        const size_t SSM_PER_LAYER = (size_t)16 * 128 * 384 * sizeof(float);      // 3 MB
+        const size_t SSM_PER_LAYER = (size_t)16 * 128 * 384 * sizeof(__nv_bfloat16);  // 1.5 MB
         const size_t CONV_PER_LAYER = (size_t)10240 * 3 * sizeof(__nv_bfloat16);   // 60 KB
 
         int prompt_lens[] = {512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 204800, 262144};

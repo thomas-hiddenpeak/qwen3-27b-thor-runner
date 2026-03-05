@@ -53,10 +53,10 @@ struct InferRequest {
     float       temperature     = 1.0f;
     float       top_p           = 0.95f;
     int         top_k           = 20;
-    float       min_p           = 0.1f;   // min-p 过滤 (移除 prob < min_p*max_prob 的 token)
+    float       min_p           = 0.0f;   // min-p 过滤 (官方推荐 0.0, 即不使用)
     float       repeat_penalty  = 1.0f;   // 重复惩罚 (1.0=无惩罚, >1.0 抑制重复)
     float       frequency_penalty = 0.0f; // 频率惩罚 (OpenAI 风格, 0.0=无惩罚)
-    float       presence_penalty  = 0.0f; // 存在性惩罚 (OpenAI 风格, 0.0=无惩罚)
+    float       presence_penalty  = 1.5f; // 存在性惩罚 (官方推荐 1.5, 减少无限重复)
     int64_t     seed            = -1;     // 随机种子 (-1=随机, >=0 确定性采样)
     bool        stream          = true;
 

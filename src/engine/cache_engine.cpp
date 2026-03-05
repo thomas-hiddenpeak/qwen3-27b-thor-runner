@@ -117,7 +117,7 @@ void CacheEngine::store_prefix(
     const ops::KVCacheManager& kv_manager,
     const int* d_block_table,
     int num_blocks,
-    float** ssm_states,
+    __nv_bfloat16** ssm_states,
     __nv_bfloat16** conv_states,
     __nv_bfloat16* workspace,
     cudaStream_t stream)
@@ -216,7 +216,7 @@ int CacheEngine::retrieve_prefix(
     const int* tokens, int num_tokens,
     ops::KVCacheManager& kv_manager,
     std::vector<int>& out_block_table,
-    float** ssm_states,
+    __nv_bfloat16** ssm_states,
     __nv_bfloat16** conv_states,
     __nv_bfloat16* workspace,
     cudaStream_t stream)
@@ -312,7 +312,7 @@ int CacheEngine::retrieve_prefix(
 // SSM/Conv 状态拷贝
 // ---------------------------------------------------------------------------
 void CacheEngine::copy_state_to_host(CacheEntry& entry,
-                                     float** ssm_states,
+                                     __nv_bfloat16** ssm_states,
                                      __nv_bfloat16** conv_states,
                                      cudaStream_t stream) {
     int num_lin = params_.num_linear_attn_layers;
@@ -334,7 +334,7 @@ void CacheEngine::copy_state_to_host(CacheEntry& entry,
 }
 
 void CacheEngine::copy_state_from_host(const CacheEntry& entry,
-                                       float** ssm_states,
+                                       __nv_bfloat16** ssm_states,
                                        __nv_bfloat16** conv_states,
                                        cudaStream_t stream) {
     int num_lin = params_.num_linear_attn_layers;

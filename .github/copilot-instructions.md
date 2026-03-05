@@ -2,292 +2,196 @@
 
 ## 项目概述
 
-这是一个运行在 NVIDIA Jetson AGX Thor (SM110a Blackwell) 上的 Qwen3.5-27B 大语言模型推理引擎。使用 C++17 / CUDA 编写，BF16 精度，目标是实现高性能的本地推理。
+运行在 NVIDIA Jetson AGX Thor (SM110a Blackwell) 上的 Qwen3.5-27B 推理引擎。C++17 / CUDA，BF16 精度，目标是极致性能与稳定。
 
-## 硬件约束
+## 硬件规格 (Jetson AGX Thor)
 
-- **GPU**: NVIDIA Thor, Blackwell SM110, 20 SM (10 TPC × 2), 2560 CUDA Cores, 5th-gen Tensor Cores
-- **GPU 时钟**: 1575 MHz (GPC), 1692 MHz (NVD), Power Mode = MAXN
-- **FP32 峰值**: 8.064 TFLOPS (2560 × 1575 MHz × 2 FMA)
-- **内存**: 128 GB LPDDR5X 统一内存, 4266 MHz, 256-bit bus, 峰值 273 GB/s, 实测 GEMV ~230 GB/s (85%)
+- **GPU**: Blackwell SM110a, 20 SM (10 TPC × 2), 2560 CUDA Cores, 5th-gen Tensor Cores
+- **时钟**: GPC 1575 MHz, NVD 1692 MHz, Power Mode = MAXN
+- **FP32 峰值**: 8.064 TFLOPS
+- **内存**: 128 GB LPDDR5X 统一内存, 4266 MHz, 256-bit bus
+  - 峰值带宽 273 GB/s, 实测 GEMV ~220 GB/s (80%)
+  - **无独立显存**: CPU 和 GPU 共享同一物理内存
+  - `cudaMalloc` 由 GPU driver 管理, 不可 CPU 访问, 不计入进程 RSS, jtop 也可能不显示
+  - `cudaMallocManaged` 走 OS VM, 有 lazy page fault, 计入进程 RSS
+  - 系统级可通过 tegrastats / `/proc/meminfo` MemAvailable 监控实际物理占用
 - **L2 Cache**: 32 MB
 - **Shared Memory**: 228 KB/SM, 48 KB/block
 - **Registers**: 65536/SM (= 65536/block)
 - **Threads**: 1536/SM (48 warps), 1024/block, max 24 blocks/SM
 - **CPU**: 14-core Arm Neoverse V3AE @ 2601 MHz
-- **功耗**: 40-130W 可配置 (当前 MAXN)
-- **没有独立显存**: CPU 和 GPU 共享 128 GB 统一内存，使用 `cudaMallocManaged` / Unified Memory
-- **SM110 特性**: Cluster Launch ✅, TMA (Tensor Memory Accelerator) ✅, Cooperative Launch ✅, ATS Addressing ✅
-- 这不是数据中心 GPU，不能假设 PCIe/NVLink 带宽或独立 HBM
+- **功耗**: 40-130W (当前 MAXN)
+- **SM110 特性**: Cluster Launch ✅, TMA ✅, Cooperative Launch ✅, ATS ✅
+- 不是数据中心 GPU, 不能假设 PCIe/NVLink 或独立 HBM
 
-## 模型架构
+### 统一内存的关键约束
 
-- **Qwen3.5-27B**: 64 层混合架构
-  - 48 层 **Linear Attention** (Gated DeltaNet SSM) — layer_idx % 4 != 3
-  - 16 层 **Full Attention** (GQA + Paged KV Cache) — layer_idx % 4 == 3
+权重 (~51 GB) + merged 权重 (~5 GB) + KV Cache + SSM 状态 + Workspace 全在 128 GB 物理内存中:
+- 大 prefill chunk (>256 tokens) 的 MLP GEMM 同时访问 >300 MB 权重, 超过 SMMU 资源 → GPU hard-reset
+- 必须 `loaders_.clear()` 释放 mmap 防止双份权重 (~54 GB)
+- `max_chunk_size_ = 256` 是稳定性硬约束
+- 每层 forward 需 `cudaStreamSynchronize` 防止统一内存并发访问超载
+
+## 模型架构 (Qwen3.5-27B)
+
+- **64 层混合架构**:
+  - 48 层 **Linear Attention** (Gated DeltaNet SSM) — `layer_idx % 4 != 3`
+  - 16 层 **Full Attention** (GQA + Paged KV Cache) — `layer_idx % 4 == 3`
 - **Hidden Size**: 5120, **Intermediate Size**: 17408, **Vocab**: 248320
 - **Full Attn**: 24 Q heads, 4 KV heads, head_dim=256, RoPE partial (64/256)
 - **Linear Attn**: 16 key heads, 48 value heads, key_dim=128, value_dim=128, conv_k=4
-- **精度**: BF16 (权重/激活/KV cache), FP32 (SSM state, A_log)
+- **精度**: BF16 (权重/激活/KV cache/SSM state GMEM), FP32 (SSM state kernel 内计算, A_log)
 - **Norms**: `Qwen3_5RMSNorm` 使用 centered weight `(1+w)`, 层内 attn_norm 使用 plain weight
+
+### 官方推荐采样参数
+
+| 模式 | temperature | top_p | top_k | min_p | presence_penalty |
+|------|-------------|-------|-------|-------|------------------|
+| 思考模式 — 通用 | 1.0 | 0.95 | 20 | 0.0 | 1.5 |
+| 思考模式 — 编码 | 0.6 | 0.95 | 20 | 0.0 | 0.0 |
+| 非思考模式 — 通用 | 0.7 | 0.8 | 20 | 0.0 | 1.5 |
+| 非思考模式 — 推理 | 1.0 | 1.0 | 40 | 0.0 | 2.0 |
 
 ## 代码结构
 
 ```
 src/
-├── main.cpp             — 统一入口 (serve/chat/bench/test 子命令)
-├── tests.cpp            — 单元测试集合
-├── benchmark.cpp        — 独立性能评估程序 (--warmup/--decode/--batch/--csv/--nsys)
-├── engine/              — 核心推理引擎
-│   ├── backend.h/cpp    — 独立后端接口 (线程安全, 与传输层解耦)
-│   ├── engine.h/cpp     — 推理引擎: IPC 收发、prefill/decode 循环、连续批处理
-│   ├── model.h/cpp      — 64 层 forward、safetensors 权重加载、MTP 模块
-│   ├── layer.h/cu       — Qwen35Config 配置结构体、FullAttn/LinearAttn 层实现
-│   ├── tensor.h/cpp     — Tensor 封装
-│   ├── allocator.h/cpp  — GPU 统一内存分配器
-│   ├── perf_stats.h/cpp — CUDA 事件计时/阶段统计/利用率监控
-│   ├── light_ops.h/cu   — 基础算子 + 融合 kernel (RMSNorm, RoPE, SiLU, Conv1d, DeltaNet, etc.)
-│   ├── dense_gemm.h     — GEMM/GEMV 接口
-│   ├── dense_gemm_sm110.cu — CUTLASS SM110 GEMM + 散列映射 GEMV + Dual GEMV + GEMV+Add
-│   ├── paged_attention.h/cpp/cu — KV Cache 管理 + Paged Attention
+├── main.cpp              — 统一入口 (serve/chat/bench/test 子命令)
+├── tests.cpp             — 单元测试集合
+├── benchmark.cpp         — 性能评估 (--warmup/--decode/--batch/--csv)
+├── engine/
+│   ├── engine.h/cpp      — 推理引擎: prefill/decode 循环, 连续批处理, MTP
+│   ├── backend.h/cpp     — 独立后端接口 (线程安全, 与传输层解耦)
+│   ├── model.h/cpp       — 64 层 forward, safetensors 权重加载, MTP 模块
+│   ├── layer.h/cu        — Qwen35Config, FullAttn/LinearAttn 层实现
+│   ├── light_ops.h/cu    — 融合算子 (RMSNorm, RoPE, SiLU, Conv1d, DeltaNet, GPU Sampling)
+│   ├── dense_gemm.h      — GEMM/GEMV 接口
+│   ├── dense_gemm_sm110.cu — CUTLASS SM110 GEMM + 散列 GEMV + Dual GEMV + GEMV+Add
+│   ├── gdn_umma_sm110.cu/h — GDN WY 分块 Prefill Kernel
+│   ├── paged_attention.h/cpp/cu — KV Cache 管理 + Paged/Split-K/Chunked Attention
 │   ├── streaming_attention.h/cu — GPU+SSD 混合 Streaming Attention
-│   ├── cache_config.h   — 缓存配置 + 容量规划器
+│   ├── cache_config.h    — 缓存配置 + 容量规划器
 │   ├── cache_engine.h/cpp — SSD 前缀缓存
-│   ├── kv_swapper.h/cpp — 请求级 KV+SSM+Conv 状态换出/换入 SSD
-│   ├── shm_queue.h      — POSIX 共享内存 SPSC 环形队列
-│   └── safetensors.h/cpp — Safetensors 零拷贝加载
+│   ├── kv_swapper.h/cpp  — 请求级状态换出/换入 SSD
+│   ├── allocator.h/cpp   — UnifiedAllocator (cudaMallocManaged) / DeviceAllocator (cudaMalloc)
+│   ├── tokenizer.h/cpp   — BPE tokenizer
+│   ├── vision.h/cu       — ViT 视觉编码器
+│   ├── perf_stats.h/cpp  — CUDA 事件计时/阶段统计/利用率监控
+│   ├── safetensors.h/cpp — Safetensors 零拷贝加载
+│   ├── tensor.h/cpp      — Tensor 封装
+│   ├── shm_queue.h       — POSIX 共享内存 SPSC 环形队列
+│   ├── deltanet_chunkwise.cu — WY chunkwise 评估原型 (独立 micro-benchmark, 不参与推理)
+│   └── moe_*.h/cpp, grouped_gemm.h, cutlass_grouped_gemm_sm110.cuh — MoE 预留
 ├── serve/
-│   ├── serve.h/cpp      — HTTP API 服务 (Ollama/OpenAI 兼容)
+│   └── serve.h/cpp       — HTTP API 服务 (Ollama/OpenAI 兼容)
 └── tui/
-    └── tui.h/cpp        — TUI 交互式 Chat 界面
-configs/
-├── engine.conf          — 引擎配置 (KV cache, SSD 缓存, MTP)
-└── serve.conf           — HTTP 服务配置 (端口, 并发)
-docs/
-├── API.md               — Backend Engine API 文档
-├── CLI.md               — CLI 参数手册与范例
-└── OPTIMIZATION_LOG.md  — 性能优化日志
+    └── tui.h/cpp         — TUI 交互式 Chat 界面
 ```
+
+## 已实现的核心优化
+
+### 内存管理
+- 权重/KV/SSM/Workspace: `cudaMalloc` (GPU driver 管理, 无 page fault)
+- 少量 CPU 需访问的数据 (argmax result, pointer arrays): `cudaMallocManaged`
+- 权重加载后释放 mmap (`loaders_.clear()`)
+
+### GEMV/GEMM
+- 散列映射 GEMV, Dual GEMV, GEMV+Add 融合
+- Level 2 投影合并: Init-time 权重合并 + 单 GEMV 替代多次
+  - FullAttn QKV: [12288+1024+1024, 5120] → 3 GEMV→1, 16 层 × 2 = 32 launches saved
+  - LinearAttn QKVZAB 超级合并: [10240+6144+48+48, 5120] → 4 GEMV→1, 48 层 × 3 = 144 launches saved
+  - 合并后释放原始权重, net zero 内存; T>1 GEMM 用子指针偏移
+- Fused RMSNorm+GEMV: Input RMSNorm 在 GEMV SMEM 内完成, 省 norm_out GMEM I/O + 64 launches
+- CUTLASS SM110 GEMM, can_implement() 失败自动回退 cuBLAS
+
+### Kernel Fusion
+- Fused Add+RMSNorm, Deinterleave+RMSNorm, RMSNorm+SiLU Gate
+- Fused QK_norm+RoPE: deinterleave+Q_norm + K_norm + partial RoPE → 单 kernel (32 launches saved)
+- Fused SwiGLU, Sigmoid-Mul, Deinterleave 3-Way Split
+
+### DeltaNet SSM
+- SSM State BF16 化: GMEM BF16 存储, kernel 内 FP32 计算 (Level 1 已完成)
+- Serial prefill: SSM state 全量缓存 SMEM
+- WY 分块 prefill (Phase 16): T≥4 启用, 1.71× 加速
+- Conv1d prefill 全并行
+- MTP checkpoint 用于 reject 回滚
+
+### Attention
+- Split-K decode paged attention
+- Chunked prefill tiled GEMM attention
+- Fused prefill attention kernel (已实现, 未启用)
+- SSD streaming attention (256K+)
+
+### GPU Sampling (参考 FlashInfer)
+- Gumbel-Max 快速路径 + GPU top-k/top-p/min_p/presence_penalty
+
+### 其他
+- Batched argmax, MTP 投机解码, KV/SSM 状态 SSD offload, L2 persistence
+
+## 关键实现陷阱 (绝对不可回退)
+
+- RMSNorm 使用 `(1+weight)`, 除 DeltaNet attn_norm 用 plain weight
+- RoPE 半旋转 `(d, d+rot_dim/2)`, **不是**交错 `(2i, 2i+1)`
+- q_proj 输出 = Q + Gate, 需 deinterleave 后 Gate 做 sigmoid
+- KV cache 每层独立, 布局 `[block, slot, head, dim]`
+- paged_attention read 和 write_kv_cache 偏移一致
+- Conv1d 操作全部 10240 通道 (Q+K+V), 不只是 Q
+- CUTLASS output RowMajor, `can_implement()` 失败必须 cuBLAS 回退
+- Chunked prefill chunk 1+ 用 tiled GEMM attention
+- `max_chunk_size_ = 256` 不可放宽 (GPU hard-reset)
+- `loaders_.clear()` 不可移除 (双份权重 → OOM)
+- per-layer `cudaStreamSynchronize` 不可移除 (forward_decode/forward_prefill)
+
+## 绝对禁止
+
+- **不做量化** (INT8/INT4/FP4/MX 等)
+- **不做剪枝**
+- **不引入外部 draft model** (仅用模型自带 MTP)
+- **不许说"已达极致"** — 距理论峰值 273 GB/s 还有 ~20%
+
+## 性能优化方向
+
+### 单请求 Decode (带宽瓶颈)
+- 当前 ~4.3 tok/s, ~220 GB/s (80% 峰值), 每步读 ~51 GB 权重
+- 方向: DRAM bank-level 访问模式, GEMV kernel 微调
+
+### Prefill
+- WY 已加速 DeltaNet 1.71×; Fused prefill attention 可替代 28 次 launch/层
+- TTFT 优化空间显著
+
+### 多并发吞吐 (核心方向)
+- batched decode GEMV→GEMM, 权重只读一次服务多 token
+- Head-Group Batch Attention: 同 KV head 的 6 Q head 合并读取
+- SSM State BF16 化: ✅ 已完成, 72MB/request, B=128 吞吐 +42.6%
+
+### 稳定性
+- 统一内存 SMMU 资源有限, 大规模并发访问可致 GPU hard-reset
+- 压力测试覆盖多轮、长上下文、多并发
+- 内存监控: cudaMalloc 不计进程 RSS, 需 tegrastats 或 CUDA API
 
 ## 编码规范
 
-- **语言**: C++17 + CUDA, 所有 kernel 使用 `__nv_bfloat16`
-- **GEMM**: Decode (T=1) 使用 GEMV, Prefill (T>1) 使用 CUTLASS GEMM
-- **内存**: 优先使用预分配 workspace, 避免推理时动态 malloc
-- **流式**: 单 CUDA stream (compute_stream_), 支持连续批处理多并发
-- **IPC**: POSIX shm SPSC 队列, Python 客户端通过 mmap 读写
-- **Batch**: batched decode 时 num_tokens=batch_size, 使用 GEMM 而非 GEMV
-
-## 性能优化方向 (当前重点)
-
-### 绝对禁止
-- **不做量化** (INT8/INT4/FP4/MX 等)
-- **不做剪枝** (structured/unstructured pruning)
-- **不做外部投机解码** (不引入外部 draft model，但可以使用模型自带的 MTP 模块做投机解码)
-- **不许说"已达极致"** — 距离理论峰值 273 GB/s 还有 ~15%，这是必争之地
-
-### 核心目标: 连续批处理 + 多并发吞吐
-- **Continuous Batching**: 引擎必须支持同时处理多个请求，batched decode
-- **多并发基准测试**: benchmark 必须覆盖 1/2/4/8/16/32 并发请求
-- batched decode 时 GEMV→GEMM, 权重只读一次服务多 token, 带宽利用率成倍提升
-- 每项优化都必须用并发度梯度数据证明效果
-
-### CPU 也是瓶颈
-- 推理时 cudaStreamSynchronize 默认 spin-wait, 会烧满一个 CPU 核心
-- 必须使用 cudaDeviceScheduleBlockingSync 或 event-based 等待
-- CPU kernel launch overhead 在多并发场景下更关键
-- 避免 inference loop 中不必要的 cudaMemcpy 和 host-device 同步
-
-### 持续微优化 (聚沙成塔)
-1. **Kernel fusion**: RMSNorm+GEMM, SiLU+Gate, Conv1d+SiLU 等
-2. **DeltaNet chunk-wise**: Prefill 时 SSM 递推的并行化
-3. **Paged Attention 优化**: decode Split-K 并行化、prefill tiled GEMM
-4. **内存带宽优化**: 统一内存的访问模式对性能影响极大, 注意局部性
-5. **GEMV 优化**: Decode 阶段 GEMV 是主要瓶颈, 需要针对 SM110 优化
-6. **减少 Host-Device 同步**: argmax 等操作已在 GPU, 确保无多余 sync
-
-## 已完成的优化 (按时间序)
-
-### Kernel Fusion 系列
-
-#### Fused Add + RMSNorm (`light_ops.cu`)
-- `fused_add_rmsnorm_kernel` / `invoke_fused_add_rmsnorm` — 残差加法 + RMSNorm 合并为单 kernel
-- 消除 add 和 rmsnorm 之间的 global memory 往返
-- 寄存器缓存 (MAX_REGS=40) 避免 hidden_size 数据的二次读取
-- 已集成: `common_mlp_block` 在有 `residual_in` 和 `post_attn_norm_w` 时调用
-
-#### Fused Deinterleave Q+Gate + Per-head RMSNorm (`light_ops.cu`)
-- `fused_deinterleave_q_rmsnorm_kernel` — q_proj 输出的 deinterleave 和 Q 的 per-head RMSNorm 合二为一
-- Grid: `(T, num_heads)`, Block: `min(head_dim, 256)`
-- 已集成: FullAttnLayer forward
-
-#### Fused Per-head RMSNorm + SiLU Gate (`light_ops.cu`)
-- `fused_norm_silu_gate_kernel` — LinearAttn 的 per-head RMSNorm 和 SiLU gate 合一
-- `y_ssm = rmsnorm(y_ssm) * silu(z_out)`
-- 已集成: LinearAttnLayer forward
-
-#### Fused SwiGLU for Merged Layout (`light_ops.cu`)
-- `swiglu_merged_kernel` — 从 `[T, 2*is]` merged gate+up 布局直接计算 SwiGLU
-- 向量化 float4
-
-#### Sigmoid-Mul (向量化) (`light_ops.cu`)
-- `sigmoid_mul_kernel` — `out[i] = a[i] * sigmoid(b[i])`, float4 向量化
-- 用于 FullAttnLayer 中 attn_gate 应用
-
-### GEMV 优化系列 (`dense_gemm_sm110.cu`)
-
-#### 散列映射 GEMV
-- `gemv_kernel_scattered` — warp 散列映射: `out_idx = blockIdx.x + warp_id * num_blocks`
-- 同 block 的 8 warp 各访问 DRAM 远端列, 降低 bank conflict
-- 微基准: down_proj (N=5120, K=17408) **206.2 → 225.7 GB/s (+9.5%)**
-
-#### GEMV + Residual Add 融合
-- `invoke_dense_gemv_add` — 4 个 kernel 变体 (scattered_add, standard_add, tiled_add, scattered_tiled_add)
-- 消除 down_proj 后额外的 `add` kernel launch + 一次内存写读
-- dispatch: K>8192 用 scattered_tiled_add (4 warps, 8KB smem → 12 blocks/SM)
-- 已集成: `common_mlp_block` 的 decode 路径
-
-#### Dual-output GEMV
-- `dual_gemv_kernel` — 一个 kernel 同时计算 `C1 = A × B1` 和 `C2 = A × B2`
-- A 向量只加载一次到 shared memory, 节省 DRAM 读取
-- 已集成: `common_mlp_block` decode gate_proj + up_proj 共享 input
-
-### CUTLASS GEMM cuBLAS 回退 (`dense_gemm_sm110.cu`)
-- CUTLASS TileShape(128) 对齐要求导致某些 N 值 (如 N=478 prefill attention score) 崩溃
-- `invoke_dense_gemm` 和 `invoke_dense_gemm_add` 中: `can_implement()` 失败时自动回退到 cuBLAS
-- cuBLAS handle 懒初始化 (`get_cublas_handle()`)
-
-### DeltaNet SSM 优化
-
-#### GatedDeltaNet Prefill Kernel (`light_ops.cu`)
-- `gated_delta_net_prefill_kernel` — SSM state `S[kd, vd]` 全量缓存在 extended shared memory (66KB)
-- `__launch_bounds__(128, 2)` — max 2 blocks/SM
-- 支持 prefill 时序列化 token loop, 避免 S 在 global memory 的频繁读写
-- Conv/SSM state checkpoint 逻辑 (用于 MTP T=2 verify rollback)
-
-#### Conv1d Prefill 全并行 (`light_ops.cu`)
-- `causal_conv1d_prefill_parallel_kernel` — Prefill 时所有 T 个 token 同时处理
-- `causal_conv1d_update_state_kernel` — 更新最后 3 个 input 到 conv_state
-- dispatch: `num_tokens > 2 && batch_size <= 1` 时使用
-
-### Attention 优化系列
-
-#### Chunked Prefill Tiled GEMM Attention (`paged_attention.cu`)
-- **问题**: Chunked prefill 的 chunk 1+ 使用 decode 风格逐 token paged_attention_kernel → O(T_q × context) 串行
-- 8K 上下文 TTFT: 76.5s → 16.2s (4.7×), 16K/32K 从超时变为可用
-- 实现: `invoke_chunked_prefill_paged_attention`, TILE=256
-  - 每 tile: gather K/V from paged cache → Score GEMM → tiled causal softmax → Output GEMM → online softmax merge
-  - 辅助 kernel: `gather_kv_paged_kernel`, `tiled_causal_softmax_kernel`, `merge_attention_tile_kernel`, `finalize_chunked_softmax_kernel`
-- Dispatch: `force_paged_attn && num_tokens > 1 && batch_size <= 1` → tiled attention
-
-#### Split-K Paged Attention (`paged_attention.cu`)
-- **问题**: Decode paged attention 每 (token, head) 仅 1 block, 24 blocks 占 20 SMs → 17% 占用率
-- 32K decode: 986ms→385ms (2.6×), 16K: 588ms→303ms (1.9×), 8K: 400ms→263ms (1.5×)
-- 实现: `paged_attention_split_k_kernel` + `paged_attention_merge_kernel`
-  - Split kernel: Grid(num_tokens, num_heads, num_partitions), 每 partition 独立 online softmax
-  - Merge kernel: Grid(num_tokens, num_heads), 合并 P 个 partial results
-  - Auto-dispatch: `max_context_len >= 512 && (num_tokens == 1 || batch_size > 1)` → split-K
-  - Partition: partition_size=256, max_partitions=64
-  - Lazy 静态分配 partial 缓冲区 (max ~6 MB for batch=8)
-- 短上下文 (<512) 仍用原始 kernel, 无额外开销
-
-#### Fused Prefill Attention Kernel (`paged_attention.cu`)
-- `fused_prefill_attention_kernel` — FlashAttention 风格 online softmax, 直接从 strided Q/K/V 读取
-- Grid: `(num_heads, T)`, Block: head_dim threads, `__launch_bounds__(256, 1)`
-- 相比 GEMM-based 路径 (28 kernel launches/layer), 理论 ~40× 提速
-- *当前未启用* (layer.cu 仍走 GEMM-based invoke_prefill_attention)
-
-### SSD Streaming Attention (`streaming_attention.cu`)
-- GPU + SSD 混合 Paged Attention, 支持超长上下文 (256K+)
-- 3 kernel:
-  - `paged_attention_partial_kernel` — 与标准 paged attention 同逻辑, 输出未归一化 `(acc, m, l)`
-  - `merge_attention_kernel` — Online softmax merge 两个 partial results (in-place)
-  - `finalize_attention_kernel` — 最终归一化 `out = acc / l`
-- Host 函数: `invoke_paged_attention_partial` (支持 forced_context_len 参数)、`invoke_merge_attention`、`invoke_finalize_attention`
-- 已集成: FullAttnLayer forward 的 streaming 分支, 从 `StreamingAttnCtx` 获取 GPU/SSD block tables 和 staging buffers
-
-### KV Cache Offload 系统 (`src/cache/`)
-- 完整 SSD 缓存子系统 (15 文件):
-  - `CacheEngine` — SSD 前缀缓存, 从 KV 提取/注入
-  - `DiskBackend` — SSD 文件存储 + LRU 驱逐
-  - `KVSwapper` — 请求级 KV+SSM+Conv 状态换出/换入 SSD
-  - `BlockTracker` — GPU vs SSD blocks 分布追踪
-  - `cache_kernels.cu` — paged KV ↔ flat buffer scatter/gather kernels
-- 关键设计: `POSIX_FADV_DONTNEED` (写后 drop page cache), 预分配 I/O staging buffer, 后台预取线程
-
-### MTP (Multi-Token Prediction) 投机解码
-- 使用模型自带 MTP 模块 (不引入外部 draft model)
-- 模块权重: `mtp.pre_fc_norm_hidden`, `mtp.pre_fc_norm_embedding`, `mtp.fc`, `mtp.norm`, `mtp.layers.0.*`
-- 独立 KV Cache (1 层 FullAttnLayer)
-- 支持 `--mtp-enable` / `--mtp-disable` / auto 模式
-- T=2 Verify: 主模型同时处理 `[last_token, draft_token]`, accept 一次产出 2 token
-- SSM/Conv 状态 checkpoint 用于 reject 时回滚
-
-### Batched Argmax (`light_ops.cu`)
-- `batched_argmax_bf16_kernel` — 每个 batch 元素一个 block
-- 消除 B≥256 时 256 次 kernel launch 开销 (33ms → <0.5ms)
-
-### Deinterleave 3-Way Split (`light_ops.cu`)
-- `deinterleave_3way_kernel` — merged GEMM 输出 `[T, N_total]` 拆分为 3 个独立张量, float4 向量化
-
-### IPC 结构体修复
-- `MAX_PROMPT_LEN` 4096→262144, `IPC_CAPACITY` 128→8 (chat.py, test_chat.py)
-
-### 性能基线 (优化前, BF16, 单并发, --kv-cache-gb 8)
-| 上下文长度 | TTFT(ms) | Decode tok/s | Prefill tok/s |
-|-----------|----------|-------------|---------------|
-| 32 | 282 | 4.6 | 110 |
-| 512 | 688 | 4.4 | 695 |
-| 1K | 1193 | 4.2 | 837 |
-| 4K | 7468 | 3.2 | 530 |
-| 8K | 16178 | 2.5 | 492 |
-| 16K | 36487 | 1.7 | 436 |
-| 32K | 89845 | 1.0 | 354 |
-
-**Decode 瓶颈分析**: 32K decode 986ms/step, 其中 paged attention 贡献 ~766ms (16 层 × ~48ms/层)
-- 根因: 仅 24 CUDA blocks (每 Q head 一个), 256 threads/block → 17% SM 占用率 → 无法隐藏内存延迟
-- 理论带宽下限: 131 MB KV/层 @ 230 GB/s = 0.57ms, 实际 48ms = 84× slower
-
-### 当前优化后性能 (BF16, 单并发, --kv-cache-gb 8)
-| 上下文长度 | TTFT(ms) | Decode tok/s | Prefill tok/s | Decode 提升 |
-|-----------|----------|-------------|---------------|-------------|
-| 32 | 290 | 4.5 | 110 | — |
-| 512 | 600 | 4.5 | 796 | +2% |
-| 1K | 1191 | 4.5 | 838 | +7% |
-| 4K | 7563 | 4.2 | 523 | +31% |
-| 8K | 16003 | 3.8 | 497 | +52% |
-| 16K | 35873 | 3.3 | 443 | +94% |
-| 32K | 87276 | 2.6 | 364 | +160% |
-
-## 关键实现陷阱 (避免回退)
-
-以下是已经修复的 bug, **不要在重构中重新引入**:
-
-- RMSNorm 必须使用 `(1+weight)` (centered), 唯一例外是 DeltaNet 的 attn_norm
-- RoPE 使用半旋转配对 (d, d+rot_dim/2), 不是交错 (2i, 2i+1)
-- q_proj 输出 = Q + Gate (12288), 需要 deinterleave 后 Gate 做 sigmoid
-- KV cache 每层独立 (16 层 × 4096 blocks), 布局 [block, slot, head, dim]
-- paged_attention read 和 write_kv_cache 的偏移计算必须一致
-- Conv1d 对全部 Q+K+V 10240 通道操作, 不只是 Q
-- CUTLASS output layout 必须 RowMajor
-- CUTLASS `can_implement()` 失败时必须有 cuBLAS 回退路径
-- Chunked prefill chunk 1+ 必须使用 tiled GEMM attention, 不能用逐 token paged_attention_kernel
+- C++17 + CUDA, kernel 使用 `__nv_bfloat16`
+- Decode T=1 GEMV, Prefill T>1 CUTLASS GEMM
+- 预分配 workspace, 推理时**禁止**动态 malloc
+- 单 CUDA stream, 连续批处理
 
 ## 构建
 
 ```bash
 mkdir -p build && cd build && cmake .. && make -j$(nproc)
-# 产物: build/qwen-thor
-# 运行: ./qwen-thor serve --kv-cache-gb 8
-#       ./qwen-thor chat  --kv-cache-gb 4
-#       ./qwen-thor bench --decode 30
-#       ./qwen-thor test
+# 产物: build/qwen3-27b-thor
+# 运行: ./build/qwen3-27b-thor serve --kv-cache-gb 8
+#       ./build/qwen3-27b-thor chat  --kv-cache-gb 4
+#       ./build/qwen3-27b-thor bench --decode 30
+#       ./build/qwen3-27b-thor test
 ```
 
-## 当跟我讨论时
+## 沟通规范
 
 - 使用中文
-- 涉及内存尺寸时明确单位 (bytes / elements / BF16 count)
-- kernel 维度注释使用 `[M, K] x [K, N] -> [M, N]` 格式
-- 修改 kernel 时注明线程布局 (grid, block, shared memory)
-- 性能相关改动附带粗略的理论计算 (FLOPS, 带宽, roofline 位置)
+- 内存尺寸明确单位 (bytes / elements / BF16 count)
+- kernel 维度: `[M, K] x [K, N] -> [M, N]`
+- 修改 kernel 注明线程布局 (grid, block, shared memory)
+- 性能改动附带理论计算 (FLOPS, 带宽, roofline)
+- 每次执行程序前先 kill 之前的进程

@@ -51,6 +51,20 @@ void invoke_dense_gemm(
     cudaStream_t stream = nullptr
 );
 
+// Fused RMSNorm + GEMV: Input RMSNorm 在 SMEM 内完成后直接开始 GEMV
+// 省去 norm_out 的 GMEM write+read + 1 kernel launch
+// hidden_states → SMEM load → in-SMEM RMSNorm(centered) → GEMV
+// 仅用于 T=1 decode, K 必须能装入 SMEM (K*2 ≤ 48KB)
+void invoke_dense_gemv_with_rmsnorm(
+    const __nv_bfloat16* hidden_states,  // [1, K]
+    const __nv_bfloat16* norm_weight,    // [K] centered RMSNorm weight
+    float eps,
+    const __nv_bfloat16* B,              // [K, N]
+    __nv_bfloat16* C,                    // [1, N] output
+    int N, int K,
+    cudaStream_t stream = nullptr
+);
+
 // 辅助函数：针对 M=1 的矩阵向量乘法 (GEMV)
 // 用于 Decode 阶段和 LM Head
 void invoke_dense_gemv(

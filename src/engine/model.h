@@ -37,7 +37,7 @@ public:
         int max_num_blocks_per_seq,
         int max_context_len,
         int num_tokens,                  // T > 1
-        float** ssm_states,             // [num_lin_layers]
+        __nv_bfloat16** ssm_states,             // [num_lin_layers]
         __nv_bfloat16** conv_states,     // [num_lin_layers]
         __nv_bfloat16* workspace,
         cudaStream_t stream = 0,
@@ -56,7 +56,7 @@ public:
         int max_num_blocks_per_seq,
         int max_context_len,
         int batch_size,                  // num_tokens = batch_size
-        float** ssm_states,             // [num_lin_layers * batch_size]
+        __nv_bfloat16** ssm_states,             // [num_lin_layers * batch_size]
         __nv_bfloat16** conv_states,     // [num_lin_layers * batch_size]
         __nv_bfloat16* workspace,
         cudaStream_t stream = 0

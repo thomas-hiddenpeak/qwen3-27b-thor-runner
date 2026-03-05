@@ -17,6 +17,9 @@
 #include "engine/backend.h"
 #include "serve/serve.h"
 #include "tui/tui.h"
+
+// SM110a hardware probe (Level 0)
+namespace sm110a_probe { void run_sm110a_probes(); }
 #include <iostream>
 #include <cstring>
 #include <csignal>
@@ -65,6 +68,7 @@ static void print_usage() {
     printf("    chat        Start interactive TUI chat\n");
     printf("    bench       Run inference benchmarks\n");
     printf("    test        Run unit tests\n");
+    printf("    probe       SM110a hardware primitives micro-benchmark\n");
     printf("    version     Print version information\n\n");
     printf("  Engine Options (shared by serve/chat/bench):\n");
     printf("    --config <file>       Load unified configuration from file (engine + serve)\n");
@@ -106,6 +110,8 @@ static void print_usage() {
     printf("    qwen3-27b-thor serve --config configs/config.conf\n\n");
     printf("    # Run benchmarks\n");
     printf("    qwen3-27b-thor bench --decode 50 --prompt-len 512 --batch 4\n\n");
+    printf("    # SM110a hardware primitives probe\n");
+    printf("    qwen3-27b-thor probe\n\n");
 }
 
 static void print_version() {
@@ -262,6 +268,7 @@ int main(int argc, char** argv) {
     if (cmd == "chat")    return cmd_chat(argc, argv);
     if (cmd == "bench")   return cmd_bench(argc, argv);
     if (cmd == "test")    return cmd_test(argc, argv);
+    if (cmd == "probe")   { sm110a_probe::run_sm110a_probes(); return 0; }
     if (cmd == "version" || cmd == "--version" || cmd == "-v") {
         print_version();
         return 0;

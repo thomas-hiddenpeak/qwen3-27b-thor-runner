@@ -50,9 +50,9 @@ struct RequestContext {
     bool uses_ssd_blocks = false;  // 是否有 blocks 在 SSD 上
     
     // Gated DeltaNet SSM 状态 (每个 linear_attn 层一份)
-    // ssm_states[i] : [nkh * kd * vpk] float32  on device
+    // ssm_states[i] : [nkh * kd * vpk] bf16  on device
     // conv_states[i]: [nkh*2 * kd * (conv_k-1)] fp16  on device
-    std::vector<float*> ssm_states;
+    std::vector<__nv_bfloat16*> ssm_states;
     std::vector<__nv_bfloat16*>  conv_states;
     int ssm_slot = -1;  // 该请求持有的 SSM/Conv 状态池槽位 (-1 = 未分配)
     
@@ -135,10 +135,10 @@ private:
 
     // 预分配的多槽位 SSM/Conv 状态池 (MAX_SSM_SLOTS 个独立 slot, 每个活跃请求占一个)
     // 避免每次请求 cudaMalloc/cudaFree 导致 Jetson 统一内存页面回收崩溃
-    float* ssm_pool_base_ = nullptr;              // 连续分配 [MAX_SSM_SLOTS * num_linear_layers_ * ssm_size_per_layer_]
+    __nv_bfloat16* ssm_pool_base_ = nullptr;              // 连续分配 [MAX_SSM_SLOTS * num_linear_layers_ * ssm_size_per_layer_]
     __nv_bfloat16* conv_pool_base_ = nullptr;      // 连续分配 [MAX_SSM_SLOTS * num_linear_layers_ * conv_size_per_layer_]
     // pooled_ssm_states_[slot][layer] → 指向 slot 的第 layer 层 SSM buffer
-    std::vector<std::vector<float*>> pooled_ssm_states_;            // [MAX_SSM_SLOTS][num_linear_layers_]
+    std::vector<std::vector<__nv_bfloat16*>> pooled_ssm_states_;            // [MAX_SSM_SLOTS][num_linear_layers_]
     std::vector<std::vector<__nv_bfloat16*>> pooled_conv_states_;   // [MAX_SSM_SLOTS][num_linear_layers_]
     std::vector<int> free_ssm_slots_;  // 可用槽位索引 (LIFO stack)
     std::unique_ptr<Qwen35Model> model_;
@@ -198,7 +198,7 @@ private:
 
     // MTP 投机解码相关
     std::unique_ptr<ops::KVCacheManager> mtp_kv_manager_;  // 1 层 KV cache
-    float* d_ssm_checkpoints_ = nullptr;         // SSM 状态 checkpoint [48 layers contiguous]
+    __nv_bfloat16* d_ssm_checkpoints_ = nullptr;         // SSM 状态 checkpoint [48 layers contiguous]
     __nv_bfloat16* d_conv_checkpoints_ = nullptr;// Conv 状态 checkpoint [48 layers contiguous]
     int* d_mtp_block_tables_ = nullptr;          // MTP KV block table (device)
     int* d_mtp_context_lens_ = nullptr;          // MTP KV context lens (device)

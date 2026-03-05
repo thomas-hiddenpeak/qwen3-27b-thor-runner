@@ -247,7 +247,7 @@ static void check_memory_budget(const BackendConfig& config, const core::Qwen35C
     // ---- 6. SSM/Conv 状态 (单请求) ----
     int num_linear_layers = model_cfg.num_hidden_layers - model_cfg.num_full_attn_layers();
     size_t ssm_per_layer  = (size_t)nkh * model_cfg.linear_key_head_dim
-                            * model_cfg.lin_v_per_kh() * sizeof(float);
+                            * model_cfg.lin_v_per_kh() * sizeof(__nv_bfloat16);
     double ssm_gb = (double)(num_linear_layers * ssm_per_layer) / (1024.0 * 1024 * 1024);
 
     // ---- 7. OS/系统开销预留 ----

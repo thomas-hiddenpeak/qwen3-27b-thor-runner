@@ -253,6 +253,9 @@ void ChatApp::generate(const std::string& user_input) {
     req.max_new_tokens = config_.max_new_tokens;
     req.temperature    = config_.temperature;
     req.top_p          = config_.top_p;
+    req.top_k          = 20;              // Qwen3.5 官方推荐
+    req.min_p          = 0.0f;            // Qwen3.5 官方推荐不使用
+    req.presence_penalty = 1.5f;          // Qwen3.5 官方推荐
     req.stream         = true;
 
     // 4. 提交请求

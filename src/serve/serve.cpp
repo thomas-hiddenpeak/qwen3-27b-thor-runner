@@ -1184,25 +1184,24 @@ void ServeApp::run() {
 
     if (bind(ollama_fd_, (struct sockaddr*)&ollama_addr, sizeof(ollama_addr)) < 0) {
         std::cerr << "[Serve] bind() failed for Ollama port " << config_.ollama_port
-                  << ": " << strerror(errno) << std::endl;
+                  << ": " << strerror(errno) << " (continuing with OpenAI port only)" << std::endl;
         close(ollama_fd_);
         ollama_fd_ = -1;
-        return;
+        // Don't return — OpenAI port may still work
     }
 
-    if (listen(ollama_fd_, config_.max_conns) < 0) {
+    if (ollama_fd_ >= 0 && listen(ollama_fd_, config_.max_conns) < 0) {
         std::cerr << "[Serve] listen() failed for Ollama port: " << strerror(errno) << std::endl;
         close(ollama_fd_);
         ollama_fd_ = -1;
-        return;
+        // Don't return — OpenAI port may still work
     }
 
     // 创建 OpenAI 端口 socket
     openai_fd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (openai_fd_ < 0) {
         std::cerr << "[Serve] socket() failed for OpenAI port: " << strerror(errno) << std::endl;
-        close(ollama_fd_);
-        ollama_fd_ = -1;
+        if (ollama_fd_ >= 0) { close(ollama_fd_); ollama_fd_ = -1; }
         return;
     }
 
@@ -1218,37 +1217,45 @@ void ServeApp::run() {
                   << ": " << strerror(errno) << std::endl;
         close(openai_fd_);
         openai_fd_ = -1;
-        close(ollama_fd_);
-        ollama_fd_ = -1;
-        return;
     }
 
-    if (listen(openai_fd_, config_.max_conns) < 0) {
+    if (openai_fd_ >= 0 && listen(openai_fd_, config_.max_conns) < 0) {
         std::cerr << "[Serve] listen() failed for OpenAI port: " << strerror(errno) << std::endl;
         close(openai_fd_);
         openai_fd_ = -1;
-        close(ollama_fd_);
-        ollama_fd_ = -1;
+    }
+
+    // 两个端口都失败时才退出
+    if (ollama_fd_ < 0 && openai_fd_ < 0) {
+        std::cerr << "[Serve] Both Ollama and OpenAI ports failed to bind. Exiting." << std::endl;
         return;
     }
 
     running_ = true;
     config_.print();
-    printf("\n[Serve] Ollama API on http://%s:%d\n", config_.host.c_str(), config_.ollama_port);
-    printf("  POST /api/generate          — Ollama Generate API\n");
-    printf("  POST /api/chat              — Ollama Chat API\n");
-    printf("  POST /api/show              — Model information\n");
-    printf("  GET  /api/tags              — List local models\n");
-    printf("  GET  /api/ps                — List running models\n");
-    printf("  GET  /api/version           — Version info\n");
-    printf("  GET  /health                — Health check\n");
-    printf("\n[Serve] OpenAI API on http://%s:%d\n", config_.host.c_str(), config_.openai_port);
-    printf("  POST /v1/responses          — OpenAI Responses API (minimal)\n");
-    printf("  POST /v1/chat/completions   — OpenAI Chat API\n");
-    printf("  POST /v1/completions        — OpenAI Completions API\n");
-    printf("  GET  /v1/models             — Model list\n");
-    printf("  GET  /v1/models/{model}     — Retrieve model\n");
-    printf("  GET  /health                — Health check\n\n");
+    if (ollama_fd_ >= 0) {
+        printf("\n[Serve] Ollama API on http://%s:%d\n", config_.host.c_str(), config_.ollama_port);
+        printf("  POST /api/generate          — Ollama Generate API\n");
+        printf("  POST /api/chat              — Ollama Chat API\n");
+        printf("  POST /api/show              — Model information\n");
+        printf("  GET  /api/tags              — List local models\n");
+        printf("  GET  /api/ps                — List running models\n");
+        printf("  GET  /api/version           — Version info\n");
+        printf("  GET  /health                — Health check\n");
+    } else {
+        printf("\n[Serve] Ollama API: DISABLED (port %d unavailable)\n", config_.ollama_port);
+    }
+    if (openai_fd_ >= 0) {
+        printf("\n[Serve] OpenAI API on http://%s:%d\n", config_.host.c_str(), config_.openai_port);
+        printf("  POST /v1/responses          — OpenAI Responses API (minimal)\n");
+        printf("  POST /v1/chat/completions   — OpenAI Chat API\n");
+        printf("  POST /v1/completions        — OpenAI Completions API\n");
+        printf("  GET  /v1/models             — Model list\n");
+        printf("  GET  /v1/models/{model}     — Retrieve model\n");
+        printf("  GET  /health                — Health check\n\n");
+    } else {
+        printf("\n[Serve] OpenAI API: DISABLED (port %d unavailable)\n\n", config_.openai_port);
+    }
 
     // 启动响应分发线程 (从 backend 单消费者队列路由到 per-request 队列)
     resp_dispatcher_ = std::thread(&ServeApp::response_dispatch_loop, this);

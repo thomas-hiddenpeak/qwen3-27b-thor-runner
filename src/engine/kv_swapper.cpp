@@ -232,7 +232,7 @@ size_t KVSwapper::read_and_inject_kv(
 // cudaMemcpy D2H 是 Jetson Thor 上唯一可靠的 GPU→CPU 传输机制
 // ---------------------------------------------------------------------------
 size_t KVSwapper::write_ssm_conv(int fd,
-    float** ssm_states, int num_layers, size_t ssm_per_layer,
+    __nv_bfloat16** ssm_states, int num_layers, size_t ssm_per_layer,
     __nv_bfloat16** conv_states, size_t conv_per_layer) {
 
     size_t total = 0;
@@ -272,7 +272,7 @@ size_t KVSwapper::write_ssm_conv(int fd,
 // Thor 统一内存: SSM/Conv 是 cudaMallocManaged, 用 memcpy 直接注入
 // ---------------------------------------------------------------------------
 size_t KVSwapper::read_ssm_conv(const uint8_t* data, size_t data_size,
-    float** ssm_states, __nv_bfloat16** conv_states) {
+    __nv_bfloat16** ssm_states, __nv_bfloat16** conv_states) {
 
     size_t offset = 0;
 
@@ -311,7 +311,7 @@ SwapRecord KVSwapper::swap_out(
     ops::KVCacheManager& kv_manager,
     const std::vector<int>& block_table,
     int context_len,
-    float** ssm_states, int num_linear_layers, size_t ssm_size_per_layer,
+    __nv_bfloat16** ssm_states, int num_linear_layers, size_t ssm_size_per_layer,
     __nv_bfloat16** conv_states, size_t conv_size_per_layer,
     cudaStream_t stream) {
 
@@ -397,7 +397,7 @@ SwapRecord KVSwapper::swap_out(
 std::vector<int> KVSwapper::swap_in(
     uint64_t request_id,
     ops::KVCacheManager& kv_manager,
-    float** ssm_states,
+    __nv_bfloat16** ssm_states,
     __nv_bfloat16** conv_states,
     cudaStream_t stream) {
 

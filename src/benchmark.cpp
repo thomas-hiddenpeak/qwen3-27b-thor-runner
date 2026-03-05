@@ -129,6 +129,7 @@ struct BenchConfig {
     bool nsys_mode     = false;
     bool csv_output    = false;
     bool per_step      = false; // 是否打印每步详情
+    bool no_graph      = false; // 禁用 CUDA Graph (用于精确计时)
     std::string model_dir = "/home/rm01/models/dev/llm/Qwen/Qwen3.5-27B";
 };
 
@@ -148,6 +149,7 @@ BenchConfig parse_args(int argc, char** argv) {
         else if (arg == "--nsys")      cfg.nsys_mode  = true;
         else if (arg == "--csv")       cfg.csv_output = true;
         else if (arg == "--per-step")  cfg.per_step   = true;
+        else if (arg == "--no-graph")  cfg.no_graph   = true;
         else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: benchmark [options]\n"
                       << "  --warmup N       Warmup decode steps (default: 5)\n"
@@ -158,7 +160,8 @@ BenchConfig parse_args(int argc, char** argv) {
                       << "  --model-dir DIR  Model weights directory\n"
                       << "  --nsys           Enable NVTX markers for nsys/ncu\n"
                       << "  --csv            Output CSV format\n"
-                      << "  --per-step       Print per-step timing details\n";
+                      << "  --per-step       Print per-step timing details\n"
+                      << "  --no-graph       Disable CUDA Graph for accurate per-phase timing\n";
             exit(0);
         }
     }
@@ -313,14 +316,14 @@ int run_benchmark(int argc, char** argv) {
     for (int i = 0; i < config.num_hidden_layers; ++i)
         if (!config.is_full_attention(i)) ++num_lin;
 
-    size_t ssm_sz = (size_t)nkh * config.linear_key_head_dim * config.lin_v_per_kh() * sizeof(float);
+    size_t ssm_sz = (size_t)nkh * config.linear_key_head_dim * config.lin_v_per_kh() * sizeof(__nv_bfloat16);
     size_t conv_sz = (size_t)in_qkv * (config.linear_conv_kernel_dim - 1) * sizeof(__nv_bfloat16);
 
     // Per-request context
     struct ReqCtx {
         std::vector<int> block_table;
         int context_len;
-        std::vector<float*> ssm_states;
+        std::vector<__nv_bfloat16*> ssm_states;
         std::vector<__nv_bfloat16*> conv_states;
         int last_token;
     };
@@ -338,9 +341,9 @@ int run_benchmark(int argc, char** argv) {
 
     // Managed pointer arrays for SSM/Conv states (device-accessible)
     // Layout: [lin_idx * batch_size + batch_idx]
-    float** d_ssm_ptrs = nullptr;
+    __nv_bfloat16** d_ssm_ptrs = nullptr;
     __nv_bfloat16** d_conv_ptrs = nullptr;
-    cudaMallocManaged(&d_ssm_ptrs, (size_t)num_lin * batch_size * sizeof(float*));
+    cudaMallocManaged(&d_ssm_ptrs, (size_t)num_lin * batch_size * sizeof(__nv_bfloat16*));
     cudaMallocManaged(&d_conv_ptrs, (size_t)num_lin * batch_size * sizeof(__nv_bfloat16*));
     for (int li = 0; li < num_lin; ++li) {
         for (int bi = 0; bi < batch_size; ++bi) {
@@ -382,7 +385,7 @@ int run_benchmark(int argc, char** argv) {
         int cl = prompt_len;
         cudaMemcpyAsync(d_context_lens, &cl, sizeof(int), cudaMemcpyHostToDevice, stream);
 
-        std::vector<float*> single_ssm(num_lin);
+        std::vector<__nv_bfloat16*> single_ssm(num_lin);
         std::vector<__nv_bfloat16*> single_conv(num_lin);
         for (int li = 0; li < num_lin; ++li) {
             single_ssm[li] = requests[0].ssm_states[li];
@@ -487,7 +490,7 @@ int run_benchmark(int argc, char** argv) {
         cudaMemcpyAsync(d_context_lens, &cl, sizeof(int), cudaMemcpyHostToDevice, stream);
 
         // 构建单请求状态指针 (batch_size=1 for prefill)
-        std::vector<float*> single_ssm(num_lin);
+        std::vector<__nv_bfloat16*> single_ssm(num_lin);
         std::vector<__nv_bfloat16*> single_conv(num_lin);
         for (int li = 0; li < num_lin; ++li) {
             single_ssm[li] = requests[b].ssm_states[li];
@@ -687,7 +690,7 @@ int run_benchmark(int argc, char** argv) {
             nvtx_pop();
 
             // -- 在最后一个 warmup step 之后, 捕获 CUDA Graph --
-            if (is_warmup && step == cfg.warmup_steps - 1) {
+            if (is_warmup && step == cfg.warmup_steps - 1 && !cfg.no_graph) {
                 // 先同步确保上面的 warmup step 完成
                 cudaStreamSynchronize(stream);
 

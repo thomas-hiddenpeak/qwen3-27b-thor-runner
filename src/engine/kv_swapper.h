@@ -125,7 +125,7 @@ public:
         ops::KVCacheManager& kv_manager,
         const std::vector<int>& block_table,
         int context_len,
-        float** ssm_states, int num_linear_layers, size_t ssm_size_per_layer,
+        __nv_bfloat16** ssm_states, int num_linear_layers, size_t ssm_size_per_layer,
         __nv_bfloat16** conv_states, size_t conv_size_per_layer,
         cudaStream_t stream);
 
@@ -133,7 +133,7 @@ public:
     std::vector<int> swap_in(
         uint64_t request_id,
         ops::KVCacheManager& kv_manager,
-        float** ssm_states,
+        __nv_bfloat16** ssm_states,
         __nv_bfloat16** conv_states,
         cudaStream_t stream);
 
@@ -171,10 +171,10 @@ private:
 
     // 统一内存直写 SSM/Conv (不经 staging)
     size_t write_ssm_conv(int fd,
-        float** ssm_states, int num_layers, size_t ssm_per_layer,
+        __nv_bfloat16** ssm_states, int num_layers, size_t ssm_per_layer,
         __nv_bfloat16** conv_states, size_t conv_per_layer);
     size_t read_ssm_conv(const uint8_t* data, size_t data_size,
-        float** ssm_states, __nv_bfloat16** conv_states);
+        __nv_bfloat16** ssm_states, __nv_bfloat16** conv_states);
 
     // drop page cache (统一内存上至关重要!)
     static void drop_page_cache(int fd, size_t size);

@@ -144,6 +144,93 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
         }
     }
 
+    // 2b. 合并投影权重 — T=1 Decode GEMV 优化 (128 kernel launches/step saved)
+    //     FullAttn: Q+K+V → 单个 [qp_dim+kv_dim*2, hs] 合并权重
+    //     LinearAttn: Z+A+B → 单个 [lin_v+nv*2, hs] 合并权重
+    //     合并后释放原始分离分配, 个别指针重定向到合并缓冲区子区域
+    {
+        const int qp_dim = config_.q_proj_dim();   // 12288
+        const int kv_dim = config_.kv_dim();       // 1024
+        const int lin_v  = config_.lin_v_dim();    // 6144
+        const int nv     = config_.linear_num_value_heads;  // 48
+        const int hs     = config_.hidden_size;    // 5120
+
+        // Build ptr→index map for O(1) lookup when freeing originals
+        std::unordered_map<void*, size_t> ptr_idx;
+        for (size_t j = 0; j < device_weights_.size(); j++) {
+            if (device_weights_[j]) ptr_idx[device_weights_[j]] = j;
+        }
+        auto release_weight = [&](void* ptr) {
+            auto it = ptr_idx.find(ptr);
+            if (it != ptr_idx.end()) {
+                cudaFree(ptr);
+                device_weights_[it->second] = nullptr;
+                ptr_idx.erase(it);
+            }
+        };
+
+        size_t merged_total = 0;
+        for (int i = 0; i < config_.num_hidden_layers; i++) {
+            std::string p = "model.language_model.layers." + std::to_string(i) + ".";
+
+            if (config_.is_full_attention(i)) {
+                // Merge Q[qp_dim,hs] + K[kv_dim,hs] + V[kv_dim,hs] → [qp_dim+kv_dim*2, hs]
+                __nv_bfloat16* q_w = tensor_map[p + "self_attn.q_proj.weight"];
+                __nv_bfloat16* k_w = tensor_map[p + "self_attn.k_proj.weight"];
+                __nv_bfloat16* v_w = tensor_map[p + "self_attn.v_proj.weight"];
+
+                int merged_N = qp_dim + kv_dim * 2;  // 14336
+                size_t bytes = (size_t)merged_N * hs * sizeof(__nv_bfloat16);
+                __nv_bfloat16* merged = nullptr;
+                cudaMalloc(&merged, bytes);
+                cudaMemcpy(merged, q_w,
+                           (size_t)qp_dim * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+                cudaMemcpy(merged + (size_t)qp_dim * hs, k_w,
+                           (size_t)kv_dim * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+                cudaMemcpy(merged + (size_t)(qp_dim + kv_dim) * hs, v_w,
+                           (size_t)kv_dim * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+
+                device_weights_.push_back(merged);
+                layers_[i].get_full_attn()->set_merged_qkv(merged);
+                release_weight(q_w);
+                release_weight(k_w);
+                release_weight(v_w);
+                merged_total += bytes;
+            } else {
+                // Super-merge QKV[in_qkv,hs] + Z[lin_v,hs] + A[nv,hs] + B[nv,hs]
+                // → single [in_qkv+lin_v+nv*2, hs] = [16480, 5120]
+                __nv_bfloat16* qkv_w = tensor_map[p + "linear_attn.in_proj_qkv.weight"];
+                __nv_bfloat16* z_w = tensor_map[p + "linear_attn.in_proj_z.weight"];
+                __nv_bfloat16* a_w = tensor_map[p + "linear_attn.in_proj_a.weight"];
+                __nv_bfloat16* b_w = tensor_map[p + "linear_attn.in_proj_b.weight"];
+
+                int in_qkv_dim = config_.lin_qk_dim() * 2 + lin_v;  // 10240
+                int merged_N = in_qkv_dim + lin_v + nv * 2;  // 16480
+                size_t bytes = (size_t)merged_N * hs * sizeof(__nv_bfloat16);
+                __nv_bfloat16* merged = nullptr;
+                cudaMalloc(&merged, bytes);
+                cudaMemcpy(merged, qkv_w,
+                           (size_t)in_qkv_dim * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+                cudaMemcpy(merged + (size_t)in_qkv_dim * hs, z_w,
+                           (size_t)lin_v * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+                cudaMemcpy(merged + (size_t)(in_qkv_dim + lin_v) * hs, a_w,
+                           (size_t)nv * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+                cudaMemcpy(merged + (size_t)(in_qkv_dim + lin_v + nv) * hs, b_w,
+                           (size_t)nv * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+
+                device_weights_.push_back(merged);
+                layers_[i].get_linear_attn()->set_merged_all_proj(merged);
+                release_weight(qkv_w);
+                release_weight(z_w);
+                release_weight(a_w);
+                release_weight(b_w);
+                merged_total += bytes;
+            }
+        }
+        std::cout << "      Merged projections: " << (merged_total >> 20)
+                  << " MB (QKV×16 + QKVZAB×48, net zero)" << std::endl;
+    }
+
     // 3. 全局权重
     embed_tokens_w_ = get_ptr("model.language_model.embed_tokens.weight");
     norm_w_         = get_ptr("model.language_model.norm.weight");
@@ -370,7 +457,7 @@ void Qwen35Model::forward_prefill(
     int max_num_blocks_per_seq,
     int max_context_len,
     int num_tokens,
-    float** ssm_states,
+    __nv_bfloat16** ssm_states,
     __nv_bfloat16** conv_states,
     __nv_bfloat16* workspace,
     cudaStream_t stream,
@@ -390,7 +477,7 @@ void Qwen35Model::forward_prefill(
                 1 /* batch_size=1 */, force_paged_attn);
             ++fa_idx;
         } else {
-            float** lin_ssm = ssm_states ? ssm_states + lin_idx : nullptr;
+            __nv_bfloat16** lin_ssm = ssm_states ? ssm_states + lin_idx : nullptr;
             __nv_bfloat16** lin_conv = conv_states ? conv_states + lin_idx : nullptr;
             layers_[i].get_linear_attn()->forward(
                 hidden_states,
@@ -426,7 +513,7 @@ void Qwen35Model::forward_decode(
     int max_num_blocks_per_seq,
     int max_context_len,
     int batch_size,
-    float** ssm_states,
+    __nv_bfloat16** ssm_states,
     __nv_bfloat16** conv_states,
     __nv_bfloat16* workspace,
     cudaStream_t stream)
@@ -446,7 +533,7 @@ void Qwen35Model::forward_decode(
                 batch_size);
             ++fa_idx;
         } else {
-            float** lin_ssm = ssm_states ? ssm_states + lin_idx * batch_size : nullptr;
+            __nv_bfloat16** lin_ssm = ssm_states ? ssm_states + lin_idx * batch_size : nullptr;
             __nv_bfloat16** lin_conv = conv_states ? conv_states + lin_idx * batch_size : nullptr;
             layers_[i].get_linear_attn()->forward(
                 hidden_states,

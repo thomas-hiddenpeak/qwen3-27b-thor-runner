@@ -79,12 +79,12 @@ void invoke_gated_delta_net(const __nv_bfloat16* q, const __nv_bfloat16* k,
                              const __nv_bfloat16* v,
                              const __nv_bfloat16* a_raw, const __nv_bfloat16* dt_bias,
                              const float* A_log, const __nv_bfloat16* beta_raw,
-                             float* ssm_state, __nv_bfloat16* y_out,
+                             __nv_bfloat16* ssm_state, __nv_bfloat16* y_out,
                              int num_tokens,
                              int nkh, int kd, int nv_per_kh, int vd,
                              cudaStream_t stream = 0, int token_stride = 0,
-                             int batch_size = 1, float** ssm_state_ptrs = nullptr,
-                             float* ssm_state_checkpoint = nullptr);
+                             int batch_size = 1, __nv_bfloat16** ssm_state_ptrs = nullptr,
+                             __nv_bfloat16* ssm_state_checkpoint = nullptr);
 
 // element-wise: out[i] = a[i] + b[i]
 void invoke_add(__nv_bfloat16* out, const __nv_bfloat16* a, const __nv_bfloat16* b,
@@ -114,6 +114,20 @@ void invoke_fused_deinterleave_q_rmsnorm(
     __nv_bfloat16* q_out, __nv_bfloat16* gate_out,
     const __nv_bfloat16* qg_in, const __nv_bfloat16* q_norm_weight,
     float eps, int num_tokens, int num_heads, int head_dim,
+    cudaStream_t stream = 0);
+
+// Fused Deinterleave+Q_norm + K_norm + RoPE: 3 kernels → 1
+// Grid: (T, num_q + num_kv), Block: min(head_dim, 256)
+// Q blocks: deinterleave qg_in → q+gate, RMSNorm Q, RoPE first rotary_dim dims
+// K blocks: RMSNorm K (centered), RoPE first rotary_dim dims
+// 节省 2 launches/层 × 16 FullAttn 层 = 32 launches/step
+void invoke_fused_qk_norm_rope(
+    __nv_bfloat16* q_out, __nv_bfloat16* gate_out,
+    const __nv_bfloat16* qg_in, __nv_bfloat16* k,
+    const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
+    const int* pos_ids,
+    float eps, int num_tokens, int num_q, int num_kv,
+    int head_dim, int rotary_dim, float rope_base,
     cudaStream_t stream = 0);
 
 // GPU Argmax: 在 GPU 上计算 argmax，结果写到 result_idx（device 或 managed 内存）

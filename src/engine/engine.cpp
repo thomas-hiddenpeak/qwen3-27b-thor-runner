@@ -147,7 +147,7 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
             if (!config_.is_full_attention(li)) ++num_linear_layers_;
         ssm_size_per_layer_ = (size_t)config_.linear_num_key_heads
                               * config_.linear_key_head_dim
-                              * config_.lin_v_per_kh() * sizeof(float);
+                              * config_.lin_v_per_kh() * sizeof(__nv_bfloat16);
         int in_qkv_conv = config_.lin_qk_dim() * 2 + config_.lin_v_dim();
         conv_size_per_layer_ = (size_t)in_qkv_conv
                                * (config_.linear_conv_kernel_dim - 1) * sizeof(__nv_bfloat16);
@@ -168,7 +168,7 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
             pooled_ssm_states_[s].resize(num_linear_layers_);
             pooled_conv_states_[s].resize(num_linear_layers_);
             for (int li = 0; li < num_linear_layers_; ++li) {
-                pooled_ssm_states_[s][li]  = (float*)((char*)ssm_pool_base_ + s * ssm_slot_stride + (size_t)li * ssm_size_per_layer_);
+                pooled_ssm_states_[s][li]  = (__nv_bfloat16*)((char*)ssm_pool_base_ + s * ssm_slot_stride + (size_t)li * ssm_size_per_layer_);
                 pooled_conv_states_[s][li] = (__nv_bfloat16*)((char*)conv_pool_base_ + s * conv_slot_stride + (size_t)li * conv_size_per_layer_);
             }
         }
@@ -275,7 +275,7 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
                                    * config_.lin_v_per_kh();
             conv_elems_per_layer_ = (size_t)(config_.lin_qk_dim() * 2 + config_.lin_v_dim())
                                     * (config_.linear_conv_kernel_dim - 1);
-            cudaMalloc(&d_ssm_checkpoints_,  num_linear_layers_ * ssm_elems_per_layer_ * sizeof(float));
+            cudaMalloc(&d_ssm_checkpoints_,  num_linear_layers_ * ssm_elems_per_layer_ * sizeof(__nv_bfloat16));
             cudaMalloc(&d_conv_checkpoints_, num_linear_layers_ * conv_elems_per_layer_ * sizeof(__nv_bfloat16));
 
             // c) MTP device buffers
@@ -285,7 +285,7 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
             printf("[Engine] MTP speculative decoding ENABLED (mode=%s, kv_blocks=%d = %d max tokens)\n",
                    cache_config.mtp_mode.c_str(), mtp_blocks, mtp_blocks * 16);
             printf("[Engine]   SSM checkpoint %.1f MB, Conv checkpoint %.1f MB\n",
-                   num_linear_layers_ * ssm_elems_per_layer_ * sizeof(float) / 1048576.0,
+                   num_linear_layers_ * ssm_elems_per_layer_ * sizeof(__nv_bfloat16) / 1048576.0,
                    num_linear_layers_ * conv_elems_per_layer_ * sizeof(__nv_bfloat16) / 1048576.0);
         } else {
             printf("[Engine] MTP speculative decoding DISABLED (mode=%s, model_has_mtp=%s)\n",
@@ -1038,7 +1038,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                                 &sctx);
                             fa_idx++;
                         } else {
-                            float** lin_ssm = ctx->ssm_states.empty() ? nullptr : ctx->ssm_states.data() + lin_idx;
+                            __nv_bfloat16** lin_ssm = ctx->ssm_states.empty() ? nullptr : ctx->ssm_states.data() + lin_idx;
                             __nv_bfloat16** lin_conv = ctx->conv_states.empty() ? nullptr : ctx->conv_states.data() + lin_idx;
                             model_->get_layer(li).get_linear_attn()->forward(
                                 d_hidden_states_,
@@ -1253,7 +1253,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                             1 /*batch_size*/, true /*force_paged_attn*/);
                         fa_idx++;
                     } else {
-                        float* ssm_ckpt = d_ssm_checkpoints_
+                        __nv_bfloat16* ssm_ckpt = d_ssm_checkpoints_
                                           + lin_idx * ssm_elems_per_layer_;
                         __nv_bfloat16* conv_ckpt = d_conv_checkpoints_
                                                    + lin_idx * conv_elems_per_layer_;
@@ -1398,12 +1398,12 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
 
                 // 回滚: 从 checkpoint 恢复 SSM/Conv 到 token[0] 之后的状态
                 for (int li = 0; li < num_linear_layers_; ++li) {
-                    float* ssm_ckpt = d_ssm_checkpoints_
+                    __nv_bfloat16* ssm_ckpt = d_ssm_checkpoints_
                                       + li * ssm_elems_per_layer_;
                     __nv_bfloat16* conv_ckpt = d_conv_checkpoints_
                                                + li * conv_elems_per_layer_;
                     cudaMemcpyAsync(ctx->ssm_states[li], ssm_ckpt,
-                                    ssm_elems_per_layer_ * sizeof(float),
+                                    ssm_elems_per_layer_ * sizeof(__nv_bfloat16),
                                     cudaMemcpyDeviceToDevice, compute_stream_);
                     cudaMemcpyAsync(ctx->conv_states[li], conv_ckpt,
                                     conv_elems_per_layer_ * sizeof(__nv_bfloat16),
@@ -1607,7 +1607,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                                 1, false, &sctx);
                             fa_idx++;
                         } else {
-                            float** lin_ssm = ctx->ssm_states.empty() ? nullptr : ctx->ssm_states.data() + lin_idx;
+                            __nv_bfloat16** lin_ssm = ctx->ssm_states.empty() ? nullptr : ctx->ssm_states.data() + lin_idx;
                             __nv_bfloat16** lin_conv = ctx->conv_states.empty() ? nullptr : ctx->conv_states.data() + lin_idx;
                             model_->get_layer(li).get_linear_attn()->forward(
                                 d_hidden_states_,

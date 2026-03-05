@@ -146,41 +146,54 @@ void Qwen35FullAttnLayer::forward(
     __nv_bfloat16* swiglu_out    = up_out     + num_tokens * is;
     __nv_bfloat16* down_out      = swiglu_out + num_tokens * is;
 
-    // 1. Input RMSNorm
-    ops::invoke_rmsnorm(norm_out, hidden_states, input_layernorm_w_,
-                        config_.rms_norm_eps, num_tokens, hs, stream);
-
-    // 2. QKV Projections  (q_proj outputs 2*q_dim: first half=Q, second half=Gate)
-    if (num_tokens == 1) {
-        ops::invoke_dense_gemv(norm_out, q_proj_w_, qg_proj, qp_dim, hs, stream);
-        ops::invoke_dense_gemv(norm_out, k_proj_w_, k,       kv_dim, hs, stream);
-        ops::invoke_dense_gemv(norm_out, v_proj_w_, v,       kv_dim, hs, stream);
+    // 1+2. Input RMSNorm + QKV Projection
+    //   T=1: Fused RMSNorm in SMEM + merged GEMV (saves 1 launch, no norm_out GMEM I/O)
+    //   T>1: Separate RMSNorm + GEMM
+    if (num_tokens == 1 && qkv_merged_w_) {
+        ops::invoke_dense_gemv_with_rmsnorm(
+            hidden_states, input_layernorm_w_, config_.rms_norm_eps,
+            qkv_merged_w_, qg_proj, qp_dim + kv_dim * 2, hs, stream);
     } else {
-        ops::invoke_dense_gemm(norm_out, q_proj_w_, qg_proj, num_tokens, qp_dim, hs, stream);
-        ops::invoke_dense_gemm(norm_out, k_proj_w_, k,       num_tokens, kv_dim, hs, stream);
-        ops::invoke_dense_gemm(norm_out, v_proj_w_, v,       num_tokens, kv_dim, hs, stream);
+        ops::invoke_rmsnorm(norm_out, hidden_states, input_layernorm_w_,
+                            config_.rms_norm_eps, num_tokens, hs, stream);
+        if (num_tokens == 1) {
+            if (qkv_merged_w_) {
+                ops::invoke_dense_gemv(norm_out, qkv_merged_w_, qg_proj, qp_dim + kv_dim * 2, hs, stream);
+            } else {
+                ops::invoke_dense_gemv(norm_out, q_proj_w_, qg_proj, qp_dim, hs, stream);
+                ops::invoke_dense_gemv(norm_out, k_proj_w_, k,       kv_dim, hs, stream);
+                ops::invoke_dense_gemv(norm_out, v_proj_w_, v,       kv_dim, hs, stream);
+            }
+        } else {
+            ops::invoke_dense_gemm(norm_out, q_proj_w_, qg_proj, num_tokens, qp_dim, hs, stream);
+            ops::invoke_dense_gemm(norm_out, k_proj_w_, k,       num_tokens, kv_dim, hs, stream);
+            ops::invoke_dense_gemm(norm_out, v_proj_w_, v,       num_tokens, kv_dim, hs, stream);
+        }
     }
 
-    // 2b. Split qg_proj into Q and attn_gate, with fused Q RMSNorm
-
+    // 2b+3+4. Fused: deinterleave Q+Gate, Q/K per-head RMSNorm, partial RoPE
+    // 3 kernels → 1: saves 2 launches/layer × 16 FullAttn = 32 launches/step
     __nv_bfloat16* q = qg_proj;
     __nv_bfloat16* attn_gate = gate_buf;
-    if (q_norm_w_) {
-        // Fused: deinterleave + Q per-head RMSNorm in one kernel
-        ops::invoke_fused_deinterleave_q_rmsnorm(q, attn_gate, qg_proj, q_norm_w_,
-                                                  config_.rms_norm_eps, num_tokens, num_q, hd, stream);
+    if (q_norm_w_ && k_norm_w_) {
+        ops::invoke_fused_qk_norm_rope(q, attn_gate, qg_proj, k,
+                                        q_norm_w_, k_norm_w_, pos_ids,
+                                        config_.rms_norm_eps, num_tokens, num_q, num_kv,
+                                        hd, rot_d, config_.rope_theta, stream);
     } else {
-        ops::invoke_deinterleave_qgate(q, attn_gate, qg_proj, num_tokens, num_q, hd, stream);
+        // Fallback: separate kernels
+        if (q_norm_w_) {
+            ops::invoke_fused_deinterleave_q_rmsnorm(q, attn_gate, qg_proj, q_norm_w_,
+                                                      config_.rms_norm_eps, num_tokens, num_q, hd, stream);
+        } else {
+            ops::invoke_deinterleave_qgate(q, attn_gate, qg_proj, num_tokens, num_q, hd, stream);
+        }
+        if (k_norm_w_)
+            ops::invoke_per_head_rmsnorm(k, k, k_norm_w_,
+                                         config_.rms_norm_eps, num_tokens, num_kv, hd, stream, /*centered=*/true);
+        ops::invoke_rope_partial(q, k, pos_ids, num_tokens, num_q, num_kv,
+                                  hd, rot_d, config_.rope_theta, stream);
     }
-
-    // 3. Per-head K RMSNorm
-    if (k_norm_w_)
-        ops::invoke_per_head_rmsnorm(k, k, k_norm_w_,
-                                     config_.rms_norm_eps, num_tokens, num_kv, hd, stream, /*centered=*/true);
-
-    // 4. Partial RoPE
-    ops::invoke_rope_partial(q, k, pos_ids, num_tokens, num_q, num_kv,
-                              hd, rot_d, config_.rope_theta, stream);
 
     // 5. Write K/V into Paged Cache (per-layer)
     __nv_bfloat16* k_cache = const_cast<__nv_bfloat16*>(kv_manager.get_layer_k_cache(full_attn_idx));
@@ -365,15 +378,15 @@ __global__ void silu_gate_kernel(__nv_bfloat16* y, const __nv_bfloat16* z, int n
 
 void Qwen35LinearAttnLayer::forward(
     __nv_bfloat16* hidden_states,
-    float* ssm_state,
+    __nv_bfloat16* ssm_state,
     __nv_bfloat16*  conv_state,
     int num_tokens,
     __nv_bfloat16* workspace,
     cudaStream_t stream,
     int batch_size,
-    float** ssm_state_ptrs,
+    __nv_bfloat16** ssm_state_ptrs,
     __nv_bfloat16** conv_state_ptrs,
-    float* ssm_state_checkpoint,
+    __nv_bfloat16* ssm_state_checkpoint,
     __nv_bfloat16* conv_state_checkpoint)
 {
     if (!in_proj_qkv_w_) return;
@@ -405,28 +418,33 @@ void Qwen35LinearAttnLayer::forward(
     __nv_bfloat16*  swiglu_out    = up_out        + num_tokens * is;
     __nv_bfloat16*  down_out      = swiglu_out    + num_tokens * is;
 
-    // 1. Input RMSNorm
-    ops::invoke_rmsnorm(norm_out, hidden_states, input_layernorm_w_,
-                        config_.rms_norm_eps, num_tokens, hs, stream);
-
-    // 2. Projections
-    //    T=1 时 ZAB 可合并 (输出连续在 workspace)；T>1 时 GEMM 行交错布局不兼容
-    // QKV projection: always merged for GEMV
-    if (num_tokens == 1) {
-        ops::invoke_dense_gemv(norm_out, in_proj_qkv_w_, qkv_out, in_qkv, hs, stream);
+    // 1+2. Input RMSNorm + All projections (QKV + ZAB)
+    //   T=1 + super-merged: Fused RMSNorm in SMEM + GEMV (saves 1 launch)
+    //   Otherwise: separate RMSNorm + GEMV/GEMM
+    if (num_tokens == 1 && all_proj_merged_w_) {
+        // Fused: RMSNorm in SMEM + super-merged GEMV (N=16480), no norm_out GMEM I/O
+        ops::invoke_dense_gemv_with_rmsnorm(
+            hidden_states, input_layernorm_w_, config_.rms_norm_eps,
+            all_proj_merged_w_, qkv_out, in_qkv + lin_v + nv * 2, hs, stream);
     } else {
-        ops::invoke_dense_gemm(norm_out, in_proj_qkv_w_, qkv_out, num_tokens, in_qkv, hs, stream);
-    }
-
-    // Z+A+B projection
-    if (num_tokens == 1) {
-        ops::invoke_dense_gemv(norm_out, in_proj_z_w_,   z_out,     lin_v,  hs, stream);
-        ops::invoke_dense_gemv(norm_out, in_proj_a_w_,   a_out_f16, nv,     hs, stream);
-        ops::invoke_dense_gemv(norm_out, in_proj_b_w_,   beta_out,  nv,     hs, stream);
-    } else {
-        ops::invoke_dense_gemm(norm_out, in_proj_z_w_,   z_out,     num_tokens, lin_v,  hs, stream);
-        ops::invoke_dense_gemm(norm_out, in_proj_a_w_,   a_out_f16, num_tokens, nv,     hs, stream);
-        ops::invoke_dense_gemm(norm_out, in_proj_b_w_,   beta_out,  num_tokens, nv,     hs, stream);
+        ops::invoke_rmsnorm(norm_out, hidden_states, input_layernorm_w_,
+                            config_.rms_norm_eps, num_tokens, hs, stream);
+        if (num_tokens == 1) {
+            if (all_proj_merged_w_) {
+                ops::invoke_dense_gemv(norm_out, all_proj_merged_w_, qkv_out,
+                                       in_qkv + lin_v + nv * 2, hs, stream);
+            } else {
+                ops::invoke_dense_gemv(norm_out, in_proj_qkv_w_, qkv_out, in_qkv, hs, stream);
+                ops::invoke_dense_gemv(norm_out, in_proj_z_w_,   z_out,     lin_v,  hs, stream);
+                ops::invoke_dense_gemv(norm_out, in_proj_a_w_,   a_out_f16, nv,     hs, stream);
+                ops::invoke_dense_gemv(norm_out, in_proj_b_w_,   beta_out,  nv,     hs, stream);
+            }
+        } else {
+            ops::invoke_dense_gemm(norm_out, in_proj_qkv_w_, qkv_out, num_tokens, in_qkv, hs, stream);
+            ops::invoke_dense_gemm(norm_out, in_proj_z_w_,   z_out,     num_tokens, lin_v,  hs, stream);
+            ops::invoke_dense_gemm(norm_out, in_proj_a_w_,   a_out_f16, num_tokens, nv,     hs, stream);
+            ops::invoke_dense_gemm(norm_out, in_proj_b_w_,   beta_out,  num_tokens, nv,     hs, stream);
+        }
     }
 
     __nv_bfloat16* q_buf = qkv_out;

@@ -1,4 +1,5 @@
 #include "light_ops.h"
+#include "gdn_umma_sm110.h"
 #include <cuda_bf16.h>
 #include <stdio.h>
 #include <algorithm>
@@ -748,11 +749,11 @@ gated_delta_net_prefill_kernel(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
     const __nv_bfloat16* a_raw, const __nv_bfloat16* dt_bias, const float* A_log,
     const __nv_bfloat16* beta_raw,
-    float* ssm_state,
+    __nv_bfloat16* ssm_state,
     __nv_bfloat16* y_out,
     int num_tokens, int kd, int nv_per_kh, int vd,
     int token_stride, int nkh_x_nvpkh,
-    float* ssm_state_checkpoint)
+    __nv_bfloat16* ssm_state_checkpoint)
 {
     int h_v = blockIdx.x;
     int h_k = h_v / nv_per_kh;
@@ -770,7 +771,7 @@ gated_delta_net_prefill_kernel(
     float q_scale = rsqrtf((float)kd);
 
     for (int i = 0; i < kd; i++)
-        S_smem[i * vd_pad + j] = ssm_state[ss_base + i * vd + j];
+        S_smem[i * vd_pad + j] = __bfloat162float(ssm_state[ss_base + i * vd + j]);
     __syncthreads();
 
     for (int t = 0; t < num_tokens; t++) {
@@ -833,22 +834,26 @@ gated_delta_net_prefill_kernel(
         // MTP speculative checkpoint: save SSM state after token[0] for T=2 verify rollback
         if (ssm_state_checkpoint && t == 0 && num_tokens > 1) {
             for (int i = 0; i < kd; i++)
-                ssm_state_checkpoint[ss_base + i * vd + j] = S_smem[i * vd_pad + j];
+                ssm_state_checkpoint[ss_base + i * vd + j] = __float2bfloat16(S_smem[i * vd_pad + j]);
             __syncthreads();
         }
     }
 
     for (int i = 0; i < kd; i++)
-        ssm_state[ss_base + i * vd + j] = S_smem[i * vd_pad + j];
+        ssm_state[ss_base + i * vd + j] = __float2bfloat16(S_smem[i * vd_pad + j]);
 }
 
-// ---- Decode 版 (batch_size > 1): 原始 kernel ----
+// ---- Decode 版 (batch_size > 1): 独立 block per (batch, value_head) ----
+// 每 block 处理 1 token 的 1 个 value head, SSM state 直接 GMEM 访问
+// L2 cache 覆盖 block 内的 2 次 kd 遍历 (32 KB BF16 SSM state/block < 32 MB L2)
+// 不使用 SMEM 缓存 SSM state: 66 KB/block 导致 occupancy 从 100% 降至 25%,
+// 实测 B=128 从 338ms 退化至 693ms — 占用率代价远超 GMEM 节省
 __global__ void gated_delta_net_kernel(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
     const __nv_bfloat16* a_raw, const __nv_bfloat16* dt_bias, const float* A_log,
     const __nv_bfloat16* beta_raw,
-    float** ssm_state_ptrs,     // [batch_size] 指针数组, 每个→ [nv, kd, vd]
-    float*  ssm_state_single,   // legacy 单序列 state (batch_size<=1 时使用)
+    __nv_bfloat16** ssm_state_ptrs,     // [batch_size] 指针数组, 每个→ [nv, kd, vd]
+    __nv_bfloat16*  ssm_state_single,   // legacy 单序列 state (batch_size<=1 时使用)
     __nv_bfloat16* y_out,
     int num_tokens, int kd, int nv_per_kh, int vd,
     int token_stride, int batch_size, int nkh_x_nvpkh)
@@ -857,7 +862,7 @@ __global__ void gated_delta_net_kernel(
     //   batch_size <= 1: blockIdx.x = h_v (0..nkh*nv_per_kh-1), loop over num_tokens
     //   batch_size > 1:  blockIdx.x = batch_idx * nkh_x_nvpkh + h_v, process 1 token
     int h_v, batch_idx;
-    float* ssm_state;
+    __nv_bfloat16* ssm_state;
     int tokens_to_process;
     int token_start;
 
@@ -929,20 +934,22 @@ __global__ void gated_delta_net_kernel(
 
         int v_base = t * token_stride + h_v * vd;
 
+        // kS_j: dot product of k_hat with SSM state column j
         float kS_j = 0.f;
         for (int i = 0; i < kd; i++) {
-            kS_j += k_hat_s[i] * ssm_state[ss_base + i * vd + j];
+            kS_j += k_hat_s[i] * __bfloat162float(ssm_state[ss_base + i * vd + j]);
         }
 
         float v_j = __bfloat162float(v[v_base + j]);
         float delta_j = v_j - alpha_v * kS_j;
 
+        // Update SSM state and compute output
         float y_j = 0.f;
         for (int i = 0; i < kd; i++) {
             float beta_k_i = beta_v * k_hat_s[i];
-            float old_s = ssm_state[ss_base + i * vd + j];
+            float old_s = __bfloat162float(ssm_state[ss_base + i * vd + j]);
             float new_s = alpha_v * old_s + beta_k_i * delta_j;
-            ssm_state[ss_base + i * vd + j] = new_s;
+            ssm_state[ss_base + i * vd + j] = __float2bfloat16(new_s);
             y_j += new_s * q_hat_s[i];
         }
 
@@ -955,15 +962,24 @@ __global__ void gated_delta_net_kernel(
 void invoke_gated_delta_net(const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
                              const __nv_bfloat16* a_raw, const __nv_bfloat16* dt_bias,
                              const float* A_log, const __nv_bfloat16* beta_raw,
-                             float* ssm_state, __nv_bfloat16* y_out,
+                             __nv_bfloat16* ssm_state, __nv_bfloat16* y_out,
                              int num_tokens, int nkh, int kd, int nv_per_kh, int vd,
                              cudaStream_t stream, int token_stride,
-                             int batch_size, float** ssm_state_ptrs,
-                             float* ssm_state_checkpoint) {
+                             int batch_size, __nv_bfloat16** ssm_state_ptrs,
+                             __nv_bfloat16* ssm_state_checkpoint) {
     if (token_stride <= 0) token_stride = nkh * kd;
     int nkh_x_nvpkh = nkh * nv_per_kh;  // 48
 
     if (batch_size <= 1) {
+        // WY 分块 prefill: T≥4 时启用, chunk_size=4, 矩阵化加速 ~1.71×
+        if (num_tokens >= 4) {
+            gdn_umma::invoke_gdn_wy_prefill(
+                q, k, v, a_raw, dt_bias, A_log, beta_raw,
+                ssm_state, y_out,
+                num_tokens, nkh, kd, nv_per_kh, vd,
+                stream, token_stride, ssm_state_checkpoint);
+            return;
+        }
         // ---- Prefill / single-decode: extended shared memory 缓存 SSM state ----
         // S[kd, vd] 全量放入 shared memory, 128 threads (1 per vd), 
         // sequential token loop. 已验证: norm 外提和 kd 并行化均无收益
@@ -993,7 +1009,7 @@ void invoke_gated_delta_net(const __nv_bfloat16* q, const __nv_bfloat16* k, cons
             num_tokens, kd, nv_per_kh, vd, token_stride, nkh_x_nvpkh,
             ssm_state_checkpoint);
     } else {
-        // ---- Batched decode 路径: 原始 kernel ----
+        // ---- Batched decode 路径 ----
         int threads = std::min(vd, 256);
         int grid = batch_size * nkh_x_nvpkh;
         size_t smem = (size_t)(2 * kd + 2) * sizeof(float);
@@ -1148,6 +1164,138 @@ void invoke_fused_deinterleave_q_rmsnorm(
     int threads = std::min(head_dim, 256);
     fused_deinterleave_q_rmsnorm_kernel<<<blocks, threads, 0, stream>>>(
         q_out, gate_out, qg_in, q_norm_weight, eps, num_heads, head_dim);
+}
+
+// ============================================================================
+// Fused Deinterleave+Q_norm + K_norm + Partial RoPE (FullAttn steps 2b+3+4)
+// 3 kernels → 1: saves 2 launches/layer × 16 FullAttn layers = 32 launches/step
+// Grid: (T, num_q + num_kv), Block: min(head_dim, 256)
+// Q blocks (blockIdx.y < num_q): deinterleave qg→q+gate, Q RMSNorm (centered), RoPE
+// K blocks (blockIdx.y >= num_q): K RMSNorm (centered), RoPE
+// SMEM: head_dim floats for normalized Q/K before RoPE, + blockReduceSum's static 32 floats
+// ============================================================================
+__global__ void fused_qk_norm_rope_kernel(
+    __nv_bfloat16* q_out, __nv_bfloat16* gate_out,
+    const __nv_bfloat16* qg_in, __nv_bfloat16* k,
+    const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
+    const int* pos_ids,
+    float eps, int num_q, int num_kv,
+    int head_dim, int rotary_dim, float rope_base)
+{
+    int token = blockIdx.x;
+    int idx   = blockIdx.y;  // [0, num_q): Q head, [num_q, num_q+num_kv): K head
+    int tid   = threadIdx.x;
+    int half_rot = rotary_dim / 2;
+
+    // SMEM for holding normalized values before RoPE application
+    __shared__ float s_normed[256];  // head_dim ≤ 256 for Qwen3.5-27B
+    __shared__ float s_inv_rms2;
+
+    int pos = pos_ids[token];
+
+    if (idx < num_q) {
+        // === Q head: deinterleave + RMSNorm (centered) + RoPE ===
+        int head = idx;
+        int src_stride = num_q * 2 * head_dim;
+        int src_base   = token * src_stride + head * 2 * head_dim;
+        int dst_base   = (token * num_q + head) * head_dim;
+
+        // Pass 1: deinterleave + compute Q sum-of-squares + write gate
+        float sum_sq = 0.0f;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float q_val = __bfloat162float(qg_in[src_base + d]);
+            float g_val = __bfloat162float(qg_in[src_base + head_dim + d]);
+            gate_out[dst_base + d] = __float2bfloat16(g_val);
+            sum_sq += q_val * q_val;
+        }
+        sum_sq = blockReduceSum(sum_sq);
+        if (tid == 0) s_inv_rms2 = rsqrtf(sum_sq / (float)head_dim + eps);
+        __syncthreads();
+
+        float inv_rms = s_inv_rms2;
+
+        // Pass 2: normalize Q → SMEM
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float q_val = __bfloat162float(qg_in[src_base + d]);
+            float w = __bfloat162float(q_norm_w[d]);
+            s_normed[d] = q_val * inv_rms * (1.0f + w);
+        }
+        __syncthreads();
+
+        // Pass 3: RoPE on first rotary_dim dims + write to GMEM
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            if (d < half_rot) {
+                float inv_freq = powf(rope_base, -(float)(d * 2) / (float)rotary_dim);
+                float angle = (float)pos * inv_freq;
+                float cos_v = cosf(angle);
+                float sin_v = sinf(angle);
+                float x0 = s_normed[d];
+                float x1 = s_normed[d + half_rot];
+                q_out[dst_base + d]            = __float2bfloat16(x0 * cos_v - x1 * sin_v);
+                q_out[dst_base + d + half_rot]  = __float2bfloat16(x1 * cos_v + x0 * sin_v);
+            } else if (d >= rotary_dim) {
+                // Non-rotary dims: pass through normalized value
+                q_out[dst_base + d] = __float2bfloat16(s_normed[d]);
+            }
+            // dims [half_rot, rotary_dim) are written by threads [0, half_rot)
+        }
+    } else {
+        // === K head: RMSNorm (centered) + RoPE ===
+        int kh = idx - num_q;
+        int k_base = (token * num_kv + kh) * head_dim;
+
+        // Pass 1: compute sum-of-squares
+        float sum_sq = 0.0f;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float v = __bfloat162float(k[k_base + d]);
+            sum_sq += v * v;
+        }
+        sum_sq = blockReduceSum(sum_sq);
+        if (tid == 0) s_inv_rms2 = rsqrtf(sum_sq / (float)head_dim + eps);
+        __syncthreads();
+
+        float inv_rms = s_inv_rms2;
+
+        // Pass 2: normalize K → SMEM
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float v = __bfloat162float(k[k_base + d]);
+            float w = __bfloat162float(k_norm_w[d]);
+            s_normed[d] = v * inv_rms * (1.0f + w);
+        }
+        __syncthreads();
+
+        // Pass 3: RoPE + write to GMEM
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            if (d < half_rot) {
+                float inv_freq = powf(rope_base, -(float)(d * 2) / (float)rotary_dim);
+                float angle = (float)pos * inv_freq;
+                float cos_v = cosf(angle);
+                float sin_v = sinf(angle);
+                float x0 = s_normed[d];
+                float x1 = s_normed[d + half_rot];
+                k[k_base + d]            = __float2bfloat16(x0 * cos_v - x1 * sin_v);
+                k[k_base + d + half_rot]  = __float2bfloat16(x1 * cos_v + x0 * sin_v);
+            } else if (d >= rotary_dim) {
+                k[k_base + d] = __float2bfloat16(s_normed[d]);
+            }
+        }
+    }
+}
+
+void invoke_fused_qk_norm_rope(
+    __nv_bfloat16* q_out, __nv_bfloat16* gate_out,
+    const __nv_bfloat16* qg_in, __nv_bfloat16* k,
+    const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
+    const int* pos_ids,
+    float eps, int num_tokens, int num_q, int num_kv,
+    int head_dim, int rotary_dim, float rope_base,
+    cudaStream_t stream)
+{
+    dim3 grid(num_tokens, num_q + num_kv);  // (T, 24+4=28)
+    int threads = std::min(head_dim, 256);
+    fused_qk_norm_rope_kernel<<<grid, threads, 0, stream>>>(
+        q_out, gate_out, qg_in, k, q_norm_w, k_norm_w, pos_ids,
+        eps, num_q, num_kv, head_dim, rotary_dim, rope_base);
 }
 
 // ============================================================================
