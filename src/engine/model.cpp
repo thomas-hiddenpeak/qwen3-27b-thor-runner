@@ -362,10 +362,9 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
 //   [0..hs)           norm_h       (RMSNorm of main hidden)
 //   [hs..2hs)         norm_e       (RMSNorm of embedding, concat = [0..2hs))
 //   [2hs..3hs)        projected    (fc output, also hidden_states for attn layer)
-//   [3hs..3hs+4)      temp int     (device token_id / pos_id holder)
-//   [3hs+8..4hs+8)    raw_embed    (embedding lookup output)
-//   [4hs+8..end)      attn_ws      (FullAttnLayer workspace for T=1)
-//   after attn_ws:    normed [hs] + logits [vocab]
+//   [3hs..4hs)        raw_embed    (embedding lookup output)
+//   [4hs..4hs+93184)  attn_ws      (FullAttnLayer workspace for T=1)
+//   after attn_ws:    normed [hs] + logits [vocab] + d_ids [2 ints]
 // ============================================================================
 __nv_bfloat16* Qwen35Model::mtp_forward(
     const __nv_bfloat16* main_hidden,
@@ -385,16 +384,18 @@ __nv_bfloat16* Qwen35Model::mtp_forward(
     const int vocab = config_.vocab_size;      // 248320
 
     // Workspace pointers
+    // Layout: norm_h[hs] | norm_e[hs] | projected[hs] | raw_embed[hs] | attn_ws[93184] | normed[hs] | logits[vocab] | d_ids[2 ints]
+    // d_ids 放到末尾避免中间 int 对齐破坏后续 BF16 指针的 16-byte boundary
     __nv_bfloat16* norm_h    = workspace;                     // [5120]
     __nv_bfloat16* norm_e    = norm_h + hs;                   // [5120] → concat = [0..10240)
     __nv_bfloat16* projected = norm_e + hs;                   // [5120]
-    int* d_ids               = reinterpret_cast<int*>(projected + hs);  // 2 ints (token_id, pos_id)
-    __nv_bfloat16* raw_embed = reinterpret_cast<__nv_bfloat16*>(d_ids + 2);  // [5120]
+    __nv_bfloat16* raw_embed = projected + hs;                // [5120]
     __nv_bfloat16* attn_ws   = raw_embed + hs;
     // After attn layer: normed + logits (size determined by layer workspace)
     // Full attn T=1 workspace: 5120+12288+1024+1024+6144+5120+5120+17408+17408+17408+5120 = 93184
     __nv_bfloat16* normed    = attn_ws + 93184;
     __nv_bfloat16* logits    = normed + hs;
+    int* d_ids               = reinterpret_cast<int*>(logits + vocab);  // 2 ints at the very end
 
     // 1. RMSNorm(main_hidden) → norm_h
     ops::invoke_rmsnorm(norm_h, main_hidden, mtp_pre_norm_h_w_,

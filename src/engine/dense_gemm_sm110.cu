@@ -158,6 +158,27 @@ void invoke_dense_gemm(
     int K,
     cudaStream_t stream
 ) {
+    // Small M: skip CUTLASS entirely, use cuBLAS directly.
+    // CUTLASS SM110 TileShape<128,128,64> + ClusterShape<2,2,1> requires
+    // TMA descriptor boxDim[1] = 128/2 = 64. M_padded must be >= 64 for TMA.
+    // When M < 128, M_padded could be < 64 (e.g. M=39 → M_padded=40) → error 716.
+    // Also: MTP verify T=2 (M=2). cuBLAS handles small GEMM efficiently.
+    if (M > 1 && M < 128) {
+        auto h = get_cublas_handle();
+        cublasSetStream(h, stream);
+        float alpha = 1.0f, beta_val = 0.0f;
+        cublasGemmEx(h,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            B, CUDA_R_16BF, K,
+            A, CUDA_R_16BF, K,
+            &beta_val,
+            C, CUDA_R_16BF, N,
+            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        return;
+    }
+
     // M padding to 8-aligned (required by CUTLASS tensor core)
     int M_padded = M;
     const __nv_bfloat16* A_eff = A;
@@ -253,7 +274,27 @@ void invoke_dense_gemm(
     // 传入相同 stream 保证 stream 内串行执行顺序。
     status = gemm.initialize(args, s_workspace, stream);
     if (status != cutlass::Status::kSuccess) {
-        throw std::runtime_error("CUTLASS GEMM initialization failed.");
+        // CUTLASS initialize failed (e.g., TMA descriptor creation error for small M).
+        // Fallback to cuBLAS.
+        auto h = get_cublas_handle();
+        cublasSetStream(h, stream);
+        float alpha = 1.0f, beta_val = 0.0f;
+        cublasGemmEx(h,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            A_eff == A ? B : B, CUDA_R_16BF, K,
+            A_eff, CUDA_R_16BF, K,
+            &beta_val,
+            C_eff, CUDA_R_16BF, N,
+            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        if (M_padded != M) {
+            cudaMemcpy2DAsync(C, (size_t)N * sizeof(__nv_bfloat16),
+                              C_eff, (size_t)N * sizeof(__nv_bfloat16),
+                              (size_t)N * sizeof(__nv_bfloat16), M,
+                              cudaMemcpyDeviceToDevice, stream);
+        }
+        return;
     }
 
     // CUTLASS initialize(args, workspace, stream) 用 stream-ordered ops 设置 workspace:
@@ -289,6 +330,28 @@ void invoke_dense_gemm_add(
     int M, int N, int K,
     cudaStream_t stream
 ) {
+    // Small M: skip CUTLASS, use cuBLAS with residual add.
+    // Same TMA descriptor issue as invoke_dense_gemm: M < 128 → use cuBLAS.
+    if (M > 1 && M < 128) {
+        auto h = get_cublas_handle();
+        cublasSetStream(h, stream);
+        if (D != residual) {
+            cudaMemcpyAsync(D, residual, (size_t)M * N * sizeof(__nv_bfloat16),
+                            cudaMemcpyDeviceToDevice, stream);
+        }
+        float alpha = 1.0f, beta_val = 1.0f;
+        cublasGemmEx(h,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            B, CUDA_R_16BF, K,
+            A, CUDA_R_16BF, K,
+            &beta_val,
+            D, CUDA_R_16BF, N,
+            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        return;
+    }
+
     int M_padded = M;
     const __nv_bfloat16* A_eff = A;
     __nv_bfloat16* D_eff = D;
@@ -382,7 +445,24 @@ void invoke_dense_gemm_add(
     // 同 invoke_dense_gemm: 必须传 stream 给 initialize() 避免跨 stream 竞态
     status = gemm.initialize(args, s_workspace2, stream);
     if (status != cutlass::Status::kSuccess) {
-        throw std::runtime_error("CUTLASS GEMM+Add initialization failed.");
+        // CUTLASS initialize failed, fallback to cuBLAS with residual add
+        auto h = get_cublas_handle();
+        cublasSetStream(h, stream);
+        if (D != residual) {
+            cudaMemcpyAsync(D, residual, (size_t)M * N * sizeof(__nv_bfloat16),
+                            cudaMemcpyDeviceToDevice, stream);
+        }
+        float alpha = 1.0f, beta_val = 1.0f;
+        cublasGemmEx(h,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            B, CUDA_R_16BF, K,
+            A, CUDA_R_16BF, K,
+            &beta_val,
+            D, CUDA_R_16BF, N,
+            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        return;
     }
 
     // 同 invoke_dense_gemm: stream-ordered workspace init, 无需额外 sync

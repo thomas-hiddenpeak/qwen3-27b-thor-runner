@@ -60,3 +60,4 @@ docs/references/*.pdf
 
 # Third-party source (submodules)
 # third_party/
+tmp/

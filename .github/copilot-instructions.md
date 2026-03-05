@@ -221,6 +221,12 @@ bench: B=1 baseline 229.2ms ITL / 218.3ms fwd / 223.6 GB/s
 - 对比必须控制相同参数 (kv-cache-gb, batch, decode steps)
 - `docs/OPTIMIZATION_LOG.md` 记录每次优化的 A/B 结果
 
+## 临时文件
+
+- 调试日志、临时输出一律写到 `tmp/` 目录 (已加入 `.gitignore`)
+- 例如: `./build/qwen3-27b-thor serve ... > tmp/debug.log 2>&1`
+- 不要使用 `/tmp/` 等系统目录，避免需要额外授权
+
 ## 沟通规范
 
 - 使用中文
