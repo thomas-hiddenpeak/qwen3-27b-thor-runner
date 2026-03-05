@@ -164,6 +164,15 @@ src/
 - Head-Group Batch Attention: 同 KV head 的 6 Q head 合并读取
 - SSM State BF16 化: ✅ 已完成, 72MB/request, B=128 吞吐 +42.6%
 
+### 已完成优化清单
+- ✅ Level 1: SSM State BF16化 (GMEM BF16, kernel FP32), B=128 +42.6%
+- ✅ Level 2: FullAttn QKV merge (3→1 GEMV, 16层 ×2=32 launches)
+- ✅ Level 2b: LinearAttn QKVZAB super-merge (4→1 GEMV, 48层 ×3=144 launches)
+- ✅ Fused QK_norm + RoPE (3→1 kernel, 32 launches)
+- ✅ Fused RMSNorm + GEMV (norm in SMEM, 64 launches, ~1ms)
+- ❌ GDN SMEM caching (occupancy drop, reverted)
+- ❌ Dual GEMV + SwiGLU fusion (block count halved, +4.6%, reverted)
+
 ### 稳定性
 - 统一内存 SMMU 资源有限, 大规模并发访问可致 GPU hard-reset
 - 压力测试覆盖多轮、长上下文、多并发
@@ -186,6 +195,31 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc)
 #       ./build/qwen3-27b-thor bench --decode 30
 #       ./build/qwen3-27b-thor test
 ```
+
+## 工作流规范
+
+### Git Commit（强制）
+
+每次取得阶段性成果时**必须** `git commit` 记录:
+- **编译通过 + 测试通过**: 立即 commit
+- **性能测量完成 (A/B 对比有结论)**: 立即 commit，commit message 包含关键数值
+- **新优化实现**: 实现 + 验证后 commit，不要积累多个优化再一次性提交
+- **失败回退**: 回退后也要 commit，注明失败原因
+- **Benchmark 基线更新**: commit message 包含 ITL/Forward/BW 数值
+
+示例 commit message 格式:
+```
+perf: fused RMSNorm+GEMV saves 64 launches, ITL 230→229ms (-0.5%)
+revert: dual GEMV+SwiGLU fusion — block count halved, +4.6% regression
+bench: B=1 baseline 229.2ms ITL / 218.3ms fwd / 223.6 GB/s
+```
+
+### Benchmark 基本要求
+
+- 最少 `--decode 30 --warmup 5`, N≥30 才有统计意义
+- 每次测量前 `pkill` 之前的进程, 确保 GPU 空闲
+- 对比必须控制相同参数 (kv-cache-gb, batch, decode steps)
+- `docs/OPTIMIZATION_LOG.md` 记录每次优化的 A/B 结果
 
 ## 沟通规范
 
