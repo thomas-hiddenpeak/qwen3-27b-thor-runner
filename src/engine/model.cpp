@@ -250,13 +250,13 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
             return it != tensor_map.end() ? it->second : nullptr;
         };
 
-        mtp_pre_norm_h_w_ = mtp_get("model.language_model.mtp.pre_fc_norm_hidden.weight");
-        mtp_pre_norm_e_w_ = mtp_get("model.language_model.mtp.pre_fc_norm_embedding.weight");
-        mtp_fc_w_          = mtp_get("model.language_model.mtp.fc.weight");
-        mtp_norm_w_        = mtp_get("model.language_model.mtp.norm.weight");
+        mtp_pre_norm_h_w_ = mtp_get("mtp.pre_fc_norm_hidden.weight");
+        mtp_pre_norm_e_w_ = mtp_get("mtp.pre_fc_norm_embedding.weight");
+        mtp_fc_w_          = mtp_get("mtp.fc.weight");
+        mtp_norm_w_        = mtp_get("mtp.norm.weight");
 
         // MTP transformer layer weights
-        std::string mp = "model.language_model.mtp.layers.0.";
+        std::string mp = "mtp.layers.0.";
         __nv_bfloat16* mtp_q  = mtp_get(mp + "self_attn.q_proj.weight");
         __nv_bfloat16* mtp_k  = mtp_get(mp + "self_attn.k_proj.weight");
         __nv_bfloat16* mtp_v  = mtp_get(mp + "self_attn.v_proj.weight");
