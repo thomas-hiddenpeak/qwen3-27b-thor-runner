@@ -37,7 +37,7 @@ CacheEngine::CacheEngine(const CacheConfig& config, const ModelCacheParams& para
     : config_(config), params_(params), hasher_(config.chunk_size) {
 
     if (!config_.enabled) {
-        std::cout << "[CacheEngine] Prefix caching DISABLED" << std::endl;
+        std::cerr << "[CacheEngine] Prefix caching DISABLED" << std::endl;
         return;
     }
 
@@ -49,14 +49,14 @@ CacheEngine::CacheEngine(const CacheConfig& config, const ModelCacheParams& para
         monitor_.record_eviction(evicted_bytes);
     });
 
-    std::cout << "[CacheEngine] Prefix caching ENABLED (SSD-only)" << std::endl;
-    std::cout << "  Cache Dir:     " << config_.cache_dir << std::endl;
-    std::cout << "  Max SSD:       " << (config_.max_cache_bytes / (1024ULL*1024*1024)) << " GB" << std::endl;
-    std::cout << "  Chunk Size:    " << config_.chunk_size << " tokens" << std::endl;
-    std::cout << "  SSM Caching:   " << (config_.cache_ssm_state ? "ON" : "OFF") << std::endl;
-    std::cout << "  KV/token:      " << params_.kv_bytes_per_token() << " bytes" << std::endl;
-    std::cout << "  SSM total:     " << (params_.ssm_bytes_total() / (1024*1024)) << " MB" << std::endl;
-    std::cout << "  Conv total:    " << (params_.conv_bytes_total() / 1024) << " KB" << std::endl;
+    std::cerr << "[CacheEngine] Prefix caching ENABLED (SSD-only)" << std::endl;
+    std::cerr << "  Cache Dir:     " << config_.cache_dir << std::endl;
+    std::cerr << "  Max SSD:       " << (config_.max_cache_bytes / (1024ULL*1024*1024)) << " GB" << std::endl;
+    std::cerr << "  Chunk Size:    " << config_.chunk_size << " tokens" << std::endl;
+    std::cerr << "  SSM Caching:   " << (config_.cache_ssm_state ? "ON" : "OFF") << std::endl;
+    std::cerr << "  KV/token:      " << params_.kv_bytes_per_token() << " bytes" << std::endl;
+    std::cerr << "  SSM total:     " << (params_.ssm_bytes_total() / (1024*1024)) << " MB" << std::endl;
+    std::cerr << "  Conv total:    " << (params_.conv_bytes_total() / 1024) << " KB" << std::endl;
 }
 
 CacheEngine::~CacheEngine() = default;
@@ -400,20 +400,20 @@ CacheStats CacheEngine::get_stats() const {
 void CacheEngine::print_stats() const {
     // 旧格式 (兼容)
     auto s = get_stats();
-    std::cout << "=== KV Cache Stats ===" << std::endl;
-    std::cout << "  Lookups:       " << s.total_lookups << std::endl;
-    std::cout << "  Hits:          " << s.cache_hits
+    std::cerr << "=== KV Cache Stats ===" << std::endl;
+    std::cerr << "  Lookups:       " << s.total_lookups << std::endl;
+    std::cerr << "  Hits:          " << s.cache_hits
               << " (" << (s.total_lookups > 0 ? 100.0 * s.cache_hits / s.total_lookups : 0) << "%)" << std::endl;
-    std::cout << "  Misses:        " << s.cache_misses << std::endl;
-    std::cout << "  Tokens Saved:  " << s.total_tokens_saved << std::endl;
-    std::cout << "  Store Count:   " << s.store_count << std::endl;
-    std::cout << "  Store Bytes:   " << (s.store_bytes / (1024*1024)) << " MB" << std::endl;
-    std::cout << "  Retrieve:      " << s.retrieve_count << std::endl;
-    std::cout << "  Retrieve Bytes:" << (s.retrieve_bytes / (1024*1024)) << " MB" << std::endl;
+    std::cerr << "  Misses:        " << s.cache_misses << std::endl;
+    std::cerr << "  Tokens Saved:  " << s.total_tokens_saved << std::endl;
+    std::cerr << "  Store Count:   " << s.store_count << std::endl;
+    std::cerr << "  Store Bytes:   " << (s.store_bytes / (1024*1024)) << " MB" << std::endl;
+    std::cerr << "  Retrieve:      " << s.retrieve_count << std::endl;
+    std::cerr << "  Retrieve Bytes:" << (s.retrieve_bytes / (1024*1024)) << " MB" << std::endl;
     if (backend_) {
-        std::cout << "  SSD Used:      " << (backend_->current_size_bytes() / (1024*1024)) << " MB"
+        std::cerr << "  SSD Used:      " << (backend_->current_size_bytes() / (1024*1024)) << " MB"
                   << " / " << (backend_->max_size_bytes() / (1024ULL*1024*1024)) << " GB" << std::endl;
-        std::cout << "  SSD Entries:   " << backend_->num_entries() << std::endl;
+        std::cerr << "  SSD Entries:   " << backend_->num_entries() << std::endl;
     }
     // LMCache-style 全面报告
     monitor_.print_report();

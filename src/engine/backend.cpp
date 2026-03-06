@@ -117,22 +117,22 @@ cache::CacheConfig BackendConfig::to_cache_config() const {
 }
 
 void BackendConfig::print() const {
-    printf("\n");
-    printf("┌─────────────────────────────────────────────┐\n");
-    printf("│          Backend Configuration              │\n");
-    printf("├─────────────────────────────────────────────┤\n");
-    printf("│  Model Dir:     %-26s │\n", model_dir.c_str());
-    printf("│  KV Cache:      %-6.1f GB                   │\n", kv_cache_gb);
-    printf("│  Prefix Cache:  %-8s                    │\n", cache_enabled ? "ENABLED" : "DISABLED");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "┌─────────────────────────────────────────────┐\n");
+    fprintf(stderr, "│          Backend Configuration              │\n");
+    fprintf(stderr, "├─────────────────────────────────────────────┤\n");
+    fprintf(stderr, "│  Model Dir:     %-26s │\n", model_dir.c_str());
+    fprintf(stderr, "│  KV Cache:      %-6.1f GB                   │\n", kv_cache_gb);
+    fprintf(stderr, "│  Prefix Cache:  %-8s                    │\n", cache_enabled ? "ENABLED" : "DISABLED");
     if (cache_enabled) {
-        printf("│  Cache Dir:     %-26s │\n", cache_dir.c_str());
-        printf("│  SSD Budget:    %-6.1f GB                   │\n", cache_max_gb);
-        printf("│  Chunk Size:    %-6d tokens               │\n", cache_chunk_size);
-        printf("│  SSM Caching:   %-3s                        │\n", cache_ssm_state ? "ON" : "OFF");
+        fprintf(stderr, "│  Cache Dir:     %-26s │\n", cache_dir.c_str());
+        fprintf(stderr, "│  SSD Budget:    %-6.1f GB                   │\n", cache_max_gb);
+        fprintf(stderr, "│  Chunk Size:    %-6d tokens               │\n", cache_chunk_size);
+        fprintf(stderr, "│  SSM Caching:   %-3s                        │\n", cache_ssm_state ? "ON" : "OFF");
     }
-    printf("│  MTP Mode:      %-8s                    │\n", mtp_mode.c_str());
-    printf("│  MTP Drafts:    %-6d                      │\n", mtp_num_drafts);
-    printf("└─────────────────────────────────────────────┘\n\n");
+    fprintf(stderr, "│  MTP Mode:      %-8s                    │\n", mtp_mode.c_str());
+    fprintf(stderr, "│  MTP Drafts:    %-6d                      │\n", mtp_num_drafts);
+    fprintf(stderr, "└─────────────────────────────────────────────┘\n\n");
 }
 
 // ============================================================================
@@ -264,45 +264,45 @@ static void check_memory_budget(const BackendConfig& config, const core::Qwen35C
     double total_gb = weight_gb + kv_gb + workspace_gb + vision_gb + ssm_gb + os_reserve_gb;
 
     // ---- 打印内存预算报告 ----
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════════╗\n");
-    printf("║                 Memory Budget Check                        ║\n");
-    printf("╠══════════════════════════════════════════════════════════════╣\n");
-    printf("║  System Memory:    %6.1f GB total, %6.1f GB available      ║\n",
+    fprintf(stderr, "\n");
+    fprintf(stderr, "╔══════════════════════════════════════════════════════════════╗\n");
+    fprintf(stderr, "║                 Memory Budget Check                        ║\n");
+    fprintf(stderr, "╠══════════════════════════════════════════════════════════════╣\n");
+    fprintf(stderr, "║  System Memory:    %6.1f GB total, %6.1f GB available      ║\n",
            mem_total_gb, mem_available_gb);
     if (cuda_total_gb > 0) {
-        printf("║  CUDA Memory:     %6.1f GB total, %6.1f GB free          ║\n",
+        fprintf(stderr, "║  CUDA Memory:     %6.1f GB total, %6.1f GB free          ║\n",
                cuda_total_gb, cuda_free_gb);
     }
-    printf("║                                                            ║\n");
-    printf("║  Estimated Requirements:                                   ║\n");
-    printf("║    Model Weights:  %6.1f GB  (%d safetensors files)        ║\n",
+    fprintf(stderr, "║                                                            ║\n");
+    fprintf(stderr, "║  Estimated Requirements:                                   ║\n");
+    fprintf(stderr, "║    Model Weights:  %6.1f GB  (%d safetensors files)        ║\n",
            weight_gb, (int)std::count_if(
                fs::directory_iterator(config.model_dir),
                fs::directory_iterator{},
                [](const auto& e) { return e.path().extension() == ".safetensors"; }));
-    printf("║    KV Cache:       %6.1f GB  (--kv-cache-gb)               ║\n", kv_gb);
-    printf("║    Workspace:      %6.1f GB  (activations)                 ║\n", workspace_gb);
-    printf("║    Vision:         %6.1f GB  (ViT encoder)                 ║\n", vision_gb);
-    printf("║    SSM State:      %6.2f GB  (DeltaNet, 1 req)             ║\n", ssm_gb);
-    printf("║    OS Reserve:     %6.1f GB                                ║\n", os_reserve_gb);
-    printf("║    ─────────────────────────────────                       ║\n");
-    printf("║    Total:          %6.1f GB                                ║\n", total_gb);
-    printf("║                                                            ║\n");
+    fprintf(stderr, "║    KV Cache:       %6.1f GB  (--kv-cache-gb)               ║\n", kv_gb);
+    fprintf(stderr, "║    Workspace:      %6.1f GB  (activations)                 ║\n", workspace_gb);
+    fprintf(stderr, "║    Vision:         %6.1f GB  (ViT encoder)                 ║\n", vision_gb);
+    fprintf(stderr, "║    SSM State:      %6.2f GB  (DeltaNet, 1 req)             ║\n", ssm_gb);
+    fprintf(stderr, "║    OS Reserve:     %6.1f GB                                ║\n", os_reserve_gb);
+    fprintf(stderr, "║    ─────────────────────────────────                       ║\n");
+    fprintf(stderr, "║    Total:          %6.1f GB                                ║\n", total_gb);
+    fprintf(stderr, "║                                                            ║\n");
 
     if (total_gb > effective_available_gb) {
         double deficit = total_gb - effective_available_gb;
-        printf("║  ⚠  WARNING: Estimated %.1f GB exceeds available %.1f GB   ║\n",
+        fprintf(stderr, "║  ⚠  WARNING: Estimated %.1f GB exceeds available %.1f GB   ║\n",
                total_gb, effective_available_gb);
-        printf("║     Deficit: %.1f GB — risk of OOM!                       ║\n", deficit);
-        printf("║                                                            ║\n");
-        printf("║  Suggestions:                                              ║\n");
+        fprintf(stderr, "║     Deficit: %.1f GB — risk of OOM!                       ║\n", deficit);
+        fprintf(stderr, "║                                                            ║\n");
+        fprintf(stderr, "║  Suggestions:                                              ║\n");
         if (kv_gb > 4.0) {
-            printf("║    • Reduce --kv-cache-gb (current: %.1f)                  ║\n", kv_gb);
+            fprintf(stderr, "║    • Reduce --kv-cache-gb (current: %.1f)                  ║\n", kv_gb);
         }
-        printf("║    • Free system memory (kill other processes)             ║\n");
-        printf("║    • Check: free -h                                        ║\n");
-        printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+        fprintf(stderr, "║    • Free system memory (kill other processes)             ║\n");
+        fprintf(stderr, "║    • Check: free -h                                        ║\n");
+        fprintf(stderr, "╚══════════════════════════════════════════════════════════════╝\n\n");
 
         // 如果超过物理总内存 (无论如何都不可能启动), 直接终止
         if (total_gb > mem_total_gb) {
@@ -315,9 +315,9 @@ static void check_memory_budget(const BackendConfig& config, const core::Qwen35C
         fprintf(stderr, "[MemCheck] Proceeding with warning — OOM may occur during inference.\n\n");
     } else {
         double headroom = effective_available_gb - total_gb;
-        printf("║  ✓  Memory OK: %.1f GB headroom (%.0f concurrent reqs)     ║\n",
+        fprintf(stderr, "║  ✓  Memory OK: %.1f GB headroom (%.0f concurrent reqs)     ║\n",
                headroom, std::max(1.0, headroom / (ssm_gb > 0 ? ssm_gb : 0.15)));
-        printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+        fprintf(stderr, "╚══════════════════════════════════════════════════════════════╝\n\n");
     }
 }
 
@@ -345,13 +345,13 @@ InferenceBackend::~InferenceBackend() {
 void InferenceBackend::start() {
     if (running_.exchange(true)) return;  // 已在运行
     engine_->start();
-    std::cout << "[Backend] Inference engine started." << std::endl;
+    std::cerr << "[Backend] Inference engine started." << std::endl;
 }
 
 void InferenceBackend::stop() {
     if (!running_.exchange(false)) return;
     engine_->stop();
-    std::cout << "[Backend] Inference engine stopped." << std::endl;
+    std::cerr << "[Backend] Inference engine stopped." << std::endl;
 }
 
 bool InferenceBackend::submit(InferRequest& request) {
@@ -389,7 +389,7 @@ bool InferenceBackend::submit(InferRequest& request) {
             input.height = img.height;
             all_processed.push_back(core::VisionEncoder::preprocess_image(input, vcfg));
             auto& p = all_processed.back();
-            std::cout << "[Backend] Image preprocessed: grid=" << p.grid_t << "x"
+            std::cerr << "[Backend] Image preprocessed: grid=" << p.grid_t << "x"
                       << p.grid_h << "x" << p.grid_w
                       << " patches=" << p.num_patches()
                       << " output_tokens=" << p.num_output_tokens()
@@ -397,10 +397,10 @@ bool InferenceBackend::submit(InferRequest& request) {
         }
 
         // 处理视频 (帧序列)
-        std::cout << "[Backend] Videos: " << request.videos.size()
+        std::cerr << "[Backend] Videos: " << request.videos.size()
                   << ", Images: " << request.images.size() << std::endl;
         for (auto& vid : request.videos) {
-            std::cout << "[Backend] Video: " << vid.frames.size() << " frames, "
+            std::cerr << "[Backend] Video: " << vid.frames.size() << " frames, "
                       << vid.width << "x" << vid.height
                       << ", fps=" << vid.source_fps << std::endl;
             core::VideoInput input;
@@ -410,7 +410,7 @@ bool InferenceBackend::submit(InferRequest& request) {
             input.source_fps = vid.source_fps;
             all_processed.push_back(core::VisionEncoder::preprocess_video(input, vcfg));
             auto& p = all_processed.back();
-            std::cout << "[Backend] Video preprocessed: grid=" << p.grid_t << "x"
+            std::cerr << "[Backend] Video preprocessed: grid=" << p.grid_t << "x"
                       << p.grid_h << "x" << p.grid_w
                       << " patches=" << p.num_patches()
                       << " output_tokens=" << p.num_output_tokens()
@@ -419,9 +419,9 @@ bool InferenceBackend::submit(InferRequest& request) {
         }
 
         if (!all_processed.empty()) {
-            std::cout << "[Backend] Attaching " << all_processed.size()
+            std::cerr << "[Backend] Attaching " << all_processed.size()
                       << " vision items to request " << request.request_id << std::endl;
-            std::cout.flush();
+            std::cerr.flush();
             engine_->attach_images(request.request_id, std::move(all_processed));
         }
     }

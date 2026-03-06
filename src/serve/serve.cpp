@@ -45,7 +45,7 @@ namespace serve {
 static std::string json_escape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 16);
-    for (char c : s) {
+    for (unsigned char c : s) {
         switch (c) {
             case '"':  out += "\\\""; break;
             case '\\': out += "\\\\"; break;
@@ -54,11 +54,23 @@ static std::string json_escape(const std::string& s) {
             case '\n': out += "\\n";  break;
             case '\r': out += "\\r";  break;
             case '\t': out += "\\t";  break;
-            default:   out += c;      break;
+            default:
+                if (c < 0x20) {
+                    // Escape control chars as \u00XX
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+                break;
         }
     }
     return out;
 }
+
+// Forward declaration
+static std::string json_unescape(const std::string& s);
 
 // Minimal JSON value extraction (no full parser, just enough for API)
 static std::string json_get_string(const std::string& json, const std::string& key) {
@@ -72,9 +84,18 @@ static std::string json_get_string(const std::string& json, const std::string& k
     pos = json.find('"', pos + 1);
     if (pos == std::string::npos) return "";
 
+    // Scan for unescaped closing quote — count preceding backslashes
     auto end = pos + 1;
-    while (end < json.size() && !(json[end] == '"' && json[end-1] != '\\')) end++;
-    return json.substr(pos + 1, end - pos - 1);
+    while (end < json.size()) {
+        if (json[end] == '"') {
+            // Count consecutive backslashes before this quote
+            size_t bs = 0;
+            while (end - 1 - bs > pos && json[end - 1 - bs] == '\\') bs++;
+            if (bs % 2 == 0) break;  // Even backslashes → quote is unescaped
+        }
+        end++;
+    }
+    return json_unescape(json.substr(pos + 1, end - pos - 1));
 }
 
 static double json_get_number(const std::string& json, const std::string& key, double def = 0) {
@@ -605,10 +626,10 @@ static MultimodalContent parse_multimodal_content(const std::string& content_jso
             } else if (type == "video_url" || type == "input_video_url") {
                 // Parse video_url: {"type":"video_url","video_url":{"url":"data:video/mp4;base64,..."}}
                 // Decode video file, extract frames with ffmpeg, build VideoData
-                std::cout << "[Serve] video_url type detected, obj.size()=" << obj.size() << std::endl;
+                std::cerr << "[Serve] video_url type detected, obj.size()=" << obj.size() << std::endl;
                 std::string url = extract_media_url(obj, "video_url");
                 if (!url.empty()) {
-                        std::cout << "[Serve] url.size()=" << url.size() << std::endl;
+                        std::cerr << "[Serve] url.size()=" << url.size() << std::endl;
                             // Strip data URI prefix to get raw base64
                             std::string b64_data;
                             auto comma = url.find(',');
@@ -617,9 +638,9 @@ static MultimodalContent parse_multimodal_content(const std::string& content_jso
                             else
                                 b64_data = url;
 
-                            std::cout << "[Serve] b64_data.size()=" << b64_data.size() << std::endl;
+                            std::cerr << "[Serve] b64_data.size()=" << b64_data.size() << std::endl;
                             auto video_bytes = base64_decode(b64_data);
-                            std::cout << "[Serve] video_bytes.size()=" << video_bytes.size() << std::endl;
+                            std::cerr << "[Serve] video_bytes.size()=" << video_bytes.size() << std::endl;
                             if (!video_bytes.empty()) {
                                 // Write to temp file
                                 std::string tmp_video = "/tmp/qwen_video_" + std::to_string(getpid()) + ".mp4";
@@ -655,9 +676,9 @@ static MultimodalContent parse_multimodal_content(const std::string& content_jso
                                 system(mkdir_cmd.c_str());
                                 std::string ffmpeg_cmd = "ffmpeg -y -i " + tmp_video
                                     + " -vf fps=2 -frames:v 16 -q:v 2 " + tmp_dir + "/frame_%04d.jpg";
-                                std::cout << "[Serve] Running: " << ffmpeg_cmd << std::endl;
+                                std::cerr << "[Serve] Running: " << ffmpeg_cmd << std::endl;
                                 int ffret = system(ffmpeg_cmd.c_str());
-                                std::cout << "[Serve] ffmpeg returned: " << ffret << std::endl;
+                                std::cerr << "[Serve] ffmpeg returned: " << ffret << std::endl;
 
                                 // Load extracted frames
                                 VideoData vd;
@@ -697,7 +718,7 @@ static MultimodalContent parse_multimodal_content(const std::string& content_jso
                                         result.text += buf;
                                         result.text += "<|vision_start|><|video_pad|><|vision_end|>";
                                     }
-                                    std::cout << "[Serve] video_url: " << vd.frames.size()
+                                    std::cerr << "[Serve] video_url: " << vd.frames.size()
                                               << " frames extracted, " << vd.width << "x" << vd.height
                                               << " grid=" << grid_t << "x" << grid_h << "x" << grid_w
                                               << std::endl;
@@ -753,7 +774,7 @@ static void expand_image_placeholders(std::vector<int>& tokens,
             if (group_idx < skip_groups) {
                 // Collapse: history group with no image data available
                 // Emit 0 image_pads — just vision_start + vision_end
-                std::cout << "[Serve] Vision group " << group_idx
+                std::cerr << "[Serve] Vision group " << group_idx
                           << " collapsed (no matching image in request)" << std::endl;
                 expanded.push_back(vision_end_id);
             } else if (img_idx < (int)images.size()) {
@@ -776,7 +797,7 @@ static void expand_image_placeholders(std::vector<int>& tokens,
                 int grid_h = h_bar / vcfg.patch_size;   // patch_size=16
                 int grid_w = w_bar / vcfg.patch_size;
                 int n_tokens = 1 * (grid_h / 2) * (grid_w / 2);  // grid_t=1, spatial_merge_size=2
-                std::cout << "[Serve] Vision group " << group_idx
+                std::cerr << "[Serve] Vision group " << group_idx
                           << " expanded to " << n_tokens << " image_pad tokens" << std::endl;
                 for (int k = 0; k < n_tokens; k++)
                     expanded.push_back(image_pad_id);
@@ -802,10 +823,10 @@ static void expand_image_placeholders(std::vector<int>& tokens,
     // Count resulting image_pad tokens for verification
     int final_pad_count = 0;
     for (int t : expanded) if (t == image_pad_id) final_pad_count++;
-    std::cout << "[Serve] expand_image_placeholders: total_groups=" << total_vision_groups
+    std::cerr << "[Serve] expand_image_placeholders: total_groups=" << total_vision_groups
               << " images=" << images.size() << " skip=" << skip_groups
               << " final_pad_count=" << final_pad_count << std::endl;
-    std::cout.flush();
+    std::cerr.flush();
 
     tokens = std::move(expanded);
 }
@@ -1075,9 +1096,11 @@ static std::string iso8601_now() {
 static std::string generate_id(const std::string& prefix = "chatcmpl") {
     // Generate chatcmpl-xxxxxxxxxxxx style ID with random hex suffix
     static std::mt19937_64 rng(std::random_device{}());
+    static std::mutex rng_mu;
     static const char hex[] = "0123456789abcdef";
     char buf[13]; // 12 hex chars + null
-    uint64_t val = rng();
+    uint64_t val;
+    { std::lock_guard<std::mutex> lk(rng_mu); val = rng(); }
     for (int i = 0; i < 12; ++i) {
         buf[i] = hex[(val >> (i * 4)) & 0xf];
     }
@@ -1483,7 +1506,7 @@ HttpRequest ServeApp::parse_request(int client_fd) {
 void ServeApp::send_response(int client_fd, const HttpResponse& resp) {
     std::ostringstream oss;
     oss << "HTTP/1.1 " << resp.status_code << " " << resp.status_text << "\r\n";
-    oss << "Content-Type: " << resp.content_type << "\r\n";
+    oss << "Content-Type: " << resp.content_type << "; charset=utf-8\r\n";
     oss << "Access-Control-Allow-Origin: *\r\n";
     oss << "Content-Length: " << resp.body.size() << "\r\n";
     oss << "\r\n";
@@ -1902,7 +1925,7 @@ void ServeApp::handle_ollama_version(const HttpRequest& /*req*/, int client_fd) 
 }
 
 void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
-    std::cout << "[Serve] handle_openai_chat: body=" << req.body.size() << std::endl;
+    std::cerr << "[Serve] handle_openai_chat: body=" << req.body.size() << std::endl;
     const auto& tok = backend_.tokenizer();
     if (!tok.is_loaded()) {
         HttpResponse resp;
@@ -2056,10 +2079,10 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
             if (t == 248056) n_img_pad++;
             else if (t == 248057) n_vid_pad++;
         }
-        std::cout << "[Serve] Final prompt: tokens=" << prompt_count
+        std::cerr << "[Serve] Final prompt: tokens=" << prompt_count
                   << " image_pad=" << n_img_pad << " video_pad=" << n_vid_pad
                   << " images_to_encode=" << images.size() << std::endl;
-        std::cout.flush();
+        std::cerr.flush();
     }
 
     // Submit inference request
@@ -2095,7 +2118,7 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
     if (stream) {
         // SSE streaming response
         std::string header = "HTTP/1.1 200 OK\r\n"
-                             "Content-Type: text/event-stream\r\n"
+                             "Content-Type: text/event-stream; charset=utf-8\r\n"
                              "Cache-Control: no-cache\r\n"
                              "Connection: keep-alive\r\n"
                              "Access-Control-Allow-Origin: *\r\n\r\n";
@@ -2402,7 +2425,7 @@ void ServeApp::handle_openai_completions(const HttpRequest& req, int client_fd) 
 
     if (stream) {
         std::string header = "HTTP/1.1 200 OK\r\n"
-                             "Content-Type: text/event-stream\r\n"
+                             "Content-Type: text/event-stream; charset=utf-8\r\n"
                              "Cache-Control: no-cache\r\n"
                              "Connection: keep-alive\r\n"
                              "Access-Control-Allow-Origin: *\r\n\r\n";
@@ -2722,7 +2745,7 @@ void ServeApp::handle_ollama_generate(const HttpRequest& req, int client_fd) {
 
     if (stream) {
         std::string header = "HTTP/1.1 200 OK\r\n"
-                             "Content-Type: application/x-ndjson\r\n"
+                             "Content-Type: application/x-ndjson; charset=utf-8\r\n"
                              "Transfer-Encoding: chunked\r\n\r\n";
         send(client_fd, header.c_str(), header.size(), MSG_NOSIGNAL);
 
@@ -2949,7 +2972,7 @@ void ServeApp::handle_ollama_chat(const HttpRequest& req, int client_fd) {
 
     if (stream) {
         std::string header = "HTTP/1.1 200 OK\r\n"
-                             "Content-Type: application/x-ndjson\r\n"
+                             "Content-Type: application/x-ndjson; charset=utf-8\r\n"
                              "Transfer-Encoding: chunked\r\n\r\n";
         send(client_fd, header.c_str(), header.size(), MSG_NOSIGNAL);
 

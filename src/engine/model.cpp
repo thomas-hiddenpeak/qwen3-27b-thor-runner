@@ -41,7 +41,7 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
     for (const auto& entry : fs::directory_iterator(model_dir)) {
         if (entry.path().extension() != ".safetensors") continue;
         ++file_count;
-        std::cout << "Loading shard " << file_count << ": "
+        std::cerr << "Loading shard " << file_count << ": "
                   << entry.path().filename().string() << std::endl;
 
         auto loader = std::make_unique<io::SafetensorsLoader>(entry.path().string());
@@ -92,7 +92,7 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
     cudaStreamSynchronize(conv_stream);
     cudaStreamDestroy(conv_stream);
 
-    std::cout << "Loaded " << (tensor_map.size() + f32_map.size()) << " tensors ("
+    std::cerr << "Loaded " << (tensor_map.size() + f32_map.size()) << " tensors ("
               << file_count << " shards) into VRAM." << std::endl;
 
     // 2. 绑定权重 — 根据层类型分别绑定
@@ -109,7 +109,7 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
         return nullptr;
     };
 
-    std::cout << "Weight binding complete." << std::endl;
+    std::cerr << "Weight binding complete." << std::endl;
 
     for (int i = 0; i < config_.num_hidden_layers; ++i) {
         std::string p = "model.language_model.layers." + std::to_string(i) + ".";
@@ -227,7 +227,7 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
                 merged_total += bytes;
             }
         }
-        std::cout << "      Merged projections: " << (merged_total >> 20)
+        std::cerr << "      Merged projections: " << (merged_total >> 20)
                   << " MB (QKV×16 + QKVZAB×48, net zero)" << std::endl;
 
         // Level 3: Merge Gate+Up projections for T>1 (all 64 layers)
@@ -260,7 +260,7 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
             release_weight(up_w);
             gate_up_total += bytes;
         }
-        std::cout << "      Merged Gate+Up: " << (gate_up_total >> 20)
+        std::cerr << "      Merged Gate+Up: " << (gate_up_total >> 20)
                   << " MB (64 layers, net zero)" << std::endl;
     }
 
@@ -361,10 +361,10 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
                 mtp_release(mtp_up);
             }
 
-            std::cout << "[Model] MTP module loaded (1 transformer layer, "
+            std::cerr << "[Model] MTP module loaded (1 transformer layer, "
                       << "QKV+GateUp merged, speculative decoding enabled)" << std::endl;
         } else {
-            std::cout << "[Model] No MTP weights found, speculative decoding disabled" << std::endl;
+            std::cerr << "[Model] No MTP weights found, speculative decoding disabled" << std::endl;
         }
     }
 
@@ -426,14 +426,14 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
             if (all_blocks_ok && mn_w && mf1w && mf2w) {
                 vision_encoder_->set_merger_weights(mn_w, mn_b, mf1w, mf1b, mf2w, mf2b);
                 has_vision_ = true;
-                std::cout << "[Model] Vision encoder loaded (27-layer ViT + merger, "
+                std::cerr << "[Model] Vision encoder loaded (27-layer ViT + merger, "
                           << "~461M params)" << std::endl;
             } else {
                 std::cerr << "[Model] Missing merger weights, vision disabled" << std::endl;
                 vision_encoder_.reset();
             }
         } else {
-            std::cout << "[Model] No vision weights found, multimodal disabled" << std::endl;
+            std::cerr << "[Model] No vision weights found, multimodal disabled" << std::endl;
         }
     }
 }

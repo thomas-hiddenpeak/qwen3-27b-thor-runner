@@ -34,7 +34,7 @@ KVCacheManager::KVCacheManager(
     k_cache_ = std::make_unique<core::Tensor>(shape, dtype_, device_allocator);
     v_cache_ = std::make_unique<core::Tensor>(shape, dtype_, device_allocator);
     
-    std::cout << "KVCacheManager: " << num_layers_ << " layers x " << num_blocks_ << " blocks = " 
+    std::cerr << "KVCacheManager: " << num_layers_ << " layers x " << num_blocks_ << " blocks = " 
               << total_blocks << " total blocks, "
               << (total_blocks * block_size_ * num_heads_ * head_dim_ * 2 * 2 / (1024*1024)) << " MB (device)" << std::endl;
 

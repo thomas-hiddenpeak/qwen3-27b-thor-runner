@@ -81,7 +81,7 @@ DiskBackend::DiskBackend(const std::string& cache_dir, size_t max_bytes)
     // 扫描已有缓存文件, 重建索引 (持久缓存启动恢复)
     scan_existing_files();
 
-    std::cout << "[DiskBackend] Initialized at " << cache_dir
+    std::cerr << "[DiskBackend] Initialized at " << cache_dir
               << " with max " << (max_bytes / (1024*1024)) << " MB"
               << ", recovered " << index_.size() << " entries ("
               << (current_bytes_ / (1024*1024)) << " MB)" << std::endl;

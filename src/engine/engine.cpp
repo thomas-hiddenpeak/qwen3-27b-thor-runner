@@ -73,7 +73,7 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
     cudaStreamCreate(&compute_stream_);
 
     // 1. 初始化模型
-    std::cout << "Initializing Qwen3.5 Model..." << std::endl;
+    std::cerr << "Initializing Qwen3.5 Model..." << std::endl;
     model_ = std::make_unique<Qwen35Model>(config_);
     model_->load_weights(model_dir);
 
@@ -281,7 +281,7 @@ void InferenceEngine::stop() {
 }
 
 void InferenceEngine::inference_loop() {
-    std::cout << "Inference engine started." << std::endl;
+    std::cerr << "Inference engine started." << std::endl;
     
     std::vector<RequestContext*> active_requests;
 
@@ -312,10 +312,10 @@ void InferenceEngine::inference_loop() {
                 if (it != pending_images_.end()) {
                     ctx->processed_images = std::move(it->second);
                     pending_images_.erase(it);
-                    std::cout << "[Engine] Found " << ctx->processed_images.size()
+                    std::cerr << "[Engine] Found " << ctx->processed_images.size()
                               << " vision items for request " << req.request_id << std::endl;
                 } else {
-                    std::cout << "[Engine] No vision items for request " << req.request_id
+                    std::cerr << "[Engine] No vision items for request " << req.request_id
                               << " (pending_images size=" << pending_images_.size() << ")" << std::endl;
                 }
             }
@@ -358,7 +358,7 @@ void InferenceEngine::inference_loop() {
                 // SSD 模式: 只分配一个 chunk 的 blocks
                 int first_chunk = std::min(req.prompt_len, max_chunk_size_);
                 num_blocks_needed = (first_chunk + 15) / 16;
-                std::cout << "[Engine] SSD mode: allocating " << num_blocks_needed
+                std::cerr << "[Engine] SSD mode: allocating " << num_blocks_needed
                           << " blocks for first chunk (total prompt=" << req.prompt_len << ")" << std::endl;
             } else {
                 num_blocks_needed = (req.prompt_len + 15) / 16;
@@ -392,7 +392,7 @@ void InferenceEngine::inference_loop() {
                 for (size_t i = 1; i < active_requests.size(); ++i) {
                     auto* r = active_requests[i];
                     if (!r->cache_state.is_swapped && !r->is_finished && r->cache_state.ssm_slot >= 0) {
-                        std::cout << "[Engine] No free SSM slot, swapping out request "
+                        std::cerr << "[Engine] No free SSM slot, swapping out request "
                                   << r->request_id << " (slot " << r->cache_state.ssm_slot << ")" << std::endl;
                         try_swap_out_victim(active_requests, 0);
                         freed_slot = cache_manager_->num_free_ssm_slots() > 0;
@@ -428,12 +428,12 @@ void InferenceEngine::inference_loop() {
                     cudaMemsetAsync(ctx->cache_state.ssm_states[li], 0, ssm_size_per_layer_, compute_stream_);
                     cudaMemsetAsync(ctx->cache_state.conv_states[li], 0, conv_size_per_layer_, compute_stream_);
                 }
-                std::cout << "[Engine] Assigned SSM slot " << slot << " to request "
+                std::cerr << "[Engine] Assigned SSM slot " << slot << " to request "
                           << req.request_id << " (free slots: " << cache_manager_->num_free_ssm_slots() << ")" << std::endl;
             }
             all_requests_.push_back(std::move(ctx));
             
-            std::cout << "Received request " << req.request_id << " with prompt len " << req.prompt_len << std::endl;
+            std::cerr << "Received request " << req.request_id << " with prompt len " << req.prompt_len << std::endl;
         }
 
         if (active_requests.empty()) {
@@ -455,7 +455,7 @@ void InferenceEngine::inference_loop() {
                         resp.is_finished = true;
                         resp.error_code = -2;  // cancelled
                         ipc_resp_queue_->push(resp);
-                        std::cout << "[Engine] Cancelled request " << ctx->request_id << std::endl;
+                        std::cerr << "[Engine] Cancelled request " << ctx->request_id << std::endl;
                     }
                 }
                 cancel_set_.clear();
@@ -561,7 +561,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
 
     // ---- 如果该请求被换出过, 先换入 ----
     if (ctx->cache_state.is_swapped && cache_manager_->has_swapper()) {
-        std::cout << "[Engine] Swapping in request " << ctx->request_id << std::endl;
+        std::cerr << "[Engine] Swapping in request " << ctx->request_id << std::endl;
 
         // 换入前检查: 需要足够的 free blocks, 否则先换出其它请求
         int ctx_len = cache_manager_->get_swapped_context_len(ctx->request_id);
@@ -587,7 +587,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             ctx->is_finished = true;
             return;
         }
-        std::cout << "[Engine] Swap-in: assigned SSM slot " << ctx->cache_state.ssm_slot
+        std::cerr << "[Engine] Swap-in: assigned SSM slot " << ctx->cache_state.ssm_slot
                   << " to request " << ctx->request_id << std::endl;
     }
     
@@ -607,7 +607,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                     ctx->prompt_tokens.data(), num_tokens,
                     ctx, d_workspace_, d_block_tables_);
                 if (cached_tokens > 0) {
-                    std::cout << "[Cache] Restored " << cached_tokens << "/" << num_tokens
+                    std::cerr << "[Cache] Restored " << cached_tokens << "/" << num_tokens
                               << " tokens from SSD" << std::endl;
                 }
             }
@@ -640,7 +640,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             int num_chunks = (prefill_tokens + chunk_size - 1) / chunk_size;
 
             if (num_chunks > 1) {
-                std::cout << "[ChunkedPrefill] " << prefill_tokens << " tokens → "
+                std::cerr << "[ChunkedPrefill] " << prefill_tokens << " tokens → "
                           << num_chunks << " chunks of ≤" << chunk_size << std::endl;
             }
 
@@ -700,7 +700,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                                 }
                                 ctx->cache_state.block_tracker.mark_evicted(ssd_evict_cursor, to_evict);
 
-                                std::cout << "[SSD-Evict] Evicted " << evict_logical.size()
+                                std::cerr << "[SSD-Evict] Evicted " << evict_logical.size()
                                           << " blocks [" << ssd_evict_cursor << ", "
                                           << ssd_evict_cursor + to_evict << ") to SSD" << std::endl;
                             }
@@ -899,7 +899,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 ctx->cache_state.context_len = ctx_len_for_chunk;
 
                 if (num_chunks > 1) {
-                    std::cout << "[ChunkedPrefill]   chunk " << chunk_idx
+                    std::cerr << "[ChunkedPrefill]   chunk " << chunk_idx
                               << "/" << num_chunks << ": tokens ["
                               << chunk_start << ", " << chunk_end
                               << "), ctx_len=" << ctx_len_for_chunk
@@ -962,7 +962,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             }
             
             profiler_.request_prefill_done(num_tokens);
-            std::cout << "Prefill tok=" << next_token
+            std::cerr << "Prefill tok=" << next_token
                       << " txt=\"" << token_to_log_text(next_token) << "\""
                       << " (" << num_tokens << " tokens)" << std::endl;
             profiler_.print_step_report(0);
@@ -975,7 +975,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             // 用占位符标记 prefill 完成, 下一次 step() 会进入 decode 生成第一个 token
             ctx->generated_tokens.push_back(-1);  // 占位, decode 会使用 last prompt token
             profiler_.request_prefill_done(num_tokens);
-            std::cout << "[Cache] Full hit! Skipped prefill (" << num_tokens << " tokens)" << std::endl;
+            std::cerr << "[Cache] Full hit! Skipped prefill (" << num_tokens << " tokens)" << std::endl;
 
             // ---- LMCache Monitor: 完全命中 ----
             cache_manager_->record_prefix_stats(num_tokens, num_tokens, 0);
@@ -997,7 +997,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             ctx->is_finished = true;
             profiler_.request_done();
             profiler_.print_request_summary();
-            std::cout << "Request " << ctx->request_id << " finished (max_new_tokens)." << std::endl;
+            std::cerr << "Request " << ctx->request_id << " finished (max_new_tokens)." << std::endl;
             return;
         }
 
@@ -1178,7 +1178,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                     ctx->draft_tokens.clear();
                     profiler_.request_done();
                     profiler_.print_request_summary();
-                    std::cout << "Decode step " << ctx->generated_tokens.size()
+                    std::cerr << "Decode step " << ctx->generated_tokens.size()
                               << ". tok=" << dtok
                               << " (MTP partial accept, EOS at draft " << i << ")" << std::endl;
                     return;
@@ -1205,7 +1205,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 ctx->draft_tokens.clear();
                 profiler_.request_done();
                 profiler_.print_request_summary();
-                std::cout << "Decode step " << ctx->generated_tokens.size()
+                std::cerr << "Decode step " << ctx->generated_tokens.size()
                           << ". tok=" << next_token << " (MTP done)" << std::endl;
                 return;
             }
@@ -1261,7 +1261,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 ? (float)mtp_total_accepted_ / (mtp_verify_count_ * N) * 100.f : 0.f;
             float avg_tok_per_step = mtp_verify_count_ > 0
                 ? (float)mtp_total_emitted_ / mtp_verify_count_ : 0.f;
-            std::cout << "Decode step " << step_n
+            std::cerr << "Decode step " << step_n
                       << ". tok=" << next_token
                       << " txt=\"" << token_to_log_text(next_token) << "\""
                       << " (MTP " << accept_count << "/" << N
@@ -1468,7 +1468,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 if (is_repeating) {
                     done = true;
                     eos = true;
-                    std::cout << "[Engine] Repetition detected at step "
+                    std::cerr << "[Engine] Repetition detected at step "
                               << sz << ", force stopping." << std::endl;
                 }
             }
@@ -1504,11 +1504,10 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             if (step_n % 10 == 0) {
                 profiler_.print_step_report(step_n);
             }
-            std::cout << "Decode step " << step_n
+            std::cerr << "Decode step " << step_n
                       << ". tok=" << next_token
                       << " txt=\"" << token_to_log_text(next_token) << "\""
                       << std::endl;
-            fflush(stdout);
         }
     }
 }
@@ -1604,14 +1603,30 @@ std::string InferenceEngine::token_to_log_text(int token_id) const {
     if (piece.empty()) return "";
 
     std::ostringstream oss;
-    for (unsigned char ch : piece) {
-        if (ch == '\n') oss << "\\n";
-        else if (ch == '\r') oss << "\\r";
-        else if (ch == '\t') oss << "\\t";
-        else if (std::isprint(ch)) oss << static_cast<char>(ch);
-        else {
-            oss << "\\x" << std::hex << std::setw(2) << std::setfill('0')
-                << static_cast<int>(ch) << std::dec;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(piece.data());
+    size_t len = piece.size();
+    for (size_t i = 0; i < len; ) {
+        unsigned char ch = p[i];
+        if (ch == '\n') { oss << "\\n"; ++i; }
+        else if (ch == '\r') { oss << "\\r"; ++i; }
+        else if (ch == '\t') { oss << "\\t"; ++i; }
+        else if (ch < 0x80) {
+            // ASCII printable or escape control chars
+            if (std::isprint(ch)) oss << static_cast<char>(ch);
+            else oss << "\\x" << std::hex << std::setw(2) << std::setfill('0')
+                     << static_cast<int>(ch) << std::dec;
+            ++i;
+        } else {
+            // UTF-8 multi-byte: pass through entire sequence
+            int seq_len = (ch < 0xC0) ? 1 : (ch < 0xE0) ? 2 : (ch < 0xF0) ? 3 : 4;
+            if (i + seq_len <= len) {
+                oss.write(reinterpret_cast<const char*>(p + i), seq_len);
+                i += seq_len;
+            } else {
+                oss << "\\x" << std::hex << std::setw(2) << std::setfill('0')
+                    << static_cast<int>(ch) << std::dec;
+                ++i;
+            }
         }
     }
     return oss.str();
@@ -1804,12 +1819,12 @@ int InferenceEngine::try_swap_out_victim(
         return 0;  // 没有可换出的请求
     }
 
-    std::cout << "[Engine] Swapping out request " << victim->request_id
+    std::cerr << "[Engine] Swapping out request " << victim->request_id
               << " (" << max_blocks << " blocks, ctx=" << victim->cache_state.context_len << ")" << std::endl;
 
     cache_manager_->swap_out_request(victim->request_id, victim);
 
-    std::cout << "[Engine] Swap-out: returned SSM slot (free slots: "
+    std::cerr << "[Engine] Swap-out: returned SSM slot (free slots: "
               << cache_manager_->num_free_ssm_slots() << ")" << std::endl;
 
     return max_blocks;
