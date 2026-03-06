@@ -152,6 +152,7 @@ void ChatApp::print_banner() {
     printf("    %s/clear%s    — Clear history\n", color::YELLOW, color::RESET);
     printf("    %s/tokens N%s — Set max_new_tokens\n", color::YELLOW, color::RESET);
     printf("    %s/think%s    — Toggle thinking mode\n", color::YELLOW, color::RESET);
+    printf("    %s/nothink%s  — Disable thinking mode\n", color::YELLOW, color::RESET);
     printf("    %s/stats%s    — Toggle performance stats\n", color::YELLOW, color::RESET);
     printf("    %s/exit%s     — Quit\n", color::YELLOW, color::RESET);
     printf("    %sCtrl+C%s    — Interrupt current generation\n", color::YELLOW, color::RESET);

@@ -57,7 +57,8 @@ struct RequestContext {
 class InferenceEngine {
 public:
     InferenceEngine(const Qwen35Config& config, const std::string& model_dir,
-                    const cache::CacheConfig& cache_config = cache::CacheConfig());
+                    const cache::CacheConfig& cache_config = cache::CacheConfig(),
+                    bool verbose = true);
     ~InferenceEngine();
 
     // 启动后台推理线程
@@ -184,6 +185,9 @@ private:
     // 调试日志: token_id -> 文本
     Tokenizer log_tokenizer_;
     bool log_tokenizer_ready_ = false;
+
+    // 日志详细度
+    bool verbose_ = true;
 
     // 性能统计
     perf::PerfProfiler profiler_;

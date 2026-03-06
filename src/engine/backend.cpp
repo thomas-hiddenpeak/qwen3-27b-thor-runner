@@ -335,7 +335,7 @@ InferenceBackend::InferenceBackend(const BackendConfig& config)
         std::cerr << "[Backend] Warning: tokenizer load failed from " << config_.model_dir << std::endl;
     }
 
-    engine_ = std::make_unique<core::InferenceEngine>(model_config_, config_.model_dir, cache_config);
+    engine_ = std::make_unique<core::InferenceEngine>(model_config_, config_.model_dir, cache_config, config_.verbose);
 }
 
 InferenceBackend::~InferenceBackend() {

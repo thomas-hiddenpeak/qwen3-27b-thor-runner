@@ -97,6 +97,9 @@ struct BackendConfig {
     int         mtp_kv_blocks    = 256;
     int         mtp_num_drafts   = 3;    // 每步生成的 draft token 数 (1~8)
 
+    // 日志详细度 (chat 模式下设为 false 以抑制推理日志)
+    bool        verbose          = true;
+
     // 从 CLI 参数构建
     static BackendConfig from_args(int argc, char** argv);
 

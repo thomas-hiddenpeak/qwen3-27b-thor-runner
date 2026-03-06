@@ -208,6 +208,7 @@ static int cmd_chat(int argc, char** argv) {
     using namespace qwen_thor;
 
     auto backend_config = BackendConfig::from_args(argc, argv);
+    backend_config.verbose = false;  // chat 模式抑制推理日志
     auto tui_config = tui::TuiConfig::from_args(argc, argv);
 
     try {
