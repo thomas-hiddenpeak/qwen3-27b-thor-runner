@@ -1466,6 +1466,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             }
 
             // 10. SSM/Conv state recovery
+            profiler_.begin("mtp_restore", compute_stream_);
             if (accept_count == N) {
                 // Full accept: SSM/Conv state is correct (processed all tokens)
                 mtp_accept_count_++;
@@ -1488,6 +1489,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                                     cudaMemcpyDeviceToDevice, compute_stream_);
                 }
             }
+            profiler_.end("mtp_restore", compute_stream_);
 
             // 11. Rollback MTP context & generate new drafts
             if (accept_count < N) {
@@ -1496,9 +1498,11 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             }
 
             // Generate N new drafts from the last accepted position's hidden state
+            profiler_.begin("mtp_draft", compute_stream_);
             __nv_bfloat16* h_for_mtp = d_hidden_states_ + (size_t)accept_count * hs;
             ctx->mtp_pos = ctx->context_len - 1;
             generate_mtp_drafts(h_for_mtp, next_token, ctx->mtp_pos);
+            profiler_.end("mtp_draft", compute_stream_);
 
             // 12. Statistics
             int total_emitted = accept_count + 1;
@@ -1769,6 +1773,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             // GPU-resident argmax chain: 与 verify 路径共享相同的优化模式
             if (mtp_kv_manager_ && !ctx->is_finished && !ctx->uses_ssd_blocks
                 && ctx->draft_tokens.empty()) {
+                profiler_.begin("mtp_bootstrap", compute_stream_);
                 const int N = num_mtp_drafts_;
                 __nv_bfloat16* h = d_hidden_states_;
                 ctx->mtp_pos = ctx->context_len - 1;
@@ -1830,6 +1835,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                     }
                     ctx->mtp_context_len += N;
                 }
+                profiler_.end("mtp_bootstrap", compute_stream_);
             }
 
             profiler_.request_decode_step();
