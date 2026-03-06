@@ -52,7 +52,7 @@ CacheManager::CacheManager(const core::Qwen35Config& model_config,
     kv_manager_ = std::make_unique<ops::KVCacheManager>(
         capacity.gpu_kv_blocks, block_size_, model_config.num_key_value_heads,
         model_config.head_dim, core::DataType::FP16, allocator, num_full_attn);
-    printf("[CacheManager] GPU KV pool: %d blocks, %d max tokens (%.1f GB)\n",
+    fprintf(stderr, "[CacheManager] GPU KV pool: %d blocks, %d max tokens (%.1f GB)\n",
            total_gpu_blocks_, gpu_max_tokens_, cache_config.kv_cache_budget_gb);
 
     // 2. SSM/Conv Pool
@@ -83,7 +83,7 @@ CacheManager::CacheManager(const core::Qwen35Config& model_config,
         for (int s = MAX_CACHE_SSM_SLOTS - 1; s >= 0; --s)
             free_ssm_slots_.push_back(s);
 
-        printf("[CacheManager] SSM/Conv pool: %d slots × %d layers, "
+        fprintf(stderr, "[CacheManager] SSM/Conv pool: %d slots × %d layers, "
                "SSM=%.1f KB/layer, Conv=%.1f KB/layer, total=%.1f MB\n",
                MAX_CACHE_SSM_SLOTS, num_linear_layers_,
                ssm_size_per_layer_ / 1024.0, conv_size_per_layer_ / 1024.0,
@@ -98,7 +98,7 @@ CacheManager::CacheManager(const core::Qwen35Config& model_config,
         int block_bytes = block_size_ * num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16);
         std::string swap_dir = cache_config.cache_dir + "/kv_swap";
         kv_swapper_ = std::make_unique<KVSwapper>(swap_dir, block_bytes, num_layers_);
-        printf("[CacheManager] KV Swapper at %s\n", swap_dir.c_str());
+        fprintf(stderr, "[CacheManager] KV Swapper at %s\n", swap_dir.c_str());
     }
 
     // 5. Block SSD Store + Streaming Attention Buffers
@@ -133,7 +133,7 @@ CacheManager::CacheManager(const core::Qwen35Config& model_config,
                    (size_t)(total_gpu_blocks_ + staging_num_blocks_ + 256) * sizeof(int));
         cudaMalloc(&d_ssd_context_lens_, sizeof(int));
 
-        printf("[CacheManager] Streaming attention: staging %d blocks\n", staging_num_blocks_);
+        fprintf(stderr, "[CacheManager] Streaming attention: staging %d blocks\n", staging_num_blocks_);
     }
 }
 

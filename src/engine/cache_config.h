@@ -167,16 +167,16 @@ struct CacheConfig {
     }
 
     void print() const {
-        std::cout << "  KV Cache Budget: " << kv_cache_budget_gb << " GB" << std::endl;
-        std::cout << "  Prefix Cache:    " << (enabled ? "ENABLED" : "DISABLED") << std::endl;
+        std::cerr << "  KV Cache Budget: " << kv_cache_budget_gb << " GB" << std::endl;
+        std::cerr << "  Prefix Cache:    " << (enabled ? "ENABLED" : "DISABLED") << std::endl;
         if (!enabled) return;
-        std::cout << "  Cache Dir:       " << cache_dir << std::endl;
-        std::cout << "  SSD Budget:      " << (max_cache_bytes / (1024ULL*1024*1024)) << " GB" << std::endl;
-        std::cout << "  Chunk Size:      " << chunk_size << " tokens" << std::endl;
-        std::cout << "  SSM Caching:     " << (cache_ssm_state ? "ON" : "OFF") << std::endl;
-        std::cout << "  Eviction:        " << eviction_policy << std::endl;
-        std::cout << "  MTP Spec Decode: " << mtp_mode << std::endl;
-        std::cout << "  MTP KV Blocks:   " << mtp_kv_blocks << std::endl;
+        std::cerr << "  Cache Dir:       " << cache_dir << std::endl;
+        std::cerr << "  SSD Budget:      " << (max_cache_bytes / (1024ULL*1024*1024)) << " GB" << std::endl;
+        std::cerr << "  Chunk Size:      " << chunk_size << " tokens" << std::endl;
+        std::cerr << "  SSM Caching:     " << (cache_ssm_state ? "ON" : "OFF") << std::endl;
+        std::cerr << "  Eviction:        " << eviction_policy << std::endl;
+        std::cerr << "  MTP Spec Decode: " << mtp_mode << std::endl;
+        std::cerr << "  MTP KV Blocks:   " << mtp_kv_blocks << std::endl;
     }
 };
 
@@ -314,47 +314,47 @@ public:
 
     // 打印格式化容量报告
     static void print_report(const CapacityReport& r, const CacheConfig& config) {
-        printf("\n");
-        printf("╔══════════════════════════════════════════════════════════════╗\n");
-        printf("║              Capacity Planning Report                      ║\n");
-        printf("╠══════════════════════════════════════════════════════════════╣\n");
-        printf("║                                                            ║\n");
-        printf("║  ── GPU KV Cache (Active, In-Memory) ──                    ║\n");
-        printf("║    Budget:           %6.1f GB                              ║\n", config.kv_cache_budget_gb);
-        printf("║    Blocks:           %6d  (block_size=16)                 ║\n", r.gpu_kv_blocks);
-        printf("║    Max Tokens/Req:   %6d  (%.1f K, 单请求上限)            ║\n",
+        fprintf(stderr, "\n");
+        fprintf(stderr, "╔══════════════════════════════════════════════════════════════╗\n");
+        fprintf(stderr, "║              Capacity Planning Report                      ║\n");
+        fprintf(stderr, "╠══════════════════════════════════════════════════════════════╣\n");
+        fprintf(stderr, "║                                                            ║\n");
+        fprintf(stderr, "║  ── GPU KV Cache (Active, In-Memory) ──                    ║\n");
+        fprintf(stderr, "║    Budget:           %6.1f GB                              ║\n", config.kv_cache_budget_gb);
+        fprintf(stderr, "║    Blocks:           %6d  (block_size=16)                 ║\n", r.gpu_kv_blocks);
+        fprintf(stderr, "║    Max Tokens/Req:   %6d  (%.1f K, 单请求上限)            ║\n",
                r.gpu_max_tokens, r.gpu_max_tokens / 1024.0);
-        printf("║    Actual Memory:    %6.2f GB                              ║\n", r.gpu_kv_memory_gb);
-        printf("║                                                            ║\n");
+        fprintf(stderr, "║    Actual Memory:    %6.2f GB                              ║\n", r.gpu_kv_memory_gb);
+        fprintf(stderr, "║                                                            ║\n");
         if (config.enabled) {
-            printf("║  ── SSD Swap (Idle Request Offload) ──                     ║\n");
-            printf("║    Budget:           %6.1f GB                              ║\n", r.ssd_budget_gb);
-            printf("║    Swap Capacity:    %6d tokens (%.1f K)                  ║\n",
+            fprintf(stderr, "║  ── SSD Swap (Idle Request Offload) ──                     ║\n");
+            fprintf(stderr, "║    Budget:           %6.1f GB                              ║\n", r.ssd_budget_gb);
+            fprintf(stderr, "║    Swap Capacity:    %6d tokens (%.1f K)                  ║\n",
                    r.ssd_swap_tokens, r.ssd_swap_tokens / 1024.0);
-            printf("║    Directory:        %-36s   ║\n", config.cache_dir.c_str());
-            printf("║                                                            ║\n");
-            printf("║  ── Multi-Request Total ──                                 ║\n");
-            printf("║    GPU (active):     %6d tokens                          ║\n", r.gpu_max_tokens);
-            printf("║    SSD (swapped):  + %6d tokens                          ║\n", r.ssd_swap_tokens);
-            printf("║                     ────────                               ║\n");
-            printf("║    Total:            %6d tokens  (%.1f K)                ║\n",
+            fprintf(stderr, "║    Directory:        %-36s   ║\n", config.cache_dir.c_str());
+            fprintf(stderr, "║                                                            ║\n");
+            fprintf(stderr, "║  ── Multi-Request Total ──                                 ║\n");
+            fprintf(stderr, "║    GPU (active):     %6d tokens                          ║\n", r.gpu_max_tokens);
+            fprintf(stderr, "║    SSD (swapped):  + %6d tokens                          ║\n", r.ssd_swap_tokens);
+            fprintf(stderr, "║                     ────────                               ║\n");
+            fprintf(stderr, "║    Total:            %6d tokens  (%.1f K)                ║\n",
                    r.total_multi_req_tokens, r.total_multi_req_tokens / 1024.0);
-            printf("║    (单请求最大上下文仍为 %d tokens)                        ║\n", r.gpu_max_tokens);
+            fprintf(stderr, "║    (单请求最大上下文仍为 %d tokens)                        ║\n", r.gpu_max_tokens);
         } else {
-            printf("║    Max Tokens:       %6d  (%.1f K, GPU only)             ║\n",
+            fprintf(stderr, "║    Max Tokens:       %6d  (%.1f K, GPU only)             ║\n",
                    r.gpu_max_tokens, r.gpu_max_tokens / 1024.0);
         }
-        printf("║                                                            ║\n");
-        printf("║  ── Per-Request Fixed Cost (SSM/Conv) ──                   ║\n");
-        printf("║    SSM State:        %6.1f MB  (48 layers, BF16)           ║\n", r.ssm_per_request_mb);
-        printf("║    Conv State:       %6.1f MB  (48 layers, BF16)           ║\n", r.conv_per_request_mb);
-        printf("║    Total/Request:    %6.1f MB                              ║\n", r.total_per_request_mb);
-        printf("║                                                            ║\n");
-        printf("║  ── Concurrency Estimate ──                                ║\n");
-        printf("║    Memory for SSM:   %6.1f GB available                    ║\n", r.available_for_ssm_gb);
-        printf("║    Max Batch Size:   %6d requests (同时 decode)            ║\n", r.estimated_max_batch);
-        printf("║                                                            ║\n");
-        printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+        fprintf(stderr, "║                                                            ║\n");
+        fprintf(stderr, "║  ── Per-Request Fixed Cost (SSM/Conv) ──                   ║\n");
+        fprintf(stderr, "║    SSM State:        %6.1f MB  (48 layers, BF16)           ║\n", r.ssm_per_request_mb);
+        fprintf(stderr, "║    Conv State:       %6.1f MB  (48 layers, BF16)           ║\n", r.conv_per_request_mb);
+        fprintf(stderr, "║    Total/Request:    %6.1f MB                              ║\n", r.total_per_request_mb);
+        fprintf(stderr, "║                                                            ║\n");
+        fprintf(stderr, "║  ── Concurrency Estimate ──                                ║\n");
+        fprintf(stderr, "║    Memory for SSM:   %6.1f GB available                    ║\n", r.available_for_ssm_gb);
+        fprintf(stderr, "║    Max Batch Size:   %6d requests (同时 decode)            ║\n", r.estimated_max_batch);
+        fprintf(stderr, "║                                                            ║\n");
+        fprintf(stderr, "╚══════════════════════════════════════════════════════════════╝\n\n");
     }
 };
 

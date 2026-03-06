@@ -77,7 +77,7 @@ KVSwapper::KVSwapper(const std::string& swap_dir, int block_bytes, int num_layer
     size_t per_block_total = (size_t)num_layers_ * block_bytes_ * 2;
     blocks_per_batch_ = std::max(1, (int)(staging_capacity_ / per_block_total));
 
-    printf("[KVSwapper] Initialized: staging=%zu MB, %d blocks/batch, "
+    fprintf(stderr, "[KVSwapper] Initialized: staging=%zu MB, %d blocks/batch, "
            "block_bytes=%d, layers=%d, dir=%s\n",
            staging_mb, blocks_per_batch_, block_bytes_, num_layers_,
            swap_dir_.c_str());
@@ -385,7 +385,7 @@ SwapRecord KVSwapper::swap_out(
         stats_.total_bytes_written += total_bytes;
     }
 
-    printf("[KVSwapper] Swap out req %lu: %d blocks, %zu bytes → SSD (%.1f ms, FADV_DONTNEED)\n",
+    fprintf(stderr, "[KVSwapper] Swap out req %lu: %d blocks, %zu bytes → SSD (%.1f ms, FADV_DONTNEED)\n",
            request_id, rec.num_blocks, total_bytes, rec.swap_out_ms);
 
     return rec;
@@ -571,7 +571,7 @@ std::vector<int> KVSwapper::swap_in(
         stats_.total_bytes_read += total_bytes;
     }
 
-    printf("[KVSwapper] Swap in req %lu: %d blocks, %zu bytes ← %s (%.1f ms)\n",
+    fprintf(stderr, "[KVSwapper] Swap in req %lu: %d blocks, %zu bytes ← %s (%.1f ms)\n",
            request_id, rec.num_blocks, total_bytes,
            pf ? "PREFETCH" : "SSD", swap_in_ms);
 
@@ -709,7 +709,7 @@ void KVSwapper::drain() {
 }
 
 void KVSwapper::print_stats() const {
-    printf("[KVSwapper] Stats: swap_out=%d (avg %.1fms, %.1f MB written), "
+    fprintf(stderr, "[KVSwapper] Stats: swap_out=%d (avg %.1fms, %.1f MB written), "
            "swap_in=%d (avg %.1fms, %.1f MB read), "
            "prefetch=%d (hits=%d), page_cache_dropped=%.1f MB\n",
            stats_.total_swap_out, stats_.avg_swap_out_ms(),

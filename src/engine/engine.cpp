@@ -104,12 +104,12 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
     // 4. 统一缓存管理器 (包含 KV pool, SSM/Conv pool, prefix cache, KV swapper, SSD store + streaming buffers)
     cache_manager_ = std::make_unique<cache::CacheManager>(config_, cache_config, mcp, capacity, compute_stream_);
     gpu_max_tokens_ = cache_manager_->gpu_max_tokens();
-    printf("[Engine] Max tokens per request: %d (%.1fK) from KV budget %.1f GB\n",
+    fprintf(stderr, "[Engine] Max tokens per request: %d (%.1fK) from KV budget %.1f GB\n",
            gpu_max_tokens_, gpu_max_tokens_ / 1024.0, cache_config.kv_cache_budget_gb);
 
     // 安全检查: gpu_max_tokens 不能超过 IPC 最大 prompt 长度
     if (gpu_max_tokens_ > ipc::MAX_PROMPT_LEN) {
-        printf("[Engine] WARNING: gpu_max_tokens(%d) > MAX_PROMPT_LEN(%d), "
+        fprintf(stderr, "[Engine] WARNING: gpu_max_tokens(%d) > MAX_PROMPT_LEN(%d), "
                "clamping. Recompile with larger MAX_PROMPT_LEN to use full budget.\n",
                gpu_max_tokens_, ipc::MAX_PROMPT_LEN);
         gpu_max_tokens_ = ipc::MAX_PROMPT_LEN;
@@ -168,13 +168,13 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
         if (cache_config.mtp_mode == "on") {
             mtp_want = true;
             if (!model_->has_mtp()) {
-                printf("[Engine] WARNING: --mtp-enable specified but model has no MTP weights. Ignoring.\n");
+                fprintf(stderr, "[Engine] WARNING: --mtp-enable specified but model has no MTP weights. Ignoring.\n");
                 mtp_want = false;
             }
         } else if (cache_config.mtp_mode == "off") {
             mtp_want = false;
             if (model_->has_mtp()) {
-                printf("[Engine] MTP speculative decoding explicitly disabled via --mtp-disable\n");
+                fprintf(stderr, "[Engine] MTP speculative decoding explicitly disabled via --mtp-disable\n");
             }
         } else {
             // auto: 模型有 MTP 权重则启用
@@ -210,15 +210,15 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
             cudaMalloc(&d_mtp_block_tables_,  mtp_blocks * sizeof(int));
             cudaMalloc(&d_mtp_context_lens_,  sizeof(int));
 
-            printf("[Engine] MTP speculative decoding ENABLED (mode=%s, drafts=%d, kv_blocks=%d = %d max tokens)\n",
+            fprintf(stderr, "[Engine] MTP speculative decoding ENABLED (mode=%s, drafts=%d, kv_blocks=%d = %d max tokens)\n",
                    cache_config.mtp_mode.c_str(), cache_config.mtp_num_drafts, mtp_blocks, mtp_blocks * 16);
-            printf("[Engine]   SSM checkpoint %.1f MB (%d slots), Conv checkpoint %.1f MB\n",
+            fprintf(stderr, "[Engine]   SSM checkpoint %.1f MB (%d slots), Conv checkpoint %.1f MB\n",
                    (double)N_ckpt * num_linear_layers_ * ssm_elems_per_layer_ * sizeof(__nv_bfloat16) / 1048576.0,
                    N_ckpt,
                    (double)N_ckpt * num_linear_layers_ * conv_elems_per_layer_ * sizeof(__nv_bfloat16) / 1048576.0);
             num_mtp_drafts_ = cache_config.mtp_num_drafts;
         } else {
-            printf("[Engine] MTP speculative decoding DISABLED (mode=%s, model_has_mtp=%s)\n",
+            fprintf(stderr, "[Engine] MTP speculative decoding DISABLED (mode=%s, model_has_mtp=%s)\n",
                    cache_config.mtp_mode.c_str(), model_->has_mtp() ? "yes" : "no");
         }
     }
@@ -238,13 +238,13 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
         vision_workspace_bytes_ = model_->get_vision_encoder()->workspace_bytes(max_patches);
         // BF16 pixel values are uploaded directly into workspace (no FP32 temp needed)
         cudaMalloc(&d_vision_workspace_, vision_workspace_bytes_);
-        printf("[Engine] Vision workspace: %.1f MB (max %d patches from %d max_pixels)\n",
+        fprintf(stderr, "[Engine] Vision workspace: %.1f MB (max %d patches from %d max_pixels)\n",
                vision_workspace_bytes_ / 1048576.0, max_patches, vcfg.max_pixels);
     }
 
     // 确保所有 CUDA 初始化完成 (页面映射、memset 等), 避免首请求时延迟缺页
     cudaDeviceSynchronize();
-    printf("[Engine] Initialization complete, all CUDA pages settled.\n");
+    fprintf(stderr, "[Engine] Initialization complete, all CUDA pages settled.\n");
 }
 
 InferenceEngine::~InferenceEngine() {

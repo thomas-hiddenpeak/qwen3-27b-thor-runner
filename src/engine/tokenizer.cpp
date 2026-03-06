@@ -624,7 +624,7 @@ bool Tokenizer::load(const std::string& model_dir) {
     tool_call_end_id_   = special_tokens_["</tool_call>"];
 
     loaded_ = true;
-    printf("[Tokenizer] Loaded: vocab=%d, merges=%d, specials=%d\n",
+    fprintf(stderr, "[Tokenizer] Loaded: vocab=%d, merges=%d, specials=%d\n",
            static_cast<int>(piece_to_id_.size()),
            static_cast<int>(merges_.size()),
            static_cast<int>(special_tokens_.size()));

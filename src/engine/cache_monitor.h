@@ -259,53 +259,53 @@ public:
         auto m = snapshot();
         double uptime = uptime_seconds();
 
-        std::cout << "\n"
+        std::cerr << "\n"
             "╔══════════════════════════════════════════════════════════╗\n"
             "║             LMCache Monitor Report                     ║\n"
             "╠══════════════════════════════════════════════════════════╣\n";
 
         // 前缀缓存加速
-        printf("║ %-30s                          ║\n", "── Prefix Cache Acceleration ──");
-        printf("║   Hit Rate:           %6.1f%%  (%lu/%lu requests)       \n",
+        fprintf(stderr, "║ %-30s                          ║\n", "── Prefix Cache Acceleration ──");
+        fprintf(stderr, "║   Hit Rate:           %6.1f%%  (%lu/%lu requests)       \n",
                m.hit_rate(), m.cache_hit_requests, m.total_requests);
-        printf("║   Full Hit Rate:      %6.1f%%  (%lu skipped prefill)    \n",
+        fprintf(stderr, "║   Full Hit Rate:      %6.1f%%  (%lu skipped prefill)    \n",
                m.full_hit_rate(), m.full_hit_requests);
-        printf("║   Token Save Ratio:   %6.1f%%  (%lu/%lu tokens)        \n",
+        fprintf(stderr, "║   Token Save Ratio:   %6.1f%%  (%lu/%lu tokens)        \n",
                m.token_save_ratio(), m.tokens_restored, m.total_prompt_tokens);
-        printf("║   TTFT Saved:       %8.1f ms cumulative              \n", m.ttft_saved_ms);
-        printf("║   Compute Saved:    %8.2f TFLOPS                     \n", m.compute_flops_saved);
+        fprintf(stderr, "║   TTFT Saved:       %8.1f ms cumulative              \n", m.ttft_saved_ms);
+        fprintf(stderr, "║   Compute Saved:    %8.2f TFLOPS                     \n", m.compute_flops_saved);
 
         // 上下文扩展
-        printf("║ %-30s                          ║\n", "── Context Extension ──");
-        printf("║   Effective Context:  %6lu tokens (mem + SSD)          \n",
+        fprintf(stderr, "║ %-30s                          ║\n", "── Context Extension ──");
+        fprintf(stderr, "║   Effective Context:  %6lu tokens (mem + SSD)          \n",
                m.effective_context_tokens());
-        printf("║   Max Context Seen:   %6lu tokens                     \n", m.max_context_seen);
-        printf("║   Offloaded to SSD:   %6lu chunks (%lu tokens)         \n",
+        fprintf(stderr, "║   Max Context Seen:   %6lu tokens                     \n", m.max_context_seen);
+        fprintf(stderr, "║   Offloaded to SSD:   %6lu chunks (%lu tokens)         \n",
                m.offloaded_chunks, m.offloaded_tokens);
-        printf("║   KV Mem Utilization: %6.1f%%                          \n",
+        fprintf(stderr, "║   KV Mem Utilization: %6.1f%%                          \n",
                m.kv_memory_utilization());
 
         // SSD I/O
-        printf("║ %-30s                          ║\n", "── SSD I/O Performance ──");
-        printf("║   Write BW:           %5.2f GB/s  (%.0f MB total)      \n",
+        fprintf(stderr, "║ %-30s                          ║\n", "── SSD I/O Performance ──");
+        fprintf(stderr, "║   Write BW:           %5.2f GB/s  (%.0f MB total)      \n",
                m.ssd_write_bandwidth_gbps(), m.ssd_write_bytes / 1e6);
-        printf("║   Read BW:            %5.2f GB/s  (%.0f MB total)      \n",
+        fprintf(stderr, "║   Read BW:            %5.2f GB/s  (%.0f MB total)      \n",
                m.ssd_read_bandwidth_gbps(), m.ssd_read_bytes / 1e6);
-        printf("║   Store Latency:      %5.1f ms avg (%lu ops)           \n",
+        fprintf(stderr, "║   Store Latency:      %5.1f ms avg (%lu ops)           \n",
                store_latency_.avg_ms(), m.store_ops);
-        printf("║   Retrieve Latency:   %5.1f ms avg (%lu ops)           \n",
+        fprintf(stderr, "║   Retrieve Latency:   %5.1f ms avg (%lu ops)           \n",
                retrieve_latency_.avg_ms(), m.retrieve_ops);
 
         // 驱逐与容量
-        printf("║ %-30s                          ║\n", "── Eviction & Capacity ──");
-        printf("║   SSD Utilization:    %6.1f%%  (%.0f/%.0f MB)          \n",
+        fprintf(stderr, "║ %-30s                          ║\n", "── Eviction & Capacity ──");
+        fprintf(stderr, "║   SSD Utilization:    %6.1f%%  (%.0f/%.0f MB)          \n",
                m.ssd_utilization(), m.ssd_used_bytes / 1e6, m.ssd_capacity_bytes / 1e6);
-        printf("║   Entries:            %6lu                             \n", m.num_entries);
-        printf("║   Evictions:          %6lu  (%.0f MB freed)            \n",
+        fprintf(stderr, "║   Entries:            %6lu                             \n", m.num_entries);
+        fprintf(stderr, "║   Evictions:          %6lu  (%.0f MB freed)            \n",
                m.eviction_count, m.eviction_bytes / 1e6);
 
-        printf("║   Uptime:            %6.1f seconds                     \n", uptime);
-        std::cout <<
+        fprintf(stderr, "║   Uptime:            %6.1f seconds                     \n", uptime);
+        std::cerr <<
             "╚══════════════════════════════════════════════════════════╝\n";
     }
 
