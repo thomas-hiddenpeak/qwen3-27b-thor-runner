@@ -918,7 +918,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             }
         
             // ---- Cache Store: prefill 完成后缓存 KV + SSM/Conv 到 SSD ----
-            cache_manager_->store_prefix(ctx->prompt_tokens.data(), num_tokens, ctx, d_workspace_);
+            cache_manager_->store_prefix(ctx->prompt_tokens.data(), num_tokens, ctx, d_workspace_, d_block_tables_);
         } // end if (prefill_tokens > 0)
 
         if (prefill_tokens > 0) {

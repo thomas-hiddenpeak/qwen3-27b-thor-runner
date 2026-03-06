@@ -442,12 +442,18 @@ int CacheManager::restore_prefix(const int* tokens, int num_tokens,
 
 void CacheManager::store_prefix(const int* tokens, int num_tokens,
                                 const RequestCacheState& state,
-                                __nv_bfloat16* workspace) {
+                                __nv_bfloat16* workspace,
+                                int* d_block_table_buf) {
     if (!cache_engine_ || !cache_engine_->is_enabled()) return;
+
+    // 上传 block_table 到 device
+    cudaMemcpyAsync(d_block_table_buf, state.block_table.data(),
+                    state.block_table.size() * sizeof(int),
+                    cudaMemcpyHostToDevice, stream_);
 
     cache_engine_->store_prefix(
         tokens, num_tokens, *kv_manager_,
-        nullptr,  // d_block_table (will use host block table)
+        d_block_table_buf,
         (int)state.block_table.size(),
         const_cast<__nv_bfloat16**>(state.ssm_states.data()),
         const_cast<__nv_bfloat16**>(state.conv_states.data()),
@@ -601,8 +607,8 @@ int CacheManager::restore_prefix(const int* tokens, int num_tokens,
 
 void CacheManager::store_prefix(const int* tokens, int num_tokens,
                                 const core::RequestContext* ctx,
-                                __nv_bfloat16* workspace) {
-    store_prefix(tokens, num_tokens, ctx->cache_state, workspace);
+                                __nv_bfloat16* workspace, int* d_block_table_buf) {
+    store_prefix(tokens, num_tokens, ctx->cache_state, workspace, d_block_table_buf);
 }
 
 ops::StreamingAttnCtx CacheManager::build_streaming_ctx(

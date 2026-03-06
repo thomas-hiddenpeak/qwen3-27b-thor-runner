@@ -136,7 +136,8 @@ public:
     // 存储 prefix cache
     void store_prefix(const int* tokens, int num_tokens,
                       const RequestCacheState& state,
-                      __nv_bfloat16* workspace);
+                      __nv_bfloat16* workspace,
+                      int* d_block_table_buf);
 
     // 记录统计
     void record_prefix_stats(int prompt_tokens, int restored, int computed);
@@ -238,7 +239,7 @@ public:
     // Prefix cache: 存储
     void store_prefix(const int* tokens, int num_tokens,
                       const core::RequestContext* ctx,
-                      __nv_bfloat16* workspace);
+                      __nv_bfloat16* workspace, int* d_block_table_buf);
 
     // Streaming attention context (从 RequestContext 构建)
     ops::StreamingAttnCtx build_streaming_ctx(
