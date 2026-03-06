@@ -359,8 +359,8 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
 //   concat(RMSNorm(h), RMSNorm(embed(tok))) → fc [hs, 2hs] → FullAttnLayer → RMSNorm → lm_head
 //
 // Workspace layout (T=1, all at workspace pointer):
-//   [0..hs)           norm_h       (RMSNorm of main hidden)
-//   [hs..2hs)         norm_e       (RMSNorm of embedding, concat = [0..2hs))
+//   [0..hs)           norm_e       (RMSNorm of embedding)
+//   [hs..2hs)         norm_h       (RMSNorm of main hidden, concat = [0..2hs) = [embed,hidden])
 //   [2hs..3hs)        projected    (fc output, also hidden_states for attn layer)
 //   [3hs..4hs)        raw_embed    (embedding lookup output)
 //   [4hs..4hs+93184)  attn_ws      (FullAttnLayer workspace for T=1)
@@ -384,11 +384,11 @@ __nv_bfloat16* Qwen35Model::mtp_forward(
     const int vocab = config_.vocab_size;      // 248320
 
     // Workspace pointers
-    // Layout: norm_h[hs] | norm_e[hs] | projected[hs] | raw_embed[hs] | attn_ws[93184] | normed[hs] | logits[vocab] | d_ids[2 ints]
-    // d_ids 放到末尾避免中间 int 对齐破坏后续 BF16 指针的 16-byte boundary
-    __nv_bfloat16* norm_h    = workspace;                     // [5120]
-    __nv_bfloat16* norm_e    = norm_h + hs;                   // [5120] → concat = [0..10240)
-    __nv_bfloat16* projected = norm_e + hs;                   // [5120]
+    // Layout: norm_e[hs] | norm_h[hs] | projected[hs] | raw_embed[hs] | attn_ws[93184] | normed[hs] | logits[vocab] | d_ids[2 ints]
+    // concat = [norm_e, norm_h] = [embed_norm, hidden_norm] (SGLang/HF 标准顺序)
+    __nv_bfloat16* norm_e    = workspace;                     // [5120] — embed norm FIRST
+    __nv_bfloat16* norm_h    = norm_e + hs;                   // [5120] — hidden norm SECOND
+    __nv_bfloat16* projected = norm_h + hs;                   // [5120]
     __nv_bfloat16* raw_embed = projected + hs;                // [5120]
     __nv_bfloat16* attn_ws   = raw_embed + hs;
     // After attn layer: normed + logits (size determined by layer workspace)
@@ -407,9 +407,9 @@ __nv_bfloat16* Qwen35Model::mtp_forward(
     ops::invoke_rmsnorm(norm_e, raw_embed, mtp_pre_norm_e_w_,
                         config_.rms_norm_eps, 1, hs, stream);
 
-    // 3. FC projection: concat(norm_h, norm_e) = [10240] → projected = [5120]
-    //    fc.weight is [5120, 10240], GEMV: projected = fc_w × concat
-    ops::invoke_dense_gemv(norm_h, mtp_fc_w_, projected, hs, 2 * hs, stream);
+    // 3. FC projection: concat(norm_e, norm_h) = [10240] → projected = [5120]
+    //    fc.weight is [5120, 10240], GEMV: projected = fc_w × [embed_norm, hidden_norm]
+    ops::invoke_dense_gemv(norm_e, mtp_fc_w_, projected, hs, 2 * hs, stream);
 
     // 4. Full attention transformer layer
     //    projected serves as hidden_states (modified in-place with residual)

@@ -239,8 +239,7 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
     }
 
     // 10. MTP 投机解码初始化
-    //     --mtp-enable: 强制开; --mtp-disable: 强制关; 默认 auto (关闭)
-    //     注: Qwen3.5 的 MTP 模块是训练辅助 loss, 不适合推理投机解码 (accept rate ≈ 0%)
+    //     --mtp-enable: 强制开; --mtp-disable: 强制关; 默认 auto (模型有 MTP 权重则启用)
     {
         bool mtp_want = false;
         if (cache_config.mtp_mode == "on") {
@@ -248,9 +247,6 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
             if (!model_->has_mtp()) {
                 printf("[Engine] WARNING: --mtp-enable specified but model has no MTP weights. Ignoring.\n");
                 mtp_want = false;
-            } else {
-                printf("[Engine] WARNING: MTP is a training-only auxiliary loss module. "
-                       "Speculative decoding accept rate is near 0%%. Enabling anyway per user request.\n");
             }
         } else if (cache_config.mtp_mode == "off") {
             mtp_want = false;
@@ -258,12 +254,8 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
                 printf("[Engine] MTP speculative decoding explicitly disabled via --mtp-disable\n");
             }
         } else {
-            // auto: 默认关闭 (MTP 是训练辅助 loss, 推理无收益)
-            mtp_want = false;
-            if (model_->has_mtp()) {
-                printf("[Engine] MTP weights found but auto-disabled (training-only aux loss, ~0%% accept rate).\n"
-                       "[Engine]   Use --mtp-enable to force enable.\n");
-            }
+            // auto: 模型有 MTP 权重则启用
+            mtp_want = model_->has_mtp();
         }
 
         if (mtp_want) {
