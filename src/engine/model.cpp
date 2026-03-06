@@ -377,7 +377,8 @@ __nv_bfloat16* Qwen35Model::mtp_forward(
     int max_context_len,
     __nv_bfloat16* workspace,
     cudaStream_t stream,
-    __nv_bfloat16** out_hidden)
+    __nv_bfloat16** out_hidden,
+    const int* d_input_token_id)
 {
     if (!has_mtp_ || !mtp_layer_) return nullptr;
 
@@ -403,8 +404,14 @@ __nv_bfloat16* Qwen35Model::mtp_forward(
                         config_.rms_norm_eps, 1, hs, stream);
 
     // 2. Embedding lookup → raw_embed, then RMSNorm → norm_e
-    cudaMemcpyAsync(d_ids, &input_token_id, sizeof(int), cudaMemcpyHostToDevice, stream);
-    ops::invoke_embedding_lookup(raw_embed, d_ids, embed_tokens_w_, 1, hs, stream);
+    if (d_input_token_id) {
+        // GPU-resident path: token ID already on device
+        ops::invoke_embedding_lookup(raw_embed, d_input_token_id, embed_tokens_w_, 1, hs, stream);
+    } else {
+        // CPU path: H2D copy then lookup
+        cudaMemcpyAsync(d_ids, &input_token_id, sizeof(int), cudaMemcpyHostToDevice, stream);
+        ops::invoke_embedding_lookup(raw_embed, d_ids, embed_tokens_w_, 1, hs, stream);
+    }
     ops::invoke_rmsnorm(norm_e, raw_embed, mtp_pre_norm_e_w_,
                         config_.rms_norm_eps, 1, hs, stream);
 

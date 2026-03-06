@@ -1335,47 +1335,78 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             }
 
             // Helper lambda: chain N MTP calls to generate N draft tokens
+            // GPU-resident argmax chain: argmax results stay on GPU, only 1 final sync
             auto generate_mtp_drafts = [&](__nv_bfloat16* main_hidden,
                                            int first_token, int start_pos) {
                 ctx->draft_tokens.clear();
+
+                // Pre-allocate MTP KV blocks for all N drafts at once
+                int final_mtp_ctx = ctx->mtp_context_len + N;
+                int final_mtp_blks = (final_mtp_ctx + 15) / 16;
+                while ((int)ctx->mtp_block_table.size() < final_mtp_blks) {
+                    auto mb = mtp_kv_manager_->allocate_blocks(1);
+                    ctx->mtp_block_table.push_back(mb[0]);
+                }
+                // Single block_table upload (covers all N drafts)
+                cudaMemcpyAsync(d_mtp_block_tables_,
+                                ctx->mtp_block_table.data(),
+                                ctx->mtp_block_table.size() * sizeof(int),
+                                cudaMemcpyHostToDevice, compute_stream_);
+
                 __nv_bfloat16* h = main_hidden;
-                int tok = first_token;
                 int pos = start_pos;
+
                 for (int di = 0; di < N; di++) {
-                    int mtp_ctx_fwd = ctx->mtp_context_len + 1;
-                    int mtp_blks = (mtp_ctx_fwd + 15) / 16;
-                    while ((int)ctx->mtp_block_table.size() < mtp_blks) {
-                        auto mb = mtp_kv_manager_->allocate_blocks(1);
-                        ctx->mtp_block_table.push_back(mb[0]);
-                    }
-                    cudaMemcpyAsync(d_mtp_block_tables_,
-                                    ctx->mtp_block_table.data(),
-                                    ctx->mtp_block_table.size() * sizeof(int),
-                                    cudaMemcpyHostToDevice, compute_stream_);
+                    int mtp_ctx_fwd = ctx->mtp_context_len + di + 1;
                     cudaMemcpyAsync(d_mtp_context_lens_, &mtp_ctx_fwd,
                                     sizeof(int),
                                     cudaMemcpyHostToDevice, compute_stream_);
 
                     __nv_bfloat16* mtp_hidden = nullptr;
-                    __nv_bfloat16* mtp_logits = model_->mtp_forward(
-                        h, tok, pos,
-                        *mtp_kv_manager_,
-                        d_mtp_block_tables_, d_mtp_context_lens_,
-                        (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
-                        d_workspace_, compute_stream_,
-                        (di < N - 1) ? &mtp_hidden : nullptr);
+                    __nv_bfloat16* mtp_logits;
 
-                    int draft = sample_argmax(mtp_logits, vocab_size,
-                                              compute_stream_);
-                    ctx->draft_tokens.push_back(draft);
-                    ctx->mtp_context_len++;
+                    if (di == 0) {
+                        // First draft: CPU token (first_token)
+                        mtp_logits = model_->mtp_forward(
+                            h, first_token, pos,
+                            *mtp_kv_manager_,
+                            d_mtp_block_tables_, d_mtp_context_lens_,
+                            (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
+                            d_workspace_, compute_stream_,
+                            (di < N - 1) ? &mtp_hidden : nullptr,
+                            nullptr);
+                    } else {
+                        // Subsequent drafts: GPU-resident token from previous argmax
+                        mtp_logits = model_->mtp_forward(
+                            h, -1 /*ignored*/, pos,
+                            *mtp_kv_manager_,
+                            d_mtp_block_tables_, d_mtp_context_lens_,
+                            (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
+                            d_workspace_, compute_stream_,
+                            (di < N - 1) ? &mtp_hidden : nullptr,
+                            d_argmax_result_ + (di - 1));
+                    }
+
+                    // Argmax → d_argmax_result_[di], NO sync (stays on GPU)
+                    ops::invoke_argmax(mtp_logits, d_argmax_result_ + di,
+                                       vocab_size, compute_stream_);
 
                     if (di < N - 1) {
                         h = mtp_hidden;
-                        tok = draft;
                         pos++;
                     }
                 }
+
+                // Single final sync: read all N draft token IDs
+                if (!sync_stream_with_timeout(compute_stream_, 60, "mtp_drafts_batch")) {
+                    fprintf(stderr, "[Engine] FATAL: GPU hang in MTP draft generation\n");
+                    ctx->is_finished = true;
+                    return;
+                }
+                for (int di = 0; di < N; di++) {
+                    ctx->draft_tokens.push_back(d_argmax_result_[di]);
+                }
+                ctx->mtp_context_len += N;
             };
 
             // ============================================================
@@ -1735,45 +1766,69 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             }
 
             // ---- MTP Bootstrap: 首次 decode 后链式产出 N 个 draft ----
+            // GPU-resident argmax chain: 与 verify 路径共享相同的优化模式
             if (mtp_kv_manager_ && !ctx->is_finished && !ctx->uses_ssd_blocks
                 && ctx->draft_tokens.empty()) {
                 const int N = num_mtp_drafts_;
                 __nv_bfloat16* h = d_hidden_states_;
-                int tok = next_token;
                 ctx->mtp_pos = ctx->context_len - 1;
                 int pos = ctx->mtp_pos;
 
+                // Pre-allocate MTP KV blocks for all N drafts
+                int final_mtp_ctx = ctx->mtp_context_len + N;
+                int final_mtp_blks = (final_mtp_ctx + 15) / 16;
+                while ((int)ctx->mtp_block_table.size() < final_mtp_blks) {
+                    auto mb = mtp_kv_manager_->allocate_blocks(1);
+                    ctx->mtp_block_table.push_back(mb[0]);
+                }
+                // Single block_table upload
+                cudaMemcpyAsync(d_mtp_block_tables_, ctx->mtp_block_table.data(),
+                                ctx->mtp_block_table.size() * sizeof(int),
+                                cudaMemcpyHostToDevice, compute_stream_);
+
                 for (int di = 0; di < N; di++) {
-                    int mtp_ctx_fwd = ctx->mtp_context_len + 1;
-                    int mtp_blks = (mtp_ctx_fwd + 15) / 16;
-                    while ((int)ctx->mtp_block_table.size() < mtp_blks) {
-                        auto mb = mtp_kv_manager_->allocate_blocks(1);
-                        ctx->mtp_block_table.push_back(mb[0]);
-                    }
-                    cudaMemcpyAsync(d_mtp_block_tables_, ctx->mtp_block_table.data(),
-                                    ctx->mtp_block_table.size() * sizeof(int),
-                                    cudaMemcpyHostToDevice, compute_stream_);
+                    int mtp_ctx_fwd = ctx->mtp_context_len + di + 1;
                     cudaMemcpyAsync(d_mtp_context_lens_, &mtp_ctx_fwd, sizeof(int),
                                     cudaMemcpyHostToDevice, compute_stream_);
 
                     __nv_bfloat16* mtp_hidden = nullptr;
-                    __nv_bfloat16* mtp_logits = model_->mtp_forward(
-                        h, tok, pos,
-                        *mtp_kv_manager_,
-                        d_mtp_block_tables_, d_mtp_context_lens_,
-                        (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
-                        d_workspace_, compute_stream_,
-                        (di < N - 1) ? &mtp_hidden : nullptr);
-
-                    int draft = sample_argmax(mtp_logits, vocab_size, compute_stream_);
-                    ctx->draft_tokens.push_back(draft);
-                    ctx->mtp_context_len++;
-
+                    __nv_bfloat16* mtp_logits;
+                    if (di == 0) {
+                        mtp_logits = model_->mtp_forward(
+                            h, next_token, pos,
+                            *mtp_kv_manager_,
+                            d_mtp_block_tables_, d_mtp_context_lens_,
+                            (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
+                            d_workspace_, compute_stream_,
+                            (di < N - 1) ? &mtp_hidden : nullptr,
+                            nullptr);
+                    } else {
+                        mtp_logits = model_->mtp_forward(
+                            h, -1, pos,
+                            *mtp_kv_manager_,
+                            d_mtp_block_tables_, d_mtp_context_lens_,
+                            (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
+                            d_workspace_, compute_stream_,
+                            (di < N - 1) ? &mtp_hidden : nullptr,
+                            d_argmax_result_ + (di - 1));
+                    }
+                    ops::invoke_argmax(mtp_logits, d_argmax_result_ + di,
+                                       vocab_size, compute_stream_);
                     if (di < N - 1) {
                         h = mtp_hidden;
-                        tok = draft;
                         pos++;
                     }
+                }
+
+                // Single final sync
+                if (!sync_stream_with_timeout(compute_stream_, 60, "mtp_bootstrap_batch")) {
+                    fprintf(stderr, "[Engine] FATAL: GPU hang in MTP bootstrap\n");
+                    ctx->is_finished = true;
+                } else {
+                    for (int di = 0; di < N; di++) {
+                        ctx->draft_tokens.push_back(d_argmax_result_[di]);
+                    }
+                    ctx->mtp_context_len += N;
                 }
             }
 

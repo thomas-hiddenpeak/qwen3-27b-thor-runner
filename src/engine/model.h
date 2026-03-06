@@ -80,11 +80,12 @@ public:
     // MTP forward: 根据主模型隐藏状态 + token embedding 预测下一个 token 的 logits
     // 返回指向 workspace 中 logits 的指针 [vocab_size]
     // main_hidden: [1, hidden_size] — 主模型最后一层输出 (未 norm)
-    // input_token_id: token to embed (host value)
+    // input_token_id: token to embed (host value, ignored if d_input_token_id non-null)
     // pos_id: 绝对位置 (用于 RoPE, host value)
     // mtp_kv_manager: MTP 层自己的 KV cache (1 层)
     // out_hidden: if non-null, *out_hidden set to MTP transformer output (workspace内)
     //             用于链式 MTP 调用: 作为下一次 mtp_forward 的 main_hidden
+    // d_input_token_id: GPU-resident token ID (可选, 用于 GPU-resident draft chain)
     __nv_bfloat16* mtp_forward(
         const __nv_bfloat16* main_hidden,
         int input_token_id,
@@ -96,7 +97,8 @@ public:
         int max_context_len,
         __nv_bfloat16* workspace,
         cudaStream_t stream,
-        __nv_bfloat16** out_hidden = nullptr
+        __nv_bfloat16** out_hidden = nullptr,
+        const int* d_input_token_id = nullptr
     );
 
 private:
