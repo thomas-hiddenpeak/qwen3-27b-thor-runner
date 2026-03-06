@@ -41,14 +41,18 @@ __device__ __forceinline__ float e4m3_to_float(uint8_t v) {
 }
 
 // ============================================================================
-// FP4 GEMV Kernel — Scattered mapping, process per-group-16
+// FP4 GEMV Kernel V2 — Optimized for SM110 bandwidth
 //
-// Grid:  [ceil(N / WARPS_PER_BLOCK)]
-// Block: [WARPS_PER_BLOCK × 32]
-// SMEM:  [K] × sizeof(bf16) for activation A
+// Key optimizations vs V1:
+//   1. SMEM LUT (16 floats) instead of __constant__ → no warp serialization
+//   2. uint2 vectorized weight load (8 bytes = 1 group of 16 FP4)
+//   3. float4 vectorized activation load from SMEM
+//   4. Deferred group_scale multiply (1× per group instead of 16×)
+//   5. Contiguous output mapping for L2 locality
 //
+// SMEM layout: [LUT: 64 bytes] [A: K × bf16]
+// Grid:  ceil(N / WARPS_PER_BLOCK), Block: 256 (8 warps)
 // Each warp computes one output element C[n]
-// Weight layout: packed[N, K/2] U8, scale[N, K/16] U8 (E4M3)
 // ============================================================================
 template <bool ADD_RESIDUAL>
 __global__ void fp4_gemv_kernel(
@@ -63,12 +67,17 @@ __global__ void fp4_gemv_kernel(
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_BLOCK = 8;
 
-    extern __shared__ __nv_bfloat16 s_A[];
+    extern __shared__ char s_mem[];
+    float* s_lut = reinterpret_cast<float*>(s_mem);
+    __nv_bfloat16* s_A = reinterpret_cast<__nv_bfloat16*>(s_mem + 64);
 
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x & (WARP_SIZE - 1);
-    int num_blocks = (N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-    int out_idx = blockIdx.x + warp_id * num_blocks;
+    int out_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+
+    // Load FP4 LUT into shared memory (16 floats, first 16 threads)
+    if (threadIdx.x < 16)
+        s_lut[threadIdx.x] = c_fp4_lut[threadIdx.x];
 
     // Cooperative load A → shared memory
     for (int i = threadIdx.x; i < K; i += blockDim.x)
@@ -77,32 +86,46 @@ __global__ void fp4_gemv_kernel(
 
     if (out_idx >= N) return;
 
-    const int K_half = K / 2;      // packed dimension
-    const int K_groups = K / 16;   // number of scale groups
+    const int K_half = K >> 1;
+    const int K_groups = K >> 4;   // K / 16
     const uint8_t* w_row = packed + (size_t)out_idx * K_half;
     const uint8_t* s_row = scale + (size_t)out_idx * K_groups;
 
     float sum = 0.0f;
 
-    // Each lane processes groups in stride of WARP_SIZE
-    // Each group: 16 FP4 values (8 bytes packed), 1 E4M3 scale byte
     for (int g = lane_id; g < K_groups; g += WARP_SIZE) {
         float group_scale = e4m3_to_float(s_row[g]) * inv_global_scale;
-        int k_base = g * 16;
 
-        // Load 8 bytes of packed weight (16 FP4 values)
-        const uint8_t* w_ptr = w_row + g * 8;
-        // Process 16 FP4 values
+        // Vectorized load: 8 packed bytes = 16 FP4 values
+        uint2 pack = *reinterpret_cast<const uint2*>(w_row + g * 8);
+        uint32_t lo = pack.x, hi = pack.y;
+        int k_base = g << 4;
+
+        // Vectorized activation load from SMEM (2 × float4 = 16 bf16)
+        float4 a4_lo = *reinterpret_cast<const float4*>(s_A + k_base);
+        float4 a4_hi = *reinterpret_cast<const float4*>(s_A + k_base + 8);
+        const __nv_bfloat162* a_lo = reinterpret_cast<const __nv_bfloat162*>(&a4_lo);
+        const __nv_bfloat162* a_hi = reinterpret_cast<const __nv_bfloat162*>(&a4_hi);
+
+        // Accumulate raw dot product, defer group_scale multiply
+        float group_dot = 0.0f;
+
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            uint8_t byte = w_ptr[j];
-            int k0 = k_base + j * 2;
-            float a0 = __bfloat162float(s_A[k0]);
-            float a1 = __bfloat162float(s_A[k0 + 1]);
-            float w0 = c_fp4_lut[byte & 0xF] * group_scale;
-            float w1 = c_fp4_lut[(byte >> 4) & 0xF] * group_scale;
-            sum += a0 * w0 + a1 * w1;
+        for (int j = 0; j < 4; j++) {
+            uint32_t byte_val = (lo >> (j * 8)) & 0xFF;
+            float2 af = __bfloat1622float2(a_lo[j]);
+            group_dot += af.x * s_lut[byte_val & 0xF]
+                       + af.y * s_lut[(byte_val >> 4) & 0xF];
         }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint32_t byte_val = (hi >> (j * 8)) & 0xFF;
+            float2 af = __bfloat1622float2(a_hi[j]);
+            group_dot += af.x * s_lut[byte_val & 0xF]
+                       + af.y * s_lut[(byte_val >> 4) & 0xF];
+        }
+
+        sum += group_dot * group_scale;
     }
 
     // Warp reduce
@@ -120,7 +143,7 @@ __global__ void fp4_gemv_kernel(
 
 // ============================================================================
 // FP4 Dual GEMV Kernel — Gate + Up sharing A in SMEM
-// Grid front half → W1/C1, back half → W2/C2
+// Same optimizations as single GEMV; grid front half → W1/C1, back half → W2/C2
 // ============================================================================
 __global__ void fp4_dual_gemv_kernel(
     const __nv_bfloat16* __restrict__ A,
@@ -137,7 +160,9 @@ __global__ void fp4_dual_gemv_kernel(
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_BLOCK = 8;
 
-    extern __shared__ __nv_bfloat16 s_A[];
+    extern __shared__ char s_mem[];
+    float* s_lut = reinterpret_cast<float*>(s_mem);
+    __nv_bfloat16* s_A = reinterpret_cast<__nv_bfloat16*>(s_mem + 64);
 
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x & (WARP_SIZE - 1);
@@ -146,15 +171,17 @@ __global__ void fp4_dual_gemv_kernel(
     int local_block = is_second ? (blockIdx.x - blocks_per_output) : blockIdx.x;
     int out_idx = local_block * WARPS_PER_BLOCK + warp_id;
 
-    // Cooperative load A → shared memory
+    if (threadIdx.x < 16)
+        s_lut[threadIdx.x] = c_fp4_lut[threadIdx.x];
+
     for (int i = threadIdx.x; i < K; i += blockDim.x)
         s_A[i] = A[i];
     __syncthreads();
 
     if (out_idx >= N) return;
 
-    const int K_half = K / 2;
-    const int K_groups = K / 16;
+    const int K_half = K >> 1;
+    const int K_groups = K >> 4;
     const uint8_t* w_row = is_second
         ? (packed2 + (size_t)out_idx * K_half)
         : (packed1 + (size_t)out_idx * K_half);
@@ -167,18 +194,34 @@ __global__ void fp4_dual_gemv_kernel(
 
     for (int g = lane_id; g < K_groups; g += WARP_SIZE) {
         float group_scale = e4m3_to_float(s_row[g]) * inv_gs;
-        int k_base = g * 16;
-        const uint8_t* w_ptr = w_row + g * 8;
+
+        uint2 pack = *reinterpret_cast<const uint2*>(w_row + g * 8);
+        uint32_t lo = pack.x, hi = pack.y;
+        int k_base = g << 4;
+
+        float4 a4_lo = *reinterpret_cast<const float4*>(s_A + k_base);
+        float4 a4_hi = *reinterpret_cast<const float4*>(s_A + k_base + 8);
+        const __nv_bfloat162* a_lo = reinterpret_cast<const __nv_bfloat162*>(&a4_lo);
+        const __nv_bfloat162* a_hi = reinterpret_cast<const __nv_bfloat162*>(&a4_hi);
+
+        float group_dot = 0.0f;
 
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            uint8_t byte = w_ptr[j];
-            int k0 = k_base + j * 2;
-            float a0 = __bfloat162float(s_A[k0]);
-            float a1 = __bfloat162float(s_A[k0 + 1]);
-            sum += a0 * (c_fp4_lut[byte & 0xF] * group_scale)
-                 + a1 * (c_fp4_lut[(byte >> 4) & 0xF] * group_scale);
+        for (int j = 0; j < 4; j++) {
+            uint32_t byte_val = (lo >> (j * 8)) & 0xFF;
+            float2 af = __bfloat1622float2(a_lo[j]);
+            group_dot += af.x * s_lut[byte_val & 0xF]
+                       + af.y * s_lut[(byte_val >> 4) & 0xF];
         }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint32_t byte_val = (hi >> (j * 8)) & 0xFF;
+            float2 af = __bfloat1622float2(a_hi[j]);
+            group_dot += af.x * s_lut[byte_val & 0xF]
+                       + af.y * s_lut[(byte_val >> 4) & 0xF];
+        }
+
+        sum += group_dot * group_scale;
     }
 
     #pragma unroll
@@ -195,6 +238,9 @@ __global__ void fp4_dual_gemv_kernel(
 // Host dispatch functions
 // ============================================================================
 
+// SMEM: 64 bytes LUT + K * sizeof(bf16) bytes for A
+static constexpr size_t FP4_LUT_SMEM = 64;
+
 void invoke_fp4_gemv(
     const __nv_bfloat16* A,
     const core::QuantizedWeight& W,
@@ -206,7 +252,7 @@ void invoke_fp4_gemv(
     int N = W.N, K = W.K;
     float inv_gs = 1.0f / W.global_scale;
     int blocks = (N + WARPS - 1) / WARPS;
-    size_t smem = K * sizeof(__nv_bfloat16);
+    size_t smem = FP4_LUT_SMEM + K * sizeof(__nv_bfloat16);
 
     fp4_gemv_kernel<false><<<blocks, BLOCK_THREADS, smem, stream>>>(
         A, W.packed, W.scale, C, nullptr, inv_gs, N, K);
@@ -224,7 +270,7 @@ void invoke_fp4_gemv_add(
     int N = W.N, K = W.K;
     float inv_gs = 1.0f / W.global_scale;
     int blocks = (N + WARPS - 1) / WARPS;
-    size_t smem = K * sizeof(__nv_bfloat16);
+    size_t smem = FP4_LUT_SMEM + K * sizeof(__nv_bfloat16);
 
     fp4_gemv_kernel<true><<<blocks, BLOCK_THREADS, smem, stream>>>(
         A, W.packed, W.scale, C, residual, inv_gs, N, K);
@@ -240,11 +286,11 @@ void invoke_fp4_dual_gemv(
 {
     constexpr int BLOCK_THREADS = 256;
     constexpr int WARPS = BLOCK_THREADS / 32;
-    int N = W1.N;  // W1, W2 should have same N for gate+up
+    int N = W1.N;
     int K = W1.K;
     int blocks_per_output = (N + WARPS - 1) / WARPS;
     int total_blocks = blocks_per_output * 2;
-    size_t smem = K * sizeof(__nv_bfloat16);
+    size_t smem = FP4_LUT_SMEM + K * sizeof(__nv_bfloat16);
 
     fp4_dual_gemv_kernel<<<total_blocks, BLOCK_THREADS, smem, stream>>>(
         A,
