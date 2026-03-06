@@ -27,16 +27,15 @@ namespace sm110a_probe { void run_sm110a_probes(); }
 #include <chrono>
 #include <execinfo.h>
 #include <unistd.h>
-#include <sys/mman.h>
-#include <cerrno>
 
 // Crash signal handler — writes directly to fd 2 (unbuffered)
 static void crash_handler(int sig) {
     const char* msg = "\n[CRASH] Signal: ";
-    write(STDERR_FILENO, msg, strlen(msg));
+    ssize_t r_ __attribute__((unused));
+    r_ = write(STDERR_FILENO, msg, strlen(msg));
     char num[16];
     int len = snprintf(num, sizeof(num), "%d\n", sig);
-    write(STDERR_FILENO, num, len);
+    r_ = write(STDERR_FILENO, num, len);
 
     // Print backtrace
     void* frames[32];
@@ -269,21 +268,28 @@ int main(int argc, char** argv) {
 
     std::string cmd = argv[1];
 
-    if (cmd == "serve")   return cmd_serve(argc, argv);
-    if (cmd == "chat")    return cmd_chat(argc, argv);
-    if (cmd == "bench")   return cmd_bench(argc, argv);
-    if (cmd == "test")    return cmd_test(argc, argv);
-    if (cmd == "probe")   { sm110a_probe::run_sm110a_probes(); return 0; }
-    if (cmd == "version" || cmd == "--version" || cmd == "-v") {
+    int rc = 0;
+    if (cmd == "serve")   rc = cmd_serve(argc, argv);
+    else if (cmd == "chat")    rc = cmd_chat(argc, argv);
+    else if (cmd == "bench")   rc = cmd_bench(argc, argv);
+    else if (cmd == "test")    rc = cmd_test(argc, argv);
+    else if (cmd == "probe")   { sm110a_probe::run_sm110a_probes(); }
+    else if (cmd == "version" || cmd == "--version" || cmd == "-v") {
         print_version();
-        return 0;
     }
-    if (cmd == "--help" || cmd == "-h" || cmd == "help") {
+    else if (cmd == "--help" || cmd == "-h" || cmd == "help") {
         print_usage();
-        return 0;
+    }
+    else {
+        std::cerr << "Unknown command: " << cmd << "\n";
+        std::cerr << "Run 'qwen3-27b-thor --help' for usage.\n";
+        rc = 1;
     }
 
-    std::cerr << "Unknown command: " << cmd << "\n";
-    std::cerr << "Run 'qwen3-27b-thor --help' for usage.\n";
-    return 1;
+    // 释放所有 CUDA 资源 (包括 function-local static 缓冲区)
+    // Jetson UMA: cudaDeviceReset 后物理页变为内核可回收 cache,
+    // MemAvailable 会正确反映, 其他进程分配时内核自动回收
+    cudaDeviceReset();
+
+    return rc;
 }

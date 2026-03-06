@@ -154,7 +154,9 @@ public:
 
         // 创建目录
         std::string cmd = "mkdir -p " + store_dir_;
-        (void)system(cmd.c_str());
+        if (system(cmd.c_str()) != 0) {
+            fprintf(stderr, "[BlockSSDStore] mkdir -p failed for %s\n", store_dir_.c_str());
+        }
     }
 
     // Evict: 将指定 blocks 的 KV 从 GPU cache 写入 SSD (所有 layers)
@@ -192,7 +194,9 @@ public:
 
                 // 写入 SSD 的正确偏移位置
                 off_t offset = (off_t)bi * per_block_bytes_;
-                pwrite(fd, staging_buffer_, per_block_bytes_, offset);
+                if (pwrite(fd, staging_buffer_, per_block_bytes_, offset) < 0) {
+                    fprintf(stderr, "[BlockSSDStore] pwrite failed block %d: %s\n", bi, strerror(errno));
+                }
             }
 
             // Drop page cache
@@ -238,8 +242,11 @@ public:
                 off_t offset = (off_t)logical_idx * per_block_bytes_;
 
                 // 读取 K+V 到 staging buffer
-                pread(fd, (uint8_t*)staging_buffer_ + bi * per_block_bytes_,
-                      per_block_bytes_, offset);
+                if (pread(fd, (uint8_t*)staging_buffer_ + bi * per_block_bytes_,
+                          per_block_bytes_, offset) < 0) {
+                    fprintf(stderr, "[BlockSSDStore] pread failed block %d: %s\n",
+                            logical_idx, strerror(errno));
+                }
             }
 
             // 注入 GPU staging cache

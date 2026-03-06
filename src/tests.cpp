@@ -2,6 +2,9 @@
 //
 // 通过 qwen3-27b-thor test 调用, 入口函数: run_tests()
 
+// test cleanup 用 system("rm -rf ..."), 返回值无需检查
+#pragma GCC diagnostic ignored "-Wunused-result"
+
 #include <iostream>
 #include <vector>
 #include <memory>
@@ -439,7 +442,7 @@ void test_cache_engine() {
 
         // Cleanup
         std::string cmd = "rm -rf " + test_dir;
-        system(cmd.c_str());
+        (void)system(cmd.c_str());
         std::cout << "    PASS: DiskBackend operations correct" << std::endl;
     }
     
@@ -495,7 +498,7 @@ void test_cache_engine() {
         auto result = engine.lookup_prefix(tokens.data(), 32);
         if (result.matched_chunks != 0) {
             std::cerr << "  FAIL: expected 0 matched_chunks, got " << result.matched_chunks << std::endl;
-            system(("rm -rf " + test_dir).c_str());
+            (void)system(("rm -rf " + test_dir).c_str());
             return;
         }
         
@@ -503,11 +506,11 @@ void test_cache_engine() {
         auto stats = engine.get_stats();
         if (stats.total_lookups != 1 || stats.cache_misses != 1) {
             std::cerr << "  FAIL: stats mismatch" << std::endl;
-            system(("rm -rf " + test_dir).c_str());
+            (void)system(("rm -rf " + test_dir).c_str());
             return;
         }
         
-        system(("rm -rf " + test_dir).c_str());
+        (void)system(("rm -rf " + test_dir).c_str());
         std::cout << "    PASS: CacheEngine lifecycle correct" << std::endl;
     }
 
@@ -617,7 +620,7 @@ void test_cache_engine() {
             // 20 个 entry, 每个 ~8KB+256=~8.5KB, 总需 ~170 KB, max=100 KB → 必有驱逐
             if (eviction_count == 0) {
                 std::cerr << "  FAIL: expected evictions, got 0" << std::endl;
-                system(("rm -rf " + test_dir).c_str());
+                (void)system(("rm -rf " + test_dir).c_str());
                 return;
             }
 
@@ -626,7 +629,7 @@ void test_cache_engine() {
             cache::CacheKey oldest{0xAABB0000};
             if (backend.contains(oldest)) {
                 std::cerr << "  FAIL: oldest entry should be evicted" << std::endl;
-                system(("rm -rf " + test_dir).c_str());
+                (void)system(("rm -rf " + test_dir).c_str());
                 return;
             }
 
@@ -634,11 +637,11 @@ void test_cache_engine() {
             cache::CacheKey newest{(uint64_t)(0xAABB0000 + 19)};
             if (!backend.contains(newest)) {
                 std::cerr << "  FAIL: newest entry should exist" << std::endl;
-                system(("rm -rf " + test_dir).c_str());
+                (void)system(("rm -rf " + test_dir).c_str());
                 return;
             }
         }
-        system(("rm -rf " + test_dir).c_str());
+        (void)system(("rm -rf " + test_dir).c_str());
         std::cout << "    PASS: LRU eviction correct (evicted " << eviction_count
                   << " entries, " << eviction_total_bytes << " bytes)" << std::endl;
     }
@@ -711,12 +714,12 @@ void test_cache_engine() {
 
             if (keysA[0] != keysB[0]) {
                 std::cerr << "  FAIL: Shared prefix should produce same chunk key" << std::endl;
-                system(("rm -rf " + test_dir).c_str());
+                (void)system(("rm -rf " + test_dir).c_str());
                 return;
             }
             if (keysA[1] == keysB[1]) {
                 std::cerr << "  FAIL: Different suffix should produce different chunk key" << std::endl;
-                system(("rm -rf " + test_dir).c_str());
+                (void)system(("rm -rf " + test_dir).c_str());
                 return;
             }
         }
@@ -736,12 +739,12 @@ void test_cache_engine() {
             // (0+256+1024)/3072 ≈ 41.7%
             if (tsr < 41.0 || tsr > 42.5) {
                 std::cerr << "  FAIL: shared prefix token_save_ratio=" << tsr << std::endl;
-                system(("rm -rf " + test_dir).c_str());
+                (void)system(("rm -rf " + test_dir).c_str());
                 return;
             }
         }
 
-        system(("rm -rf " + test_dir).c_str());
+        (void)system(("rm -rf " + test_dir).c_str());
         std::cout << "    PASS: Shared prefix key matching correct" << std::endl;
     }
     
@@ -897,7 +900,7 @@ void test_kv_swapper() {
     swapper.print_stats();
 
     // Cleanup
-    system(("rm -rf " + swap_dir).c_str());
+    (void)system(("rm -rf " + swap_dir).c_str());
     std::cout << "    PASS: Data integrity verified after KV swap roundtrip" << std::endl;
     std::cout << "KV Swapper test passed.\n" << std::endl;
 }
@@ -1497,7 +1500,7 @@ void test_swap_256k_benchmark() {
 
     // Cleanup SSD
     printf("  Cleaning SSD files: %s\n", swap_dir.c_str());
-    system(("rm -rf " + swap_dir).c_str());
+    (void)system(("rm -rf " + swap_dir).c_str());
 
     printf("\n  256K Swap Benchmark complete.\n\n");
 }

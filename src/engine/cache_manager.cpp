@@ -105,7 +105,10 @@ CacheManager::CacheManager(const core::Qwen35Config& model_config,
     // 5. Block SSD Store + Streaming Attention Buffers
     {
         ssd_io_staging_size_ = 32ULL * 1024 * 1024;  // 32 MB
-        posix_memalign(&ssd_io_staging_, 4096, ssd_io_staging_size_);
+        if (posix_memalign(&ssd_io_staging_, 4096, ssd_io_staging_size_) != 0) {
+            fprintf(stderr, "[CacheManager] posix_memalign failed for SSD staging (%zu bytes)\n", ssd_io_staging_size_);
+            ssd_io_staging_ = nullptr;
+        }
 
         std::string block_store_dir = cache_config.cache_dir + "/block_store";
         block_ssd_store_ = std::make_unique<BlockSSDStore>(

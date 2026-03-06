@@ -673,7 +673,9 @@ static MultimodalContent parse_multimodal_content(const std::string& content_jso
 
                                 // Extract frames with ffmpeg at 2 fps
                                 std::string mkdir_cmd = "mkdir -p " + tmp_dir;
-                                system(mkdir_cmd.c_str());
+                                if (system(mkdir_cmd.c_str()) != 0) {
+                                    std::cerr << "[Serve] mkdir failed: " << tmp_dir << std::endl;
+                                }
                                 std::string ffmpeg_cmd = "ffmpeg -y -i " + tmp_video
                                     + " -vf fps=2 -frames:v 16 -q:v 2 " + tmp_dir + "/frame_%04d.jpg";
                                 std::cerr << "[Serve] Running: " << ffmpeg_cmd << std::endl;
@@ -696,7 +698,9 @@ static MultimodalContent parse_multimodal_content(const std::string& content_jso
 
                                 // Cleanup temp files
                                 std::string cleanup = "rm -rf " + tmp_video + " " + tmp_dir;
-                                system(cleanup.c_str());
+                                if (system(cleanup.c_str()) != 0) {
+                                    std::cerr << "[Serve] cleanup failed" << std::endl;
+                                }
 
                                 if (!vd.frames.empty()) {
                                     core::VisionConfig vcfg;
