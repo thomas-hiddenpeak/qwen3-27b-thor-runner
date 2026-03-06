@@ -59,6 +59,11 @@ static void run_mlp(
         ops::invoke_dense_dual_gemv(post_norm_out, gate_proj_w, up_proj_w,
                                      gate_out, up_out, is, hs, stream);
         ops::invoke_swiglu(swiglu_out, gate_out, up_out, 1, is, stream);
+    } else if (gate_proj_w + (size_t)is * hs == up_proj_w) {
+        // T>1 + merged gate_up weight: single GEMM → [T, 2*is], then fused SwiGLU
+        // gate_out has room for [T, 2*is] since gate_out → up_out are contiguous
+        ops::invoke_dense_gemm(post_norm_out, gate_proj_w, gate_out, num_tokens, 2 * is, hs, stream);
+        ops::invoke_swiglu_merged(swiglu_out, gate_out, num_tokens, is, stream);
     } else {
         ops::invoke_dense_gemm(post_norm_out, gate_proj_w, gate_out, num_tokens, is, hs, stream);
         ops::invoke_dense_gemm(post_norm_out, up_proj_w,   up_out,  num_tokens, is, hs, stream);
@@ -165,9 +170,18 @@ void Qwen35FullAttnLayer::forward(
                 ops::invoke_dense_gemv(norm_out, v_proj_w_, v,       kv_dim, hs, stream);
             }
         } else {
-            ops::invoke_dense_gemm(norm_out, q_proj_w_, qg_proj, num_tokens, qp_dim, hs, stream);
-            ops::invoke_dense_gemm(norm_out, k_proj_w_, k,       num_tokens, kv_dim, hs, stream);
-            ops::invoke_dense_gemm(norm_out, v_proj_w_, v,       num_tokens, kv_dim, hs, stream);
+            if (qkv_merged_w_) {
+                // T>1 + merged QKV: single GEMM + deinterleave (3 calls → 1+1)
+                // Use gate_buf as temp buffer (not used until MLP, size >= T * merged_N)
+                int merged_N = qp_dim + kv_dim * 2;
+                ops::invoke_dense_gemm(norm_out, qkv_merged_w_, gate_buf, num_tokens, merged_N, hs, stream);
+                ops::invoke_deinterleave_gemm_3way(qg_proj, k, v, gate_buf,
+                    num_tokens, merged_N, qp_dim, qp_dim + kv_dim, stream);
+            } else {
+                ops::invoke_dense_gemm(norm_out, q_proj_w_, qg_proj, num_tokens, qp_dim, hs, stream);
+                ops::invoke_dense_gemm(norm_out, k_proj_w_, k,       num_tokens, kv_dim, hs, stream);
+                ops::invoke_dense_gemm(norm_out, v_proj_w_, v,       num_tokens, kv_dim, hs, stream);
+            }
         }
     }
 
@@ -441,10 +455,24 @@ void Qwen35LinearAttnLayer::forward(
                 ops::invoke_dense_gemv(norm_out, in_proj_b_w_,   beta_out,  nv,     hs, stream);
             }
         } else {
-            ops::invoke_dense_gemm(norm_out, in_proj_qkv_w_, qkv_out, num_tokens, in_qkv, hs, stream);
-            ops::invoke_dense_gemm(norm_out, in_proj_z_w_,   z_out,     num_tokens, lin_v,  hs, stream);
-            ops::invoke_dense_gemm(norm_out, in_proj_a_w_,   a_out_f16, num_tokens, nv,     hs, stream);
-            ops::invoke_dense_gemm(norm_out, in_proj_b_w_,   beta_out,  num_tokens, nv,     hs, stream);
+            if (all_proj_merged_w_) {
+                // T>1 + super-merged: merge QKV+Z into 1 GEMM (saves 1 cuBLAS call)
+                // in_proj_qkv_w_ and in_proj_z_w_ are contiguous sub-pointers of all_proj_merged
+                int qkv_z_N = in_qkv + lin_v;  // 10240 + 6144 = 16384
+                // Use gate_out as temp (not used until MLP, large enough)
+                ops::invoke_dense_gemm(norm_out, in_proj_qkv_w_, gate_out, num_tokens, qkv_z_N, hs, stream);
+                // 2-way split: QKV[T, in_qkv] + Z[T, lin_v]
+                ops::invoke_deinterleave_gemm_3way(qkv_out, z_out, z_out, gate_out,
+                    num_tokens, qkv_z_N, in_qkv, qkv_z_N, stream);
+                // A and B are tiny (N=48 each), keep separate
+                ops::invoke_dense_gemm(norm_out, in_proj_a_w_, a_out_f16, num_tokens, nv, hs, stream);
+                ops::invoke_dense_gemm(norm_out, in_proj_b_w_, beta_out, num_tokens, nv, hs, stream);
+            } else {
+                ops::invoke_dense_gemm(norm_out, in_proj_qkv_w_, qkv_out, num_tokens, in_qkv, hs, stream);
+                ops::invoke_dense_gemm(norm_out, in_proj_z_w_,   z_out,     num_tokens, lin_v,  hs, stream);
+                ops::invoke_dense_gemm(norm_out, in_proj_a_w_,   a_out_f16, num_tokens, nv,     hs, stream);
+                ops::invoke_dense_gemm(norm_out, in_proj_b_w_,   beta_out,  num_tokens, nv,     hs, stream);
+            }
         }
     }
 

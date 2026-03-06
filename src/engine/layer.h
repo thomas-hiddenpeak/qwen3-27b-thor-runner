@@ -116,20 +116,29 @@ public:
         v_proj_w_ = merged + (size_t)(config_.q_proj_dim() + config_.kv_dim()) * config_.hidden_size;
     }
 
+    // 设置合并后的 Gate+Up 权重 (T>1 GEMM 优化: 2 launches → 1)
+    // merged 布局: [2*is, hs], 同时更新 gate/up_proj_w_ 指向子区域
+    void set_merged_gate_up(__nv_bfloat16* merged) {
+        gate_up_merged_w_ = merged;
+        gate_proj_w_ = merged;
+        up_proj_w_ = merged + (size_t)config_.intermediate_size * config_.hidden_size;
+    }
+
 private:
     Qwen35Config config_;
     int layer_idx_;
 
     __nv_bfloat16* qkv_merged_w_ = nullptr;  // [q_proj_dim + kv_dim*2, hs] 合并权重
+    __nv_bfloat16* gate_up_merged_w_ = nullptr; // [2*is, hs] 合并权重
     __nv_bfloat16* q_proj_w_   = nullptr;
     __nv_bfloat16* k_proj_w_   = nullptr;
     __nv_bfloat16* v_proj_w_   = nullptr;
     __nv_bfloat16* o_proj_w_   = nullptr;
     __nv_bfloat16* q_norm_w_   = nullptr;
     __nv_bfloat16* k_norm_w_   = nullptr;
-    __nv_bfloat16* gate_proj_w_  = nullptr;
-    __nv_bfloat16* up_proj_w_    = nullptr;
-    __nv_bfloat16* down_proj_w_  = nullptr;
+    __nv_bfloat16* gate_proj_w_   = nullptr;
+    __nv_bfloat16* up_proj_w_     = nullptr;
+    __nv_bfloat16* down_proj_w_   = nullptr;
     __nv_bfloat16* input_layernorm_w_          = nullptr;
     __nv_bfloat16* post_attention_layernorm_w_ = nullptr;
 };
@@ -201,6 +210,7 @@ private:
     __nv_bfloat16* in_proj_a_w_   = nullptr;
     __nv_bfloat16* in_proj_b_w_   = nullptr;
     __nv_bfloat16* all_proj_merged_w_ = nullptr;  // [in_qkv+lin_v+nv*2, hs] 超级合并权重
+    __nv_bfloat16* gate_up_merged_w_ = nullptr;   // [2*is, hs] 合并权重
     __nv_bfloat16* out_proj_w_    = nullptr;
     __nv_bfloat16* conv1d_w_      = nullptr;
     float* A_log_f32_    = nullptr;  // F32 pointer (A_log is stored as float32)
@@ -211,6 +221,14 @@ private:
     __nv_bfloat16* down_proj_w_   = nullptr;
     __nv_bfloat16* input_layernorm_w_          = nullptr;
     __nv_bfloat16* post_attention_layernorm_w_ = nullptr;
+
+public:
+    // 设置合并后的 Gate+Up 权重 (T>1 GEMM 优化: 2 launches → 1)
+    void set_merged_gate_up(__nv_bfloat16* merged) {
+        gate_up_merged_w_ = merged;
+        gate_proj_w_ = merged;
+        up_proj_w_ = merged + (size_t)config_.intermediate_size * config_.hidden_size;
+    }
 };
 
 // ============================================================================

@@ -229,6 +229,39 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
         }
         std::cout << "      Merged projections: " << (merged_total >> 20)
                   << " MB (QKV×16 + QKVZAB×48, net zero)" << std::endl;
+
+        // Level 3: Merge Gate+Up projections for T>1 (all 64 layers)
+        // gate_proj[is, hs] + up_proj[is, hs] → [2*is, hs] = [34816, 5120]
+        // Saves 64 cuBLAS launches per T>1 step (MTP verify T=4)
+        size_t gate_up_total = 0;
+        for (int i = 0; i < config_.num_hidden_layers; ++i) {
+            std::string p = "model.language_model.layers." + std::to_string(i) + ".";
+            __nv_bfloat16* gate_w = tensor_map[p + "mlp.gate_proj.weight"];
+            __nv_bfloat16* up_w   = tensor_map[p + "mlp.up_proj.weight"];
+            if (!gate_w || !up_w) continue;
+
+            int is = config_.intermediate_size;
+            int hs = config_.hidden_size;
+            size_t bytes = (size_t)2 * is * hs * sizeof(__nv_bfloat16);
+            __nv_bfloat16* merged = nullptr;
+            cudaMalloc(&merged, bytes);
+            cudaMemcpy(merged, gate_w,
+                       (size_t)is * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(merged + (size_t)is * hs, up_w,
+                       (size_t)is * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+
+            device_weights_.push_back(merged);
+            if (config_.is_full_attention(i)) {
+                layers_[i].get_full_attn()->set_merged_gate_up(merged);
+            } else {
+                layers_[i].get_linear_attn()->set_merged_gate_up(merged);
+            }
+            release_weight(gate_w);
+            release_weight(up_w);
+            gate_up_total += bytes;
+        }
+        std::cout << "      Merged Gate+Up: " << (gate_up_total >> 20)
+                  << " MB (64 layers, net zero)" << std::endl;
     }
 
     // 3. 全局权重
