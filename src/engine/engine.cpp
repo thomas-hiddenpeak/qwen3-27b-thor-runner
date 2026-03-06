@@ -641,7 +641,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             int chunk_size = max_chunk_size_;
             int num_chunks = (prefill_tokens + chunk_size - 1) / chunk_size;
 
-            if (num_chunks > 1) {
+            if (num_chunks > 1 && verbose_) {
                 std::cerr << "[ChunkedPrefill] " << prefill_tokens << " tokens → "
                           << num_chunks << " chunks of ≤" << chunk_size << std::endl;
             }
@@ -751,10 +751,12 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
 
                 // 1b. Vision: 如果有图像且是第一个 chunk, 运行视觉编码器并替换 image_pad 嵌入
                 if (chunk_idx == 0) {
-                    fprintf(stderr, "[Engine] Chunk 0: req=%lu processed_images=%zu has_vision=%d workspace=%s\n",
-                            ctx->request_id, ctx->processed_images.size(),
-                            (int)model_->has_vision(), d_vision_workspace_ ? "yes" : "no");
-                    fflush(stderr);
+                    if (verbose_) {
+                        fprintf(stderr, "[Engine] Chunk 0: req=%lu processed_images=%zu has_vision=%d workspace=%s\n",
+                                ctx->request_id, ctx->processed_images.size(),
+                                (int)model_->has_vision(), d_vision_workspace_ ? "yes" : "no");
+                        fflush(stderr);
+                    }
                     // Count image_pad tokens in this chunk for alignment verification
                     int pad_count_in_chunk = 0;
                     for (int ci = 0; ci < chunk_len; ci++) {
@@ -904,7 +906,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
 
                 ctx->cache_state.context_len = ctx_len_for_chunk;
 
-                if (num_chunks > 1) {
+                if (num_chunks > 1 && verbose_) {
                     std::cerr << "[ChunkedPrefill]   chunk " << chunk_idx
                               << "/" << num_chunks << ": tokens ["
                               << chunk_start << ", " << chunk_end

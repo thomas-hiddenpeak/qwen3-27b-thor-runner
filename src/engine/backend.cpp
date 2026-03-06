@@ -389,7 +389,7 @@ bool InferenceBackend::submit(InferRequest& request) {
             input.height = img.height;
             all_processed.push_back(core::VisionEncoder::preprocess_image(input, vcfg));
             auto& p = all_processed.back();
-            std::cerr << "[Backend] Image preprocessed: grid=" << p.grid_t << "x"
+            if (config_.verbose) std::cerr << "[Backend] Image preprocessed: grid=" << p.grid_t << "x"
                       << p.grid_h << "x" << p.grid_w
                       << " patches=" << p.num_patches()
                       << " output_tokens=" << p.num_output_tokens()
@@ -397,10 +397,12 @@ bool InferenceBackend::submit(InferRequest& request) {
         }
 
         // 处理视频 (帧序列)
-        std::cerr << "[Backend] Videos: " << request.videos.size()
-                  << ", Images: " << request.images.size() << std::endl;
+        if (config_.verbose) {
+            std::cerr << "[Backend] Videos: " << request.videos.size()
+                      << ", Images: " << request.images.size() << std::endl;
+        }
         for (auto& vid : request.videos) {
-            std::cerr << "[Backend] Video: " << vid.frames.size() << " frames, "
+            if (config_.verbose) std::cerr << "[Backend] Video: " << vid.frames.size() << " frames, "
                       << vid.width << "x" << vid.height
                       << ", fps=" << vid.source_fps << std::endl;
             core::VideoInput input;
@@ -410,7 +412,7 @@ bool InferenceBackend::submit(InferRequest& request) {
             input.source_fps = vid.source_fps;
             all_processed.push_back(core::VisionEncoder::preprocess_video(input, vcfg));
             auto& p = all_processed.back();
-            std::cerr << "[Backend] Video preprocessed: grid=" << p.grid_t << "x"
+            if (config_.verbose) std::cerr << "[Backend] Video preprocessed: grid=" << p.grid_t << "x"
                       << p.grid_h << "x" << p.grid_w
                       << " patches=" << p.num_patches()
                       << " output_tokens=" << p.num_output_tokens()
@@ -419,9 +421,11 @@ bool InferenceBackend::submit(InferRequest& request) {
         }
 
         if (!all_processed.empty()) {
-            std::cerr << "[Backend] Attaching " << all_processed.size()
-                      << " vision items to request " << request.request_id << std::endl;
-            std::cerr.flush();
+            if (config_.verbose) {
+                std::cerr << "[Backend] Attaching " << all_processed.size()
+                          << " vision items to request " << request.request_id << std::endl;
+                std::cerr.flush();
+            }
             engine_->attach_images(request.request_id, std::move(all_processed));
         }
     }

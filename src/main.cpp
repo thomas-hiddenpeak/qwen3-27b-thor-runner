@@ -209,6 +209,9 @@ static int cmd_chat(int argc, char** argv) {
 
     auto backend_config = BackendConfig::from_args(argc, argv);
     backend_config.verbose = false;  // chat 模式抑制推理日志
+    if (!backend_config.cache_enabled) {
+        backend_config.cache_enabled = true;  // chat 模式默认启用 prefix cache
+    }
     auto tui_config = tui::TuiConfig::from_args(argc, argv);
 
     try {
