@@ -237,20 +237,26 @@ public:
             size_t end = std::min(start + (size_t)blocks_per_batch_, ssd_logical_indices.size());
             size_t batch = end - start;
 
+            // Phase 1: 批量从 SSD 读取到 staging buffer
+            bool read_ok[256];  // blocks_per_batch_ 不会超过 staging 容量
             for (size_t bi = 0; bi < batch; ++bi) {
                 int logical_idx = ssd_logical_indices[start + bi];
                 off_t offset = (off_t)logical_idx * per_block_bytes_;
 
-                // 读取 K+V 到 staging buffer
-                if (pread(fd, (uint8_t*)staging_buffer_ + bi * per_block_bytes_,
-                          per_block_bytes_, offset) < 0) {
+                ssize_t nr = pread(fd, (uint8_t*)staging_buffer_ + bi * per_block_bytes_,
+                                   per_block_bytes_, offset);
+                if (nr < (ssize_t)per_block_bytes_) {
                     fprintf(stderr, "[BlockSSDStore] pread failed block %d: %s\n",
-                            logical_idx, strerror(errno));
+                            logical_idx, nr < 0 ? strerror(errno) : "short read");
+                    read_ok[bi] = false;
+                } else {
+                    read_ok[bi] = true;
                 }
             }
 
-            // 注入 GPU staging cache
+            // Phase 2: 注入 GPU staging cache (跳过读取失败的 block)
             for (size_t bi = 0; bi < batch; ++bi) {
+                if (!read_ok[bi]) continue;
                 int staging_slot = (int)(start + bi);
                 uint8_t* src = (uint8_t*)staging_buffer_ + bi * per_block_bytes_;
 
