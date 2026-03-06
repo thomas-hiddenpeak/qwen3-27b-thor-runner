@@ -450,7 +450,7 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
 //   [hs..2hs)         norm_h       (RMSNorm of main hidden, concat = [0..2hs) = [embed,hidden])
 //   [2hs..3hs)        projected    (fc output, also hidden_states for attn layer)
 //   [3hs..4hs)        raw_embed    (embedding lookup output)
-//   [4hs..4hs+93184)  attn_ws      (FullAttnLayer workspace for T=1)
+//   [4hs..4hs+attn_ws)  attn_ws    (FullAttnLayer workspace for T=1)
 //   after attn_ws:    normed [hs] + logits [vocab] + d_ids [2 ints]
 // ============================================================================
 __nv_bfloat16* Qwen35Model::mtp_forward(
@@ -474,16 +474,15 @@ __nv_bfloat16* Qwen35Model::mtp_forward(
     const int vocab = config_.vocab_size;      // 248320
 
     // Workspace pointers
-    // Layout: norm_e[hs] | norm_h[hs] | projected[hs] | raw_embed[hs] | attn_ws[93184] | normed[hs] | logits[vocab] | d_ids[2 ints]
+    // Layout: norm_e[hs] | norm_h[hs] | projected[hs] | raw_embed[hs] | attn_ws[full_attn_ws] | normed[hs] | logits[vocab] | d_ids[2 ints]
     // concat = [norm_e, norm_h] = [embed_norm, hidden_norm] (SGLang/HF 标准顺序)
+    const int attn_ws_elems = config_.full_attn_workspace_elems_t1();  // 93184
     __nv_bfloat16* norm_e    = workspace;                     // [5120] — embed norm FIRST
     __nv_bfloat16* norm_h    = norm_e + hs;                   // [5120] — hidden norm SECOND
     __nv_bfloat16* projected = norm_h + hs;                   // [5120]
     __nv_bfloat16* raw_embed = projected + hs;                // [5120]
     __nv_bfloat16* attn_ws   = raw_embed + hs;
-    // After attn layer: normed + logits (size determined by layer workspace)
-    // Full attn T=1 workspace: 5120+12288+1024+1024+6144+5120+5120+17408+17408+17408+5120 = 93184
-    __nv_bfloat16* normed    = attn_ws + 93184;
+    __nv_bfloat16* normed    = attn_ws + attn_ws_elems;
     __nv_bfloat16* logits    = normed + hs;
     int* d_ids               = reinterpret_cast<int*>(logits + vocab);  // 2 ints at the very end
 

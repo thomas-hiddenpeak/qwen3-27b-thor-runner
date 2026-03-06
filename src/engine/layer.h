@@ -53,6 +53,16 @@ struct Qwen35Config {
         return count;
     }
 
+    // -- EOS Token IDs --
+    static constexpr int EOS_TOKEN_IM_END  = 248046;  // <|im_end|>
+    static constexpr int EOS_TOKEN_ENDOFTEXT = 248044; // <|endoftext|>
+    static bool is_eos(int token_id) {
+        return token_id == EOS_TOKEN_IM_END || token_id == EOS_TOKEN_ENDOFTEXT;
+    }
+
+    // -- MTP 常量 --
+    static constexpr int MAX_MTP_DRAFTS = 8;  // 最大 draft 数 (T_max = MAX_MTP_DRAFTS + 1)
+
     // -- 派生尺寸 --
     int q_dim()        const { return num_attention_heads * head_dim; }         // 24*256=6144
     int q_proj_dim()   const { return num_attention_heads * head_dim * 2; }     // 24*256*2=12288 (Q+Gate)
@@ -62,6 +72,14 @@ struct Qwen35Config {
     // 每个 key-head 对应的 value 维度: (48/16)*128 = 384
     int lin_v_per_kh() const {
         return (linear_num_value_heads / linear_num_key_heads) * linear_value_head_dim;
+    }
+
+    // FullAttn 层 T=1 workspace 元素数 (bf16)
+    // norm_out[hs] + qg_proj[qp_dim] + k[kv_dim] + v[kv_dim] + attn_out[q_dim]
+    // + o_proj_out[hs] + post_norm_out[hs] + gate_buf[is] + up_out[is] + swiglu_out[is] + down_out[hs]
+    int full_attn_workspace_elems_t1() const {
+        return hidden_size + q_proj_dim() + kv_dim() * 2 + q_dim()
+             + hidden_size * 3 + intermediate_size * 3;
     }
 };
 

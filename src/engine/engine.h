@@ -126,6 +126,10 @@ private:
     int try_swap_out_victim(std::vector<RequestContext*>& active_requests,
                             int blocks_needed);
 
+    // MTP draft 生成: 链式调用 N 次 mtp_forward → argmax, GPU-resident chain
+    void generate_mtp_drafts(RequestContext* ctx, __nv_bfloat16* main_hidden,
+                             int first_token, int start_pos, int N, int vocab_size);
+
     std::string token_to_log_text(int token_id) const;
 
     Qwen35Config config_;

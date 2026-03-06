@@ -1148,7 +1148,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             
             // 推送响应 token 给 Python 前端
             {
-                bool eos = (next_token == 248046 || next_token == 248044);
+                bool eos = Qwen35Config::is_eos(next_token);
                 ipc::InferenceResponse resp{};
                 resp.request_id  = ctx->request_id;
                 resp.token_id    = next_token;
@@ -1230,7 +1230,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             profiler_.begin("embedding", compute_stream_);
 
             // 1. Embed [last_token, D0, ..., D_{N-1}] → d_hidden_states_ [T, hs]
-            int tokens_T[9];  // max N=8 → T=9
+            int tokens_T[Qwen35Config::MAX_MTP_DRAFTS + 1];  // max N=8 → T=9
             tokens_T[0] = last_token;
             for (int i = 0; i < N; i++) tokens_T[i + 1] = ctx->draft_tokens[i];
             cudaMemcpyAsync(d_pos_ids_, tokens_T, T * sizeof(int), cudaMemcpyHostToDevice, compute_stream_);
@@ -1327,7 +1327,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
 
             // 7. Batched argmax for all T logit positions (1 kernel + 1 sync)
             profiler_.begin("sample", compute_stream_);
-            int verify[9];
+            int verify[Qwen35Config::MAX_MTP_DRAFTS + 1];
             ops::invoke_batched_argmax(logits_T, d_argmax_result_, vocab_size, T, compute_stream_);
             if (!fast_sync_stream(compute_stream_, "batched_argmax_verify")) {
                 fprintf(stderr, "[Engine] FATAL: GPU hang in batched argmax verify\n");
@@ -1349,85 +1349,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 }
             }
 
-            // Helper lambda: chain N MTP calls to generate N draft tokens
-            // GPU-resident argmax chain: argmax results stay on GPU, only 1 final sync
-            auto generate_mtp_drafts = [&](__nv_bfloat16* main_hidden,
-                                           int first_token, int start_pos) {
-                ctx->draft_tokens.clear();
-
-                // Pre-allocate MTP KV blocks for all N drafts at once
-                int final_mtp_ctx = ctx->mtp_context_len + N;
-                int final_mtp_blks = (final_mtp_ctx + 15) / 16;
-                try {
-                    while ((int)ctx->mtp_block_table.size() < final_mtp_blks) {
-                        auto mb = mtp_kv_manager_->allocate_blocks(1);
-                        ctx->mtp_block_table.push_back(mb[0]);
-                    }
-                } catch (const std::runtime_error&) {
-                    // MTP KV pool exhausted — skip draft generation this step
-                    return;
-                }
-                // Single block_table upload (covers all N drafts)
-                cudaMemcpyAsync(d_mtp_block_tables_,
-                                ctx->mtp_block_table.data(),
-                                ctx->mtp_block_table.size() * sizeof(int),
-                                cudaMemcpyHostToDevice, compute_stream_);
-
-                __nv_bfloat16* h = main_hidden;
-                int pos = start_pos;
-
-                for (int di = 0; di < N; di++) {
-                    int mtp_ctx_fwd = ctx->mtp_context_len + di + 1;
-                    cudaMemcpyAsync(d_mtp_context_lens_, &mtp_ctx_fwd,
-                                    sizeof(int),
-                                    cudaMemcpyHostToDevice, compute_stream_);
-
-                    __nv_bfloat16* mtp_hidden = nullptr;
-                    __nv_bfloat16* mtp_logits;
-
-                    if (di == 0) {
-                        // First draft: CPU token (first_token)
-                        mtp_logits = model_->mtp_forward(
-                            h, first_token, pos,
-                            *mtp_kv_manager_,
-                            d_mtp_block_tables_, d_mtp_context_lens_,
-                            (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
-                            d_workspace_, compute_stream_,
-                            (di < N - 1) ? &mtp_hidden : nullptr,
-                            nullptr, &profiler_);
-                    } else {
-                        // Subsequent drafts: GPU-resident token from previous argmax
-                        mtp_logits = model_->mtp_forward(
-                            h, -1 /*ignored*/, pos,
-                            *mtp_kv_manager_,
-                            d_mtp_block_tables_, d_mtp_context_lens_,
-                            (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
-                            d_workspace_, compute_stream_,
-                            (di < N - 1) ? &mtp_hidden : nullptr,
-                            d_argmax_result_ + (di - 1), &profiler_);
-                    }
-
-                    // Argmax → d_argmax_result_[di], NO sync (stays on GPU)
-                    ops::invoke_argmax(mtp_logits, d_argmax_result_ + di,
-                                       vocab_size, compute_stream_);
-
-                    if (di < N - 1) {
-                        h = mtp_hidden;
-                        pos++;
-                    }
-                }
-
-                // Single final sync: read all N draft token IDs
-                if (!fast_sync_stream(compute_stream_, "mtp_drafts_batch")) {
-                    fprintf(stderr, "[Engine] FATAL: GPU hang in MTP draft generation\n");
-                    ctx->is_finished = true;
-                    return;
-                }
-                for (int di = 0; di < N; di++) {
-                    ctx->draft_tokens.push_back(d_argmax_result_[di]);
-                }
-                ctx->mtp_context_len += N;
-            };
+            // MTP draft generation uses member function generate_mtp_drafts()
 
             // ============================================================
             // 9. Emit accepted tokens + corrected/bonus token
@@ -1443,7 +1365,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 int dtok = ctx->draft_tokens[i];
                 ctx->generated_tokens.push_back(dtok);
                 ctx->context_len++;
-                bool eos_d = (dtok == 248046 || dtok == 248044);
+                bool eos_d = Qwen35Config::is_eos(dtok);
                 {
                     ipc::InferenceResponse resp{};
                     resp.request_id  = ctx->request_id;
@@ -1469,7 +1391,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             int next_token = verify[accept_count];
             ctx->generated_tokens.push_back(next_token);
             ctx->context_len++;
-            bool eos_n = (next_token == 248046 || next_token == 248044);
+            bool eos_n = Qwen35Config::is_eos(next_token);
             bool done_n = (int)ctx->generated_tokens.size() >= ctx->max_new_tokens || eos_n;
             {
                 ipc::InferenceResponse resp{};
@@ -1527,7 +1449,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             profiler_.begin("mtp_draft", compute_stream_);
             __nv_bfloat16* h_for_mtp = d_hidden_states_ + (size_t)accept_count * hs;
             ctx->mtp_pos = ctx->context_len - 1;
-            generate_mtp_drafts(h_for_mtp, next_token, ctx->mtp_pos);
+            generate_mtp_drafts(ctx, h_for_mtp, next_token, ctx->mtp_pos, N, vocab_size);
             profiler_.end("mtp_draft", compute_stream_);
 
             // 12. Statistics
@@ -1760,7 +1682,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             ctx->context_len++;
 
             // 推送响应 token 给 Python 前端
-            bool eos = (next_token == 248046 || next_token == 248044);
+            bool eos = Qwen35Config::is_eos(next_token);
             bool done = (int)ctx->generated_tokens.size() >= ctx->max_new_tokens || eos;
 
             // N-gram 重复检测: 检测 4-gram 连续重复 >= 8 次 → 强制终止
@@ -1802,82 +1724,14 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             }
 
             // ---- MTP Bootstrap: 首次 decode 后链式产出 N 个 draft ----
-            // GPU-resident argmax chain: 与 verify 路径共享相同的优化模式
+            // 复用 generate_mtp_drafts() 成员函数, 避免代码重复
             if (mtp_kv_manager_ && !ctx->is_finished && !ctx->uses_ssd_blocks
                 && ctx->draft_tokens.empty()) {
                 profiler_.begin("mtp_bootstrap", compute_stream_);
-                const int N = num_mtp_drafts_;
-                __nv_bfloat16* h = d_hidden_states_;
                 ctx->mtp_pos = ctx->context_len - 1;
-                int pos = ctx->mtp_pos;
-
-                // Pre-allocate MTP KV blocks for all N drafts
-                bool mtp_alloc_ok = true;
-                int final_mtp_ctx = ctx->mtp_context_len + N;
-                int final_mtp_blks = (final_mtp_ctx + 15) / 16;
-                try {
-                    while ((int)ctx->mtp_block_table.size() < final_mtp_blks) {
-                        auto mb = mtp_kv_manager_->allocate_blocks(1);
-                        ctx->mtp_block_table.push_back(mb[0]);
-                    }
-                } catch (const std::runtime_error&) {
-                    // MTP KV pool exhausted — skip bootstrap, degrade to T=1
-                    mtp_alloc_ok = false;
-                }
-                if (!mtp_alloc_ok) {
-                    profiler_.end("mtp_bootstrap", compute_stream_);
-                } else {
-                // Single block_table upload
-                cudaMemcpyAsync(d_mtp_block_tables_, ctx->mtp_block_table.data(),
-                                ctx->mtp_block_table.size() * sizeof(int),
-                                cudaMemcpyHostToDevice, compute_stream_);
-
-                for (int di = 0; di < N; di++) {
-                    int mtp_ctx_fwd = ctx->mtp_context_len + di + 1;
-                    cudaMemcpyAsync(d_mtp_context_lens_, &mtp_ctx_fwd, sizeof(int),
-                                    cudaMemcpyHostToDevice, compute_stream_);
-
-                    __nv_bfloat16* mtp_hidden = nullptr;
-                    __nv_bfloat16* mtp_logits;
-                    if (di == 0) {
-                        mtp_logits = model_->mtp_forward(
-                            h, next_token, pos,
-                            *mtp_kv_manager_,
-                            d_mtp_block_tables_, d_mtp_context_lens_,
-                            (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
-                            d_workspace_, compute_stream_,
-                            (di < N - 1) ? &mtp_hidden : nullptr,
-                            nullptr, &profiler_);
-                    } else {
-                        mtp_logits = model_->mtp_forward(
-                            h, -1, pos,
-                            *mtp_kv_manager_,
-                            d_mtp_block_tables_, d_mtp_context_lens_,
-                            (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
-                            d_workspace_, compute_stream_,
-                            (di < N - 1) ? &mtp_hidden : nullptr,
-                            d_argmax_result_ + (di - 1), &profiler_);
-                    }
-                    ops::invoke_argmax(mtp_logits, d_argmax_result_ + di,
-                                       vocab_size, compute_stream_);
-                    if (di < N - 1) {
-                        h = mtp_hidden;
-                        pos++;
-                    }
-                }
-
-                // Single final sync
-                if (!fast_sync_stream(compute_stream_, "mtp_bootstrap_batch")) {
-                    fprintf(stderr, "[Engine] FATAL: GPU hang in MTP bootstrap\n");
-                    ctx->is_finished = true;
-                } else {
-                    for (int di = 0; di < N; di++) {
-                        ctx->draft_tokens.push_back(d_argmax_result_[di]);
-                    }
-                    ctx->mtp_context_len += N;
-                }
+                generate_mtp_drafts(ctx, d_hidden_states_, next_token,
+                                    ctx->mtp_pos, num_mtp_drafts_, vocab_size);
                 profiler_.end("mtp_bootstrap", compute_stream_);
-                } // else mtp_alloc_ok
             }
 
             profiler_.request_decode_step();
@@ -1892,6 +1746,90 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             fflush(stdout);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// generate_mtp_drafts: 链式调用 N 次 mtp_forward → argmax 产出 draft tokens
+// GPU-resident argmax chain: argmax results stay on GPU, only 1 final sync
+// ---------------------------------------------------------------------------
+void InferenceEngine::generate_mtp_drafts(RequestContext* ctx,
+                                           __nv_bfloat16* main_hidden,
+                                           int first_token, int start_pos,
+                                           int N, int vocab_size) {
+    ctx->draft_tokens.clear();
+
+    // Pre-allocate MTP KV blocks for all N drafts at once
+    int final_mtp_ctx = ctx->mtp_context_len + N;
+    int final_mtp_blks = (final_mtp_ctx + 15) / 16;
+    try {
+        while ((int)ctx->mtp_block_table.size() < final_mtp_blks) {
+            auto mb = mtp_kv_manager_->allocate_blocks(1);
+            ctx->mtp_block_table.push_back(mb[0]);
+        }
+    } catch (const std::runtime_error&) {
+        // MTP KV pool exhausted — skip draft generation this step
+        return;
+    }
+    // Single block_table upload (covers all N drafts)
+    cudaMemcpyAsync(d_mtp_block_tables_,
+                    ctx->mtp_block_table.data(),
+                    ctx->mtp_block_table.size() * sizeof(int),
+                    cudaMemcpyHostToDevice, compute_stream_);
+
+    __nv_bfloat16* h = main_hidden;
+    int pos = start_pos;
+
+    for (int di = 0; di < N; di++) {
+        int mtp_ctx_fwd = ctx->mtp_context_len + di + 1;
+        cudaMemcpyAsync(d_mtp_context_lens_, &mtp_ctx_fwd,
+                        sizeof(int),
+                        cudaMemcpyHostToDevice, compute_stream_);
+
+        __nv_bfloat16* mtp_hidden = nullptr;
+        __nv_bfloat16* mtp_logits;
+
+        if (di == 0) {
+            // First draft: CPU token (first_token)
+            mtp_logits = model_->mtp_forward(
+                h, first_token, pos,
+                *mtp_kv_manager_,
+                d_mtp_block_tables_, d_mtp_context_lens_,
+                (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
+                d_workspace_, compute_stream_,
+                (di < N - 1) ? &mtp_hidden : nullptr,
+                nullptr, &profiler_);
+        } else {
+            // Subsequent drafts: GPU-resident token from previous argmax
+            mtp_logits = model_->mtp_forward(
+                h, -1 /*ignored*/, pos,
+                *mtp_kv_manager_,
+                d_mtp_block_tables_, d_mtp_context_lens_,
+                (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
+                d_workspace_, compute_stream_,
+                (di < N - 1) ? &mtp_hidden : nullptr,
+                d_argmax_result_ + (di - 1), &profiler_);
+        }
+
+        // Argmax → d_argmax_result_[di], NO sync (stays on GPU)
+        ops::invoke_argmax(mtp_logits, d_argmax_result_ + di,
+                           vocab_size, compute_stream_);
+
+        if (di < N - 1) {
+            h = mtp_hidden;
+            pos++;
+        }
+    }
+
+    // Single final sync: read all N draft token IDs
+    if (!fast_sync_stream(compute_stream_, "mtp_drafts_batch")) {
+        fprintf(stderr, "[Engine] FATAL: GPU hang in MTP draft generation\n");
+        ctx->is_finished = true;
+        return;
+    }
+    for (int di = 0; di < N; di++) {
+        ctx->draft_tokens.push_back(d_argmax_result_[di]);
+    }
+    ctx->mtp_context_len += N;
 }
 
 std::string InferenceEngine::token_to_log_text(int token_id) const {
@@ -1920,7 +1858,7 @@ int InferenceEngine::sample_argmax(__nv_bfloat16* logits, int vocab_size, cudaSt
     if (!fast_sync_stream(stream, "sample_argmax")) {
         fprintf(stderr, "[Engine] FATAL: GPU hang detected in sample_argmax, returning EOS\n");
         fflush(stderr);
-        return 248046; // EOS token — force stop
+        return Qwen35Config::EOS_TOKEN_IM_END; // EOS token — force stop
     }
     return *d_argmax_result_;
 }
@@ -1955,7 +1893,7 @@ int InferenceEngine::sample_token(__nv_bfloat16* logits, int vocab_size,
     if (!fast_sync_stream(stream, "sample_token")) {
         fprintf(stderr, "[Engine] FATAL: GPU hang detected in sample_token, returning EOS\n");
         fflush(stderr);
-        return 248046; // EOS token — force stop
+        return Qwen35Config::EOS_TOKEN_IM_END; // EOS token — force stop
     }
     cudaMemcpy(sampling_logits_bf16_.data(), logits,
                vocab_size * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
