@@ -85,6 +85,18 @@ struct Qwen35Config {
 
 
 // ============================================================================
+// NVFP4 量化权重: FP4 E2M1 packed + F8_E4M3 per-group scale + F32 global scale
+// ============================================================================
+struct QuantizedWeight {
+    uint8_t* packed = nullptr;   // [N, K/2] FP4 packed as U8 (2 values per byte)
+    uint8_t* scale = nullptr;    // [N, K/group_size] F8_E4M3 per-group scale
+    float global_scale = 1.0f;   // per-projection F32 weight_global_scale
+    float input_scale = 1.0f;    // per-projection F32 input_global_scale
+    int N = 0, K = 0;            // logical weight shape [N, K]
+    bool valid() const { return packed != nullptr; }
+};
+
+// ============================================================================
 // Full Attention Layer - GQA + RoPE(partial) + Paged KV Cache + Dense MLP
 // ============================================================================
 class Qwen35FullAttnLayer {
@@ -159,6 +171,31 @@ private:
     __nv_bfloat16* down_proj_w_   = nullptr;
     __nv_bfloat16* input_layernorm_w_          = nullptr;
     __nv_bfloat16* post_attention_layernorm_w_ = nullptr;
+
+    // NVFP4 量化权重 (仅在 quantized_==true 时使用)
+    bool quantized_ = false;
+    // Self-Attention 投影 (q/k/v/o)
+    QuantizedWeight q_qw_, k_qw_, v_qw_, o_qw_;
+    // MLP 投影 (gate/up/down)
+    QuantizedWeight gate_qw_, up_qw_, down_qw_;
+
+public:
+    bool is_quantized() const { return quantized_; }
+
+    // 设置量化自注意力权重 (不合并 QKV — global_scale 各不同)
+    void set_quantized_attn(
+        const QuantizedWeight& q, const QuantizedWeight& k,
+        const QuantizedWeight& v, const QuantizedWeight& o) {
+        quantized_ = true;
+        q_qw_ = q; k_qw_ = k; v_qw_ = v; o_qw_ = o;
+    }
+
+    // 设置量化 MLP 权重 (不合并 gate+up — global_scale 各不同)
+    void set_quantized_mlp(
+        const QuantizedWeight& gate, const QuantizedWeight& up,
+        const QuantizedWeight& down) {
+        gate_qw_ = gate; up_qw_ = up; down_qw_ = down;
+    }
 };
 
 // ============================================================================
@@ -240,7 +277,20 @@ private:
     __nv_bfloat16* input_layernorm_w_          = nullptr;
     __nv_bfloat16* post_attention_layernorm_w_ = nullptr;
 
+    // NVFP4 量化权重 — 仅 MLP 被量化, Linear Attn 投影保持 BF16
+    bool quantized_ = false;
+    QuantizedWeight gate_qw_, up_qw_, down_qw_;
+
 public:
+    bool is_quantized() const { return quantized_; }
+
+    void set_quantized_mlp(
+        const QuantizedWeight& gate, const QuantizedWeight& up,
+        const QuantizedWeight& down) {
+        quantized_ = true;
+        gate_qw_ = gate; up_qw_ = up; down_qw_ = down;
+    }
+
     // 设置合并后的 Gate+Up 权重 (T>1 GEMM 优化: 2 launches → 1)
     void set_merged_gate_up(__nv_bfloat16* merged) {
         gate_up_merged_w_ = merged;
@@ -260,6 +310,11 @@ public:
     Qwen35Layer& operator=(Qwen35Layer&&) noexcept = default;
 
     bool is_full_attention() const { return config_.is_full_attention(layer_idx_); }
+    bool is_quantized() const {
+        if (full_attn_) return full_attn_->is_quantized();
+        if (linear_attn_) return linear_attn_->is_quantized();
+        return false;
+    }
     Qwen35FullAttnLayer*   get_full_attn()   { return full_attn_.get();   }
     Qwen35LinearAttnLayer* get_linear_attn() { return linear_attn_.get(); }
     int get_layer_idx() const { return layer_idx_; }

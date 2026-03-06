@@ -1,6 +1,7 @@
 #include "layer.h"
 #include "light_ops.h"
 #include "dense_gemm.h"
+#include "dense_gemm_fp4.h"
 #include "streaming_attention.h"
 #include <cmath>
 #include <vector>
@@ -36,7 +37,10 @@ static void run_mlp(
     int num_tokens, int hs, int is,
     cudaStream_t stream,
     const __nv_bfloat16* post_attn_norm_w = nullptr,
-    const __nv_bfloat16* residual_in = nullptr)
+    const __nv_bfloat16* residual_in = nullptr,
+    const QuantizedWeight* gate_qw = nullptr,
+    const QuantizedWeight* up_qw = nullptr,
+    const QuantizedWeight* down_qw = nullptr)
 {
     // 可选: fused residual + RMSNorm (单 kernel 替代 add + rmsnorm)
     if (residual_in && post_attn_norm_w) {
@@ -54,11 +58,22 @@ static void run_mlp(
     }
 
     // Gate + Up projections: [T, hs] × [hs, is] → [T, is] (各一次)
+    bool use_fp4 = (gate_qw && gate_qw->valid());
     if (num_tokens == 1) {
-        // Decode 路径: dual GEMV — 1 kernel 同时完成 gate + up, A 只加载一次
-        ops::invoke_dense_dual_gemv(post_norm_out, gate_proj_w, up_proj_w,
-                                     gate_out, up_out, is, hs, stream);
+        if (use_fp4) {
+            ops::invoke_fp4_dual_gemv(post_norm_out, *gate_qw, *up_qw,
+                                      gate_out, up_out, stream);
+        } else {
+            // Decode 路径: dual GEMV — 1 kernel 同时完成 gate + up, A 只加载一次
+            ops::invoke_dense_dual_gemv(post_norm_out, gate_proj_w, up_proj_w,
+                                         gate_out, up_out, is, hs, stream);
+        }
         ops::invoke_swiglu(swiglu_out, gate_out, up_out, 1, is, stream);
+    } else if (use_fp4) {
+        // T>1 FP4 GEMM path (no gate+up merge)
+        ops::invoke_fp4_gemm(post_norm_out, *gate_qw, gate_out, num_tokens, stream);
+        ops::invoke_fp4_gemm(post_norm_out, *up_qw,   up_out,   num_tokens, stream);
+        ops::invoke_swiglu(swiglu_out, gate_out, up_out, num_tokens, is, stream);
     } else if (gate_proj_w + (size_t)is * hs == up_proj_w) {
         // T>1 + merged gate_up weight: single GEMM → [T, 2*is], then fused SwiGLU
         // gate_out has room for [T, 2*is] since gate_out → up_out are contiguous
@@ -71,7 +86,13 @@ static void run_mlp(
     }
 
     // Down projection + residual add
-    if (num_tokens == 1) {
+    if (use_fp4) {
+        if (num_tokens == 1) {
+            ops::invoke_fp4_gemv_add(swiglu_out, *down_qw, hidden_states, hidden_states, stream);
+        } else {
+            ops::invoke_fp4_gemm_add(swiglu_out, *down_qw, hidden_states, hidden_states, num_tokens, stream);
+        }
+    } else if (num_tokens == 1) {
         ops::invoke_dense_gemv_add(swiglu_out, down_proj_w, hidden_states, hidden_states, hs, is, stream);
     } else {
         ops::invoke_dense_gemm_add(swiglu_out, down_proj_w, hidden_states, hidden_states, num_tokens, hs, is, stream);
@@ -127,7 +148,7 @@ void Qwen35FullAttnLayer::forward(
     bool force_paged_attn,
     ops::StreamingAttnCtx* streaming_ctx)
 {
-    if (!q_proj_w_) return;
+    if (!q_proj_w_ && !quantized_) return;
 
     const int hs       = config_.hidden_size;
     const int is       = config_.intermediate_size;
@@ -154,7 +175,21 @@ void Qwen35FullAttnLayer::forward(
     // 1+2. Input RMSNorm + QKV Projection
     //   T=1: Fused RMSNorm in SMEM + merged GEMV (saves 1 launch, no norm_out GMEM I/O)
     //   T>1: Separate RMSNorm + GEMM
-    if (num_tokens == 1 && qkv_merged_w_) {
+    //   NVFP4: Separate RMSNorm + individual FP4 GEMV/GEMM (no merge)
+    if (quantized_) {
+        // NVFP4 path: separate RMSNorm, then individual FP4 GEMV/GEMM for Q/K/V
+        ops::invoke_rmsnorm(norm_out, hidden_states, input_layernorm_w_,
+                            config_.rms_norm_eps, num_tokens, hs, stream);
+        if (num_tokens == 1) {
+            ops::invoke_fp4_gemv(norm_out, q_qw_, qg_proj, stream);
+            ops::invoke_fp4_gemv(norm_out, k_qw_, k,       stream);
+            ops::invoke_fp4_gemv(norm_out, v_qw_, v,       stream);
+        } else {
+            ops::invoke_fp4_gemm(norm_out, q_qw_, qg_proj, num_tokens, stream);
+            ops::invoke_fp4_gemm(norm_out, k_qw_, k,       num_tokens, stream);
+            ops::invoke_fp4_gemm(norm_out, v_qw_, v,       num_tokens, stream);
+        }
+    } else if (num_tokens == 1 && qkv_merged_w_) {
         ops::invoke_dense_gemv_with_rmsnorm(
             hidden_states, input_layernorm_w_, config_.rms_norm_eps,
             qkv_merged_w_, qg_proj, qp_dim + kv_dim * 2, hs, stream);
@@ -340,7 +375,13 @@ void Qwen35FullAttnLayer::forward(
 
     // 7. O Projection
 
-    if (num_tokens == 1) {
+    if (quantized_) {
+        if (num_tokens == 1) {
+            ops::invoke_fp4_gemv(attn_out, o_qw_, o_proj_out, stream);
+        } else {
+            ops::invoke_fp4_gemm(attn_out, o_qw_, o_proj_out, num_tokens, stream);
+        }
+    } else if (num_tokens == 1) {
         ops::invoke_dense_gemv(attn_out, o_proj_w_, o_proj_out, hs, q_dim, stream);
     } else {
         ops::invoke_dense_gemm(attn_out, o_proj_w_, o_proj_out, num_tokens, hs, q_dim, stream);
@@ -350,7 +391,10 @@ void Qwen35FullAttnLayer::forward(
     run_mlp(hidden_states, post_norm_out, gate_buf, up_out, swiglu_out, down_out,
             gate_proj_w_, up_proj_w_, down_proj_w_,
             config_.rms_norm_eps, num_tokens, hs, is, stream,
-            post_attention_layernorm_w_, o_proj_out);
+            post_attention_layernorm_w_, o_proj_out,
+            quantized_ ? &gate_qw_ : nullptr,
+            quantized_ ? &up_qw_ : nullptr,
+            quantized_ ? &down_qw_ : nullptr);
 }
 
 // ============================================================================
@@ -517,7 +561,10 @@ void Qwen35LinearAttnLayer::forward(
     run_mlp(hidden_states, post_norm_out, gate_out, up_out, swiglu_out, down_out,
             gate_proj_w_, up_proj_w_, down_proj_w_,
             config_.rms_norm_eps, num_tokens, hs, is, stream,
-            post_attention_layernorm_w_, out_proj_buf);
+            post_attention_layernorm_w_, out_proj_buf,
+            quantized_ ? &gate_qw_ : nullptr,
+            quantized_ ? &up_qw_ : nullptr,
+            quantized_ ? &down_qw_ : nullptr);
 }
 
 // ============================================================================

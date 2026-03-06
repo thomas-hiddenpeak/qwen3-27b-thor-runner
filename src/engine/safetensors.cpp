@@ -117,6 +117,7 @@ core::DataType SafetensorsLoader::parse_dtype(const std::string& dtype_str) cons
     if (dtype_str == "F16") return core::DataType::FP16;
     if (dtype_str == "BF16") return core::DataType::BF16;
     if (dtype_str == "I8") return core::DataType::INT8;
+    if (dtype_str == "U8") return core::DataType::U8;
     // 扩展支持 Blackwell 的 FP8/FP4
     if (dtype_str == "F8_E4M3") return core::DataType::FP8_E4M3;
     if (dtype_str == "F8_E5M2") return core::DataType::FP8_E5M2;

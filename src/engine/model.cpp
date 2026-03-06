@@ -5,6 +5,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -27,6 +28,10 @@ Qwen35Model::~Qwen35Model() {
 void Qwen35Model::load_weights(const std::string& model_dir) {
     std::unordered_map<std::string, __nv_bfloat16*>  tensor_map;
     std::unordered_map<std::string, float*> f32_map;   // for A_log (stays FP32)
+    std::unordered_map<std::string, void*> raw_map;    // U8/F8_E4M3 NVFP4 tensors
+    std::unordered_map<std::string, std::vector<int64_t>> raw_shape_map;
+    std::unordered_map<std::string, float> scalar_f32_map;  // NVFP4 global_scale (CPU)
+    bool is_nvfp4 = false;
 
     if (!fs::exists(model_dir) || !fs::is_directory(model_dir)) {
         throw std::runtime_error("Model directory does not exist: " + model_dir);
@@ -62,9 +67,38 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
             device_weights_.push_back(d_ptr);
 
             auto dtype = tensor->dtype();
-            if (dtype == core::DataType::BF16) {
-                // 已经是 BF16，直接使用
-                tensor_map[name] = static_cast<__nv_bfloat16*>(d_ptr);
+            if (dtype == core::DataType::U8 || dtype == core::DataType::FP8_E4M3) {
+                // NVFP4 quantization tensor (weight_packed or weight_scale)
+                raw_map[name] = d_ptr;
+                raw_shape_map[name] = std::vector<int64_t>(tensor->shape().begin(), tensor->shape().end());
+                is_nvfp4 = true;
+            } else if (dtype == core::DataType::FP32 &&
+                       name.find("_global_scale") != std::string::npos) {
+                // NVFP4 per-projection scalar: read CPU value
+                float val = *static_cast<const float*>(tensor->data());
+                scalar_f32_map[name] = val;
+            } else if (dtype == core::DataType::BF16) {
+                // Check for A_log stored as BF16 (NVFP4 model variant)
+                bool is_a_log = (name.size() >= 5 &&
+                                 name.substr(name.size() - 5) == "A_log");
+                if (is_a_log) {
+                    // BF16 → FP32 conversion on CPU (only 48 elements)
+                    float* d_f32 = nullptr;
+                    size_t f32_bytes = num_elements * sizeof(float);
+                    if (cudaMalloc(reinterpret_cast<void**>(&d_f32), f32_bytes) != cudaSuccess)
+                        throw std::runtime_error("cudaMalloc failed (f32 buf) for " + name);
+                    std::vector<float> f32_buf(num_elements);
+                    const uint16_t* bf16_src = static_cast<const uint16_t*>(tensor->data());
+                    for (size_t j = 0; j < num_elements; j++) {
+                        uint32_t bits = static_cast<uint32_t>(bf16_src[j]) << 16;
+                        std::memcpy(&f32_buf[j], &bits, sizeof(float));
+                    }
+                    cudaMemcpy(d_f32, f32_buf.data(), f32_bytes, cudaMemcpyHostToDevice);
+                    device_weights_.push_back(d_f32);
+                    f32_map[name] = d_f32;
+                } else {
+                    tensor_map[name] = static_cast<__nv_bfloat16*>(d_ptr);
+                }
             } else if (dtype == core::DataType::FP32) {
                 // Check if this is an A_log tensor (keep as FP32)
                 bool is_a_log = (name.size() >= 5 &&
@@ -92,8 +126,9 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
     cudaStreamSynchronize(conv_stream);
     cudaStreamDestroy(conv_stream);
 
-    std::cerr << "Loaded " << (tensor_map.size() + f32_map.size()) << " tensors ("
-              << file_count << " shards) into VRAM." << std::endl;
+    std::cerr << "Loaded " << (tensor_map.size() + f32_map.size() + raw_map.size() + scalar_f32_map.size())
+              << " tensors (" << file_count << " shards) into VRAM."
+              << (is_nvfp4 ? " [NVFP4 quantized model detected]" : "") << std::endl;
 
     // 2. 绑定权重 — 根据层类型分别绑定
     auto get_ptr = [&](const std::string& key) -> __nv_bfloat16* {
@@ -114,34 +149,106 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
     for (int i = 0; i < config_.num_hidden_layers; ++i) {
         std::string p = "model.language_model.layers." + std::to_string(i) + ".";
 
-        __nv_bfloat16* gate = get_ptr(p + "mlp.gate_proj.weight");
-        __nv_bfloat16* up   = get_ptr(p + "mlp.up_proj.weight");
-        __nv_bfloat16* down = get_ptr(p + "mlp.down_proj.weight");
         __nv_bfloat16* in_n = get_ptr(p + "input_layernorm.weight");
         __nv_bfloat16* pa_n = get_ptr(p + "post_attention_layernorm.weight");
 
-        if (config_.is_full_attention(i)) {
-            layers_[i].get_full_attn()->set_weights(
-                get_ptr(p + "self_attn.q_proj.weight"),
-                get_ptr(p + "self_attn.k_proj.weight"),
-                get_ptr(p + "self_attn.v_proj.weight"),
-                get_ptr(p + "self_attn.o_proj.weight"),
-                get_ptr(p + "self_attn.q_norm.weight"),
-                get_ptr(p + "self_attn.k_norm.weight"),
-                gate, up, down, in_n, pa_n);
+        if (is_nvfp4) {
+            // NVFP4: MLP projections are quantized for all layers
+            if (config_.is_full_attention(i)) {
+                // Self-attn projections also quantized; only norms are BF16
+                layers_[i].get_full_attn()->set_weights(
+                    nullptr, nullptr, nullptr, nullptr,
+                    get_ptr(p + "self_attn.q_norm.weight"),
+                    get_ptr(p + "self_attn.k_norm.weight"),
+                    nullptr, nullptr, nullptr,
+                    in_n, pa_n);
+            } else {
+                // Linear attn projections are BF16; MLP is quantized
+                layers_[i].get_linear_attn()->set_weights(
+                    get_ptr(p + "linear_attn.in_proj_qkv.weight"),
+                    get_ptr(p + "linear_attn.in_proj_z.weight"),
+                    get_ptr(p + "linear_attn.in_proj_a.weight"),
+                    get_ptr(p + "linear_attn.in_proj_b.weight"),
+                    get_ptr(p + "linear_attn.out_proj.weight"),
+                    get_ptr(p + "linear_attn.conv1d.weight"),
+                    get_f32_ptr(p + "linear_attn.A_log"),
+                    get_ptr(p + "linear_attn.dt_bias"),
+                    get_ptr(p + "linear_attn.norm.weight"),
+                    nullptr, nullptr, nullptr,
+                    in_n, pa_n);
+            }
         } else {
-            layers_[i].get_linear_attn()->set_weights(
-                get_ptr(p + "linear_attn.in_proj_qkv.weight"),
-                get_ptr(p + "linear_attn.in_proj_z.weight"),
-                get_ptr(p + "linear_attn.in_proj_a.weight"),
-                get_ptr(p + "linear_attn.in_proj_b.weight"),
-                get_ptr(p + "linear_attn.out_proj.weight"),
-                get_ptr(p + "linear_attn.conv1d.weight"),
-                get_f32_ptr(p + "linear_attn.A_log"),
-                get_ptr(p + "linear_attn.dt_bias"),
-                get_ptr(p + "linear_attn.norm.weight"),
-                gate, up, down, in_n, pa_n);
+            // Original BF16 path
+            __nv_bfloat16* gate = get_ptr(p + "mlp.gate_proj.weight");
+            __nv_bfloat16* up   = get_ptr(p + "mlp.up_proj.weight");
+            __nv_bfloat16* down = get_ptr(p + "mlp.down_proj.weight");
+
+            if (config_.is_full_attention(i)) {
+                layers_[i].get_full_attn()->set_weights(
+                    get_ptr(p + "self_attn.q_proj.weight"),
+                    get_ptr(p + "self_attn.k_proj.weight"),
+                    get_ptr(p + "self_attn.v_proj.weight"),
+                    get_ptr(p + "self_attn.o_proj.weight"),
+                    get_ptr(p + "self_attn.q_norm.weight"),
+                    get_ptr(p + "self_attn.k_norm.weight"),
+                    gate, up, down, in_n, pa_n);
+            } else {
+                layers_[i].get_linear_attn()->set_weights(
+                    get_ptr(p + "linear_attn.in_proj_qkv.weight"),
+                    get_ptr(p + "linear_attn.in_proj_z.weight"),
+                    get_ptr(p + "linear_attn.in_proj_a.weight"),
+                    get_ptr(p + "linear_attn.in_proj_b.weight"),
+                    get_ptr(p + "linear_attn.out_proj.weight"),
+                    get_ptr(p + "linear_attn.conv1d.weight"),
+                    get_f32_ptr(p + "linear_attn.A_log"),
+                    get_ptr(p + "linear_attn.dt_bias"),
+                    get_ptr(p + "linear_attn.norm.weight"),
+                    gate, up, down, in_n, pa_n);
+            }
         }
+    }
+
+    // 2c. NVFP4 quantized weight binding
+    if (is_nvfp4) {
+        auto make_qw = [&](const std::string& prefix) -> QuantizedWeight {
+            QuantizedWeight qw;
+            std::string pk = prefix + ".weight_packed";
+            std::string sk = prefix + ".weight_scale";
+            auto pit = raw_map.find(pk);
+            auto sit = raw_map.find(sk);
+            if (pit == raw_map.end() || sit == raw_map.end()) return qw;
+            qw.packed = static_cast<uint8_t*>(pit->second);
+            qw.scale = static_cast<uint8_t*>(sit->second);
+            auto gsit = scalar_f32_map.find(prefix + ".weight_global_scale");
+            auto isit = scalar_f32_map.find(prefix + ".input_global_scale");
+            if (gsit != scalar_f32_map.end()) qw.global_scale = gsit->second;
+            if (isit != scalar_f32_map.end()) qw.input_scale = isit->second;
+            auto shit = raw_shape_map.find(pk);
+            if (shit != raw_shape_map.end() && shit->second.size() == 2) {
+                qw.N = static_cast<int>(shit->second[0]);
+                qw.K = static_cast<int>(shit->second[1]) * 2;  // packed K/2 → logical K
+            }
+            return qw;
+        };
+
+        for (int i = 0; i < config_.num_hidden_layers; ++i) {
+            std::string p = "model.language_model.layers." + std::to_string(i) + ".";
+            auto gate_qw = make_qw(p + "mlp.gate_proj");
+            auto up_qw   = make_qw(p + "mlp.up_proj");
+            auto down_qw = make_qw(p + "mlp.down_proj");
+            if (config_.is_full_attention(i)) {
+                auto q_qw = make_qw(p + "self_attn.q_proj");
+                auto k_qw = make_qw(p + "self_attn.k_proj");
+                auto v_qw = make_qw(p + "self_attn.v_proj");
+                auto o_qw = make_qw(p + "self_attn.o_proj");
+                layers_[i].get_full_attn()->set_quantized_attn(q_qw, k_qw, v_qw, o_qw);
+                layers_[i].get_full_attn()->set_quantized_mlp(gate_qw, up_qw, down_qw);
+            } else {
+                layers_[i].get_linear_attn()->set_quantized_mlp(gate_qw, up_qw, down_qw);
+            }
+        }
+        std::cerr << "[Model] NVFP4 quantized weights bound ("
+                  << raw_map.size() / 2 << " quantized projections)" << std::endl;
     }
 
     // 2b. 合并投影权重 — T=1 Decode GEMV 优化 (128 kernel launches/step saved)
@@ -175,9 +282,16 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
 
             if (config_.is_full_attention(i)) {
                 // Merge Q[qp_dim,hs] + K[kv_dim,hs] + V[kv_dim,hs] → [qp_dim+kv_dim*2, hs]
-                __nv_bfloat16* q_w = tensor_map[p + "self_attn.q_proj.weight"];
-                __nv_bfloat16* k_w = tensor_map[p + "self_attn.k_proj.weight"];
-                __nv_bfloat16* v_w = tensor_map[p + "self_attn.v_proj.weight"];
+                auto qit = tensor_map.find(p + "self_attn.q_proj.weight");
+                auto kit = tensor_map.find(p + "self_attn.k_proj.weight");
+                auto vit = tensor_map.find(p + "self_attn.v_proj.weight");
+                if (qit == tensor_map.end() || kit == tensor_map.end() || vit == tensor_map.end()) {
+                    // NVFP4: self-attn projections are quantized, skip QKV merge
+                    continue;
+                }
+                __nv_bfloat16* q_w = qit->second;
+                __nv_bfloat16* k_w = kit->second;
+                __nv_bfloat16* v_w = vit->second;
 
                 int merged_N = qp_dim + kv_dim * 2;  // 14336
                 size_t bytes = (size_t)merged_N * hs * sizeof(__nv_bfloat16);

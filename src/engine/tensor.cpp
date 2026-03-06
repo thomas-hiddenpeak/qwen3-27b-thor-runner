@@ -22,6 +22,12 @@ Tensor::Tensor(const std::vector<int64_t>& shape, DataType dtype, void* data_ptr
     nbytes_ = numel_ * get_dtype_size(dtype_);
 }
 
+Tensor::Tensor(const std::vector<int64_t>& shape, DataType dtype, void* data_ptr, size_t explicit_nbytes)
+    : shape_(shape), dtype_(dtype), data_ptr_(data_ptr), allocator_(nullptr) {
+    numel_ = compute_numel(shape_);
+    nbytes_ = explicit_nbytes;
+}
+
 Tensor::~Tensor() {
     if (allocator_ && data_ptr_) {
         allocator_->deallocate(data_ptr_);

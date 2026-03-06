@@ -16,6 +16,7 @@ enum class DataType {
     FP16,
     BF16,
     INT8,
+    U8,       // 无类型字节 (FP4 packed 等)
     FP8_E4M3, // Blackwell 原生支持
     FP8_E5M2,
     FP4,      // Blackwell 极低精度支持
@@ -29,6 +30,7 @@ inline size_t get_dtype_size(DataType dtype) {
         case DataType::FP16: return 2;
         case DataType::BF16: return 2;
         case DataType::INT8: return 1;
+        case DataType::U8: return 1;
         case DataType::FP8_E4M3: return 1;
         case DataType::FP8_E5M2: return 1;
         case DataType::FP4: return 0; // 特殊处理，通常 2 个 FP4 占 1 字节

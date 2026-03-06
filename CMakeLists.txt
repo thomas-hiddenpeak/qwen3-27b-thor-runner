@@ -44,7 +44,7 @@ file(GLOB_RECURSE ENGINE_SOURCES
 )
 
 add_library(qwen_thor_engine STATIC ${ENGINE_SOURCES})
-target_link_libraries(qwen_thor_engine PRIVATE CUDA::cudart CUDA::cublas rt dl)
+target_link_libraries(qwen_thor_engine PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt rt dl)
 
 # ============================================================================
 # 主可执行文件: qwen3-27b-thor

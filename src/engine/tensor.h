@@ -18,6 +18,9 @@ public:
     // 这种方式不负责释放内存，生命周期由外部管理
     Tensor(const std::vector<int64_t>& shape, DataType dtype, void* data_ptr);
 
+    // 构造函数：显式指定字节数（用于 FP4 packed 等 dtype_size 无法直接计算的情况）
+    Tensor(const std::vector<int64_t>& shape, DataType dtype, void* data_ptr, size_t explicit_nbytes);
+
     ~Tensor();
 
     // 禁用拷贝，允许移动
