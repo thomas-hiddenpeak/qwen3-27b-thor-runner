@@ -767,7 +767,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                     *kv_manager_, ctx->block_table,
                     ctx->ssm_states.empty() ? nullptr : ctx->ssm_states.data(),
                     ctx->conv_states.empty() ? nullptr : ctx->conv_states.data(),
-                    d_workspace_, compute_stream_);
+                    d_workspace_, d_block_tables_, compute_stream_);
                 if (cached_tokens > 0) {
                     ctx->context_len = cached_tokens;
                     std::cout << "[Cache] Restored " << cached_tokens << "/" << num_tokens

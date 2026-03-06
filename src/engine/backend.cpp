@@ -112,6 +112,7 @@ cache::CacheConfig BackendConfig::to_cache_config() const {
     cc.mtp_mode           = mtp_mode;
     cc.mtp_kv_blocks      = mtp_kv_blocks;
     cc.mtp_num_drafts     = mtp_num_drafts;
+    cc.validate();
     return cc;
 }
 

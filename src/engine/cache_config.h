@@ -104,7 +104,23 @@ struct CacheConfig {
                 cfg.mtp_num_drafts = std::max(1, std::min(8, std::stoi(argv[++i])));
             }
         }
+        cfg.validate();
         return cfg;
+    }
+
+    // ---- 参数校验 ----
+    void validate() const {
+        if (!enabled) return;
+        if (chunk_size <= 0 || (chunk_size % 16) != 0) {
+            std::cerr << "[CacheConfig] ERROR: chunk_size=" << chunk_size
+                      << " must be a positive multiple of block_size(16)" << std::endl;
+            std::exit(1);
+        }
+        if (kv_cache_budget_gb < 0.1) {
+            std::cerr << "[CacheConfig] ERROR: kv_cache_budget_gb=" << kv_cache_budget_gb
+                      << " too small (minimum 0.1)" << std::endl;
+            std::exit(1);
+        }
     }
 
     // ---- 从简单 key=value 配置文件加载 ----
@@ -146,6 +162,7 @@ struct CacheConfig {
             else if (key == "mtp_num_drafts" || key == "mtp_drafts")
                 cfg.mtp_num_drafts = std::max(1, std::min(8, std::stoi(val)));
         }
+        cfg.validate();
         return cfg;
     }
 

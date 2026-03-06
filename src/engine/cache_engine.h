@@ -77,6 +77,7 @@ public:
 
     // ---- 恢复: 从 SSD 恢复 KV + SSM/Conv 到新分配的 paged blocks ----
     // 返回恢复的 token 数 (0 = miss)
+    // d_block_table_buf: 预分配的 device 端 block table 缓冲区 (避免推理时 cudaMalloc)
     int retrieve_prefix(
         const int* tokens, int num_tokens,
         ops::KVCacheManager& kv_manager,
@@ -84,6 +85,7 @@ public:
         __nv_bfloat16** ssm_states,
         __nv_bfloat16** conv_states,
         __nv_bfloat16* workspace,
+        int* d_block_table_buf,
         cudaStream_t stream);
 
     // ---- 统计 (旧接口, 保持兼容) ----

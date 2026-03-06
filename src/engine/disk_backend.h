@@ -44,6 +44,9 @@ public:
 
     std::vector<CacheKey> get_evict_candidates(int n) const override;
 
+    // 查询指定 key 是否包含 SSM 状态 (仅查内存索引, 不读 SSD)
+    bool has_ssm_state(const CacheKey& key) const;
+
     const char* name() const override { return "DiskBackend"; }
 
 private:
@@ -57,12 +60,16 @@ private:
     // 驱逐
     void evict_until_fit(size_t needed_bytes);
 
+    // 启动时扫描已有缓存文件, 重建索引
+    void scan_existing_files();
+
     std::string cache_dir_;
     size_t max_bytes_;
 
-    // 元数据索引 (仅跟踪文件大小, 不缓存内容)
+    // 元数据索引 (跟踪文件大小和 SSM 状态标志)
     struct FileInfo {
         size_t file_bytes;
+        bool has_ssm;  // 是否包含 SSM/Conv 状态
     };
 
     using LRUList = std::list<std::pair<CacheKey, FileInfo>>;

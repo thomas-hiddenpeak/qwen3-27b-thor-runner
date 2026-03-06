@@ -83,11 +83,9 @@ LookupResult CacheEngine::lookup_prefix(const int* tokens, int num_tokens) {
     if (matched > 0) {
         result.matched_chunks = matched;
         result.matched_tokens = matched * config_.chunk_size;
-        // 最后一个匹配的 chunk 是否包含 SSM 状态?
-        auto entry = backend_->get(keys[matched - 1]);
-        if (entry) {
-            result.has_ssm_state = entry->has_ssm_state();
-        }
+        // 最后一个匹配的 chunk 是否包含 SSM 状态? (仅查内存索引, 不读 SSD)
+        auto* disk = static_cast<DiskBackend*>(backend_.get());
+        result.has_ssm_state = disk->has_ssm_state(keys[matched - 1]);
 
         std::lock_guard<std::mutex> lk(stats_mutex_);
         stats_.cache_hits++;
@@ -171,8 +169,8 @@ void CacheEngine::store_prefix(
 
         cudaStreamSynchronize(stream);
 
-        // 从 workspace (统一内存) 复制到 entry
-        memcpy(entry->kv_data.data(), workspace, kv_bytes);
+        // 从 workspace (cudaMalloc, GPU-only) 复制到 entry (host)
+        cudaMemcpy(entry->kv_data.data(), workspace, kv_bytes, cudaMemcpyDeviceToHost);
 
         // ---- SSM/Conv 状态 (仅最后一个 chunk) ----
         bool is_last = (ci == num_chunks - 1);
@@ -219,6 +217,7 @@ int CacheEngine::retrieve_prefix(
     __nv_bfloat16** ssm_states,
     __nv_bfloat16** conv_states,
     __nv_bfloat16* workspace,
+    int* d_block_table_buf,
     cudaStream_t stream)
 {
     if (!config_.enabled || !backend_) return 0;
@@ -226,6 +225,17 @@ int CacheEngine::retrieve_prefix(
     auto keys = hasher_.compute_keys(tokens, num_tokens);
     int matched = backend_->prefix_match(keys);
     if (matched <= 0) return 0;
+
+    // P0 安全检查: 如果启用了 SSM 缓存, 最后匹配 chunk 必须包含 SSM 状态
+    // 否则 48 层 DeltaNet 将从零 SSM 状态开始, 产生错误输出
+    if (config_.cache_ssm_state && ssm_states) {
+        auto* disk = static_cast<DiskBackend*>(backend_.get());
+        if (!disk->has_ssm_state(keys[matched - 1])) {
+            std::cerr << "[CacheEngine] Last matched chunk lacks SSM state, "
+                      << "falling back to full prefill" << std::endl;
+            return 0;
+        }
+    }
 
     ScopedTimer retrieve_timer;
 
@@ -242,11 +252,8 @@ int CacheEngine::retrieve_prefix(
     }
     out_block_table = blocks;
 
-    // 2. 上传 block_table 到 device (使用 workspace 尾部暂存)
-    // block_table 很小 (restore_blocks * 4 bytes), 直接 cudaMemcpy
-    int* d_block_table;
-    cudaMalloc(&d_block_table, restore_blocks * sizeof(int));
-    cudaMemcpyAsync(d_block_table, blocks.data(), restore_blocks * sizeof(int),
+    // 2. 上传 block_table 到 device (使用调用方预分配的 d_block_table_buf)
+    cudaMemcpyAsync(d_block_table_buf, blocks.data(), restore_blocks * sizeof(int),
                     cudaMemcpyHostToDevice, stream);
 
     // 3. 逐 chunk 恢复 KV
@@ -254,7 +261,6 @@ int CacheEngine::retrieve_prefix(
         auto entry = backend_->get(keys[ci]);
         if (!entry) {
             std::cerr << "[CacheEngine] Chunk " << ci << " disappeared from SSD!" << std::endl;
-            cudaFree(d_block_table);
             kv_manager.free_blocks(blocks);
             out_block_table.clear();
             return 0;
@@ -264,15 +270,15 @@ int CacheEngine::retrieve_prefix(
         int block_start = chunk_start / params_.block_size;
         size_t kv_bytes = entry->kv_data.size();
 
-        // 复制 KV 数据到 workspace (统一内存, 直接 memcpy)
-        memcpy(workspace, entry->kv_data.data(), kv_bytes);
+        // 复制 KV 数据到 workspace (cudaMalloc, GPU-only)
+        cudaMemcpy(workspace, entry->kv_data.data(), kv_bytes, cudaMemcpyHostToDevice);
 
         // inject kernel: flat buffer → paged KV
         invoke_inject_kv_to_pages(
             kv_manager.get_layer_k_cache_mut(0),
             kv_manager.get_layer_v_cache_mut(0),
             reinterpret_cast<const __nv_bfloat16*>(workspace),
-            d_block_table + block_start,
+            d_block_table_buf + block_start,
             config_.chunk_size,
             params_.num_kv_heads,
             params_.head_dim,
@@ -288,7 +294,6 @@ int CacheEngine::retrieve_prefix(
     }
 
     cudaStreamSynchronize(stream);
-    cudaFree(d_block_table);
 
     {
         std::lock_guard<std::mutex> lk(stats_mutex_);
