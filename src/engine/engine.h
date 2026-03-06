@@ -57,7 +57,8 @@ struct RequestContext {
     int ssm_slot = -1;  // 该请求持有的 SSM/Conv 状态池槽位 (-1 = 未分配)
     
     // MTP 投机解码状态
-    int draft_token = -1;          // 当前 draft token (-1 = 无 draft)
+    static constexpr int MTP_NUM_DRAFTS = 3;  // 每步生成 3 个 draft token → 最多 4 tokens/step
+    std::vector<int> draft_tokens;  // 当前 draft tokens (empty = 无 draft)
     int mtp_context_len = 0;       // MTP KV cache 中已有的 token 数
     std::vector<int> mtp_block_table;  // MTP KV cache block table
     int mtp_pos = 0;               // MTP 下一次调用的绝对位置 (用于 RoPE)

@@ -675,7 +675,7 @@ void invoke_causal_conv1d(__nv_bfloat16* x_io, __nv_bfloat16* conv_state,
                            __nv_bfloat16* conv_state_checkpoint) {
     if (token_stride <= 0) token_stride = channels;
 
-    if (num_tokens > 2 && batch_size <= 1 && conv_state) {
+    if (num_tokens > 2 && batch_size <= 1 && conv_state && !conv_state_checkpoint) {
         // Prefill 路径: 全并行 conv1d
         // 需要 input 副本 (因为 x_io 被 in-place 覆盖, 而后续 token 需要读前面的原始值)
         // 使用 workspace_conv_buf_ 静态分配
@@ -972,7 +972,9 @@ void invoke_gated_delta_net(const __nv_bfloat16* q, const __nv_bfloat16* k, cons
 
     if (batch_size <= 1) {
         // WY 分块 prefill: T≥4 时启用, chunk_size=4, 矩阵化加速 ~1.71×
-        if (num_tokens >= 4) {
+        // 注: WY checkpoint 在 chunk 0 后保存 (4 tokens), 但 MTP verify 需要
+        // token[0] 后的状态. 当需要 checkpoint 时回退到 serial kernel 以确保正确性.
+        if (num_tokens >= 4 && !ssm_state_checkpoint) {
             gdn_umma::invoke_gdn_wy_prefill(
                 q, k, v, a_raw, dt_bias, A_log, beta_raw,
                 ssm_state, y_out,

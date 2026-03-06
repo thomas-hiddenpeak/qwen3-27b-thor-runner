@@ -376,7 +376,8 @@ __nv_bfloat16* Qwen35Model::mtp_forward(
     int max_num_blocks_per_seq,
     int max_context_len,
     __nv_bfloat16* workspace,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    __nv_bfloat16** out_hidden)
 {
     if (!has_mtp_ || !mtp_layer_) return nullptr;
 
@@ -433,6 +434,9 @@ __nv_bfloat16* Qwen35Model::mtp_forward(
 
     // 6. LM head (shared with main model): GEMV [vocab, hs] × [hs] → [vocab]
     ops::invoke_dense_gemv(normed, lm_head_w_, logits, vocab, hs, stream);
+
+    // Output MTP hidden state for chaining (projected = post-attention transformer output)
+    if (out_hidden) *out_hidden = projected;
 
     return logits;
 }

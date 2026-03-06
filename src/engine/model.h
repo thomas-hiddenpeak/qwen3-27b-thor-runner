@@ -83,6 +83,8 @@ public:
     // input_token_id: token to embed (host value)
     // pos_id: 绝对位置 (用于 RoPE, host value)
     // mtp_kv_manager: MTP 层自己的 KV cache (1 层)
+    // out_hidden: if non-null, *out_hidden set to MTP transformer output (workspace内)
+    //             用于链式 MTP 调用: 作为下一次 mtp_forward 的 main_hidden
     __nv_bfloat16* mtp_forward(
         const __nv_bfloat16* main_hidden,
         int input_token_id,
@@ -93,7 +95,8 @@ public:
         int max_num_blocks_per_seq,
         int max_context_len,
         __nv_bfloat16* workspace,
-        cudaStream_t stream
+        cudaStream_t stream,
+        __nv_bfloat16** out_hidden = nullptr
     );
 
 private:

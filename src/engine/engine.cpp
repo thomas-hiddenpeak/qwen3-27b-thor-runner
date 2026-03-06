@@ -1191,29 +1191,34 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
         const int vocab_size = config_.vocab_size;
 
         // ================================================================
-        // 分支: MTP T=2 投机验证 vs 标准 T=1 decode
-        // MTP 条件: 有 MTP 权重 + 有 draft token + 不在 SSD streaming 模式
+        // 分支: MTP T=(N+1) 投机验证 vs 标准 T=1 decode
+        // MTP 条件: 有 MTP 权重 + 有 draft tokens + 不在 SSD streaming 模式
         // ================================================================
-        if (mtp_kv_manager_ && ctx->draft_token >= 0 && !ctx->uses_ssd_blocks) {
+        if (mtp_kv_manager_ && !ctx->draft_tokens.empty() && !ctx->uses_ssd_blocks) {
             // ============================================================
-            // MTP Speculative Decode: T=2 Verify
+            // MTP Speculative Decode: T=(N+1) All-or-Nothing Verify
             // ============================================================
+            const int N = RequestContext::MTP_NUM_DRAFTS;  // 3
+            const int T = N + 1;  // 4 tokens: [last_token, D0, D1, D2]
             profiler_.begin("embedding", compute_stream_);
 
-            // 1. Embed [last_token, draft] → d_hidden_states_ [2, hs]
-            int tokens_2[2] = {last_token, ctx->draft_token};
-            cudaMemcpyAsync(d_pos_ids_, tokens_2, 2 * sizeof(int), cudaMemcpyHostToDevice, compute_stream_);
+            // 1. Embed [last_token, D0, D1, D2] → d_hidden_states_ [T, hs]
+            int tokens_T[4];
+            tokens_T[0] = last_token;
+            for (int i = 0; i < N; i++) tokens_T[i + 1] = ctx->draft_tokens[i];
+            cudaMemcpyAsync(d_pos_ids_, tokens_T, T * sizeof(int), cudaMemcpyHostToDevice, compute_stream_);
             ops::invoke_embedding_lookup(
                 d_hidden_states_, d_pos_ids_, model_->get_embed_tokens(),
-                2, hs, compute_stream_);
+                T, hs, compute_stream_);
             profiler_.end("embedding", compute_stream_);
 
-            // 2. Pos IDs: [context_len - 1, context_len]
-            int pos_ids_2[2] = {ctx->context_len - 1, ctx->context_len};
-            cudaMemcpyAsync(d_pos_ids_, pos_ids_2, 2 * sizeof(int), cudaMemcpyHostToDevice, compute_stream_);
+            // 2. Pos IDs: [context_len - 1, ..., context_len + N - 1]
+            int pos_ids_T[4];
+            for (int i = 0; i < T; i++) pos_ids_T[i] = ctx->context_len - 1 + i;
+            cudaMemcpyAsync(d_pos_ids_, pos_ids_T, T * sizeof(int), cudaMemcpyHostToDevice, compute_stream_);
 
-            // 3. Block 分配: 确保 blocks 覆盖到 position context_len
-            int ctx_len_verify = ctx->context_len + 1;  // 包含两个新 token
+            // 3. Block 分配: 确保 blocks 覆盖到 position context_len + N - 1
+            int ctx_len_verify = ctx->context_len + N;  // 包含 T 个新 token
             {
                 int blocks_needed = (ctx_len_verify + 15) / 16;
                 while ((int)ctx->block_table.size() < blocks_needed) {
@@ -1249,7 +1254,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                             d_hidden_states_, d_pos_ids_, *kv_manager_,
                             d_block_tables_, d_context_lens_,
                             (int)ctx->block_table.size(), ctx_len_verify,
-                            2 /*num_tokens*/, fa_idx, d_workspace_, compute_stream_,
+                            T /*num_tokens*/, fa_idx, d_workspace_, compute_stream_,
                             1 /*batch_size*/, true /*force_paged_attn*/);
                         fa_idx++;
                     } else {
@@ -1261,7 +1266,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                             d_hidden_states_,
                             ctx->ssm_states[lin_idx],
                             ctx->conv_states[lin_idx],
-                            2 /*num_tokens*/, d_workspace_, compute_stream_,
+                            T /*num_tokens*/, d_workspace_, compute_stream_,
                             1 /*batch_size*/,
                             nullptr, nullptr,
                             ssm_ckpt, conv_ckpt);
@@ -1277,128 +1282,163 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 return;
             }
 
-            // 6. Norm + LM head for BOTH tokens
-            //    d_hidden_states_ = [2, hs] (last layer output, pre-norm)
+            // 6. Norm + LM head for all T tokens
+            //    d_hidden_states_ = [T, hs] (last layer output, pre-norm)
             profiler_.begin("final_norm", compute_stream_);
-            __nv_bfloat16* norm_out_2 = d_workspace_;
-            ops::invoke_rmsnorm(norm_out_2, d_hidden_states_, model_->get_norm_weight(),
-                                config_.rms_norm_eps, 2, hs, compute_stream_);
+            __nv_bfloat16* norm_out_T = d_workspace_;
+            ops::invoke_rmsnorm(norm_out_T, d_hidden_states_, model_->get_norm_weight(),
+                                config_.rms_norm_eps, T, hs, compute_stream_);
             profiler_.end("final_norm", compute_stream_);
 
             profiler_.begin("lm_head", compute_stream_);
-            __nv_bfloat16* logits_2 = norm_out_2 + 2 * hs;
-            ops::invoke_dense_gemm(norm_out_2, model_->get_lm_head(), logits_2,
-                                   2, vocab_size, hs, compute_stream_);
+            __nv_bfloat16* logits_T = norm_out_T + T * hs;
+            ops::invoke_dense_gemm(norm_out_T, model_->get_lm_head(), logits_T,
+                                   T, vocab_size, hs, compute_stream_);
             profiler_.end("lm_head", compute_stream_);
 
-            // 7. Sample verify token (logits[0]) and next token (logits[1])
+            // 7. Sample all T logit positions via argmax
             profiler_.begin("sample", compute_stream_);
-            int verify_token = sample_argmax(logits_2, vocab_size, compute_stream_);
-            int next_after_draft = sample_argmax(logits_2 + vocab_size,
-                                                  vocab_size, compute_stream_);
+            int verify[4];
+            for (int i = 0; i < T; i++) {
+                verify[i] = sample_argmax(logits_T + (size_t)i * vocab_size,
+                                          vocab_size, compute_stream_);
+            }
             profiler_.end("sample", compute_stream_);
 
             mtp_verify_count_++;
 
-            // 8. Accept / Reject
-            if (verify_token == ctx->draft_token) {
+            // 8. All-or-nothing accept: check if all N drafts match
+            bool all_match = true;
+            for (int i = 0; i < N; i++) {
+                if (verify[i] != ctx->draft_tokens[i]) {
+                    all_match = false;
+                    break;
+                }
+            }
+
+            // Helper lambda: chain N MTP calls to generate N draft tokens
+            auto generate_mtp_drafts = [&](__nv_bfloat16* main_hidden,
+                                           int first_token, int start_pos) {
+                ctx->draft_tokens.clear();
+                __nv_bfloat16* h = main_hidden;
+                int tok = first_token;
+                int pos = start_pos;
+                for (int di = 0; di < N; di++) {
+                    int mtp_ctx_fwd = ctx->mtp_context_len + 1;
+                    int mtp_blks = (mtp_ctx_fwd + 15) / 16;
+                    while ((int)ctx->mtp_block_table.size() < mtp_blks) {
+                        auto mb = mtp_kv_manager_->allocate_blocks(1);
+                        ctx->mtp_block_table.push_back(mb[0]);
+                    }
+                    cudaMemcpyAsync(d_mtp_block_tables_,
+                                    ctx->mtp_block_table.data(),
+                                    ctx->mtp_block_table.size() * sizeof(int),
+                                    cudaMemcpyHostToDevice, compute_stream_);
+                    cudaMemcpyAsync(d_mtp_context_lens_, &mtp_ctx_fwd,
+                                    sizeof(int),
+                                    cudaMemcpyHostToDevice, compute_stream_);
+
+                    __nv_bfloat16* mtp_hidden = nullptr;
+                    __nv_bfloat16* mtp_logits = model_->mtp_forward(
+                        h, tok, pos,
+                        *mtp_kv_manager_,
+                        d_mtp_block_tables_, d_mtp_context_lens_,
+                        (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
+                        d_workspace_, compute_stream_,
+                        (di < N - 1) ? &mtp_hidden : nullptr);
+
+                    int draft = sample_argmax(mtp_logits, vocab_size,
+                                              compute_stream_);
+                    ctx->draft_tokens.push_back(draft);
+                    ctx->mtp_context_len++;
+
+                    if (di < N - 1) {
+                        h = mtp_hidden;
+                        tok = draft;
+                        pos++;
+                    }
+                }
+            };
+
+            if (all_match) {
                 // ============================================================
-                // ACCEPT: draft 正确, 一次产出 2 个 token
+                // ACCEPT: all N drafts correct, emit N+1 tokens
                 // ============================================================
                 mtp_accept_count_++;
 
-                // Emit draft token
-                ctx->generated_tokens.push_back(ctx->draft_token);
+                // Emit N draft tokens
+                for (int i = 0; i < N; i++) {
+                    int dtok = ctx->draft_tokens[i];
+                    ctx->generated_tokens.push_back(dtok);
+                    ctx->context_len++;
+                    bool eos_d = (dtok == 248046 || dtok == 248044);
+                    {
+                        ipc::InferenceResponse resp{};
+                        resp.request_id  = ctx->request_id;
+                        resp.token_id    = dtok;
+                        resp.is_finished = eos_d;
+                        resp.error_code  = 0;
+                        while (!ipc_resp_queue_->push(resp))
+                            std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    }
+                    if (eos_d) {
+                        ctx->is_finished = true;
+                        ctx->draft_tokens.clear();
+                        profiler_.request_done();
+                        profiler_.print_request_summary();
+                        std::cout << "Decode step " << ctx->generated_tokens.size()
+                                  << ". tok=" << dtok
+                                  << " (MTP accept, EOS at draft " << i << ")" << std::endl;
+                        return;
+                    }
+                }
+
+                // Emit next token (verify[N] = prediction after all drafts)
+                int next_token = verify[N];
+                ctx->generated_tokens.push_back(next_token);
                 ctx->context_len++;
-                bool eos1 = (ctx->draft_token == 248046 || ctx->draft_token == 248044);
+                bool eos_n = (next_token == 248046 || next_token == 248044);
+                bool done_n = (int)ctx->generated_tokens.size() >= ctx->max_new_tokens || eos_n;
                 {
                     ipc::InferenceResponse resp{};
                     resp.request_id  = ctx->request_id;
-                    resp.token_id    = ctx->draft_token;
-                    resp.is_finished = eos1;
+                    resp.token_id    = next_token;
+                    resp.is_finished = done_n;
                     resp.error_code  = 0;
                     while (!ipc_resp_queue_->push(resp))
                         std::this_thread::sleep_for(std::chrono::microseconds(100));
                 }
-                if (eos1) {
+                if (done_n) {
                     ctx->is_finished = true;
-                    ctx->draft_token = -1;
+                    ctx->draft_tokens.clear();
                     profiler_.request_done();
                     profiler_.print_request_summary();
                     std::cout << "Decode step " << ctx->generated_tokens.size()
-                              << ". tok=" << tokens_2[1]
-                              << " txt=\"" << token_to_log_text(tokens_2[1]) << "\""
-                              << " (MTP accept, EOS)" << std::endl;
+                              << ". tok=" << next_token << " (MTP accept+done)" << std::endl;
                     return;
                 }
 
-                // Emit next_after_draft
-                ctx->generated_tokens.push_back(next_after_draft);
-                ctx->context_len++;
-                bool eos2 = (next_after_draft == 248046 || next_after_draft == 248044);
-                bool done2 = (int)ctx->generated_tokens.size() >= ctx->max_new_tokens || eos2;
-                {
-                    ipc::InferenceResponse resp{};
-                    resp.request_id  = ctx->request_id;
-                    resp.token_id    = next_after_draft;
-                    resp.is_finished = done2;
-                    resp.error_code  = 0;
-                    while (!ipc_resp_queue_->push(resp))
-                        std::this_thread::sleep_for(std::chrono::microseconds(100));
-                }
-                if (done2) {
-                    ctx->is_finished = true;
-                    ctx->draft_token = -1;
-                    profiler_.request_done();
-                    profiler_.print_request_summary();
-                    std::cout << "Decode step " << ctx->generated_tokens.size()
-                              << ". tok=" << next_after_draft << " (MTP accept+done)" << std::endl;
-                    return;
-                }
-
-                // MTP draft using hidden_states[1] (at draft position)
-                __nv_bfloat16* h_for_mtp = d_hidden_states_ + hs;
+                // Generate N new MTP drafts from hidden_states[N] (last accepted pos)
+                __nv_bfloat16* h_for_mtp = d_hidden_states_ + N * hs;
                 ctx->mtp_pos = ctx->context_len - 1;
+                generate_mtp_drafts(h_for_mtp, next_token, ctx->mtp_pos);
 
-                // MTP KV block 分配
-                int mtp_ctx_fwd = ctx->mtp_context_len + 1;
-                int mtp_blks = (mtp_ctx_fwd + 15) / 16;
-                while ((int)ctx->mtp_block_table.size() < mtp_blks) {
-                    auto mb = mtp_kv_manager_->allocate_blocks(1);
-                    ctx->mtp_block_table.push_back(mb[0]);
-                }
-                cudaMemcpyAsync(d_mtp_block_tables_, ctx->mtp_block_table.data(),
-                                ctx->mtp_block_table.size() * sizeof(int),
-                                cudaMemcpyHostToDevice, compute_stream_);
-                cudaMemcpyAsync(d_mtp_context_lens_, &mtp_ctx_fwd, sizeof(int),
-                                cudaMemcpyHostToDevice, compute_stream_);
-
-                __nv_bfloat16* mtp_logits = model_->mtp_forward(
-                    h_for_mtp, next_after_draft, ctx->mtp_pos,
-                    *mtp_kv_manager_,
-                    d_mtp_block_tables_, d_mtp_context_lens_,
-                    (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
-                    d_workspace_, compute_stream_);
-                ctx->draft_token = sample_argmax(mtp_logits, vocab_size, compute_stream_);
-                ctx->mtp_context_len++;
-
-                profiler_.request_decode_step();
-                profiler_.request_decode_step();  // 2 tokens produced
+                for (int i = 0; i < T; i++) profiler_.request_decode_step();
                 int step_n = (int)ctx->generated_tokens.size();
                 if (step_n % 10 == 0) profiler_.print_step_report(step_n);
                 float accept_rate = mtp_verify_count_ > 0
                     ? (float)mtp_accept_count_ / mtp_verify_count_ * 100.f : 0.f;
                 std::cout << "Decode step " << step_n
-                          << ". tok=" << ctx->draft_token
-                          << " txt=\"" << token_to_log_text(ctx->draft_token) << "\""
-                          << " (MTP ACCEPT 2tok, rate=" << accept_rate << "%)" << std::endl;
+                          << ". tok=" << next_token
+                          << " txt=\"" << token_to_log_text(next_token) << "\""
+                          << " (MTP ACCEPT " << T << "tok, rate=" << accept_rate << "%)" << std::endl;
 
             } else {
                 // ============================================================
-                // REJECT: draft 错误, 回滚 SSM/Conv, 只产出 1 个 token
+                // REJECT: at least one draft wrong, rollback SSM/Conv, emit 1 token
                 // ============================================================
 
-                // 回滚: 从 checkpoint 恢复 SSM/Conv 到 token[0] 之后的状态
+                // Rollback SSM/Conv from checkpoint
                 for (int li = 0; li < num_linear_layers_; ++li) {
                     __nv_bfloat16* ssm_ckpt = d_ssm_checkpoints_
                                       + li * ssm_elems_per_layer_;
@@ -1412,17 +1452,18 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                                     cudaMemcpyDeviceToDevice, compute_stream_);
                 }
 
-                // Emit corrected token
-                ctx->generated_tokens.push_back(verify_token);
+                // Emit corrected token (verify[0])
+                int corrected = verify[0];
+                ctx->generated_tokens.push_back(corrected);
                 ctx->context_len++;
                 // 注: context_len 只 +1, draft 的 KV 在下次 verify 时被覆写
 
-                bool eos = (verify_token == 248046 || verify_token == 248044);
+                bool eos = (corrected == 248046 || corrected == 248044);
                 bool done = (int)ctx->generated_tokens.size() >= ctx->max_new_tokens || eos;
                 {
                     ipc::InferenceResponse resp{};
                     resp.request_id  = ctx->request_id;
-                    resp.token_id    = verify_token;
+                    resp.token_id    = corrected;
                     resp.is_finished = done;
                     resp.error_code  = 0;
                     while (!ipc_resp_queue_->push(resp))
@@ -1430,39 +1471,21 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 }
                 if (done) {
                     ctx->is_finished = true;
-                    ctx->draft_token = -1;
+                    ctx->draft_tokens.clear();
                     profiler_.request_done();
                     profiler_.print_request_summary();
                     std::cout << "Decode step " << ctx->generated_tokens.size()
-                              << ". tok=" << verify_token << " (MTP reject+done)" << std::endl;
+                              << ". tok=" << corrected << " (MTP reject+done)" << std::endl;
                     return;
                 }
 
-                // MTP draft using hidden_states[0] (at last_emitted position)
+                // Rollback MTP context: only 1st entry valid, rest stale
+                ctx->mtp_context_len -= (N - 1);
+
+                // Generate N new MTP drafts from hidden_states[0]
                 __nv_bfloat16* h_for_mtp = d_hidden_states_;
                 ctx->mtp_pos = ctx->context_len - 1;
-
-                // MTP KV block 分配
-                int mtp_ctx_fwd = ctx->mtp_context_len + 1;
-                int mtp_blks = (mtp_ctx_fwd + 15) / 16;
-                while ((int)ctx->mtp_block_table.size() < mtp_blks) {
-                    auto mb = mtp_kv_manager_->allocate_blocks(1);
-                    ctx->mtp_block_table.push_back(mb[0]);
-                }
-                cudaMemcpyAsync(d_mtp_block_tables_, ctx->mtp_block_table.data(),
-                                ctx->mtp_block_table.size() * sizeof(int),
-                                cudaMemcpyHostToDevice, compute_stream_);
-                cudaMemcpyAsync(d_mtp_context_lens_, &mtp_ctx_fwd, sizeof(int),
-                                cudaMemcpyHostToDevice, compute_stream_);
-
-                __nv_bfloat16* mtp_logits = model_->mtp_forward(
-                    h_for_mtp, verify_token, ctx->mtp_pos,
-                    *mtp_kv_manager_,
-                    d_mtp_block_tables_, d_mtp_context_lens_,
-                    (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
-                    d_workspace_, compute_stream_);
-                ctx->draft_token = sample_argmax(mtp_logits, vocab_size, compute_stream_);
-                ctx->mtp_context_len++;
+                generate_mtp_drafts(h_for_mtp, corrected, ctx->mtp_pos);
 
                 profiler_.request_decode_step();
                 int step_n = (int)ctx->generated_tokens.size();
@@ -1470,8 +1493,8 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 float accept_rate = mtp_verify_count_ > 0
                     ? (float)mtp_accept_count_ / mtp_verify_count_ * 100.f : 0.f;
                 std::cout << "Decode step " << step_n
-                          << ". tok=" << verify_token
-                          << " txt=\"" << token_to_log_text(verify_token) << "\""
+                          << ". tok=" << corrected
+                          << " txt=\"" << token_to_log_text(corrected) << "\""
                           << " (MTP REJECT 1tok, rate=" << accept_rate << "%)" << std::endl;
             }
 
@@ -1727,35 +1750,47 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 profiler_.print_request_summary();
             }
 
-            // ---- MTP Bootstrap: 首次 decode 后产出 draft ----
+            // ---- MTP Bootstrap: 首次 decode 后链式产出 N 个 draft ----
             if (mtp_kv_manager_ && !ctx->is_finished && !ctx->uses_ssd_blocks
-                && ctx->draft_token < 0) {
-                // 保存 h (主模型最后一层输出), 用 d_hidden_states_ 原地
-                __nv_bfloat16* h_for_mtp = d_hidden_states_;
+                && ctx->draft_tokens.empty()) {
+                const int N = RequestContext::MTP_NUM_DRAFTS;
+                __nv_bfloat16* h = d_hidden_states_;
+                int tok = next_token;
                 ctx->mtp_pos = ctx->context_len - 1;
+                int pos = ctx->mtp_pos;
 
-                // MTP KV block 分配
-                int mtp_ctx_fwd = ctx->mtp_context_len + 1;
-                int mtp_blks = (mtp_ctx_fwd + 15) / 16;
-                while ((int)ctx->mtp_block_table.size() < mtp_blks) {
-                    auto mb = mtp_kv_manager_->allocate_blocks(1);
-                    ctx->mtp_block_table.push_back(mb[0]);
+                for (int di = 0; di < N; di++) {
+                    int mtp_ctx_fwd = ctx->mtp_context_len + 1;
+                    int mtp_blks = (mtp_ctx_fwd + 15) / 16;
+                    while ((int)ctx->mtp_block_table.size() < mtp_blks) {
+                        auto mb = mtp_kv_manager_->allocate_blocks(1);
+                        ctx->mtp_block_table.push_back(mb[0]);
+                    }
+                    cudaMemcpyAsync(d_mtp_block_tables_, ctx->mtp_block_table.data(),
+                                    ctx->mtp_block_table.size() * sizeof(int),
+                                    cudaMemcpyHostToDevice, compute_stream_);
+                    cudaMemcpyAsync(d_mtp_context_lens_, &mtp_ctx_fwd, sizeof(int),
+                                    cudaMemcpyHostToDevice, compute_stream_);
+
+                    __nv_bfloat16* mtp_hidden = nullptr;
+                    __nv_bfloat16* mtp_logits = model_->mtp_forward(
+                        h, tok, pos,
+                        *mtp_kv_manager_,
+                        d_mtp_block_tables_, d_mtp_context_lens_,
+                        (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
+                        d_workspace_, compute_stream_,
+                        (di < N - 1) ? &mtp_hidden : nullptr);
+
+                    int draft = sample_argmax(mtp_logits, vocab_size, compute_stream_);
+                    ctx->draft_tokens.push_back(draft);
+                    ctx->mtp_context_len++;
+
+                    if (di < N - 1) {
+                        h = mtp_hidden;
+                        tok = draft;
+                        pos++;
+                    }
                 }
-                cudaMemcpyAsync(d_mtp_block_tables_, ctx->mtp_block_table.data(),
-                                ctx->mtp_block_table.size() * sizeof(int),
-                                cudaMemcpyHostToDevice, compute_stream_);
-                cudaMemcpyAsync(d_mtp_context_lens_, &mtp_ctx_fwd, sizeof(int),
-                                cudaMemcpyHostToDevice, compute_stream_);
-
-                __nv_bfloat16* mtp_logits = model_->mtp_forward(
-                    h_for_mtp, next_token, ctx->mtp_pos,
-                    *mtp_kv_manager_,
-                    d_mtp_block_tables_, d_mtp_context_lens_,
-                    (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
-                    d_workspace_, compute_stream_);
-
-                ctx->draft_token = sample_argmax(mtp_logits, vocab_size, compute_stream_);
-                ctx->mtp_context_len++;
             }
 
             profiler_.request_decode_step();
