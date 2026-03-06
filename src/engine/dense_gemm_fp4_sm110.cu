@@ -142,6 +142,122 @@ __global__ void fp4_gemv_kernel(
 }
 
 // ============================================================================
+// FP4 Batched GEMV Kernel — Process M tokens sharing weight reads
+//
+// For small M (MTP verify T=4 etc.), reads weight once and computes M dot
+// products. Activations A[M,K] read from GMEM (L2-cached, <140KB for M=4).
+// Weight savings: M×GEMV reads M×0.5625×N×K; batched reads 1×0.5625×N×K.
+//
+// SMEM layout: [LUT: 64 bytes] only (A read from GMEM via L2)
+// Grid:  ceil(N / WARPS_PER_BLOCK), Block: 256 (8 warps)
+// Each warp computes M output elements C[m][n] for one n=out_idx
+// ============================================================================
+template <bool ADD_RESIDUAL, int MAX_M>
+__global__ void fp4_batched_gemv_kernel(
+    const __nv_bfloat16* __restrict__ A,       // [M, K]
+    const uint8_t* __restrict__ packed,        // [N, K/2]
+    const uint8_t* __restrict__ scale,         // [N, K/16]
+    __nv_bfloat16* __restrict__ C,             // [M, N]
+    const __nv_bfloat16* __restrict__ residual,// [M, N] or nullptr
+    float inv_global_scale,
+    int M, int N, int K)
+{
+    constexpr int WARP_SIZE = 32;
+    constexpr int WARPS_PER_BLOCK = 8;
+
+    extern __shared__ char s_mem[];
+    float* s_lut = reinterpret_cast<float*>(s_mem);
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x & (WARP_SIZE - 1);
+    int out_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+
+    if (threadIdx.x < 16)
+        s_lut[threadIdx.x] = c_fp4_lut[threadIdx.x];
+    __syncthreads();
+
+    if (out_idx >= N) return;
+
+    const int K_half = K >> 1;
+    const int K_groups = K >> 4;
+    const uint8_t* w_row = packed + (size_t)out_idx * K_half;
+    const uint8_t* s_row = scale + (size_t)out_idx * K_groups;
+
+    float sums[MAX_M];
+    #pragma unroll
+    for (int m = 0; m < MAX_M; m++) sums[m] = 0.0f;
+
+    for (int g = lane_id; g < K_groups; g += WARP_SIZE) {
+        float group_scale = e4m3_to_float(s_row[g]) * inv_global_scale;
+
+        // Load weight once for this group
+        uint2 pack = *reinterpret_cast<const uint2*>(w_row + g * 8);
+        uint32_t lo = pack.x, hi = pack.y;
+        int k_base = g << 4;
+
+        // Decode 16 FP4 weights into registers
+        float w_vals[16];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint32_t byte_val = (lo >> (j * 8)) & 0xFF;
+            w_vals[j * 2]     = s_lut[byte_val & 0xF];
+            w_vals[j * 2 + 1] = s_lut[(byte_val >> 4) & 0xF];
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint32_t byte_val = (hi >> (j * 8)) & 0xFF;
+            w_vals[8 + j * 2]     = s_lut[byte_val & 0xF];
+            w_vals[8 + j * 2 + 1] = s_lut[(byte_val >> 4) & 0xF];
+        }
+
+        // For each token row, load activations and dot-product with decoded weights
+        #pragma unroll
+        for (int m = 0; m < MAX_M; m++) {
+            if (m >= M) break;
+            const __nv_bfloat16* a_row = A + (size_t)m * K + k_base;
+            float4 a4_lo = *reinterpret_cast<const float4*>(a_row);
+            float4 a4_hi = *reinterpret_cast<const float4*>(a_row + 8);
+            const __nv_bfloat162* a_lo = reinterpret_cast<const __nv_bfloat162*>(&a4_lo);
+            const __nv_bfloat162* a_hi = reinterpret_cast<const __nv_bfloat162*>(&a4_hi);
+
+            float group_dot = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float2 af = __bfloat1622float2(a_lo[j]);
+                group_dot += af.x * w_vals[j * 2] + af.y * w_vals[j * 2 + 1];
+            }
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float2 af = __bfloat1622float2(a_hi[j]);
+                group_dot += af.x * w_vals[8 + j * 2] + af.y * w_vals[8 + j * 2 + 1];
+            }
+
+            sums[m] += group_dot * group_scale;
+        }
+    }
+
+    // Warp reduce each token's sum
+    #pragma unroll
+    for (int m = 0; m < MAX_M; m++) {
+        #pragma unroll
+        for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1)
+            sums[m] += __shfl_xor_sync(0xffffffff, sums[m], mask);
+    }
+
+    if (lane_id == 0) {
+        #pragma unroll
+        for (int m = 0; m < MAX_M; m++) {
+            if (m >= M) break;
+            float val = sums[m];
+            if constexpr (ADD_RESIDUAL) {
+                val += __bfloat162float(residual[m * N + out_idx]);
+            }
+            C[m * N + out_idx] = __float2bfloat16(val);
+        }
+    }
+}
+
+// ============================================================================
 // FP4 Dual GEMV Kernel — Gate + Up sharing A in SMEM
 // Same optimizations as single GEMV; grid front half → W1/C1, back half → W2/C2
 // ============================================================================
@@ -372,6 +488,54 @@ static cublasHandle_t get_cublas() {
     return s_cublas_handle;
 }
 
+// For small M (MTP verify T=4 etc.), batched GEMV reads weight once for all M tokens.
+// Bandwidth: 1×0.5625×N×K (weight) + M×2×N×K (activations, L2-cached)
+// vs dequant+GEMM: 0.5625×N×K + 2×N×K (dequant read+write) + 2×N×K (GEMM read)
+static constexpr int FP4_GEMV_THRESHOLD = 8;
+
+// Helper to dispatch batched GEMV with compile-time MAX_M
+template <bool ADD_RESIDUAL>
+static void dispatch_batched_gemv(
+    const __nv_bfloat16* A,
+    const core::QuantizedWeight& W,
+    __nv_bfloat16* C,
+    const __nv_bfloat16* residual,
+    int M,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK_THREADS = 256;
+    constexpr int WARPS = BLOCK_THREADS / 32;
+    int N = W.N, K = W.K;
+    float inv_gs = 1.0f / W.global_scale;
+    int blocks = (N + WARPS - 1) / WARPS;
+    size_t smem = FP4_LUT_SMEM;  // Only LUT, no A caching
+
+    // Dispatch with compile-time MAX_M for loop unrolling
+    switch (M) {
+        case 1:
+            fp4_batched_gemv_kernel<ADD_RESIDUAL, 1><<<blocks, BLOCK_THREADS, smem, stream>>>(
+                A, W.packed, W.scale, C, residual, inv_gs, M, N, K);
+            break;
+        case 2:
+            fp4_batched_gemv_kernel<ADD_RESIDUAL, 2><<<blocks, BLOCK_THREADS, smem, stream>>>(
+                A, W.packed, W.scale, C, residual, inv_gs, M, N, K);
+            break;
+        case 3:
+            fp4_batched_gemv_kernel<ADD_RESIDUAL, 3><<<blocks, BLOCK_THREADS, smem, stream>>>(
+                A, W.packed, W.scale, C, residual, inv_gs, M, N, K);
+            break;
+        case 4:
+            fp4_batched_gemv_kernel<ADD_RESIDUAL, 4><<<blocks, BLOCK_THREADS, smem, stream>>>(
+                A, W.packed, W.scale, C, residual, inv_gs, M, N, K);
+            break;
+        default:
+            // M=5..8: use MAX_M=8
+            fp4_batched_gemv_kernel<ADD_RESIDUAL, 8><<<blocks, BLOCK_THREADS, smem, stream>>>(
+                A, W.packed, W.scale, C, residual, inv_gs, M, N, K);
+            break;
+    }
+}
+
 void invoke_fp4_gemm(
     const __nv_bfloat16* A,
     const core::QuantizedWeight& W,
@@ -380,6 +544,13 @@ void invoke_fp4_gemm(
     cudaStream_t stream)
 {
     int N = W.N, K = W.K;
+
+    // Small M: batched GEMV — read weight once, compute M dot products
+    if (M <= FP4_GEMV_THRESHOLD) {
+        dispatch_batched_gemv<false>(A, W, C, nullptr, M, stream);
+        return;
+    }
+
     float inv_gs = 1.0f / W.global_scale;
 
     // Fallback: dequantize to BF16 then cuBLAS GEMM
@@ -421,6 +592,13 @@ void invoke_fp4_gemm_add(
     cudaStream_t stream)
 {
     int N = W.N, K = W.K;
+
+    // Small M: batched GEMV_add — read weight once, compute M dot products + residual
+    if (M <= FP4_GEMV_THRESHOLD) {
+        dispatch_batched_gemv<true>(A, W, D, residual, M, stream);
+        return;
+    }
+
     float inv_gs = 1.0f / W.global_scale;
 
     size_t need = (size_t)N * K * sizeof(__nv_bfloat16);
