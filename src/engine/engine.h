@@ -204,7 +204,7 @@ private:
     int* d_mtp_context_lens_ = nullptr;          // MTP KV context lens (device)
     size_t ssm_elems_per_layer_ = 0;             // SSM state elements per layer
     size_t conv_elems_per_layer_ = 0;            // Conv state elements per layer
-    int num_mtp_drafts_ = 3;                   // 每步 draft token 数 (从配置读取, 1~8)
+    int num_mtp_drafts_ = 1;                   // 每步 draft token 数 (从配置读取, 1~8)
     int mtp_verify_count_ = 0;
     int mtp_accept_count_ = 0;
 

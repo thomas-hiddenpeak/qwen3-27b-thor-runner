@@ -95,7 +95,7 @@ struct BackendConfig {
     // MTP 投机解码
     std::string mtp_mode         = "auto";
     int         mtp_kv_blocks    = 256;
-    int         mtp_num_drafts   = 3;    // 每步生成的 draft token 数 (1~8)
+    int         mtp_num_drafts   = 1;    // 每步生成的 draft token 数 (1~8)
 
     // 从 CLI 参数构建
     static BackendConfig from_args(int argc, char** argv);

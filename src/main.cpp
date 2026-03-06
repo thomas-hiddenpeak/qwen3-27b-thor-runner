@@ -81,7 +81,7 @@ static void print_usage() {
     printf("    --cache-no-ssm        Disable SSM/Conv state caching\n");
     printf("    --mtp-enable          Force enable MTP speculative decoding\n");
     printf("    --mtp-disable         Force disable MTP speculative decoding\n");
-    printf("    --mtp-drafts <N>      Draft tokens per step (1-8, default: 3)\n\n");
+    printf("    --mtp-drafts <N>      Draft tokens per step (1-8, default: 1)\n\n");
     printf("  Serve Options:\n");
     printf("    --host <addr>         Listen address (default: 0.0.0.0)\n");
     printf("    --ollama-port <N>     Ollama API port (default: 11434)\n");
