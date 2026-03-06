@@ -434,6 +434,8 @@ void invoke_gdn_wy_prefill(
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         (int)smem_bytes);
     if (err != cudaSuccess) {
+        // 清除 CUDA 错误状态, 防止 sticky error 传播
+        cudaGetLastError();
         fprintf(stderr, "[GDN-WY] cudaFuncSetAttribute failed: %s (need %zu bytes)\n",
                 cudaGetErrorString(err), smem_bytes);
         return;

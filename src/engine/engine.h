@@ -5,8 +5,7 @@
 #include "shm_queue.h"
 #include "paged_attention.h"
 #include "cache_config.h"
-#include "cache_engine.h"
-#include "kv_swapper.h"
+#include "cache_manager.h"
 #include "block_tracker.h"
 #include "vision.h"
 #include "tokenizer.h"
@@ -43,17 +42,15 @@ struct RequestContext {
     
     // Paged Attention 相关的状态
     std::vector<int> block_table;
-    int context_len;
+    int context_len = 0;
 
     // Block Tracker: 追踪 GPU vs SSD blocks (当 context 超过 KV budget 时启用)
     cache::BlockTracker block_tracker;
     bool uses_ssd_blocks = false;  // 是否有 blocks 在 SSD 上
     
     // Gated DeltaNet SSM 状态 (每个 linear_attn 层一份)
-    // ssm_states[i] : [nkh * kd * vpk] bf16  on device
-    // conv_states[i]: [nkh*2 * kd * (conv_k-1)] fp16  on device
     std::vector<__nv_bfloat16*> ssm_states;
-    std::vector<__nv_bfloat16*>  conv_states;
+    std::vector<__nv_bfloat16*> conv_states;
     int ssm_slot = -1;  // 该请求持有的 SSM/Conv 状态池槽位 (-1 = 未分配)
     
     // MTP 投机解码状态
@@ -137,19 +134,10 @@ private:
     size_t ssm_size_per_layer_ = 0;
     size_t conv_size_per_layer_ = 0;
 
-    // 预分配的多槽位 SSM/Conv 状态池 (MAX_SSM_SLOTS 个独立 slot, 每个活跃请求占一个)
-    // 避免每次请求 cudaMalloc/cudaFree 导致 Jetson 统一内存页面回收崩溃
-    __nv_bfloat16* ssm_pool_base_ = nullptr;              // 连续分配 [MAX_SSM_SLOTS * num_linear_layers_ * ssm_size_per_layer_]
-    __nv_bfloat16* conv_pool_base_ = nullptr;      // 连续分配 [MAX_SSM_SLOTS * num_linear_layers_ * conv_size_per_layer_]
-    // pooled_ssm_states_[slot][layer] → 指向 slot 的第 layer 层 SSM buffer
-    std::vector<std::vector<__nv_bfloat16*>> pooled_ssm_states_;            // [MAX_SSM_SLOTS][num_linear_layers_]
-    std::vector<std::vector<__nv_bfloat16*>> pooled_conv_states_;   // [MAX_SSM_SLOTS][num_linear_layers_]
-    std::vector<int> free_ssm_slots_;  // 可用槽位索引 (LIFO stack)
+    // ======== 统一缓存管理器 (替代原先 5 个独立组件) ========
+    std::unique_ptr<cache::CacheManager> cache_manager_;
+
     std::unique_ptr<Qwen35Model> model_;
-    std::unique_ptr<ops::KVCacheManager> kv_manager_;
-    std::unique_ptr<cache::CacheEngine> cache_engine_;
-    std::unique_ptr<cache::KVSwapper> kv_swapper_;   // 请求级 KV 换出/换入
-    std::unique_ptr<cache::BlockSSDStore> block_ssd_store_;  // block 级 SSD I/O
     std::unique_ptr<ipc::ShmRingBuffer<ipc::InferenceRequest,  8>> ipc_queue_;
     std::unique_ptr<ipc::ShmRingBuffer<ipc::InferenceResponse, 512>> ipc_resp_queue_;
     
@@ -162,21 +150,6 @@ private:
     int* d_block_tables_ = nullptr;
     int* d_context_lens_ = nullptr;
     int* d_argmax_result_ = nullptr;  // GPU argmax 结果 (managed memory, 16 ints for batched)
-
-    // Streaming attention: staging KV cache + softmax 中间状态
-    __nv_bfloat16* d_staging_k_ = nullptr;    // SSD blocks 的临时 K cache
-    __nv_bfloat16* d_staging_v_ = nullptr;    // SSD blocks 的临时 V cache
-    __nv_bfloat16* d_partial_out_ = nullptr;  // partial attention output
-    float* d_partial_m_ = nullptr;            // partial max scores
-    float* d_partial_l_ = nullptr;            // partial sum exp
-    __nv_bfloat16* d_partial_out2_ = nullptr; // second pass output
-    float* d_partial_m2_ = nullptr;
-    float* d_partial_l2_ = nullptr;
-    int* d_ssd_block_tables_ = nullptr;       // staging blocks 的 block table
-    int* d_ssd_context_lens_ = nullptr;
-    int staging_num_blocks_ = 0;              // staging cache 容量 (blocks)
-    void* ssd_io_staging_ = nullptr;          // SSD I/O 用的 host staging buffer
-    size_t ssd_io_staging_size_ = 0;
     
     std::thread worker_thread_;
     std::atomic<bool> running_{false};
@@ -191,7 +164,7 @@ private:
     std::unordered_map<uint64_t, std::vector<core::ProcessedImage>> pending_images_;
 
     // Chunked prefill: 当 prompt 超过此值时自动分块处理
-    int max_chunk_size_ = 4096;
+    int max_chunk_size_ = 256;  // Jetson SMMU 硬约束: >256 的 chunk 在长上下文时 →  GPU illegal memory access
 
     // 容量上限: 单请求最大 token 数 (= gpu_kv_blocks × block_size)
     int gpu_max_tokens_ = 0;

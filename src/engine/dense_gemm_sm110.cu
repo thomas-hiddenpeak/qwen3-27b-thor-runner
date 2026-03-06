@@ -276,6 +276,7 @@ void invoke_dense_gemm(
     if (status != cutlass::Status::kSuccess) {
         // CUTLASS initialize failed (e.g., TMA descriptor creation error for small M).
         // Fallback to cuBLAS.
+        cudaGetLastError();  // 清除 TMA/cudaFuncSetAttribute 设置的 CUDA 错误
         auto h = get_cublas_handle();
         cublasSetStream(h, stream);
         float alpha = 1.0f, beta_val = 0.0f;
@@ -297,12 +298,34 @@ void invoke_dense_gemm(
         return;
     }
 
-    // CUTLASS initialize(args, workspace, stream) 用 stream-ordered ops 设置 workspace:
-    //   - Mainloop: no-op (TMA descriptor 嵌入 kernel args, 不写 workspace)
-    //   - TileScheduler: cudaMemsetAsync on stream
-    // 因此 gemm.run(stream) 在同一 stream 上保证顺序, 无需额外 sync.
-    // 之前的 cudaDeviceSynchronize + cudaStreamSynchronize 在 T=1024 (312 GEMM)
-    // 导致 ~1000ms 的流水线阻塞, 已验证可安全移除.
+    // 关键安全检查: cuTensorMapEncodeTiled() 可能失败但 initialize() 仍返回 kSuccess
+    // (CUTLASS 的 to_underlying_arguments() 内创建 TMA 描述符, 失败只 print+assert(false),
+    //  在 release 模式 assert 是 no-op, 导致 garbage TMA 描述符传给 run() → GPU crash)
+    // 检查 CUDA error state, 如果有错误则跳过 CUTLASS kernel, 使用 cuBLAS 代替
+    {
+        cudaError_t init_cuda_err = cudaGetLastError();
+        if (init_cuda_err != cudaSuccess) {
+            auto h = get_cublas_handle();
+            cublasSetStream(h, stream);
+            float alpha = 1.0f, beta_val = 0.0f;
+            cublasGemmEx(h,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                N, M, K,
+                &alpha,
+                B, CUDA_R_16BF, K,
+                A_eff, CUDA_R_16BF, K,
+                &beta_val,
+                C_eff, CUDA_R_16BF, N,
+                CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+            if (M_padded != M) {
+                cudaMemcpy2DAsync(C, (size_t)N * sizeof(__nv_bfloat16),
+                                  C_eff, (size_t)N * sizeof(__nv_bfloat16),
+                                  (size_t)N * sizeof(__nv_bfloat16), M,
+                                  cudaMemcpyDeviceToDevice, stream);
+            }
+            return;
+        }
+    }
 
     status = gemm.run(stream);
     if (status != cutlass::Status::kSuccess) {
@@ -446,6 +469,7 @@ void invoke_dense_gemm_add(
     status = gemm.initialize(args, s_workspace2, stream);
     if (status != cutlass::Status::kSuccess) {
         // CUTLASS initialize failed, fallback to cuBLAS with residual add
+        cudaGetLastError();  // 清除 TMA/cudaFuncSetAttribute 设置的 CUDA 错误
         auto h = get_cublas_handle();
         cublasSetStream(h, stream);
         if (D != residual) {
@@ -465,7 +489,29 @@ void invoke_dense_gemm_add(
         return;
     }
 
-    // 同 invoke_dense_gemm: stream-ordered workspace init, 无需额外 sync
+    // 安全检查: cuTensorMapEncodeTiled() 可能失败但 initialize() 仍返回 kSuccess
+    {
+        cudaError_t init_cuda_err = cudaGetLastError();
+        if (init_cuda_err != cudaSuccess) {
+            auto h = get_cublas_handle();
+            cublasSetStream(h, stream);
+            if (D != residual) {
+                cudaMemcpyAsync(D, residual, (size_t)M * N * sizeof(__nv_bfloat16),
+                                cudaMemcpyDeviceToDevice, stream);
+            }
+            float alpha = 1.0f, beta_val = 1.0f;
+            cublasGemmEx(h,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                N, M, K,
+                &alpha,
+                B, CUDA_R_16BF, K,
+                A, CUDA_R_16BF, K,
+                &beta_val,
+                D, CUDA_R_16BF, N,
+                CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+            return;
+        }
+    }
 
     status = gemm.run(stream);
     if (status != cutlass::Status::kSuccess) {

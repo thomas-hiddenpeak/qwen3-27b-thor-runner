@@ -242,8 +242,17 @@ int CacheEngine::retrieve_prefix(
     int restore_tokens = matched * config_.chunk_size;
     int restore_blocks = restore_tokens / params_.block_size;
 
-    // 1. 分配 KV blocks
-    auto blocks = kv_manager.allocate_blocks(restore_blocks);
+    // 1. 分配 KV blocks (可能因 GPU 容量不足而失败, 特别是 SSD 模式下)
+    std::vector<int> blocks;
+    try {
+        blocks = kv_manager.allocate_blocks(restore_blocks);
+    } catch (const std::runtime_error& e) {
+        // GPU KV 容量不足以恢复全部 prefix — 跳过 cache 恢复, 走正常 prefill
+        std::cerr << "[CacheEngine] Cannot allocate " << restore_blocks
+                  << " blocks for prefix restore (free=" << kv_manager.num_free_blocks()
+                  << "), falling back to full prefill" << std::endl;
+        return 0;
+    }
     if ((int)blocks.size() < restore_blocks) {
         std::cerr << "[CacheEngine] Not enough KV blocks for restore: need "
                   << restore_blocks << ", got " << blocks.size() << std::endl;
