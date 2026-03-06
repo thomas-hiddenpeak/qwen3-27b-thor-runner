@@ -24,7 +24,10 @@
 #include <cuda_bf16.h>
 
 namespace qwen_thor {
-namespace core { struct Qwen35Config; }  // forward declaration
+namespace core {
+    struct Qwen35Config;
+    struct RequestContext;
+}  // forward declarations
 namespace cache {
 
 // SSM/Conv 状态池最大槽位数
@@ -209,6 +212,39 @@ public:
     float* partial_l2() { return d_partial_l2_; }
     int* ssd_block_tables() { return d_ssd_block_tables_; }
     int* ssd_context_lens() { return d_ssd_context_lens_; }
+
+    // =============== Phase 2: RequestContext 桥接 API ===============
+    // Engine 使用 RequestContext (engine.h), CacheManager 内部用 RequestCacheState.
+    // 下列方法直接操作 RequestContext 的字段, 避免 engine.cpp 手动管理.
+
+    // 释放请求所有缓存资源 (GPU blocks + SSD + swap + SSM slot)
+    // 不处理: MTP blocks, images, prompt/generated tokens (由 engine 管理)
+    void free_request(uint64_t req_id, core::RequestContext* ctx);
+
+    // 换出请求 (KV + SSM/Conv → SSD, 释放 GPU blocks + SSM slot)
+    bool swap_out_request(uint64_t req_id, core::RequestContext* ctx);
+
+    // 换入请求 (SSD → GPU, 分配 SSM slot + KV blocks)
+    bool swap_in_request(uint64_t req_id, core::RequestContext* ctx);
+
+    // Prefix cache: 是否启用
+    bool is_prefix_cache_enabled() const;
+
+    // Prefix cache: 恢复 — 返回恢复的 token 数 (0 = miss)
+    int restore_prefix(const int* tokens, int num_tokens,
+                       core::RequestContext* ctx,
+                       __nv_bfloat16* workspace, int* d_block_table_buf);
+
+    // Prefix cache: 存储
+    void store_prefix(const int* tokens, int num_tokens,
+                      const core::RequestContext* ctx,
+                      __nv_bfloat16* workspace);
+
+    // Streaming attention context (从 RequestContext 构建)
+    ops::StreamingAttnCtx build_streaming_ctx(
+        uint64_t req_id,
+        const core::RequestContext* ctx,
+        int gpu_ctx_len);
 
 private:
     // ---- 内部组件 ----

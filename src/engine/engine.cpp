@@ -491,25 +491,8 @@ void InferenceEngine::inference_loop() {
         for (auto* ctx : active_requests) {
             if (ctx->is_finished) {
                 fprintf(stderr, "[Engine] Cleanup: req=%lu freeing resources...\n", ctx->request_id);
-                // 释放 GPU-resident KV Cache blocks (跳过已 evict 到 SSD 的 -1 entries)
-                if (!ctx->block_table.empty() && !ctx->is_swapped) {
-                    std::vector<int> gpu_blocks;
-                    for (int b : ctx->block_table)
-                        if (b >= 0) gpu_blocks.push_back(b);
-                    if (!gpu_blocks.empty())
-                        cache_manager_->kv_manager().free_blocks(gpu_blocks);
-                    ctx->block_table.clear();
-                }
-                // 清理 SSD 上的 block store 文件
-                if (ctx->uses_ssd_blocks && cache_manager_->has_ssd_store()) {
-                    cache_manager_->ssd_store()->remove(ctx->request_id);
-                    ctx->uses_ssd_blocks = false;
-                }
-                // 清理 SSD 上的 swap 文件 (如果被换出过)
-                if (ctx->is_swapped && cache_manager_->has_swapper()) {
-                    cache_manager_->swapper()->remove(ctx->request_id);
-                    ctx->is_swapped = false;
-                }
+                // 释放 KV blocks + SSD 文件 + swap 文件 + SSM/Conv slot
+                cache_manager_->free_request(ctx->request_id, ctx);
                 // 释放 processed_images (ViT 后不再需要 bf16 pixel 数据)
                 if (!ctx->processed_images.empty()) {
                     size_t img_bytes = 0;
@@ -520,15 +503,6 @@ void InferenceEngine::inference_loop() {
                     fprintf(stderr, "[Engine] Cleanup: req=%lu freed %zu bytes of image data\n",
                             ctx->request_id, img_bytes);
                 }
-                // 池化: 不 cudaFree, 回收 slot 到 free list, 断开 ctx 指针
-                if (ctx->ssm_slot >= 0) {
-                    cache_manager_->free_ssm_slot(ctx->ssm_slot);
-                    fprintf(stderr, "[Engine] Cleanup: req=%lu returned SSM slot %d (free slots: %d)\n",
-                            ctx->request_id, ctx->ssm_slot, cache_manager_->num_free_ssm_slots());
-                    ctx->ssm_slot = -1;
-                }
-                ctx->ssm_states.clear();
-                ctx->conv_states.clear();
                 // 释放 MTP KV Cache blocks
                 if (!ctx->mtp_block_table.empty() && mtp_kv_manager_) {
                     mtp_kv_manager_->free_blocks(ctx->mtp_block_table);
@@ -608,33 +582,13 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 }
             }
         }
-        if (cache_manager_->num_free_ssm_slots() == 0) {
-            std::cerr << "[Engine] swap_in failed: no free SSM slots for request "
-                      << ctx->request_id << std::endl;
-            ctx->is_finished = true;
-            return;
-        }
-        {
-            int slot = cache_manager_->allocate_ssm_slot();
-            ctx->ssm_slot = slot;
-            for (int li = 0; li < num_linear_layers_; ++li) {
-                ctx->ssm_states[li] = cache_manager_->get_ssm_state(slot, li);
-                ctx->conv_states[li] = cache_manager_->get_conv_state(slot, li);
-            }
-            std::cout << "[Engine] Swap-in: assigned SSM slot " << slot
-                      << " to request " << ctx->request_id << std::endl;
-        }
-        auto new_blocks = cache_manager_->swapper()->swap_in(
-            ctx->request_id, cache_manager_->kv_manager(),
-            ctx->ssm_states.data(), ctx->conv_states.data(),
-            compute_stream_);
-        if (new_blocks.empty()) {
+        if (!cache_manager_->swap_in_request(ctx->request_id, ctx)) {
             std::cerr << "[Engine] swap_in failed for request " << ctx->request_id << std::endl;
             ctx->is_finished = true;
             return;
         }
-        ctx->block_table = new_blocks;
-        ctx->is_swapped = false;
+        std::cout << "[Engine] Swap-in: assigned SSM slot " << ctx->ssm_slot
+                  << " to request " << ctx->request_id << std::endl;
     }
     
     if (ctx->generated_tokens.empty()) {
@@ -646,19 +600,13 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
 
         // ---- KV Cache Prefix Lookup ----
         int cached_tokens = 0;
-        if (cache_manager_->prefix_cache() && cache_manager_->prefix_cache()->is_enabled()) {
-            auto lookup = cache_manager_->prefix_cache()->lookup_prefix(
-                ctx->prompt_tokens.data(), num_tokens);
-            if (lookup.matched_tokens > 0) {
-                // 尝试从 SSD 恢复缓存的 KV + SSM/Conv
-                cached_tokens = cache_manager_->prefix_cache()->retrieve_prefix(
+        if (cache_manager_->is_prefix_cache_enabled()) {
+            int matched = cache_manager_->lookup_prefix(ctx->prompt_tokens.data(), num_tokens);
+            if (matched > 0) {
+                cached_tokens = cache_manager_->restore_prefix(
                     ctx->prompt_tokens.data(), num_tokens,
-                    cache_manager_->kv_manager(), ctx->block_table,
-                    ctx->ssm_states.empty() ? nullptr : ctx->ssm_states.data(),
-                    ctx->conv_states.empty() ? nullptr : ctx->conv_states.data(),
-                    d_workspace_, d_block_tables_, compute_stream_);
+                    ctx, d_workspace_, d_block_tables_);
                 if (cached_tokens > 0) {
-                    ctx->context_len = cached_tokens;
                     std::cout << "[Cache] Restored " << cached_tokens << "/" << num_tokens
                               << " tokens from SSD" << std::endl;
                 }
@@ -886,61 +834,13 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                     // Streaming Forward: block_table 有 -1 (SSD) 条目
                     // 不能用标准 paged attention, 改为逐层迭代 + streaming attention
                     // ========================================================
-                    auto ssd_indices = ctx->block_tracker.get_ssd_logical_indices();
-                    auto gpu_bt = ctx->block_tracker.get_gpu_block_table();
-                    int num_full_attn = config_.num_full_attn_layers();
-
                     // 构建 StreamingAttnCtx
-                    ops::StreamingAttnCtx sctx;
-                    sctx.total_ssd_blocks = (int)ssd_indices.size();
-                    sctx.ssd_tokens = sctx.total_ssd_blocks * 16;
-                    sctx.staging_capacity = cache_manager_->staging_num_blocks();
-                    sctx.staging_k = cache_manager_->staging_k();
-                    sctx.staging_v = cache_manager_->staging_v();
-                    sctx.d_staging_block_tables = nullptr;  // 下面设置
-                    sctx.d_staging_context_lens = cache_manager_->ssd_context_lens();
-                    sctx.partial_out = cache_manager_->partial_out();
-                    sctx.partial_m = cache_manager_->partial_m();
-                    sctx.partial_l = cache_manager_->partial_l();
-                    sctx.partial_out2 = cache_manager_->partial_out2();
-                    sctx.partial_m2 = cache_manager_->partial_m2();
-                    sctx.partial_l2 = cache_manager_->partial_l2();
-
-                    // GPU block table: compact (不含 -1)
-                    sctx.gpu_num_blocks = (int)gpu_bt.size();
-                    cudaMemcpyAsync(cache_manager_->ssd_block_tables(), gpu_bt.data(),
-                                    gpu_bt.size() * sizeof(int),
-                                    cudaMemcpyHostToDevice, compute_stream_);
-                    sctx.d_gpu_block_tables = cache_manager_->ssd_block_tables();
-
-                    // GPU context lens: GPU tokens + current chunk tokens (causal masking 需要)
-                    int gpu_ctx_len = ctx_len_for_chunk - sctx.ssd_tokens;
-                    cudaMemcpyAsync(cache_manager_->ssd_context_lens(), &gpu_ctx_len,
-                                    sizeof(int), cudaMemcpyHostToDevice, compute_stream_);
-                    sctx.d_gpu_context_lens = cache_manager_->ssd_context_lens();
-
-                    // Staging block table: [0, 1, 2, ...]
-                    {
-                        int stg_num = cache_manager_->staging_num_blocks();
-                        std::vector<int> staging_bt(stg_num);
-                        for (int i = 0; i < stg_num; i++) staging_bt[i] = i;
-                        cudaMemcpyAsync(cache_manager_->ssd_block_tables() + gpu_bt.size(),
-                                        staging_bt.data(),
-                                        stg_num * sizeof(int),
-                                        cudaMemcpyHostToDevice, compute_stream_);
-                        sctx.d_staging_block_tables = cache_manager_->ssd_block_tables() + gpu_bt.size();
-                    }
-
-                    // SSD load callback: engine 负责从 SSD 加载 blocks 到 staging
-                    sctx.load_ssd_batch = [this, &ctx, &ssd_indices](
-                        int full_attn_idx, int batch_start, int batch_count) -> int {
-                        int end = std::min(batch_start + batch_count, (int)ssd_indices.size());
-                        std::vector<int> batch_indices(ssd_indices.begin() + batch_start,
-                                                       ssd_indices.begin() + end);
-                        return cache_manager_->ssd_store()->load_blocks_for_layer(
-                            ctx->request_id, full_attn_idx, batch_indices,
-                            cache_manager_->staging_k(), cache_manager_->staging_v());
-                    };
+                    int ssd_tokens = ctx->block_tracker.num_ssd_blocks() * 16;
+                    int gpu_ctx_len = ctx_len_for_chunk - ssd_tokens;
+                    auto sctx = cache_manager_->build_streaming_ctx(
+                        ctx->request_id, ctx, gpu_ctx_len);
+                    auto ssd_indices = ctx->block_tracker.get_ssd_logical_indices();
+                    int num_full_attn = config_.num_full_attn_layers();
 
                     // 逐层迭代 (与 model_->forward_prefill 等价, 但传入 streaming_ctx)
                     int fa_idx = 0, lin_idx = 0;
@@ -1011,15 +911,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             }
         
             // ---- Cache Store: prefill 完成后缓存 KV + SSM/Conv 到 SSD ----
-            if (cache_manager_->prefix_cache() && cache_manager_->prefix_cache()->is_enabled()) {
-                cache_manager_->prefix_cache()->store_prefix(
-                    ctx->prompt_tokens.data(), num_tokens,
-                    cache_manager_->kv_manager(), d_block_tables_,
-                    (int)ctx->block_table.size(),
-                    ctx->ssm_states.empty() ? nullptr : ctx->ssm_states.data(),
-                    ctx->conv_states.empty() ? nullptr : ctx->conv_states.data(),
-                    d_workspace_, compute_stream_);
-            }
+            cache_manager_->store_prefix(ctx->prompt_tokens.data(), num_tokens, ctx, d_workspace_);
         } // end if (prefill_tokens > 0)
 
         if (prefill_tokens > 0) {
@@ -1077,9 +969,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             profiler_.print_step_report(0);
 
             // ---- LMCache Monitor: 记录请求级指标 ----
-            if (cache_manager_->prefix_cache() && cache_manager_->prefix_cache()->is_enabled()) {
-                cache_manager_->prefix_cache()->record_request(num_tokens, cached_tokens, prefill_tokens);
-            }
+            cache_manager_->record_prefix_stats(num_tokens, cached_tokens, prefill_tokens);
         } else {
             // 完全缓存命中 (prefill_tokens == 0):
             // KV + SSM/Conv 已从 SSD 恢复, 跳过 forward
@@ -1089,9 +979,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             std::cout << "[Cache] Full hit! Skipped prefill (" << num_tokens << " tokens)" << std::endl;
 
             // ---- LMCache Monitor: 完全命中 ----
-            if (cache_manager_->prefix_cache() && cache_manager_->prefix_cache()->is_enabled()) {
-                cache_manager_->prefix_cache()->record_request(num_tokens, num_tokens, 0);
-            }
+            cache_manager_->record_prefix_stats(num_tokens, num_tokens, 0);
         }
         
     } else {
@@ -1454,55 +1342,11 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
 
                 if (ctx->uses_ssd_blocks) {
                     // Streaming Decode: SSD blocks, 逐层迭代 + streaming attention
+                    int ssd_tokens = ctx->block_tracker.num_ssd_blocks() * 16;
+                    int gpu_ctx_len = ctx->context_len - ssd_tokens;
+                    auto sctx = cache_manager_->build_streaming_ctx(
+                        ctx->request_id, ctx, gpu_ctx_len);
                     auto ssd_indices = ctx->block_tracker.get_ssd_logical_indices();
-                    auto gpu_bt = ctx->block_tracker.get_gpu_block_table();
-
-                    ops::StreamingAttnCtx sctx;
-                    sctx.total_ssd_blocks = (int)ssd_indices.size();
-                    sctx.ssd_tokens = sctx.total_ssd_blocks * 16;
-                    sctx.staging_capacity = cache_manager_->staging_num_blocks();
-                    sctx.staging_k = cache_manager_->staging_k();
-                    sctx.staging_v = cache_manager_->staging_v();
-                    sctx.d_staging_block_tables = nullptr;
-                    sctx.d_staging_context_lens = cache_manager_->ssd_context_lens();
-                    sctx.partial_out = cache_manager_->partial_out();
-                    sctx.partial_m = cache_manager_->partial_m();
-                    sctx.partial_l = cache_manager_->partial_l();
-                    sctx.partial_out2 = cache_manager_->partial_out2();
-                    sctx.partial_m2 = cache_manager_->partial_m2();
-                    sctx.partial_l2 = cache_manager_->partial_l2();
-
-                    sctx.gpu_num_blocks = (int)gpu_bt.size();
-                    cudaMemcpyAsync(cache_manager_->ssd_block_tables(), gpu_bt.data(),
-                                    gpu_bt.size() * sizeof(int),
-                                    cudaMemcpyHostToDevice, compute_stream_);
-                    sctx.d_gpu_block_tables = cache_manager_->ssd_block_tables();
-
-                    int gpu_ctx_len = ctx->context_len - sctx.ssd_tokens;
-                    cudaMemcpyAsync(cache_manager_->ssd_context_lens(), &gpu_ctx_len,
-                                    sizeof(int), cudaMemcpyHostToDevice, compute_stream_);
-                    sctx.d_gpu_context_lens = cache_manager_->ssd_context_lens();
-
-                    {
-                        int stg_num = cache_manager_->staging_num_blocks();
-                        std::vector<int> staging_bt(stg_num);
-                        for (int i = 0; i < stg_num; i++) staging_bt[i] = i;
-                        cudaMemcpyAsync(cache_manager_->ssd_block_tables() + gpu_bt.size(),
-                                        staging_bt.data(),
-                                        stg_num * sizeof(int),
-                                        cudaMemcpyHostToDevice, compute_stream_);
-                        sctx.d_staging_block_tables = cache_manager_->ssd_block_tables() + gpu_bt.size();
-                    }
-
-                    sctx.load_ssd_batch = [this, &ctx, &ssd_indices](
-                        int full_attn_idx, int batch_start, int batch_count) -> int {
-                        int end = std::min(batch_start + batch_count, (int)ssd_indices.size());
-                        std::vector<int> batch_indices(ssd_indices.begin() + batch_start,
-                                                       ssd_indices.begin() + end);
-                        return cache_manager_->ssd_store()->load_blocks_for_layer(
-                            ctx->request_id, full_attn_idx, batch_indices,
-                            cache_manager_->staging_k(), cache_manager_->staging_v());
-                    };
 
                     int fa_idx = 0, lin_idx = 0;
                     for (int li = 0; li < config_.num_hidden_layers; ++li) {
@@ -1964,29 +1808,10 @@ int InferenceEngine::try_swap_out_victim(
     std::cout << "[Engine] Swapping out request " << victim->request_id
               << " (" << max_blocks << " blocks, ctx=" << victim->context_len << ")" << std::endl;
 
-    cache_manager_->swapper()->swap_out(
-        victim->request_id,
-        cache_manager_->kv_manager(),
-        victim->block_table,
-        victim->context_len,
-        victim->ssm_states.empty() ? nullptr : victim->ssm_states.data(),
-        num_linear_layers_, ssm_size_per_layer_,
-        victim->conv_states.empty() ? nullptr : victim->conv_states.data(),
-        conv_size_per_layer_,
-        compute_stream_);
+    cache_manager_->swap_out_request(victim->request_id, victim);
 
-    // 池化: 不 cudaFree SSM/Conv, 回收 slot 到 free list, 清空指针
-    if (victim->ssm_slot >= 0) {
-        cache_manager_->free_ssm_slot(victim->ssm_slot);
-        std::cout << "[Engine] Swap-out: returned SSM slot " << victim->ssm_slot
-                  << " (free slots: " << cache_manager_->num_free_ssm_slots() << ")" << std::endl;
-        victim->ssm_slot = -1;
-    }
-    for (auto& p : victim->ssm_states)  p = nullptr;
-    for (auto& p : victim->conv_states) p = nullptr;
-
-    victim->block_table.clear();
-    victim->is_swapped = true;
+    std::cout << "[Engine] Swap-out: returned SSM slot (free slots: "
+              << cache_manager_->num_free_ssm_slots() << ")" << std::endl;
 
     return max_blocks;
 }
