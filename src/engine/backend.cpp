@@ -54,6 +54,8 @@ BackendConfig BackendConfig::from_args(int argc, char** argv) {
             cfg.mtp_mode = "off";
         } else if (arg == "--mtp-kv-blocks" && i + 1 < argc) {
             cfg.mtp_kv_blocks = std::stoi(argv[++i]);
+        } else if (arg == "--mtp-drafts" && i + 1 < argc) {
+            cfg.mtp_num_drafts = std::max(1, std::min(8, std::stoi(argv[++i])));
         } else if (arg == "--config" && i + 1 < argc) {
             cfg = BackendConfig::from_file(argv[++i]);
         }
@@ -91,6 +93,8 @@ BackendConfig BackendConfig::from_file(const std::string& path) {
         else if (key == "eviction_policy")    cfg.eviction_policy = val;
         else if (key == "mtp_mode")           cfg.mtp_mode = val;
         else if (key == "mtp_kv_blocks")      cfg.mtp_kv_blocks = std::stoi(val);
+        else if (key == "mtp_num_drafts" || key == "mtp_drafts")
+            cfg.mtp_num_drafts = std::max(1, std::min(8, std::stoi(val)));
         // Serve keys are silently ignored here (parsed by ServeConfig::from_file)
     }
     return cfg;
@@ -107,6 +111,7 @@ cache::CacheConfig BackendConfig::to_cache_config() const {
     cc.eviction_policy    = eviction_policy;
     cc.mtp_mode           = mtp_mode;
     cc.mtp_kv_blocks      = mtp_kv_blocks;
+    cc.mtp_num_drafts     = mtp_num_drafts;
     return cc;
 }
 
@@ -125,6 +130,7 @@ void BackendConfig::print() const {
         printf("│  SSM Caching:   %-3s                        │\n", cache_ssm_state ? "ON" : "OFF");
     }
     printf("│  MTP Mode:      %-8s                    │\n", mtp_mode.c_str());
+    printf("│  MTP Drafts:    %-6d                      │\n", mtp_num_drafts);
     printf("└─────────────────────────────────────────────┘\n\n");
 }
 

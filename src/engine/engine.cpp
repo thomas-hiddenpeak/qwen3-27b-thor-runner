@@ -282,11 +282,12 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
             cudaMalloc(&d_mtp_block_tables_,  mtp_blocks * sizeof(int));
             cudaMalloc(&d_mtp_context_lens_,  sizeof(int));
 
-            printf("[Engine] MTP speculative decoding ENABLED (mode=%s, kv_blocks=%d = %d max tokens)\n",
-                   cache_config.mtp_mode.c_str(), mtp_blocks, mtp_blocks * 16);
+            printf("[Engine] MTP speculative decoding ENABLED (mode=%s, drafts=%d, kv_blocks=%d = %d max tokens)\n",
+                   cache_config.mtp_mode.c_str(), cache_config.mtp_num_drafts, mtp_blocks, mtp_blocks * 16);
             printf("[Engine]   SSM checkpoint %.1f MB, Conv checkpoint %.1f MB\n",
                    num_linear_layers_ * ssm_elems_per_layer_ * sizeof(__nv_bfloat16) / 1048576.0,
                    num_linear_layers_ * conv_elems_per_layer_ * sizeof(__nv_bfloat16) / 1048576.0);
+            num_mtp_drafts_ = cache_config.mtp_num_drafts;
         } else {
             printf("[Engine] MTP speculative decoding DISABLED (mode=%s, model_has_mtp=%s)\n",
                    cache_config.mtp_mode.c_str(), model_->has_mtp() ? "yes" : "no");
@@ -1198,8 +1199,8 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             // ============================================================
             // MTP Speculative Decode: T=(N+1) All-or-Nothing Verify
             // ============================================================
-            const int N = RequestContext::MTP_NUM_DRAFTS;  // 3
-            const int T = N + 1;  // 4 tokens: [last_token, D0, D1, D2]
+            const int N = num_mtp_drafts_;
+            const int T = N + 1;  // e.g. N=3 → T=4: [last_token, D0, D1, D2]
             profiler_.begin("embedding", compute_stream_);
 
             // 1. Embed [last_token, D0, D1, D2] → d_hidden_states_ [T, hs]
@@ -1753,7 +1754,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             // ---- MTP Bootstrap: 首次 decode 后链式产出 N 个 draft ----
             if (mtp_kv_manager_ && !ctx->is_finished && !ctx->uses_ssd_blocks
                 && ctx->draft_tokens.empty()) {
-                const int N = RequestContext::MTP_NUM_DRAFTS;
+                const int N = num_mtp_drafts_;
                 __nv_bfloat16* h = d_hidden_states_;
                 int tok = next_token;
                 ctx->mtp_pos = ctx->context_len - 1;

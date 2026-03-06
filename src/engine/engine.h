@@ -57,7 +57,6 @@ struct RequestContext {
     int ssm_slot = -1;  // 该请求持有的 SSM/Conv 状态池槽位 (-1 = 未分配)
     
     // MTP 投机解码状态
-    static constexpr int MTP_NUM_DRAFTS = 3;  // 每步生成 3 个 draft token → 最多 4 tokens/step
     std::vector<int> draft_tokens;  // 当前 draft tokens (empty = 无 draft)
     int mtp_context_len = 0;       // MTP KV cache 中已有的 token 数
     std::vector<int> mtp_block_table;  // MTP KV cache block table
@@ -205,6 +204,7 @@ private:
     int* d_mtp_context_lens_ = nullptr;          // MTP KV context lens (device)
     size_t ssm_elems_per_layer_ = 0;             // SSM state elements per layer
     size_t conv_elems_per_layer_ = 0;            // Conv state elements per layer
+    int num_mtp_drafts_ = 3;                   // 每步 draft token 数 (从配置读取, 1~8)
     int mtp_verify_count_ = 0;
     int mtp_accept_count_ = 0;
 

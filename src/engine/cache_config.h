@@ -58,6 +58,8 @@ struct CacheConfig {
     std::string mtp_mode = "auto";
     // MTP KV Cache blocks 数量 (每 block 16 tokens, 默认 256 = 4096 tokens)
     int mtp_kv_blocks = 256;
+    // 每步生成的 draft token 数量 (1~8, 默认 3 → 最多 4 tokens/step)
+    int mtp_num_drafts = 3;
 
     // ---- 从 CLI 参数解析 ----
     // 支持的参数:
@@ -71,6 +73,7 @@ struct CacheConfig {
     //   --mtp-enable            强制启用 MTP 投机解码
     //   --mtp-disable           强制禁用 MTP 投机解码
     //   --mtp-kv-blocks N       MTP KV Cache blocks (默认 256)
+    //   --mtp-drafts N          每步 draft token 数 (1~8, 默认 3)
     static CacheConfig from_args(int argc, char** argv) {
         CacheConfig cfg;
         for (int i = 1; i < argc; i++) {
@@ -97,6 +100,8 @@ struct CacheConfig {
                 cfg.mtp_mode = "off";
             } else if (arg == "--mtp-kv-blocks" && i + 1 < argc) {
                 cfg.mtp_kv_blocks = std::stoi(argv[++i]);
+            } else if (arg == "--mtp-drafts" && i + 1 < argc) {
+                cfg.mtp_num_drafts = std::max(1, std::min(8, std::stoi(argv[++i])));
             }
         }
         return cfg;
@@ -138,6 +143,8 @@ struct CacheConfig {
             else if (key == "eviction_policy") cfg.eviction_policy = val;
             else if (key == "mtp_mode")        cfg.mtp_mode = val;
             else if (key == "mtp_kv_blocks")   cfg.mtp_kv_blocks = std::stoi(val);
+            else if (key == "mtp_num_drafts" || key == "mtp_drafts")
+                cfg.mtp_num_drafts = std::max(1, std::min(8, std::stoi(val)));
         }
         return cfg;
     }
