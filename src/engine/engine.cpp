@@ -1374,7 +1374,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                             (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
                             d_workspace_, compute_stream_,
                             (di < N - 1) ? &mtp_hidden : nullptr,
-                            nullptr);
+                            nullptr, &profiler_);
                     } else {
                         // Subsequent drafts: GPU-resident token from previous argmax
                         mtp_logits = model_->mtp_forward(
@@ -1384,7 +1384,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                             (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
                             d_workspace_, compute_stream_,
                             (di < N - 1) ? &mtp_hidden : nullptr,
-                            d_argmax_result_ + (di - 1));
+                            d_argmax_result_ + (di - 1), &profiler_);
                     }
 
                     // Argmax → d_argmax_result_[di], NO sync (stays on GPU)
@@ -1806,7 +1806,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                             (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
                             d_workspace_, compute_stream_,
                             (di < N - 1) ? &mtp_hidden : nullptr,
-                            nullptr);
+                            nullptr, &profiler_);
                     } else {
                         mtp_logits = model_->mtp_forward(
                             h, -1, pos,
@@ -1815,7 +1815,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                             (int)ctx->mtp_block_table.size(), mtp_ctx_fwd,
                             d_workspace_, compute_stream_,
                             (di < N - 1) ? &mtp_hidden : nullptr,
-                            d_argmax_result_ + (di - 1));
+                            d_argmax_result_ + (di - 1), &profiler_);
                     }
                     ops::invoke_argmax(mtp_logits, d_argmax_result_ + di,
                                        vocab_size, compute_stream_);

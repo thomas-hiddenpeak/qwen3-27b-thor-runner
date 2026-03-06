@@ -378,7 +378,8 @@ __nv_bfloat16* Qwen35Model::mtp_forward(
     __nv_bfloat16* workspace,
     cudaStream_t stream,
     __nv_bfloat16** out_hidden,
-    const int* d_input_token_id)
+    const int* d_input_token_id,
+    perf::PerfProfiler* profiler)
 {
     if (!has_mtp_ || !mtp_layer_) return nullptr;
 
@@ -400,6 +401,7 @@ __nv_bfloat16* Qwen35Model::mtp_forward(
     int* d_ids               = reinterpret_cast<int*>(logits + vocab);  // 2 ints at the very end
 
     // 1. RMSNorm(main_hidden) → norm_h
+    if (profiler) profiler->begin("mtp_prep", stream);
     ops::invoke_rmsnorm(norm_h, main_hidden, mtp_pre_norm_h_w_,
                         config_.rms_norm_eps, 1, hs, stream);
 
@@ -418,9 +420,11 @@ __nv_bfloat16* Qwen35Model::mtp_forward(
     // 3. FC projection: concat(norm_e, norm_h) = [10240] → projected = [5120]
     //    fc.weight is [5120, 10240], GEMV: projected = fc_w × [embed_norm, hidden_norm]
     ops::invoke_dense_gemv(norm_e, mtp_fc_w_, projected, hs, 2 * hs, stream);
+    if (profiler) profiler->end("mtp_prep", stream);
 
     // 4. Full attention transformer layer
     //    projected serves as hidden_states (modified in-place with residual)
+    if (profiler) profiler->begin("mtp_attn", stream);
     cudaMemcpyAsync(d_ids, &pos_id, sizeof(int), cudaMemcpyHostToDevice, stream);
     mtp_layer_->forward(
         projected,      // hidden_states [1, hs], in-place
@@ -434,13 +438,16 @@ __nv_bfloat16* Qwen35Model::mtp_forward(
         attn_ws,        // workspace
         stream
     );
+    if (profiler) profiler->end("mtp_attn", stream);
 
     // 5. Final RMSNorm (mtp.norm, centered weight)
+    if (profiler) profiler->begin("mtp_lmhead", stream);
     ops::invoke_rmsnorm(normed, projected, mtp_norm_w_,
                         config_.rms_norm_eps, 1, hs, stream);
 
     // 6. LM head (shared with main model): GEMV [vocab, hs] × [hs] → [vocab]
     ops::invoke_dense_gemv(normed, lm_head_w_, logits, vocab, hs, stream);
+    if (profiler) profiler->end("mtp_lmhead", stream);
 
     // Output MTP hidden state for chaining (projected = post-attention transformer output)
     if (out_hidden) *out_hidden = projected;

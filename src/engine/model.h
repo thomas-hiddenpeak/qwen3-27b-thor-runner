@@ -3,6 +3,7 @@
 #include "layer.h"
 #include "vision.h"
 #include "safetensors.h"
+#include "perf_stats.h"
 #include <vector>
 #include <string>
 #include <memory>
@@ -98,7 +99,8 @@ public:
         __nv_bfloat16* workspace,
         cudaStream_t stream,
         __nv_bfloat16** out_hidden = nullptr,
-        const int* d_input_token_id = nullptr
+        const int* d_input_token_id = nullptr,
+        perf::PerfProfiler* profiler = nullptr
     );
 
 private:
