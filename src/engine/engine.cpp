@@ -1358,9 +1358,14 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 // Pre-allocate MTP KV blocks for all N drafts at once
                 int final_mtp_ctx = ctx->mtp_context_len + N;
                 int final_mtp_blks = (final_mtp_ctx + 15) / 16;
-                while ((int)ctx->mtp_block_table.size() < final_mtp_blks) {
-                    auto mb = mtp_kv_manager_->allocate_blocks(1);
-                    ctx->mtp_block_table.push_back(mb[0]);
+                try {
+                    while ((int)ctx->mtp_block_table.size() < final_mtp_blks) {
+                        auto mb = mtp_kv_manager_->allocate_blocks(1);
+                        ctx->mtp_block_table.push_back(mb[0]);
+                    }
+                } catch (const std::runtime_error&) {
+                    // MTP KV pool exhausted — skip draft generation this step
+                    return;
                 }
                 // Single block_table upload (covers all N drafts)
                 cudaMemcpyAsync(d_mtp_block_tables_,
@@ -1429,6 +1434,11 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             // ============================================================
 
             // 9a. Emit accept_count matched draft tokens
+            // Clamp accept_count to not exceed max_new_tokens
+            int tokens_left = ctx->max_new_tokens - (int)ctx->generated_tokens.size();
+            if (tokens_left < accept_count + 1) {
+                accept_count = std::max(0, tokens_left - 1);  // reserve 1 slot for corrected token
+            }
             for (int i = 0; i < accept_count; i++) {
                 int dtok = ctx->draft_tokens[i];
                 ctx->generated_tokens.push_back(dtok);
@@ -1509,7 +1519,8 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             // 11. Rollback MTP context & generate new drafts
             if (accept_count < N) {
                 // Partial/full reject: rollback stale MTP KV entries
-                ctx->mtp_context_len -= (N - 1 - accept_count);
+                // N drafts were added, accept_count are valid → remove (N - accept_count)
+                ctx->mtp_context_len -= (N - accept_count);
             }
 
             // Generate N new drafts from the last accepted position's hidden state
@@ -1801,12 +1812,21 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 int pos = ctx->mtp_pos;
 
                 // Pre-allocate MTP KV blocks for all N drafts
+                bool mtp_alloc_ok = true;
                 int final_mtp_ctx = ctx->mtp_context_len + N;
                 int final_mtp_blks = (final_mtp_ctx + 15) / 16;
-                while ((int)ctx->mtp_block_table.size() < final_mtp_blks) {
-                    auto mb = mtp_kv_manager_->allocate_blocks(1);
-                    ctx->mtp_block_table.push_back(mb[0]);
+                try {
+                    while ((int)ctx->mtp_block_table.size() < final_mtp_blks) {
+                        auto mb = mtp_kv_manager_->allocate_blocks(1);
+                        ctx->mtp_block_table.push_back(mb[0]);
+                    }
+                } catch (const std::runtime_error&) {
+                    // MTP KV pool exhausted — skip bootstrap, degrade to T=1
+                    mtp_alloc_ok = false;
                 }
+                if (!mtp_alloc_ok) {
+                    profiler_.end("mtp_bootstrap", compute_stream_);
+                } else {
                 // Single block_table upload
                 cudaMemcpyAsync(d_mtp_block_tables_, ctx->mtp_block_table.data(),
                                 ctx->mtp_block_table.size() * sizeof(int),
@@ -1857,6 +1877,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                     ctx->mtp_context_len += N;
                 }
                 profiler_.end("mtp_bootstrap", compute_stream_);
+                } // else mtp_alloc_ok
             }
 
             profiler_.request_decode_step();

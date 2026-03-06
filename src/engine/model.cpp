@@ -307,8 +307,62 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
             mtp_layer_ = std::make_unique<Qwen35FullAttnLayer>(config_, 0 /* dummy layer_idx */);
             mtp_layer_->set_weights(mtp_q, mtp_k, mtp_v, mtp_o, mtp_qn, mtp_kn,
                                      mtp_gp, mtp_up, mtp_dp, mtp_in, mtp_pn);
+
+            // Build ptr→index map for releasing merged originals
+            std::unordered_map<void*, size_t> mtp_ptr_idx;
+            for (size_t j = 0; j < device_weights_.size(); j++) {
+                if (device_weights_[j]) mtp_ptr_idx[device_weights_[j]] = j;
+            }
+            auto mtp_release = [&](void* ptr) {
+                auto it = mtp_ptr_idx.find(ptr);
+                if (it != mtp_ptr_idx.end()) {
+                    cudaFree(ptr);
+                    device_weights_[it->second] = nullptr;
+                    mtp_ptr_idx.erase(it);
+                }
+            };
+
+            // Merge MTP QKV weights: Q[qp_dim,hs] + K[kv_dim,hs] + V[kv_dim,hs] → [merged_N, hs]
+            {
+                const int qp_dim = config_.q_proj_dim();
+                const int kv_dim = config_.kv_dim();
+                const int hs     = config_.hidden_size;
+                int merged_N = qp_dim + kv_dim * 2;
+                size_t bytes = (size_t)merged_N * hs * sizeof(__nv_bfloat16);
+                __nv_bfloat16* merged = nullptr;
+                cudaMalloc(&merged, bytes);
+                cudaMemcpy(merged, mtp_q,
+                           (size_t)qp_dim * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+                cudaMemcpy(merged + (size_t)qp_dim * hs, mtp_k,
+                           (size_t)kv_dim * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+                cudaMemcpy(merged + (size_t)(qp_dim + kv_dim) * hs, mtp_v,
+                           (size_t)kv_dim * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+                device_weights_.push_back(merged);
+                mtp_layer_->set_merged_qkv(merged);
+                mtp_release(mtp_q);
+                mtp_release(mtp_k);
+                mtp_release(mtp_v);
+            }
+
+            // Merge MTP Gate+Up weights: [2*is, hs]
+            {
+                const int is = config_.intermediate_size;
+                const int hs = config_.hidden_size;
+                size_t bytes = (size_t)2 * is * hs * sizeof(__nv_bfloat16);
+                __nv_bfloat16* merged = nullptr;
+                cudaMalloc(&merged, bytes);
+                cudaMemcpy(merged, mtp_gp,
+                           (size_t)is * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+                cudaMemcpy(merged + (size_t)is * hs, mtp_up,
+                           (size_t)is * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+                device_weights_.push_back(merged);
+                mtp_layer_->set_merged_gate_up(merged);
+                mtp_release(mtp_gp);
+                mtp_release(mtp_up);
+            }
+
             std::cout << "[Model] MTP module loaded (1 transformer layer, "
-                      << "speculative decoding enabled)" << std::endl;
+                      << "QKV+GateUp merged, speculative decoding enabled)" << std::endl;
         } else {
             std::cout << "[Model] No MTP weights found, speculative decoding disabled" << std::endl;
         }
