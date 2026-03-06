@@ -174,8 +174,9 @@ public:
     // ssm_state:  [nkh, kd, v_per_kh]  bf16, device, in-place updated
     // conv_state: [nkh*2, kd, conv_k-1] fp16,    device, in-place updated
     // batched decode: ssm_state_ptrs/conv_state_ptrs 是 device 上的指针数组 [batch_size]
-    // ssm_state_checkpoint/conv_state_checkpoint: MTP T=2 verify rollback checkpoints
-    //   if non-null, save state after processing token[0] (same layout as ssm_state/conv_state)
+    // ssm_state_checkpoint/conv_state_checkpoint: MTP T>1 verify rollback checkpoints
+    //   if non-null, save state after processing first num_checkpoints tokens
+    //   Layout: [num_checkpoints * state_size_per_layer] contiguous
     void forward(
         __nv_bfloat16* hidden_states,    // [T, hs], in-place
         __nv_bfloat16* ssm_state,       // [nkh, kd, v_per_kh] bf16 (batch_size==1)
@@ -187,7 +188,8 @@ public:
         __nv_bfloat16** ssm_state_ptrs = nullptr,      // [batch_size] device ptr array
         __nv_bfloat16** conv_state_ptrs = nullptr,  // [batch_size] device ptr array
         __nv_bfloat16* ssm_state_checkpoint = nullptr,
-        __nv_bfloat16* conv_state_checkpoint = nullptr
+        __nv_bfloat16* conv_state_checkpoint = nullptr,
+        int num_checkpoints = 1
     );
 
 private:

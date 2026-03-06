@@ -387,7 +387,8 @@ void Qwen35LinearAttnLayer::forward(
     __nv_bfloat16** ssm_state_ptrs,
     __nv_bfloat16** conv_state_ptrs,
     __nv_bfloat16* ssm_state_checkpoint,
-    __nv_bfloat16* conv_state_checkpoint)
+    __nv_bfloat16* conv_state_checkpoint,
+    int num_checkpoints)
 {
     if (!in_proj_qkv_w_) return;
 
@@ -456,7 +457,7 @@ void Qwen35LinearAttnLayer::forward(
         ops::invoke_causal_conv1d(qkv_out, conv_state,
                                    conv1d_w_, num_tokens, in_qkv, conv_k, stream,
                                    0 /* token_stride */, batch_size, conv_state_ptrs,
-                                   conv_state_checkpoint);
+                                   conv_state_checkpoint, num_checkpoints);
     }
 
     // 4+5+6. Gated DeltaNet recurrence (alpha/sigmoid-beta computed inline)
@@ -466,7 +467,7 @@ void Qwen35LinearAttnLayer::forward(
         ssm_state, y_ssm,
         num_tokens, nkh, kd, nv_per_kh, vd, stream, in_qkv,
         batch_size, ssm_state_ptrs,
-        ssm_state_checkpoint);
+        ssm_state_checkpoint, num_checkpoints);
 
     // 7+8. Fused per-head RMSNorm + SiLU gate: y_ssm = rmsnorm(y_ssm) * silu(z_out)
     if (attn_norm_w_) {

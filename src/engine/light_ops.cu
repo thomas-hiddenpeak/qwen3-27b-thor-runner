@@ -597,7 +597,8 @@ __global__ void causal_conv1d_kernel(__nv_bfloat16* x_io,
                                       const __nv_bfloat16* conv_w,
                                       int num_tokens, int channels, int conv_k,
                                       int token_stride, int batch_size,
-                                      __nv_bfloat16* conv_state_checkpoint) {
+                                      __nv_bfloat16* conv_state_checkpoint,
+                                      int num_checkpoints) {
     int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= channels) return;
 
@@ -654,11 +655,13 @@ __global__ void causal_conv1d_kernel(__nv_bfloat16* x_io,
         buf1 = buf2;
         buf2 = cur;
 
-        // MTP speculative checkpoint: save conv state after token[0] for T=2 verify rollback
-        if (conv_state_checkpoint && t == 0 && num_tokens > 1) {
-            conv_state_checkpoint[ch * hist + 0] = __float2bfloat16(buf0);
-            conv_state_checkpoint[ch * hist + 1] = __float2bfloat16(buf1);
-            conv_state_checkpoint[ch * hist + 2] = __float2bfloat16(buf2);
+        // MTP speculative checkpoint: save conv state after each of the first num_checkpoints tokens
+        // Layout: [num_checkpoints, channels, hist]
+        if (conv_state_checkpoint && t < num_checkpoints && num_tokens > 1) {
+            size_t ckpt_base = (size_t)t * channels * hist;
+            conv_state_checkpoint[ckpt_base + ch * hist + 0] = __float2bfloat16(buf0);
+            conv_state_checkpoint[ckpt_base + ch * hist + 1] = __float2bfloat16(buf1);
+            conv_state_checkpoint[ckpt_base + ch * hist + 2] = __float2bfloat16(buf2);
         }
     }
 
@@ -672,7 +675,8 @@ void invoke_causal_conv1d(__nv_bfloat16* x_io, __nv_bfloat16* conv_state,
                            int num_tokens, int channels, int conv_k,
                            cudaStream_t stream, int token_stride,
                            int batch_size, __nv_bfloat16** conv_state_ptrs,
-                           __nv_bfloat16* conv_state_checkpoint) {
+                           __nv_bfloat16* conv_state_checkpoint,
+                           int num_checkpoints) {
     if (token_stride <= 0) token_stride = channels;
 
     if (num_tokens > 2 && batch_size <= 1 && conv_state && !conv_state_checkpoint) {
@@ -706,7 +710,7 @@ void invoke_causal_conv1d(__nv_bfloat16* x_io, __nv_bfloat16* conv_state,
         causal_conv1d_kernel<<<blocks, threads, 0, stream>>>(
             x_io, conv_state_ptrs, conv_state,
             conv_w, num_tokens, channels, conv_k, token_stride, batch_size,
-            conv_state_checkpoint);
+            conv_state_checkpoint, num_checkpoints);
     }
 }
 
@@ -753,7 +757,8 @@ gated_delta_net_prefill_kernel(
     __nv_bfloat16* y_out,
     int num_tokens, int kd, int nv_per_kh, int vd,
     int token_stride, int nkh_x_nvpkh,
-    __nv_bfloat16* ssm_state_checkpoint)
+    __nv_bfloat16* ssm_state_checkpoint,
+    int num_checkpoints)
 {
     int h_v = blockIdx.x;
     int h_k = h_v / nv_per_kh;
@@ -831,10 +836,13 @@ gated_delta_net_prefill_kernel(
         y_out[y_base + j] = __float2bfloat16(y_j);
         __syncthreads();
 
-        // MTP speculative checkpoint: save SSM state after token[0] for T=2 verify rollback
-        if (ssm_state_checkpoint && t == 0 && num_tokens > 1) {
+        // MTP speculative checkpoint: save SSM state after each of first num_checkpoints tokens
+        // Layout: [num_checkpoints, nkh_x_nvpkh * kd * vd] contiguous per layer
+        if (ssm_state_checkpoint && t < num_checkpoints && num_tokens > 1) {
+            int state_stride = nkh_x_nvpkh * kd * vd;
+            size_t ckpt_base = (size_t)t * state_stride + ss_base;
             for (int i = 0; i < kd; i++)
-                ssm_state_checkpoint[ss_base + i * vd + j] = __float2bfloat16(S_smem[i * vd_pad + j]);
+                ssm_state_checkpoint[ckpt_base + i * vd + j] = __float2bfloat16(S_smem[i * vd_pad + j]);
             __syncthreads();
         }
     }
@@ -966,7 +974,8 @@ void invoke_gated_delta_net(const __nv_bfloat16* q, const __nv_bfloat16* k, cons
                              int num_tokens, int nkh, int kd, int nv_per_kh, int vd,
                              cudaStream_t stream, int token_stride,
                              int batch_size, __nv_bfloat16** ssm_state_ptrs,
-                             __nv_bfloat16* ssm_state_checkpoint) {
+                             __nv_bfloat16* ssm_state_checkpoint,
+                             int num_checkpoints) {
     if (token_stride <= 0) token_stride = nkh * kd;
     int nkh_x_nvpkh = nkh * nv_per_kh;  // 48
 
@@ -991,9 +1000,6 @@ void invoke_gated_delta_net(const __nv_bfloat16* q, const __nv_bfloat16* k, cons
         const int vd_pad = vd + 1;
         size_t smem_bytes = (size_t)(kd * vd_pad + 2 * kd + 2) * sizeof(float);
 
-        // 每次 launch 前都设置 smem 属性 — 不能用 static bool 守护！
-        // 原因: 如果 CUDA context 被看门狗重置后恢复, function attributes 会丢失
-        // 但 static bool 阻止重新配置 → kernel 以默认 48KB smem 启动 → 写越界 → SMMU fault
         cudaError_t smem_err = cudaFuncSetAttribute(
             gated_delta_net_prefill_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1002,14 +1008,14 @@ void invoke_gated_delta_net(const __nv_bfloat16* q, const __nv_bfloat16* k, cons
             fprintf(stderr, "[CUDA] cudaFuncSetAttribute failed for DeltaNet prefill: %s (need %zu bytes)\n",
                     cudaGetErrorString(smem_err), smem_bytes);
             fflush(stderr);
-            return;  // 跳过 kernel launch, 避免 SMMU fault
+            return;
         }
 
         gated_delta_net_prefill_kernel<<<grid, threads, smem_bytes, stream>>>(
             q, k, v, a_raw, dt_bias, A_log, beta_raw,
             ssm_state, y_out,
             num_tokens, kd, nv_per_kh, vd, token_stride, nkh_x_nvpkh,
-            ssm_state_checkpoint);
+            ssm_state_checkpoint, num_checkpoints);
     } else {
         // ---- Batched decode 路径 ----
         int threads = std::min(vd, 256);

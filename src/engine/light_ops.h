@@ -55,14 +55,17 @@ void invoke_write_kv_cache(__nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
 // 因果短卷积 (causal conv1d)
 // token_stride: 元素步长（= channels 独立布局; = in_qkv 交叉布局）
 // batch_size>1 + conv_state_ptrs: batched decode, 每 token 用自己的 conv state
-// conv_state_checkpoint: if non-null, save conv state after processing token[0]
-// (for MTP speculative decode rollback on T=2 verify)
+// conv_state_checkpoint: if non-null, save conv state after processing tokens
+// num_checkpoints: save state after token[0], token[1], ..., token[num_checkpoints-1]
+//   Layout: [num_checkpoints * channels * (conv_k-1)] contiguous
+//   (for MTP speculative decode partial accept rollback)
 void invoke_causal_conv1d(__nv_bfloat16* x_io, __nv_bfloat16* conv_state,
                            const __nv_bfloat16* conv_w,
                            int num_tokens, int channels, int conv_k,
                            cudaStream_t stream = 0, int token_stride = 0,
                            int batch_size = 1, __nv_bfloat16** conv_state_ptrs = nullptr,
-                           __nv_bfloat16* conv_state_checkpoint = nullptr);
+                           __nv_bfloat16* conv_state_checkpoint = nullptr,
+                           int num_checkpoints = 1);
 
 // FP32 → BF16 转换（加载权重时使用）
 void invoke_f32_to_bf16(const float* src, __nv_bfloat16* dst, size_t n,
@@ -73,8 +76,10 @@ void invoke_f32_to_bf16(const float* src, __nv_bfloat16* dst, size_t n,
 // dt_bias: [nv] per-head bias for softplus, A_log: [nv] log decay rate (FP32)
 // token_stride: q/k/v 中相邻 token 的步长（= nkh*kd 独立; = in_qkv 交叉）
 // batch_size>1 + ssm_state_ptrs: batched decode, 每 token 用自己的 SSM state
-// ssm_state_checkpoint: if non-null, save SSM state after processing token[0]
-// (for MTP speculative decode rollback on T=2 verify)
+// ssm_state_checkpoint: if non-null, save SSM state after processing tokens
+// num_checkpoints: save state after token[0], token[1], ..., token[num_checkpoints-1]
+//   Layout: [num_checkpoints * nkh * nv_per_kh * kd * vd] contiguous
+//   (for MTP speculative decode partial accept rollback)
 void invoke_gated_delta_net(const __nv_bfloat16* q, const __nv_bfloat16* k,
                              const __nv_bfloat16* v,
                              const __nv_bfloat16* a_raw, const __nv_bfloat16* dt_bias,
@@ -84,7 +89,8 @@ void invoke_gated_delta_net(const __nv_bfloat16* q, const __nv_bfloat16* k,
                              int nkh, int kd, int nv_per_kh, int vd,
                              cudaStream_t stream = 0, int token_stride = 0,
                              int batch_size = 1, __nv_bfloat16** ssm_state_ptrs = nullptr,
-                             __nv_bfloat16* ssm_state_checkpoint = nullptr);
+                             __nv_bfloat16* ssm_state_checkpoint = nullptr,
+                             int num_checkpoints = 1);
 
 // element-wise: out[i] = a[i] + b[i]
 void invoke_add(__nv_bfloat16* out, const __nv_bfloat16* a, const __nv_bfloat16* b,
