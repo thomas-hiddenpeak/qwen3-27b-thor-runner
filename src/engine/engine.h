@@ -205,8 +205,10 @@ private:
     size_t ssm_elems_per_layer_ = 0;             // SSM state elements per layer
     size_t conv_elems_per_layer_ = 0;            // Conv state elements per layer
     int num_mtp_drafts_ = 3;                   // 每步 draft token 数 (从配置读取, 1~8)
-    int mtp_verify_count_ = 0;
-    int mtp_accept_count_ = 0;
+    int mtp_verify_count_ = 0;                   // verify 步数
+    int mtp_accept_count_ = 0;                   // full accept (N/N) 步数
+    int mtp_total_accepted_ = 0;                 // 累计接受的 draft tokens
+    int mtp_total_emitted_ = 0;                  // 累计产出的 tokens (accept + bonus)
 
     // 采样用预分配缓冲区 (CPU 侧)
     std::vector<float> sampling_logits_;

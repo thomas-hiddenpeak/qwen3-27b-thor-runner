@@ -1506,16 +1506,22 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
 
             // 12. Statistics
             int total_emitted = accept_count + 1;
+            mtp_total_accepted_ += accept_count;
+            mtp_total_emitted_ += total_emitted;
             for (int i = 0; i < total_emitted; i++) profiler_.request_decode_step();
             int step_n = (int)ctx->generated_tokens.size();
             if (step_n % 10 == 0) profiler_.print_step_report(step_n);
-            float accept_rate = mtp_verify_count_ > 0
-                ? (float)mtp_accept_count_ / mtp_verify_count_ * 100.f : 0.f;
+            float token_accept_rate = mtp_verify_count_ > 0
+                ? (float)mtp_total_accepted_ / (mtp_verify_count_ * N) * 100.f : 0.f;
+            float avg_tok_per_step = mtp_verify_count_ > 0
+                ? (float)mtp_total_emitted_ / mtp_verify_count_ : 0.f;
             std::cout << "Decode step " << step_n
                       << ". tok=" << next_token
                       << " txt=\"" << token_to_log_text(next_token) << "\""
                       << " (MTP " << accept_count << "/" << N
-                      << " accept, " << total_emitted << "tok, rate=" << accept_rate << "%)" << std::endl;
+                      << " accept, " << total_emitted << "tok"
+                      << ", rate=" << token_accept_rate << "%"
+                      << ", avg=" << avg_tok_per_step << "tok/step)" << std::endl;
 
         } else {
             // ============================================================
