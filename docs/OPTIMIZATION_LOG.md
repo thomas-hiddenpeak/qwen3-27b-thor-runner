@@ -4072,3 +4072,68 @@ B=128: 344.5ms / 371.6 tok/s (无回退, T>1 走 separate 路径)
 - GDN SMEM caching: occupancy 下降抵消收益
 - Dual GEMV + SwiGLU fusion: block count 减半导致带宽利用率下降 (+4.6%)
 正确性: 12 PASS / 0 FAIL
+
+---
+
+## MTP 投机解码优化系列 (2026-03)
+
+### Phase 1: Partial Accept (d=3)
+
+**问题**: all-or-nothing verify 策略下 d=3 比 d=1 慢 (期望值 1.27 vs 1.0 accept/step)。
+**改动**: 实现 partial accept — 逐位置 verify, 接受前缀匹配的 draft token, 多位置 SSM/Conv checkpoint 回滚。
+**结果**: 5.1 → 6.2 tok/s (+21.6%), 224 steps / 509 tokens (2.27 tok/step)
+
+### Phase 2: Batched Argmax
+
+**问题**: Verify 路径 4 次独立 sample_argmax (各带 `cudaStreamSynchronize`) = 37ms。
+**改动**: `invoke_batched_argmax` 单次 kernel 处理 T 个 vocab=248320 的 logits, 1 sync。
+**结果**: Sample 37ms → 7.37ms (5× speedup), 6.2 → 6.5 tok/s (+4.8%)
+
+### Phase 3: GPU-Resident MTP Draft Chain
+
+**问题**: MTP draft 生成中, 每个 draft 需 `cudaStreamSynchronize` 读取 argmax 结果,
+再 H2D 拷回作为下一个 draft 的输入 token。3 drafts = 3 syncs, CPU→GPU 管线停滞,
+ATS 统一内存每次 sync 触发一致性协议开销。
+
+**分析**:
+- MTP draft 间: argmax 结果存于 `cudaMallocManaged` 的 `d_argmax_result_`
+- 下一个 draft 的 `mtp_forward` 只需 token ID 做 embedding lookup (GPU 操作)
+- CPU 只需在所有 draft 完成后批量读取 token IDs
+
+**改动**:
+1. `model.h/model.cpp`: `mtp_forward` 新增 `const int* d_input_token_id` 参数
+   - non-null 时直接用 GPU 指针做 embedding lookup, 跳过 H2D `cudaMemcpyAsync`
+2. `engine.cpp generate_mtp_drafts`:
+   - Pre-allocate 所有 N 个 MTP KV blocks (N alloc → 1 batch)
+   - Single block_table upload (N → 1)
+   - Draft[0]: CPU token (first_token), `invoke_argmax → d_argmax_result_[0]`, NO sync
+   - Draft[1+]: GPU token from `d_argmax_result_[di-1]`, NO sync
+   - 单次 final `cudaStreamSynchronize` 读取所有 N 个 draft token IDs
+3. MTP Bootstrap: 同样的 GPU-resident 模式
+
+**A/B 对比 (serve, max_tokens=512, temperature=0.7, 510 tokens)**
+
+| 指标 | Batched Argmax 基线 | GPU-Resident Chain | 变化 |
+|------|---------------------|-------------------|------|
+| Decode tok/s | 6.5 | 7.7-7.8 | **+18.5%** |
+| Forward avg | 260.81ms | ~220ms | **-15.7%** |
+| Sample avg | 7.37ms | ~9.6ms | +30% (噪声) |
+| lm_head avg | 12.97ms | ~10.6ms | -18% |
+| Steps | 230 | ~228 | ≈same |
+| Decode total | 78108ms | ~65700ms | **-15.9%** |
+
+**关键洞察**: Forward 时间大幅下降 (260→220ms) 超出预期。
+分析: 旧代码每步 3 次 `cudaStreamSynchronize` 引起 GPU 管线完全排空,
+Jetson ATS 统一内存的 coherence protocol 在 managed memory 上额外开销显著,
+消除中间 sync 后 GPU command queue 保持满载, 消除了管线气泡和 ATS 一致性抖动。
+
+### 当前性能基线 (MTP d=3, GPU-Resident, 2026-03)
+
+| 版本 | tok/s | Forward | Steps | 总时间 |
+|------|-------|---------|-------|--------|
+| d=1 无 MTP 基线 | 5.1 | ~229ms | 594 | 96013ms |
+| d=3 partial accept | 6.2 | ~260ms | 224 | 82146ms |
+| d=3 + batched argmax | 6.5 | ~261ms | 230 | 78108ms |
+| **d=3 + GPU-resident chain** | **7.7-7.8** | **~220ms** | **~228** | **~65700ms** |
+
+**累计 MTP 提速**: +51% (5.1 → 7.7-7.8 tok/s)
