@@ -193,10 +193,13 @@ src/
 ```bash
 mkdir -p build && cd build && cmake .. && make -j$(nproc)
 # 产物: build/qwen3-27b-thor
-# 运行: ./build/qwen3-27b-thor serve --kv-cache-gb 8
-#       ./build/qwen3-27b-thor chat  --kv-cache-gb 4
-#       ./build/qwen3-27b-thor bench --decode 30
-#       ./build/qwen3-27b-thor test
+# 运行 (推荐使用统一配置文件 configs/config.conf):
+#   ./build/qwen3-27b-thor serve --config configs/config.conf
+#   ./build/qwen3-27b-thor chat  --config configs/config.conf
+#   ./build/qwen3-27b-thor bench --decode 30
+#   ./build/qwen3-27b-thor test
+# 也可单独覆盖 serve 配置:
+#   ./build/qwen3-27b-thor serve --config configs/config.conf --serve-config configs/serve.conf
 ```
 
 ## 工作流规范
