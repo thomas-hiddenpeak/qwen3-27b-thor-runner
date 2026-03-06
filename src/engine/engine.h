@@ -157,7 +157,7 @@ private:
     int* d_pos_ids_ = nullptr;
     int* d_block_tables_ = nullptr;
     int* d_context_lens_ = nullptr;
-    int* d_argmax_result_ = nullptr;  // GPU argmax 结果 (managed memory)
+    int* d_argmax_result_ = nullptr;  // GPU argmax 结果 (managed memory, 16 ints for batched)
 
     // Streaming attention: staging KV cache + softmax 中间状态
     __nv_bfloat16* d_staging_k_ = nullptr;    // SSD blocks 的临时 K cache
@@ -204,7 +204,7 @@ private:
     int* d_mtp_context_lens_ = nullptr;          // MTP KV context lens (device)
     size_t ssm_elems_per_layer_ = 0;             // SSM state elements per layer
     size_t conv_elems_per_layer_ = 0;            // Conv state elements per layer
-    int num_mtp_drafts_ = 1;                   // 每步 draft token 数 (从配置读取, 1~8)
+    int num_mtp_drafts_ = 3;                   // 每步 draft token 数 (从配置读取, 1~8)
     int mtp_verify_count_ = 0;
     int mtp_accept_count_ = 0;
 

@@ -119,7 +119,7 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
     int max_kv_blks = (ipc::MAX_PROMPT_LEN + 15) / 16 + 1024;  // prompt + decode headroom
     cudaMalloc(&d_block_tables_,  (size_t)max_kv_blks * sizeof(int));
     cudaMalloc(&d_context_lens_,  sizeof(int));
-    cudaMallocManaged(&d_argmax_result_, sizeof(int));  // GPU argmax 结果
+    cudaMallocManaged(&d_argmax_result_, 16 * sizeof(int));  // GPU argmax 结果 (batched verify 用)
 
     // Workspace: 单层最大激活量 (linear_attn 更大)
     // FullAttn  : 4*hs + 2*qp_dim + 2*kv_dim + 3*is  (qp_dim = 2*q_dim for Q+gate)
@@ -1310,13 +1310,16 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                                    T, vocab_size, hs, compute_stream_);
             profiler_.end("lm_head", compute_stream_);
 
-            // 7. Sample all T logit positions
+            // 7. Batched argmax for all T logit positions (1 kernel + 1 sync)
             profiler_.begin("sample", compute_stream_);
             int verify[9];
-            for (int i = 0; i < T; i++) {
-                verify[i] = sample_argmax(logits_T + (size_t)i * vocab_size,
-                                          vocab_size, compute_stream_);
+            ops::invoke_batched_argmax(logits_T, d_argmax_result_, vocab_size, T, compute_stream_);
+            if (!sync_stream_with_timeout(compute_stream_, 60, "batched_argmax_verify")) {
+                fprintf(stderr, "[Engine] FATAL: GPU hang in batched argmax verify\n");
+                ctx->is_finished = true;
+                return;
             }
+            for (int i = 0; i < T; i++) verify[i] = d_argmax_result_[i];
             profiler_.end("sample", compute_stream_);
 
             mtp_verify_count_++;

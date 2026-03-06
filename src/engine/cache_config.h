@@ -59,7 +59,7 @@ struct CacheConfig {
     // MTP KV Cache blocks 数量 (每 block 16 tokens, 默认 256 = 4096 tokens)
     int mtp_kv_blocks = 256;
     // 每步生成的 draft token 数量 (1~8, 默认 3 → 最多 4 tokens/step)
-    int mtp_num_drafts = 1;
+    int mtp_num_drafts = 3;
 
     // ---- 从 CLI 参数解析 ----
     // 支持的参数:
