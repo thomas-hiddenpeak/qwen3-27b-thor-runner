@@ -20,6 +20,21 @@
 // Uses cudaStreamQuery polling with 10ms sleep intervals (not spin-wait)
 // so CPU stays responsive and systemd can feed the watchdog.
 // ---------------------------------------------------------------------------
+// Hot-path sync: direct cudaStreamSynchronize, no polling overhead.
+// forward_decode already uses 64× cudaStreamSynchronize per step without issues,
+// so watchdog feeding is not a concern for decode steps.
+static bool fast_sync_stream(cudaStream_t stream, const char* context = nullptr) {
+    cudaError_t err = cudaStreamSynchronize(stream);
+    if (err == cudaSuccess) return true;
+    fprintf(stderr, "[Engine] CUDA error during sync (%s): %s\n",
+            context ? context : "unknown",
+            cudaGetErrorString(err));
+    cudaGetLastError(); // clear sticky error
+    return false;
+}
+
+// Cold-path sync: polling with timeout for init/cleanup/recovery paths.
+// Uses 10ms sleep to let systemd feed watchdog.
 static bool sync_stream_with_timeout(cudaStream_t stream, int timeout_seconds,
                                       const char* context = nullptr) {
     auto start = std::chrono::steady_clock::now();
@@ -1314,7 +1329,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             profiler_.begin("sample", compute_stream_);
             int verify[9];
             ops::invoke_batched_argmax(logits_T, d_argmax_result_, vocab_size, T, compute_stream_);
-            if (!sync_stream_with_timeout(compute_stream_, 60, "batched_argmax_verify")) {
+            if (!fast_sync_stream(compute_stream_, "batched_argmax_verify")) {
                 fprintf(stderr, "[Engine] FATAL: GPU hang in batched argmax verify\n");
                 ctx->is_finished = true;
                 return;
@@ -1398,7 +1413,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 }
 
                 // Single final sync: read all N draft token IDs
-                if (!sync_stream_with_timeout(compute_stream_, 60, "mtp_drafts_batch")) {
+                if (!fast_sync_stream(compute_stream_, "mtp_drafts_batch")) {
                     fprintf(stderr, "[Engine] FATAL: GPU hang in MTP draft generation\n");
                     ctx->is_finished = true;
                     return;
@@ -1832,7 +1847,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 }
 
                 // Single final sync
-                if (!sync_stream_with_timeout(compute_stream_, 60, "mtp_bootstrap_batch")) {
+                if (!fast_sync_stream(compute_stream_, "mtp_bootstrap_batch")) {
                     fprintf(stderr, "[Engine] FATAL: GPU hang in MTP bootstrap\n");
                     ctx->is_finished = true;
                 } else {
@@ -1881,7 +1896,7 @@ std::string InferenceEngine::token_to_log_text(int token_id) const {
 int InferenceEngine::sample_argmax(__nv_bfloat16* logits, int vocab_size, cudaStream_t stream) {
     // GPU argmax: 单 block 1024 线程 reduce，结果写到 managed memory
     ops::invoke_argmax(logits, d_argmax_result_, vocab_size, stream);
-    if (!sync_stream_with_timeout(stream, 60, "sample_argmax")) {
+    if (!fast_sync_stream(stream, "sample_argmax")) {
         fprintf(stderr, "[Engine] FATAL: GPU hang detected in sample_argmax, returning EOS\n");
         fflush(stderr);
         return 248046; // EOS token — force stop
@@ -1916,7 +1931,7 @@ int InferenceEngine::sample_token(__nv_bfloat16* logits, int vocab_size,
     }
 
     // 1. 等待 GPU 完成, cudaMemcpy logits 到 host staging buffer
-    if (!sync_stream_with_timeout(stream, 60, "sample_token")) {
+    if (!fast_sync_stream(stream, "sample_token")) {
         fprintf(stderr, "[Engine] FATAL: GPU hang detected in sample_token, returning EOS\n");
         fflush(stderr);
         return 248046; // EOS token — force stop
