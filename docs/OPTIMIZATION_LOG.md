@@ -4136,4 +4136,61 @@ Jetson ATS 统一内存的 coherence protocol 在 managed memory 上额外开销
 | d=3 + batched argmax | 6.5 | ~261ms | 230 | 78108ms |
 | **d=3 + GPU-resident chain** | **7.7-7.8** | **~220ms** | **~228** | **~65700ms** |
 
+---
+
+## NVFP4 (FP4 E2M1) 量化推理支持
+
+### 背景
+
+引入 NVIDIA FP4 (E2M1) 量化推理，使用 `Sehyo-Qwen3.5-27B-NVFP4` 模型
+（compressed-tensors 格式，nvfp4-pack-quantized）。
+
+- **量化范围**: MLP gate/up/down_proj (64 层) + FullAttn q/k/v/o_proj (16 层) = 256 projections
+- **BF16 保留**: LinearAttn 48 层全部, embeddings, lm_head, MTP, norms
+- **格式**: FP4 E2M1 packed as U8 (2 vals/byte), F8_E4M3 per-group-16 scale, F32 global_scale
+- **Dequant**: `W = fp4_val × e4m3_scale / weight_global_scale`
+- **权重大小**: ~26.6 GB (vs BF16 ~52 GB, 节省 ~49%)
+
+### Phase 1: 初始实现 (V1 kernel)
+
+手写 FP4 GEMV kernel，常量内存 LUT 解码 FP4 E2M1。
+
+**结果**: 586ms/step, ~1.7 tok/s — 比 BF16 (229ms) 慢 2.56×
+
+**根因**: `__constant__` 内存 LUT 在 warp 内不同线程访问不同索引时串行化
+（~14 cycles/access × 16 lookups/group = 224 cycles/group），加上逐字节权重读取。
+
+### Phase 2: FP4 GEMV V2 优化
+
+**改动** (dense_gemm_fp4_sm110.cu):
+1. **SMEM LUT** (16 floats, 64 bytes) 替代 `__constant__` — 消除 warp 串行化 (0 bank conflict)
+2. **uint2 向量化权重** (8 bytes/load = 1 组 16 FP4) — 完美合并, 100% sector 利用率
+3. **float4 向量化 activation** 从 SMEM 读取 (16 bytes/load = 8 bf16)
+4. **延迟 group_scale 乘法** — 每组 1× 而非 16×, 节省 15 MUL/group
+5. **连续输出映射** `out_idx = blockIdx.x * WARPS + warp_id` 替代散列映射
+
+**A/B 对比 (bench --no-graph --mtp-mode off --decode 30 --warmup 5, B=1)**
+
+| 指标 | BF16 Baseline | NVFP4 V1 | NVFP4 V2 | V2 vs BF16 |
+|------|:---:|:---:|:---:|:---:|
+| Forward | 217.4 ms | 575 ms | **117.2 ms** | **1.85×** 加速 |
+| Total/step | 228.4 ms | 586 ms | **128.1 ms** | **1.78×** 加速 |
+| tok/s | 4.38 | ~1.7 | **7.81** | **+78%** |
+| Weight BW | 224 GB/s | ~20 GB/s | ~202 GB/s | 74% of peak |
+| LM Head | 10.9 ms | 10.6 ms | 10.7 ms | 同 (BF16) |
+| TTFT (P17) | 366 ms | 1370 ms | 1370 ms | FP4 prefill 待优化 |
+| 权重内存 | ~52 GB | ~26.6 GB | ~26.6 GB | **-49%** |
+
+**关键结论**:
+- Forward 达到理论极限 (228/128 = 1.78×) 的 86% (理论上限 51/23.6 = 2.16×)
+- LM Head 占 10.7ms = 两种模型共同瓶颈 (BF16, vocab=248K)
+- TTFT 较高因 T>1 FP4 路径使用 dequant→cuBLAS 回退 (TODO: 原生 cuBLASLt FP4)
+
+### TODO
+
+- [ ] T>1 prefill: cuBLASLt 原生 FP4 GEMM (`CUDA_R_4F_E2M1` + `VEC16_UE4M3`)
+- [ ] Fused RMSNorm+FP4 GEMV (FullAttn Q projection, 节省 16×1 launch)
+- [ ] FP4 QKV merge (需处理不同 global_scale)
+- [ ] FP4 Dual GEMV gate+up 效率验证
+
 **累计 MTP 提速**: +51% (5.1 → 7.7-7.8 tok/s)
