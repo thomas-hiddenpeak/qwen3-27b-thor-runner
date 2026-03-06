@@ -102,7 +102,7 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
     cache::CapacityPlanner::print_report(capacity, cache_config);
 
     // 4. 统一缓存管理器 (包含 KV pool, SSM/Conv pool, prefix cache, KV swapper, SSD store + streaming buffers)
-    cache_manager_ = std::make_unique<cache::CacheManager>(config_, cache_config, mcp, capacity, compute_stream_);
+    cache_manager_ = std::make_unique<cache::CacheManager>(config_, cache_config, mcp, capacity, compute_stream_, verbose_);
     gpu_max_tokens_ = cache_manager_->gpu_max_tokens();
     fprintf(stderr, "[Engine] Max tokens per request: %d (%.1fK) from KV budget %.1f GB\n",
            gpu_max_tokens_, gpu_max_tokens_ / 1024.0, cache_config.kv_cache_budget_gb);

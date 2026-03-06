@@ -84,7 +84,8 @@ public:
                  const CacheConfig& cache_config,
                  const ModelCacheParams& model_cache_params,
                  const CapacityReport& capacity,
-                 cudaStream_t stream);
+                 cudaStream_t stream,
+                 bool verbose = true);
     ~CacheManager();
 
     // =============== 请求生命周期 ===============
@@ -288,6 +289,7 @@ private:
 
     // ---- CUDA ----
     cudaStream_t stream_;
+    bool verbose_ = true;
 };
 
 } // namespace cache

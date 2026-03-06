@@ -22,8 +22,9 @@ CacheManager::CacheManager(const core::Qwen35Config& model_config,
                            const CacheConfig& cache_config,
                            const ModelCacheParams& mcp,
                            const CapacityReport& capacity,
-                           cudaStream_t stream)
-    : stream_(stream)
+                           cudaStream_t stream,
+                           bool verbose)
+    : stream_(stream), verbose_(verbose)
 {
     // 保存模型参数
     int num_full_attn = model_config.num_full_attn_layers();
@@ -267,7 +268,7 @@ void CacheManager::free_request(uint64_t req_id, RequestCacheState& state) {
     // 4. 回收 SSM/Conv slot
     if (state.ssm_slot >= 0) {
         free_ssm_slot(state.ssm_slot);
-        fprintf(stderr, "[CacheManager] free_request: req=%lu returned SSM slot %d "
+        if (verbose_) fprintf(stderr, "[CacheManager] free_request: req=%lu returned SSM slot %d "
                 "(free slots: %d)\n", req_id, state.ssm_slot, num_free_ssm_slots());
         state.ssm_slot = -1;
     }
