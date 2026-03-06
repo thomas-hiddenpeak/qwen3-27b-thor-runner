@@ -170,6 +170,9 @@ src/
 - ✅ Level 2b: LinearAttn QKVZAB super-merge (4→1 GEMV, 48层 ×3=144 launches)
 - ✅ Fused QK_norm + RoPE (3→1 kernel, 32 launches)
 - ✅ Fused RMSNorm + GEMV (norm in SMEM, 64 launches, ~1ms)
+- ✅ MTP Partial Accept (d=3, 逐位置 verify + SSM/Conv checkpoint), +21.6%
+- ✅ Batched Argmax (verify 路径 4 sync → 1 sync), sample 37→7ms
+- ✅ GPU-Resident MTP Draft Chain (3 sync → 1, pre-alloc blocks), +18.5%
 - ❌ GDN SMEM caching (occupancy drop, reverted)
 - ❌ Dual GEMV + SwiGLU fusion (block count halved, +4.6%, reverted)
 
