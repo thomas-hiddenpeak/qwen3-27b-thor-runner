@@ -338,29 +338,30 @@ struct RequestContext {
 ## 4. 实施计划
 
 ### Phase 1: CacheManager 骨架 (新文件, 不改 engine)
-- [ ] 创建 `src/engine/cache_manager.h` — 定义 CacheManager 类 + RequestCacheState + 所有公共接口
-- [ ] 创建 `src/engine/cache_manager.cpp` — 实现构造/析构/SSM pool
-- [ ] 保留现有组件作为 private 成员 (先包装, 后替换)
+- [x] 创建 `src/engine/cache_manager.h` — 定义 CacheManager 类 + RequestCacheState + 所有公共接口
+- [x] 创建 `src/engine/cache_manager.cpp` — 实现构造/析构/SSM pool
+- [x] 保留现有组件作为 private 成员 (先包装, 后替换)
 
 ### Phase 2: 实现 CacheManager 核心 API
-- [ ] `allocate_request` / `free_request` — 包装 KVCacheManager::allocate/free + SSM pool
-- [ ] `extend_blocks` — 包装 allocate_blocks + block_tracker
-- [ ] `evict_blocks` — 包装 BlockSSDStore::evict + BlockTracker::mark_evicted + KVCacheManager::free
-- [ ] `swap_out` / `swap_in` — 包装 KVSwapper
-- [ ] `build_streaming_ctx` — 移动 engine.cpp ~50 行 streaming context 组装
-- [ ] `load_ssd_blocks_for_layer` — 包装 BlockSSDStore::load_blocks_for_layer
+- [x] `allocate_request` / `free_request` — 包装 KVCacheManager::allocate/free + SSM pool
+- [x] `extend_blocks` — 包装 allocate_blocks + block_tracker
+- [x] `evict_blocks` — 包装 BlockSSDStore::evict + BlockTracker::mark_evicted + KVCacheManager::free
+- [x] `swap_out` / `swap_in` — 包装 KVSwapper
+- [x] `build_streaming_ctx` — 移动 engine.cpp ~50 行 streaming context 组装
+- [x] `load_ssd_blocks_for_layer` — 包装 BlockSSDStore::load_blocks_for_layer
 
 ### Phase 3: 集成到 Engine
-- [ ] 替换 engine.h 中的 5 个独立成员为 1 个 `cache_manager_`
-- [ ] 修改 RequestContext: 使用 `cache_state` 替代散布字段
-- [ ] 修改 engine.cpp 构造函数
-- [ ] 修改 process_prefill: 使用 CacheManager API
-- [ ] 修改 process_decode: 使用 CacheManager API
-- [ ] 修改 cleanup / swap 逻辑
+- [x] 替换 engine.h 中的 5 个独立成员为 1 个 `cache_manager_`
+- [x] 修改 RequestContext: 使用 `cache_state` 替代散布字段 (8 字段 → 1 cache_state)
+- [x] 修改 engine.cpp 构造函数
+- [x] 修改 process_prefill: 使用 CacheManager API (streaming ctx, prefix cache)
+- [x] 修改 process_decode: 使用 CacheManager API (swap, streaming)
+- [x] 修改 cleanup / swap 逻辑 (free_request/swap_out/swap_in 统一转发)
+- [x] Bridge 方法简化为一行转发到 RequestCacheState 版本
 
 ### Phase 4: 测试 & 基准
-- [ ] 编译通过
-- [ ] 现有单元测试全部通过 (`./build/qwen3-27b-thor test`)
+- [x] 编译通过
+- [x] 现有单元测试全部通过 (`./build/qwen3-27b-thor test`)
 - [ ] serve 模式单轮对话正确
 - [ ] 长上下文 SSD streaming 测试通过
 - [ ] 性能基准不退化 (decode tok/s, TTFT)

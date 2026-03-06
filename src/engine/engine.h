@@ -6,7 +6,6 @@
 #include "paged_attention.h"
 #include "cache_config.h"
 #include "cache_manager.h"
-#include "block_tracker.h"
 #include "vision.h"
 #include "tokenizer.h"
 #include <memory>
@@ -40,18 +39,8 @@ struct RequestContext {
     float presence_penalty  = 0.0f;
     int64_t seed            = -1;
     
-    // Paged Attention 相关的状态
-    std::vector<int> block_table;
-    int context_len = 0;
-
-    // Block Tracker: 追踪 GPU vs SSD blocks (当 context 超过 KV budget 时启用)
-    cache::BlockTracker block_tracker;
-    bool uses_ssd_blocks = false;  // 是否有 blocks 在 SSD 上
-    
-    // Gated DeltaNet SSM 状态 (每个 linear_attn 层一份)
-    std::vector<__nv_bfloat16*> ssm_states;
-    std::vector<__nv_bfloat16*> conv_states;
-    int ssm_slot = -1;  // 该请求持有的 SSM/Conv 状态池槽位 (-1 = 未分配)
+    // 缓存状态: 由 CacheManager 统一管理
+    cache::RequestCacheState cache_state;
     
     // MTP 投机解码状态
     std::vector<int> draft_tokens;  // 当前 draft tokens (empty = 无 draft)
@@ -63,7 +52,6 @@ struct RequestContext {
     std::vector<core::ProcessedImage> processed_images;
 
     bool is_finished = false;
-    bool is_swapped  = false;   // 该请求的 KV+SSM/Conv 已换出到 SSD
 };
 
 class InferenceEngine {

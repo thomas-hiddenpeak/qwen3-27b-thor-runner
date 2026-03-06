@@ -200,6 +200,7 @@ bool CacheManager::allocate_request(uint64_t req_id, int initial_tokens,
         try {
             auto blocks = kv_manager_->allocate_blocks(blocks_needed);
             state.block_tracker.init(blocks);
+            state.block_table = blocks;
         } catch (const std::runtime_error&) {
             // 回收 SSM slot
             free_ssm_slot(slot);
@@ -230,6 +231,7 @@ bool CacheManager::extend_blocks(uint64_t req_id, int total_tokens_needed,
         auto new_blocks = kv_manager_->allocate_blocks(blocks_to_add);
         for (int b : new_blocks) {
             state.block_tracker.push_block(b);
+            state.block_table.push_back(b);
         }
     } catch (const std::runtime_error&) {
         fprintf(stderr, "[CacheManager] Cannot extend %d blocks for req %lu "
@@ -244,9 +246,8 @@ bool CacheManager::extend_blocks(uint64_t req_id, int total_tokens_needed,
 void CacheManager::free_request(uint64_t req_id, RequestCacheState& state) {
     // 1. 释放 GPU KV blocks (跳过 SSD 的 -1)
     if (!state.is_swapped) {
-        auto full_bt = state.full_block_table();
         std::vector<int> gpu_blocks;
-        for (int b : full_bt)
+        for (int b : state.block_table)
             if (b >= 0) gpu_blocks.push_back(b);
         if (!gpu_blocks.empty())
             kv_manager_->free_blocks(gpu_blocks);
@@ -266,10 +267,13 @@ void CacheManager::free_request(uint64_t req_id, RequestCacheState& state) {
     // 4. 回收 SSM/Conv slot
     if (state.ssm_slot >= 0) {
         free_ssm_slot(state.ssm_slot);
+        fprintf(stderr, "[CacheManager] free_request: req=%lu returned SSM slot %d "
+                "(free slots: %d)\n", req_id, state.ssm_slot, num_free_ssm_slots());
         state.ssm_slot = -1;
     }
 
     // 5. 清理状态
+    state.block_table.clear();
     state.ssm_states.clear();
     state.conv_states.clear();
     state.context_len = 0;
@@ -284,14 +288,13 @@ int CacheManager::evict_blocks_to_ssd(uint64_t req_id, int num_blocks_to_free,
     if (!block_ssd_store_) return 0;
 
     // 找到可 evict 的 blocks (从头开始，FIFO)
-    auto full_bt = state.full_block_table();
     std::vector<int> evict_logical;
     std::vector<int> phys_to_free;
 
-    for (int i = 0; i < (int)full_bt.size() && (int)evict_logical.size() < num_blocks_to_free; ++i) {
-        if (full_bt[i] >= 0) {  // GPU-resident
+    for (int i = 0; i < (int)state.block_table.size() && (int)evict_logical.size() < num_blocks_to_free; ++i) {
+        if (state.block_table[i] >= 0) {  // GPU-resident
             evict_logical.push_back(i);
-            phys_to_free.push_back(full_bt[i]);
+            phys_to_free.push_back(state.block_table[i]);
         }
     }
 
@@ -301,7 +304,7 @@ int CacheManager::evict_blocks_to_ssd(uint64_t req_id, int num_blocks_to_free,
     cudaStreamSynchronize(stream_);
 
     // 写入 SSD
-    block_ssd_store_->evict_blocks(req_id, evict_logical, full_bt, *kv_manager_);
+    block_ssd_store_->evict_blocks(req_id, evict_logical, state.block_table, *kv_manager_);
 
     // 清除可能的 CUDA 错误
     {
@@ -315,8 +318,9 @@ int CacheManager::evict_blocks_to_ssd(uint64_t req_id, int num_blocks_to_free,
     // 释放 GPU blocks
     kv_manager_->free_blocks(phys_to_free);
 
-    // 更新 tracker
+    // 更新 block_table 和 tracker
     for (int idx : evict_logical) {
+        state.block_table[idx] = -1;
         state.block_tracker.mark_evicted(idx, 1);
     }
 
@@ -331,7 +335,6 @@ bool CacheManager::swap_out_request(uint64_t req_id, RequestCacheState& state) {
     if (!kv_swapper_) return false;
     if (state.is_swapped) return true;  // 已经换出
 
-    auto full_bt = state.full_block_table();
     // 只能换出全 GPU-resident 的请求 (有 SSD blocks 的不支持整请求 swap)
     if (state.has_ssd_blocks()) {
         fprintf(stderr, "[CacheManager] Cannot swap_out req %lu: has SSD blocks\n", req_id);
@@ -339,14 +342,15 @@ bool CacheManager::swap_out_request(uint64_t req_id, RequestCacheState& state) {
     }
 
     kv_swapper_->swap_out(
-        req_id, *kv_manager_, full_bt, state.context_len,
+        req_id, *kv_manager_, state.block_table, state.context_len,
         state.ssm_states.empty() ? nullptr : state.ssm_states.data(),
         num_linear_layers_, ssm_size_per_layer_,
         state.conv_states.empty() ? nullptr : state.conv_states.data(),
         conv_size_per_layer_, stream_);
 
     // 释放 GPU blocks
-    kv_manager_->free_blocks(full_bt);
+    kv_manager_->free_blocks(state.block_table);
+    state.block_table.clear();
 
     // 回收 SSM slot
     if (state.ssm_slot >= 0) {
@@ -393,6 +397,7 @@ bool CacheManager::swap_in_request(uint64_t req_id, RequestCacheState& state) {
     }
 
     state.block_tracker.init(new_blocks);
+    state.block_table = new_blocks;
     state.is_swapped = false;
     return true;
 }
@@ -426,8 +431,9 @@ int CacheManager::restore_prefix(const int* tokens, int num_tokens,
         workspace, d_block_table_buf, stream_);
 
     if (restored > 0) {
-        // 更新 block tracker
+        // 更新 block tracker 和 block_table
         state.block_tracker.init(restored_blocks);
+        state.block_table = restored_blocks;
         state.context_len = restored;
     }
     return restored;
@@ -438,11 +444,10 @@ void CacheManager::store_prefix(const int* tokens, int num_tokens,
                                 __nv_bfloat16* workspace) {
     if (!cache_engine_ || !cache_engine_->is_enabled()) return;
 
-    auto full_bt = state.full_block_table();
     cache_engine_->store_prefix(
         tokens, num_tokens, *kv_manager_,
         nullptr,  // d_block_table (will use host block table)
-        (int)full_bt.size(),
+        (int)state.block_table.size(),
         const_cast<__nv_bfloat16**>(state.ssm_states.data()),
         const_cast<__nv_bfloat16**>(state.conv_states.data()),
         workspace, stream_);
@@ -568,100 +573,19 @@ void CacheManager::drain_swapper() {
 }
 
 // ===========================================================================
-// Phase 2: RequestContext 桥接 API
+// Phase 2: RequestContext 桥接 API — 转发到 RequestCacheState 版本
 // ===========================================================================
 
 void CacheManager::free_request(uint64_t req_id, core::RequestContext* ctx) {
-    // 1. 释放 GPU-resident KV blocks (SSD-evicted 的 -1 跳过)
-    if (!ctx->block_table.empty() && !ctx->is_swapped) {
-        std::vector<int> gpu_blocks;
-        for (int b : ctx->block_table)
-            if (b >= 0) gpu_blocks.push_back(b);
-        if (!gpu_blocks.empty())
-            kv_manager_->free_blocks(gpu_blocks);
-        ctx->block_table.clear();
-    }
-    // 2. 清理 SSD block store 文件
-    if (ctx->uses_ssd_blocks && block_ssd_store_) {
-        block_ssd_store_->remove(req_id);
-        ctx->uses_ssd_blocks = false;
-    }
-    // 3. 清理 swap 文件
-    if (ctx->is_swapped && kv_swapper_) {
-        kv_swapper_->remove(req_id);
-        ctx->is_swapped = false;
-    }
-    // 4. 回收 SSM/Conv slot
-    if (ctx->ssm_slot >= 0) {
-        free_ssm_slot(ctx->ssm_slot);
-        fprintf(stderr, "[CacheManager] free_request: req=%lu returned SSM slot %d "
-                "(free slots: %d)\n", req_id, ctx->ssm_slot, num_free_ssm_slots());
-        ctx->ssm_slot = -1;
-    }
-    ctx->ssm_states.clear();
-    ctx->conv_states.clear();
+    free_request(req_id, ctx->cache_state);
 }
 
 bool CacheManager::swap_out_request(uint64_t req_id, core::RequestContext* ctx) {
-    if (!kv_swapper_) return false;
-    if (ctx->is_swapped) return true;
-
-    kv_swapper_->swap_out(
-        req_id, *kv_manager_, ctx->block_table, ctx->context_len,
-        ctx->ssm_states.empty() ? nullptr : ctx->ssm_states.data(),
-        num_linear_layers_, ssm_size_per_layer_,
-        ctx->conv_states.empty() ? nullptr : ctx->conv_states.data(),
-        conv_size_per_layer_, stream_);
-
-    // 回收 SSM/Conv slot
-    if (ctx->ssm_slot >= 0) {
-        free_ssm_slot(ctx->ssm_slot);
-        ctx->ssm_slot = -1;
-    }
-    for (auto& p : ctx->ssm_states)  p = nullptr;
-    for (auto& p : ctx->conv_states) p = nullptr;
-
-    ctx->block_table.clear();
-    ctx->is_swapped = true;
-    return true;
+    return swap_out_request(req_id, ctx->cache_state);
 }
 
 bool CacheManager::swap_in_request(uint64_t req_id, core::RequestContext* ctx) {
-    if (!kv_swapper_) return false;
-    if (!ctx->is_swapped) return true;
-
-    // 分配 SSM/Conv slot
-    int slot = allocate_ssm_slot();
-    if (slot < 0) {
-        fprintf(stderr, "[CacheManager] swap_in failed: no SSM slots for req %lu\n", req_id);
-        return false;
-    }
-    ctx->ssm_slot = slot;
-    ctx->ssm_states.resize(num_linear_layers_);
-    ctx->conv_states.resize(num_linear_layers_);
-    for (int li = 0; li < num_linear_layers_; ++li) {
-        ctx->ssm_states[li] = pooled_ssm_states_[slot][li];
-        ctx->conv_states[li] = pooled_conv_states_[slot][li];
-    }
-
-    auto new_blocks = kv_swapper_->swap_in(
-        req_id, *kv_manager_,
-        ctx->ssm_states.data(), ctx->conv_states.data(),
-        stream_);
-
-    if (new_blocks.empty()) {
-        free_ssm_slot(slot);
-        ctx->ssm_slot = -1;
-        ctx->ssm_states.clear();
-        ctx->conv_states.clear();
-        fprintf(stderr, "[CacheManager] swap_in failed for req %lu\n", req_id);
-        return false;
-    }
-
-    ctx->block_table = new_blocks;
-    ctx->block_tracker.init(new_blocks);
-    ctx->is_swapped = false;
-    return true;
+    return swap_in_request(req_id, ctx->cache_state);
 }
 
 bool CacheManager::is_prefix_cache_enabled() const {
@@ -671,33 +595,13 @@ bool CacheManager::is_prefix_cache_enabled() const {
 int CacheManager::restore_prefix(const int* tokens, int num_tokens,
                                  core::RequestContext* ctx,
                                  __nv_bfloat16* workspace, int* d_block_table_buf) {
-    if (!is_prefix_cache_enabled()) return 0;
-
-    int restored = cache_engine_->retrieve_prefix(
-        tokens, num_tokens, *kv_manager_, ctx->block_table,
-        ctx->ssm_states.empty() ? nullptr : ctx->ssm_states.data(),
-        ctx->conv_states.empty() ? nullptr : ctx->conv_states.data(),
-        workspace, d_block_table_buf, stream_);
-
-    if (restored > 0) {
-        ctx->block_tracker.init(ctx->block_table);
-        ctx->context_len = restored;
-    }
-    return restored;
+    return restore_prefix(tokens, num_tokens, ctx->cache_state, workspace, d_block_table_buf);
 }
 
 void CacheManager::store_prefix(const int* tokens, int num_tokens,
                                 const core::RequestContext* ctx,
                                 __nv_bfloat16* workspace) {
-    if (!is_prefix_cache_enabled()) return;
-
-    cache_engine_->store_prefix(
-        tokens, num_tokens, *kv_manager_,
-        nullptr,  // d_block_table — will use host block table internally
-        (int)ctx->block_table.size(),
-        const_cast<__nv_bfloat16**>(ctx->ssm_states.data()),
-        const_cast<__nv_bfloat16**>(ctx->conv_states.data()),
-        workspace, stream_);
+    store_prefix(tokens, num_tokens, ctx->cache_state, workspace);
 }
 
 ops::StreamingAttnCtx CacheManager::build_streaming_ctx(
@@ -705,58 +609,7 @@ ops::StreamingAttnCtx CacheManager::build_streaming_ctx(
     const core::RequestContext* ctx,
     int gpu_ctx_len)
 {
-    auto ssd_indices = ctx->block_tracker.get_ssd_logical_indices();
-    auto gpu_bt = ctx->block_tracker.get_gpu_block_table();
-
-    ops::StreamingAttnCtx sctx;
-    sctx.total_ssd_blocks = (int)ssd_indices.size();
-    sctx.ssd_tokens = sctx.total_ssd_blocks * block_size_;
-    sctx.staging_capacity = staging_num_blocks_;
-    sctx.staging_k = d_staging_k_;
-    sctx.staging_v = d_staging_v_;
-    sctx.d_staging_context_lens = d_ssd_context_lens_;
-    sctx.partial_out = d_partial_out_;
-    sctx.partial_m = d_partial_m_;
-    sctx.partial_l = d_partial_l_;
-    sctx.partial_out2 = d_partial_out2_;
-    sctx.partial_m2 = d_partial_m2_;
-    sctx.partial_l2 = d_partial_l2_;
-
-    // GPU block table
-    sctx.gpu_num_blocks = (int)gpu_bt.size();
-    cudaMemcpyAsync(d_ssd_block_tables_, gpu_bt.data(),
-                    gpu_bt.size() * sizeof(int),
-                    cudaMemcpyHostToDevice, stream_);
-    sctx.d_gpu_block_tables = d_ssd_block_tables_;
-
-    // GPU context lens
-    cudaMemcpyAsync(d_ssd_context_lens_, &gpu_ctx_len,
-                    sizeof(int), cudaMemcpyHostToDevice, stream_);
-    sctx.d_gpu_context_lens = d_ssd_context_lens_;
-
-    // Staging block table: [0, 1, 2, ...]
-    {
-        std::vector<int> staging_bt(staging_num_blocks_);
-        for (int i = 0; i < staging_num_blocks_; i++) staging_bt[i] = i;
-        cudaMemcpyAsync(d_ssd_block_tables_ + gpu_bt.size(),
-                        staging_bt.data(),
-                        staging_num_blocks_ * sizeof(int),
-                        cudaMemcpyHostToDevice, stream_);
-        sctx.d_staging_block_tables = d_ssd_block_tables_ + gpu_bt.size();
-    }
-
-    // SSD load callback
-    sctx.load_ssd_batch = [this, req_id, ssd_indices](
-        int full_attn_idx, int batch_start, int batch_count) -> int {
-        int end = std::min(batch_start + batch_count, (int)ssd_indices.size());
-        std::vector<int> batch_indices(ssd_indices.begin() + batch_start,
-                                       ssd_indices.begin() + end);
-        return block_ssd_store_->load_blocks_for_layer(
-            req_id, full_attn_idx, batch_indices,
-            d_staging_k_, d_staging_v_);
-    };
-
-    return sctx;
+    return build_streaming_ctx(req_id, ctx->cache_state, gpu_ctx_len);
 }
 
 } // namespace cache

@@ -303,7 +303,7 @@ void InferenceEngine::inference_loop() {
             for (int i = 0; i < req.prompt_len; ++i) {
                 ctx->prompt_tokens.push_back(req.prompt_tokens[i]);
             }
-            ctx->context_len = req.prompt_len;
+            ctx->cache_state.context_len = req.prompt_len;
 
             // 多模态: 检索附加的图像数据
             {
@@ -379,10 +379,10 @@ void InferenceEngine::inference_loop() {
                           << "). Dropping request " << req.request_id << std::endl;
                 continue;  // 丢弃请求
             }
-            ctx->block_table = blocks;
+            ctx->cache_state.block_table = blocks;
             
             // 初始化 block tracker (用于 SSD 模式追踪 GPU vs SSD blocks)
-            ctx->block_tracker.init(blocks);
+            ctx->cache_state.block_tracker.init(blocks);
             
             active_requests.push_back(ctx.get());
             // 从预分配池分配独立 SSM/Conv slot
@@ -391,9 +391,9 @@ void InferenceEngine::inference_loop() {
                 bool freed_slot = false;
                 for (size_t i = 1; i < active_requests.size(); ++i) {
                     auto* r = active_requests[i];
-                    if (!r->is_swapped && !r->is_finished && r->ssm_slot >= 0) {
+                    if (!r->cache_state.is_swapped && !r->is_finished && r->cache_state.ssm_slot >= 0) {
                         std::cout << "[Engine] No free SSM slot, swapping out request "
-                                  << r->request_id << " (slot " << r->ssm_slot << ")" << std::endl;
+                                  << r->request_id << " (slot " << r->cache_state.ssm_slot << ")" << std::endl;
                         try_swap_out_victim(active_requests, 0);
                         freed_slot = cache_manager_->num_free_ssm_slots() > 0;
                         if (freed_slot) break;
@@ -403,9 +403,9 @@ void InferenceEngine::inference_loop() {
                     std::cerr << "[Engine] FATAL: No free SSM slots and cannot swap out. "
                               << "Dropping request " << req.request_id << std::endl;
                     // 释放已分配的 KV blocks
-                    if (!ctx->block_table.empty()) {
-                        cache_manager_->kv_manager().free_blocks(ctx->block_table);
-                        ctx->block_table.clear();
+                    if (!ctx->cache_state.block_table.empty()) {
+                        cache_manager_->kv_manager().free_blocks(ctx->cache_state.block_table);
+                        ctx->cache_state.block_table.clear();
                     }
                     active_requests.pop_back();
                     ipc::InferenceResponse err_resp{};
@@ -419,14 +419,14 @@ void InferenceEngine::inference_loop() {
             }
             {
                 int slot = cache_manager_->allocate_ssm_slot();
-                ctx->ssm_slot = slot;
-                ctx->ssm_states.resize(num_linear_layers_);
-                ctx->conv_states.resize(num_linear_layers_);
+                ctx->cache_state.ssm_slot = slot;
+                ctx->cache_state.ssm_states.resize(num_linear_layers_);
+                ctx->cache_state.conv_states.resize(num_linear_layers_);
                 for (int li = 0; li < num_linear_layers_; ++li) {
-                    ctx->ssm_states[li] = cache_manager_->get_ssm_state(slot, li);
-                    ctx->conv_states[li] = cache_manager_->get_conv_state(slot, li);
-                    cudaMemsetAsync(ctx->ssm_states[li], 0, ssm_size_per_layer_, compute_stream_);
-                    cudaMemsetAsync(ctx->conv_states[li], 0, conv_size_per_layer_, compute_stream_);
+                    ctx->cache_state.ssm_states[li] = cache_manager_->get_ssm_state(slot, li);
+                    ctx->cache_state.conv_states[li] = cache_manager_->get_conv_state(slot, li);
+                    cudaMemsetAsync(ctx->cache_state.ssm_states[li], 0, ssm_size_per_layer_, compute_stream_);
+                    cudaMemsetAsync(ctx->cache_state.conv_states[li], 0, conv_size_per_layer_, compute_stream_);
                 }
                 std::cout << "[Engine] Assigned SSM slot " << slot << " to request "
                           << req.request_id << " (free slots: " << cache_manager_->num_free_ssm_slots() << ")" << std::endl;
@@ -560,7 +560,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
     auto* ctx = active_requests[0];
 
     // ---- 如果该请求被换出过, 先换入 ----
-    if (ctx->is_swapped && cache_manager_->has_swapper()) {
+    if (ctx->cache_state.is_swapped && cache_manager_->has_swapper()) {
         std::cout << "[Engine] Swapping in request " << ctx->request_id << std::endl;
 
         // 换入前检查: 需要足够的 free blocks, 否则先换出其它请求
@@ -576,7 +576,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             // 尝试换出其它请求腾出 slot
             for (size_t i = 1; i < active_requests.size(); ++i) {
                 auto* r = active_requests[i];
-                if (!r->is_swapped && !r->is_finished && r->ssm_slot >= 0 && r != ctx) {
+                if (!r->cache_state.is_swapped && !r->is_finished && r->cache_state.ssm_slot >= 0 && r != ctx) {
                     try_swap_out_victim(active_requests, 0);
                     if (cache_manager_->num_free_ssm_slots() > 0) break;
                 }
@@ -587,7 +587,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             ctx->is_finished = true;
             return;
         }
-        std::cout << "[Engine] Swap-in: assigned SSM slot " << ctx->ssm_slot
+        std::cout << "[Engine] Swap-in: assigned SSM slot " << ctx->cache_state.ssm_slot
                   << " to request " << ctx->request_id << std::endl;
     }
     
@@ -657,7 +657,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 // 增量 Block 分配: 确保当前 chunk 需要的 blocks 已分配
                 // ========================================================
                 int blocks_needed_so_far = (chunk_end + 15) / 16;
-                int blocks_to_add = blocks_needed_so_far - (int)ctx->block_table.size();
+                int blocks_to_add = blocks_needed_so_far - (int)ctx->cache_state.block_table.size();
 
                 if (blocks_to_add > 0) {
                     // 检查 GPU 是否有足够空闲 blocks
@@ -666,23 +666,23 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                         // SSD 模式: evict 最旧的 blocks 腾出空间
                         int to_evict = blocks_to_add - free_blocks;
                         // 至少 evict 一个 batch 以减少频繁 eviction
-                        to_evict = std::max(to_evict, std::min(256, (int)ctx->block_table.size() - ssd_evict_cursor));
+                        to_evict = std::max(to_evict, std::min(256, (int)ctx->cache_state.block_table.size() - ssd_evict_cursor));
 
-                        if (to_evict > 0 && ssd_evict_cursor + to_evict <= (int)ctx->block_table.size()) {
+                        if (to_evict > 0 && ssd_evict_cursor + to_evict <= (int)ctx->cache_state.block_table.size()) {
                             sync_stream_with_timeout(compute_stream_, 60, "ssd_evict_prefill");  // 确保 KV 写入完成
 
                             std::vector<int> evict_logical;
                             std::vector<int> phys_to_free;
                             for (int i = ssd_evict_cursor; i < ssd_evict_cursor + to_evict; i++) {
-                                if (ctx->block_table[i] >= 0) {
+                                if (ctx->cache_state.block_table[i] >= 0) {
                                     evict_logical.push_back(i);
-                                    phys_to_free.push_back(ctx->block_table[i]);
+                                    phys_to_free.push_back(ctx->cache_state.block_table[i]);
                                 }
                             }
 
                             if (!evict_logical.empty()) {
                                 cache_manager_->ssd_store()->evict_blocks(ctx->request_id, evict_logical,
-                                                                ctx->block_table, cache_manager_->kv_manager());
+                                                                ctx->cache_state.block_table, cache_manager_->kv_manager());
                                 // 清除 eviction 过程中可能产生的 sticky CUDA 错误
                                 // (synchronous cudaMemcpy D2H 在已释放的 block 上可能设置错误)
                                 {
@@ -696,10 +696,9 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
 
                                 // 标记为已 evict
                                 for (int idx : evict_logical) {
-                                    ctx->block_table[idx] = -1;
+                                    ctx->cache_state.block_table[idx] = -1;
                                 }
-                                ctx->block_tracker.mark_evicted(ssd_evict_cursor, to_evict);
-                                ctx->uses_ssd_blocks = true;
+                                ctx->cache_state.block_tracker.mark_evicted(ssd_evict_cursor, to_evict);
 
                                 std::cout << "[SSD-Evict] Evicted " << evict_logical.size()
                                           << " blocks [" << ssd_evict_cursor << ", "
@@ -717,9 +716,9 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
 
                     try {
                         auto new_blocks = cache_manager_->kv_manager().allocate_blocks(blocks_to_add);
-                        ctx->block_table.insert(ctx->block_table.end(), new_blocks.begin(), new_blocks.end());
+                        ctx->cache_state.block_table.insert(ctx->cache_state.block_table.end(), new_blocks.begin(), new_blocks.end());
                         // 同步 block tracker
-                        for (int b : new_blocks) ctx->block_tracker.push_block(b);
+                        for (int b : new_blocks) ctx->cache_state.block_tracker.push_block(b);
                     } catch (const std::runtime_error& e) {
                         std::cerr << "[Engine] Cannot allocate " << blocks_to_add
                                   << " blocks for chunk " << chunk_idx
@@ -732,8 +731,8 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 // ========================================================
                 // 上传 Block Table (每 chunk 重新上传, 因为可能有新分配/eviction)
                 // ========================================================
-                cudaMemcpyAsync(d_block_tables_, ctx->block_table.data(),
-                                ctx->block_table.size() * sizeof(int),
+                cudaMemcpyAsync(d_block_tables_, ctx->cache_state.block_table.data(),
+                                ctx->cache_state.block_table.size() * sizeof(int),
                                 cudaMemcpyHostToDevice, compute_stream_);
 
                 // 1. Embedding: 当前 chunk 的 tokens
@@ -829,17 +828,17 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 // 4. Forward
                 profiler_.begin("forward", compute_stream_);
 
-                if (ctx->uses_ssd_blocks && !is_first) {
+                if (ctx->cache_state.has_ssd_blocks() && !is_first) {
                     // ========================================================
                     // Streaming Forward: block_table 有 -1 (SSD) 条目
                     // 不能用标准 paged attention, 改为逐层迭代 + streaming attention
                     // ========================================================
                     // 构建 StreamingAttnCtx
-                    int ssd_tokens = ctx->block_tracker.num_ssd_blocks() * 16;
+                    int ssd_tokens = ctx->cache_state.block_tracker.num_ssd_blocks() * 16;
                     int gpu_ctx_len = ctx_len_for_chunk - ssd_tokens;
                     auto sctx = cache_manager_->build_streaming_ctx(
                         ctx->request_id, ctx, gpu_ctx_len);
-                    auto ssd_indices = ctx->block_tracker.get_ssd_logical_indices();
+                    auto ssd_indices = ctx->cache_state.block_tracker.get_ssd_logical_indices();
                     int num_full_attn = config_.num_full_attn_layers();
 
                     // 逐层迭代 (与 model_->forward_prefill 等价, 但传入 streaming_ctx)
@@ -854,14 +853,14 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                             model_->get_layer(li).get_full_attn()->forward(
                                 d_hidden_states_, d_pos_ids_, cache_manager_->kv_manager(),
                                 d_block_tables_, d_context_lens_,
-                                (int)ctx->block_table.size(), ctx_len_for_chunk,
+                                (int)ctx->cache_state.block_table.size(), ctx_len_for_chunk,
                                 chunk_len, fa_idx, d_workspace_, compute_stream_,
                                 1 /* batch_size */, true /* force_paged_attn */,
                                 &sctx);
                             fa_idx++;
                         } else {
-                            __nv_bfloat16** lin_ssm = ctx->ssm_states.empty() ? nullptr : ctx->ssm_states.data() + lin_idx;
-                            __nv_bfloat16** lin_conv = ctx->conv_states.empty() ? nullptr : ctx->conv_states.data() + lin_idx;
+                            __nv_bfloat16** lin_ssm = ctx->cache_state.ssm_states.empty() ? nullptr : ctx->cache_state.ssm_states.data() + lin_idx;
+                            __nv_bfloat16** lin_conv = ctx->cache_state.conv_states.empty() ? nullptr : ctx->cache_state.conv_states.data() + lin_idx;
                             model_->get_layer(li).get_linear_attn()->forward(
                                 d_hidden_states_,
                                 lin_ssm ? lin_ssm[0] : nullptr,
@@ -887,17 +886,17 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                     model_->forward_prefill(
                         d_hidden_states_, d_pos_ids_, cache_manager_->kv_manager(),
                         d_block_tables_, d_context_lens_,
-                        (int)ctx->block_table.size(), ctx_len_for_chunk,
+                        (int)ctx->cache_state.block_table.size(), ctx_len_for_chunk,
                         chunk_len,
-                        ctx->ssm_states.empty() ? nullptr : ctx->ssm_states.data(),
-                        ctx->conv_states.empty() ? nullptr : ctx->conv_states.data(),
+                        ctx->cache_state.ssm_states.empty() ? nullptr : ctx->cache_state.ssm_states.data(),
+                        ctx->cache_state.conv_states.empty() ? nullptr : ctx->cache_state.conv_states.data(),
                         d_workspace_, compute_stream_,
                         !is_first  // force_paged_attn for non-first chunks
                     );
                 }
                 profiler_.end("forward", compute_stream_);
 
-                ctx->context_len = ctx_len_for_chunk;
+                ctx->cache_state.context_len = ctx_len_for_chunk;
 
                 if (num_chunks > 1) {
                     std::cout << "[ChunkedPrefill]   chunk " << chunk_idx
@@ -905,7 +904,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                               << chunk_start << ", " << chunk_end
                               << "), ctx_len=" << ctx_len_for_chunk
                               << (is_first ? " (self-attn)" :
-                                  (ctx->uses_ssd_blocks ? " (streaming-attn)" : " (paged-attn)"))
+                                  (ctx->cache_state.has_ssd_blocks() ? " (streaming-attn)" : " (paged-attn)"))
                               << std::endl;
                 }
             }
@@ -947,7 +946,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             profiler_.end("sample", compute_stream_);
             
             ctx->generated_tokens.push_back(next_token);
-            ctx->context_len++;
+            ctx->cache_state.context_len++;
             
             // 推送响应 token 给 Python 前端
             {
@@ -1015,7 +1014,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
         // 分支: MTP T=(N+1) 投机验证 vs 标准 T=1 decode
         // MTP 条件: 有 MTP 权重 + 有 draft tokens + 不在 SSD streaming 模式
         // ================================================================
-        if (mtp_kv_manager_ && !ctx->draft_tokens.empty() && !ctx->uses_ssd_blocks) {
+        if (mtp_kv_manager_ && !ctx->draft_tokens.empty() && !ctx->cache_state.has_ssd_blocks()) {
             // ============================================================
             // MTP Speculative Decode: T=(N+1) Partial Accept Verify
             // 改进: 不再 all-or-nothing, 而是接受最长连续匹配前缀
@@ -1040,21 +1039,21 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
 
             // 2. Pos IDs: [context_len - 1, ..., context_len + N - 1]
             int pos_ids_T[9];
-            for (int i = 0; i < T; i++) pos_ids_T[i] = ctx->context_len - 1 + i;
+            for (int i = 0; i < T; i++) pos_ids_T[i] = ctx->cache_state.context_len - 1 + i;
             cudaMemcpyAsync(d_pos_ids_, pos_ids_T, T * sizeof(int), cudaMemcpyHostToDevice, compute_stream_);
 
             // 3. Block 分配: 确保 blocks 覆盖到 position context_len + N - 1
-            int ctx_len_verify = ctx->context_len + N;
+            int ctx_len_verify = ctx->cache_state.context_len + N;
             {
                 int blocks_needed = (ctx_len_verify + 15) / 16;
-                while ((int)ctx->block_table.size() < blocks_needed) {
+                while ((int)ctx->cache_state.block_table.size() < blocks_needed) {
                     if (cache_manager_->num_free_gpu_blocks() < 1 && cache_manager_->has_swapper()) {
                         try_swap_out_victim(active_requests, 1);
                     }
                     try {
                         auto new_blks = cache_manager_->kv_manager().allocate_blocks(1);
-                        ctx->block_table.push_back(new_blks[0]);
-                        ctx->block_tracker.push_block(new_blks[0]);
+                        ctx->cache_state.block_table.push_back(new_blks[0]);
+                        ctx->cache_state.block_tracker.push_block(new_blks[0]);
                     } catch (const std::runtime_error& e) {
                         std::cerr << "Out of KV Cache memory during MTP verify!" << std::endl;
                         ctx->is_finished = true;
@@ -1064,8 +1063,8 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             }
 
             // 4. Upload block_tables, context_lens
-            cudaMemcpyAsync(d_block_tables_, ctx->block_table.data(),
-                            ctx->block_table.size() * sizeof(int),
+            cudaMemcpyAsync(d_block_tables_, ctx->cache_state.block_table.data(),
+                            ctx->cache_state.block_table.size() * sizeof(int),
                             cudaMemcpyHostToDevice, compute_stream_);
             cudaMemcpyAsync(d_context_lens_, &ctx_len_verify, sizeof(int),
                             cudaMemcpyHostToDevice, compute_stream_);
@@ -1081,7 +1080,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                         model_->get_layer(li).get_full_attn()->forward(
                             d_hidden_states_, d_pos_ids_, cache_manager_->kv_manager(),
                             d_block_tables_, d_context_lens_,
-                            (int)ctx->block_table.size(), ctx_len_verify,
+                            (int)ctx->cache_state.block_table.size(), ctx_len_verify,
                             T /*num_tokens*/, fa_idx, d_workspace_, compute_stream_,
                             1 /*batch_size*/, true /*force_paged_attn*/);
                         fa_idx++;
@@ -1093,8 +1092,8 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                                                    + (size_t)lin_idx * N * conv_elems_per_layer_;
                         model_->get_layer(li).get_linear_attn()->forward(
                             d_hidden_states_,
-                            ctx->ssm_states[lin_idx],
-                            ctx->conv_states[lin_idx],
+                            ctx->cache_state.ssm_states[lin_idx],
+                            ctx->cache_state.conv_states[lin_idx],
                             T /*num_tokens*/, d_workspace_, compute_stream_,
                             1 /*batch_size*/,
                             nullptr, nullptr,
@@ -1163,7 +1162,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             for (int i = 0; i < accept_count; i++) {
                 int dtok = ctx->draft_tokens[i];
                 ctx->generated_tokens.push_back(dtok);
-                ctx->context_len++;
+                ctx->cache_state.context_len++;
                 bool eos_d = Qwen35Config::is_eos(dtok);
                 {
                     ipc::InferenceResponse resp{};
@@ -1189,7 +1188,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             // 9b. Emit corrected/bonus token: verify[accept_count]
             int next_token = verify[accept_count];
             ctx->generated_tokens.push_back(next_token);
-            ctx->context_len++;
+            ctx->cache_state.context_len++;
             bool eos_n = Qwen35Config::is_eos(next_token);
             bool done_n = (int)ctx->generated_tokens.size() >= ctx->max_new_tokens || eos_n;
             {
@@ -1227,10 +1226,10 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                     __nv_bfloat16* conv_ckpt = d_conv_checkpoints_
                                                + (size_t)li * N * conv_elems_per_layer_
                                                + (size_t)accept_count * conv_elems_per_layer_;
-                    cudaMemcpyAsync(ctx->ssm_states[li], ssm_ckpt,
+                    cudaMemcpyAsync(ctx->cache_state.ssm_states[li], ssm_ckpt,
                                     ssm_elems_per_layer_ * sizeof(__nv_bfloat16),
                                     cudaMemcpyDeviceToDevice, compute_stream_);
-                    cudaMemcpyAsync(ctx->conv_states[li], conv_ckpt,
+                    cudaMemcpyAsync(ctx->cache_state.conv_states[li], conv_ckpt,
                                     conv_elems_per_layer_ * sizeof(__nv_bfloat16),
                                     cudaMemcpyDeviceToDevice, compute_stream_);
                 }
@@ -1247,7 +1246,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             // Generate N new drafts from the last accepted position's hidden state
             profiler_.begin("mtp_draft", compute_stream_);
             __nv_bfloat16* h_for_mtp = d_hidden_states_ + (size_t)accept_count * hs;
-            ctx->mtp_pos = ctx->context_len - 1;
+            ctx->mtp_pos = ctx->cache_state.context_len - 1;
             generate_mtp_drafts(ctx, h_for_mtp, next_token, ctx->mtp_pos, N, vocab_size);
             profiler_.end("mtp_draft", compute_stream_);
 
@@ -1286,33 +1285,33 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             profiler_.end("embedding", compute_stream_);
 
             // 2. 位置编码 (context_len - 1)
-            int current_pos = ctx->context_len - 1;
+            int current_pos = ctx->cache_state.context_len - 1;
             cudaMemcpyAsync(d_pos_ids_, &current_pos, sizeof(int), cudaMemcpyHostToDevice, compute_stream_);
 
             // 3. Block 分配
-            if (ctx->context_len > (int)(ctx->block_table.size() * 16)) {
+            if (ctx->cache_state.context_len > (int)(ctx->cache_state.block_table.size() * 16)) {
                 // GPU blocks 不够: 先尝试 SSD eviction
-                if (cache_manager_->num_free_gpu_blocks() < 1 && cache_manager_->has_ssd_store() && ctx->uses_ssd_blocks) {
+                if (cache_manager_->num_free_gpu_blocks() < 1 && cache_manager_->has_ssd_store() && ctx->cache_state.has_ssd_blocks()) {
                     int evict_start = 0;
-                    for (int i = 0; i < (int)ctx->block_table.size(); i++) {
-                        if (ctx->block_table[i] >= 0) { evict_start = i; break; }
+                    for (int i = 0; i < (int)ctx->cache_state.block_table.size(); i++) {
+                        if (ctx->cache_state.block_table[i] >= 0) { evict_start = i; break; }
                     }
-                    int to_evict = std::min(64, (int)ctx->block_table.size() - evict_start);
+                    int to_evict = std::min(64, (int)ctx->cache_state.block_table.size() - evict_start);
                     if (to_evict > 0) {
                         sync_stream_with_timeout(compute_stream_, 60, "ssd_evict_decode");
                         std::vector<int> evict_logical, phys_to_free;
                         for (int i = evict_start; i < evict_start + to_evict; i++) {
-                            if (ctx->block_table[i] >= 0) {
+                            if (ctx->cache_state.block_table[i] >= 0) {
                                 evict_logical.push_back(i);
-                                phys_to_free.push_back(ctx->block_table[i]);
+                                phys_to_free.push_back(ctx->cache_state.block_table[i]);
                             }
                         }
                         if (!evict_logical.empty()) {
                             cache_manager_->ssd_store()->evict_blocks(ctx->request_id, evict_logical,
-                                                            ctx->block_table, cache_manager_->kv_manager());
+                                                            ctx->cache_state.block_table, cache_manager_->kv_manager());
                             cache_manager_->kv_manager().free_blocks(phys_to_free);
-                            for (int idx : evict_logical) ctx->block_table[idx] = -1;
-                            ctx->block_tracker.mark_evicted(evict_start, to_evict);
+                            for (int idx : evict_logical) ctx->cache_state.block_table[idx] = -1;
+                            ctx->cache_state.block_tracker.mark_evicted(evict_start, to_evict);
                         }
                     }
                 }
@@ -1321,8 +1320,8 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 }
                 try {
                     auto new_blocks = cache_manager_->kv_manager().allocate_blocks(1);
-                    ctx->block_table.push_back(new_blocks[0]);
-                    ctx->block_tracker.push_block(new_blocks[0]);
+                    ctx->cache_state.block_table.push_back(new_blocks[0]);
+                    ctx->cache_state.block_tracker.push_block(new_blocks[0]);
                 } catch (const std::runtime_error& e) {
                     std::cerr << "Out of KV Cache memory! (even after swap attempt)" << std::endl;
                     ctx->is_finished = true;
@@ -1330,23 +1329,23 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 }
             }
 
-            cudaMemcpyAsync(d_block_tables_, ctx->block_table.data(),
-                            ctx->block_table.size() * sizeof(int),
+            cudaMemcpyAsync(d_block_tables_, ctx->cache_state.block_table.data(),
+                            ctx->cache_state.block_table.size() * sizeof(int),
                             cudaMemcpyHostToDevice, compute_stream_);
-            cudaMemcpyAsync(d_context_lens_, &ctx->context_len, sizeof(int),
+            cudaMemcpyAsync(d_context_lens_, &ctx->cache_state.context_len, sizeof(int),
                             cudaMemcpyHostToDevice, compute_stream_);
 
             // 4. Forward
             try {
                 profiler_.begin("forward", compute_stream_);
 
-                if (ctx->uses_ssd_blocks) {
+                if (ctx->cache_state.has_ssd_blocks()) {
                     // Streaming Decode: SSD blocks, 逐层迭代 + streaming attention
-                    int ssd_tokens = ctx->block_tracker.num_ssd_blocks() * 16;
-                    int gpu_ctx_len = ctx->context_len - ssd_tokens;
+                    int ssd_tokens = ctx->cache_state.block_tracker.num_ssd_blocks() * 16;
+                    int gpu_ctx_len = ctx->cache_state.context_len - ssd_tokens;
                     auto sctx = cache_manager_->build_streaming_ctx(
                         ctx->request_id, ctx, gpu_ctx_len);
-                    auto ssd_indices = ctx->block_tracker.get_ssd_logical_indices();
+                    auto ssd_indices = ctx->cache_state.block_tracker.get_ssd_logical_indices();
 
                     int fa_idx = 0, lin_idx = 0;
                     for (int li = 0; li < config_.num_hidden_layers; ++li) {
@@ -1356,13 +1355,13 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                             model_->get_layer(li).get_full_attn()->forward(
                                 d_hidden_states_, d_pos_ids_, cache_manager_->kv_manager(),
                                 d_block_tables_, d_context_lens_,
-                                (int)ctx->block_table.size(), ctx->context_len,
+                                (int)ctx->cache_state.block_table.size(), ctx->cache_state.context_len,
                                 num_tokens, fa_idx, d_workspace_, compute_stream_,
                                 1, false, &sctx);
                             fa_idx++;
                         } else {
-                            __nv_bfloat16** lin_ssm = ctx->ssm_states.empty() ? nullptr : ctx->ssm_states.data() + lin_idx;
-                            __nv_bfloat16** lin_conv = ctx->conv_states.empty() ? nullptr : ctx->conv_states.data() + lin_idx;
+                            __nv_bfloat16** lin_ssm = ctx->cache_state.ssm_states.empty() ? nullptr : ctx->cache_state.ssm_states.data() + lin_idx;
+                            __nv_bfloat16** lin_conv = ctx->cache_state.conv_states.empty() ? nullptr : ctx->cache_state.conv_states.data() + lin_idx;
                             model_->get_layer(li).get_linear_attn()->forward(
                                 d_hidden_states_,
                                 lin_ssm ? lin_ssm[0] : nullptr,
@@ -1387,10 +1386,10 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                     model_->forward_decode(
                         d_hidden_states_, d_pos_ids_, cache_manager_->kv_manager(),
                         d_block_tables_, d_context_lens_,
-                        (int)ctx->block_table.size(), ctx->context_len,
+                        (int)ctx->cache_state.block_table.size(), ctx->cache_state.context_len,
                         num_tokens,
-                        ctx->ssm_states.empty() ? nullptr : ctx->ssm_states.data(),
-                        ctx->conv_states.empty() ? nullptr : ctx->conv_states.data(),
+                        ctx->cache_state.ssm_states.empty() ? nullptr : ctx->cache_state.ssm_states.data(),
+                        ctx->cache_state.conv_states.empty() ? nullptr : ctx->cache_state.conv_states.data(),
                         d_workspace_, compute_stream_
                     );
                 }
@@ -1445,7 +1444,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             profiler_.end("sample", compute_stream_);
 
             ctx->generated_tokens.push_back(next_token);
-            ctx->context_len++;
+            ctx->cache_state.context_len++;
 
             // 推送响应 token 给 Python 前端
             bool eos = Qwen35Config::is_eos(next_token);
@@ -1491,10 +1490,10 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
 
             // ---- MTP Bootstrap: 首次 decode 后链式产出 N 个 draft ----
             // 复用 generate_mtp_drafts() 成员函数, 避免代码重复
-            if (mtp_kv_manager_ && !ctx->is_finished && !ctx->uses_ssd_blocks
+            if (mtp_kv_manager_ && !ctx->is_finished && !ctx->cache_state.has_ssd_blocks()
                 && ctx->draft_tokens.empty()) {
                 profiler_.begin("mtp_bootstrap", compute_stream_);
-                ctx->mtp_pos = ctx->context_len - 1;
+                ctx->mtp_pos = ctx->cache_state.context_len - 1;
                 generate_mtp_drafts(ctx, d_hidden_states_, next_token,
                                     ctx->mtp_pos, num_mtp_drafts_, vocab_size);
                 profiler_.end("mtp_bootstrap", compute_stream_);
@@ -1794,9 +1793,9 @@ int InferenceEngine::try_swap_out_victim(
     int max_blocks = 0;
     for (size_t i = 1; i < active_requests.size(); ++i) {
         auto* r = active_requests[i];
-        if (r->is_swapped || r->is_finished) continue;
-        if ((int)r->block_table.size() > max_blocks) {
-            max_blocks = (int)r->block_table.size();
+        if (r->cache_state.is_swapped || r->is_finished) continue;
+        if ((int)r->cache_state.block_table.size() > max_blocks) {
+            max_blocks = (int)r->cache_state.block_table.size();
             victim = r;
         }
     }
@@ -1806,7 +1805,7 @@ int InferenceEngine::try_swap_out_victim(
     }
 
     std::cout << "[Engine] Swapping out request " << victim->request_id
-              << " (" << max_blocks << " blocks, ctx=" << victim->context_len << ")" << std::endl;
+              << " (" << max_blocks << " blocks, ctx=" << victim->cache_state.context_len << ")" << std::endl;
 
     cache_manager_->swap_out_request(victim->request_id, victim);
 

@@ -40,6 +40,10 @@ struct RequestCacheState {
     // Block 位置追踪 (统一来源)
     BlockTracker block_tracker;      // 完整的 logical → GPU/SSD 映射
 
+    // 物化 block table: physical block IDs, SSD 已驱逐的为 -1
+    // 与 block_tracker 保持同步, 用于高频 GPU 上传
+    std::vector<int> block_table;
+
     // 快速查询字段 (由 CacheManager 更新)
     int context_len = 0;             // 总 token 数 (GPU + SSD)
     int ssm_slot = -1;               // SSM/Conv pool slot (-1 = 未分配)
@@ -54,11 +58,6 @@ struct RequestCacheState {
     // 获取只含 GPU-resident blocks 的 block table (去掉 -1)
     std::vector<int> gpu_block_table() const {
         return block_tracker.get_gpu_block_table();
-    }
-
-    // 获取完整 block table (SSD 条目为 -1)
-    std::vector<int> full_block_table() const {
-        return block_tracker.get_full_block_table();
     }
 
     // SSD 上的 logical block indices
