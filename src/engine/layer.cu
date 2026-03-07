@@ -168,7 +168,8 @@ static void run_moe_mlp(
     __nv_bfloat16* shared_swiglu_buf = shared_up_out + num_tokens * shared_is;
     __nv_bfloat16* gate_scalar     = shared_swiglu_buf + num_tokens * shared_is;
     // Fixed scratch (不随 T 缩放)
-    __nv_bfloat16* expert_gu       = gate_scalar + num_tokens;
+    // Align to 8 bf16 elements (16 bytes) for vectorized GEMV stores
+    __nv_bfloat16* expert_gu       = gate_scalar + ((num_tokens + 7) & ~7);
     __nv_bfloat16* expert_swiglu   = expert_gu + 2 * moe_is;
     __nv_bfloat16* expert_out      = expert_swiglu + moe_is;
 

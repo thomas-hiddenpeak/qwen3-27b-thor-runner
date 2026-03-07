@@ -150,6 +150,14 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
         int moe_extra = config_.moe_workspace_extra_t1();
         ws_full   += moe_extra;
         ws_linear += moe_extra;
+        // LinearAttn T>1 merged GEMM writes (in_qkv+lin_v) into gate_out area as temp
+        // For MoE, MLP area (3*is) is tiny → merged temp may overflow
+        // Ensure post_norm_out tail has room for max(moe_workspace, merged_temp)
+        int merged_temp_need = in_qkv + (int)lin_v;
+        int post_norm_area = 3 * is + hs + nkh * 2 + moe_extra;
+        if (merged_temp_need > post_norm_area) {
+            ws_linear += (merged_temp_need - post_norm_area);
+        }
     }
     size_t ws_per_tok = std::max(ws_full, ws_linear);
     cudaMalloc(&d_workspace_, ws_per_tok * max_tokens * sizeof(__nv_bfloat16));

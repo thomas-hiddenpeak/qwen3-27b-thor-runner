@@ -2,7 +2,6 @@
 
 #include "layer.h"
 #include "vision.h"
-#include "safetensors.h"
 #include "perf_stats.h"
 #include <vector>
 #include <string>
@@ -106,7 +105,6 @@ public:
 private:
     Qwen35Config config_;
     std::vector<Qwen35Layer> layers_;
-    std::vector<std::unique_ptr<io::SafetensorsLoader>> loaders_;
     std::vector<void*> device_weights_; // 存储分配的显存指针
     
     // 词表 embedding 和最后的 lm_head

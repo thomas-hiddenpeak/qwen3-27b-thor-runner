@@ -1,4 +1,5 @@
 #include "model.h"
+#include "safetensors.h"
 #include "light_ops.h"
 #include "dense_gemm.h"
 #include <filesystem>
@@ -120,7 +121,9 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
                 tensor_map[name] = static_cast<__nv_bfloat16*>(d_ptr);
             }
         }
-        loaders_.push_back(std::move(loader));
+        // 统一内存: 立即释放 mmap, 避免与 cudaMalloc 同时占用双份物理内存
+        // (loader 析构 → munmap → OS 回收物理页)
+        loader.reset();
     }
     // Wait for all dtype conversions to complete
     cudaStreamSynchronize(conv_stream);
