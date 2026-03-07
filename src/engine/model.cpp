@@ -441,7 +441,9 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
             }
         }
         std::cerr << "      Merged projections: " << (merged_total >> 20)
-                  << " MB (QKV×16 + QKVZAB×48, net zero)" << std::endl;
+                  << " MB (QKV×" << config_.num_full_attn_layers()
+                  << " + QKVZAB×" << (config_.num_hidden_layers - config_.num_full_attn_layers())
+                  << ", net zero)" << std::endl;
 
         // Level 3: Merge Gate+Up projections for T>1 (all 64 layers)
         // gate_proj[is, hs] + up_proj[is, hs] → [2*is, hs] = [34816, 5120]

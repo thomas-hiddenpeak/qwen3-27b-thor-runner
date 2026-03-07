@@ -179,7 +179,7 @@ int run_benchmark(int argc, char** argv) {
     cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
 
     std::cout << "========================================\n"
-              << "  Qwen3.5-27B Benchmark (SM110 Thor)\n"
+              << "  Qwen3.5 Benchmark (SM110 Thor)\n"
               << "========================================\n"
               << "  Warmup steps : " << cfg.warmup_steps << "\n"
               << "  Decode steps : " << cfg.decode_steps  << "\n"
@@ -196,6 +196,7 @@ int run_benchmark(int argc, char** argv) {
     nvtx_push("model_init");
     core::Qwen35Config config;
     config.model_dir = cfg.model_dir;
+    config.load_from_model_dir(cfg.model_dir);
 
     cudaStream_t stream;
     cudaStreamCreate(&stream);
@@ -779,11 +780,12 @@ int run_benchmark(int argc, char** argv) {
     std::cout << "========================================\n";
 
     // 理论带宽计算 — 每步总权重读取量 (BF16)
+    int n_linear_layers = config.num_hidden_layers - num_full_attn_layers;
     size_t la_params = (size_t)in_qkv * hs + (lin_v + 2*nv) * hs + hs * lin_v
                        + (size_t)is * hs + is * hs + hs * is;
     size_t fa_params = (size_t)(qp_dim + 2*kv_dim) * hs + hs * config.q_dim()
                        + (size_t)is * hs + is * hs + hs * is;
-    size_t total_weight_bytes = (48 * la_params + 16 * fa_params
+    size_t total_weight_bytes = (n_linear_layers * la_params + num_full_attn_layers * fa_params
                                  + (size_t)config.vocab_size * hs) * 2;
 
     // --- Decode 指标 ---

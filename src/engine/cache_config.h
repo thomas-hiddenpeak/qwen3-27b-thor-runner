@@ -259,6 +259,7 @@ struct CapacityReport {
     int    total_multi_req_tokens = 0;
 
     // 每请求固定开销
+    int    num_linear_layers     = 0;   // 线性注意力层数 (用于报告)
     double ssm_per_request_mb    = 0;   // SSM 状态
     double conv_per_request_mb   = 0;   // Conv 状态
     double total_per_request_mb  = 0;   // SSM + Conv
@@ -297,6 +298,7 @@ public:
         r.total_multi_req_tokens = r.gpu_max_tokens + r.ssd_swap_tokens;
 
         // -- 每请求 SSM/Conv 开销 --
+        r.num_linear_layers    = params.num_linear_attn_layers;
         r.ssm_per_request_mb   = params.ssm_bytes_total() / (1024.0*1024);
         r.conv_per_request_mb  = params.conv_bytes_total() / (1024.0*1024);
         r.total_per_request_mb = r.ssm_per_request_mb + r.conv_per_request_mb;
@@ -346,8 +348,8 @@ public:
         }
         fprintf(stderr, "║                                                            ║\n");
         fprintf(stderr, "║  ── Per-Request Fixed Cost (SSM/Conv) ──                   ║\n");
-        fprintf(stderr, "║    SSM State:        %6.1f MB  (48 layers, BF16)           ║\n", r.ssm_per_request_mb);
-        fprintf(stderr, "║    Conv State:       %6.1f MB  (48 layers, BF16)           ║\n", r.conv_per_request_mb);
+        fprintf(stderr, "║    SSM State:        %6.1f MB  (%d layers, BF16)           ║\n", r.ssm_per_request_mb, r.num_linear_layers);
+        fprintf(stderr, "║    Conv State:       %6.1f MB  (%d layers, BF16)           ║\n", r.conv_per_request_mb, r.num_linear_layers);
         fprintf(stderr, "║    Total/Request:    %6.1f MB                              ║\n", r.total_per_request_mb);
         fprintf(stderr, "║                                                            ║\n");
         fprintf(stderr, "║  ── Concurrency Estimate ──                                ║\n");
