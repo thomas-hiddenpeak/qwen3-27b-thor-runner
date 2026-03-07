@@ -114,5 +114,27 @@ void invoke_dense_gemm_add(
     cudaStream_t stream = nullptr
 );
 
+// Grouped Expert GEMV: 单次 launch 计算 top_k 个 expert 的 GEMV
+// shared_input=true: all experts share the same input (gate_up projection)
+// shared_input=false: per-expert inputs at inputs[rank*K] (down projection)
+void invoke_grouped_expert_gemv(
+    const __nv_bfloat16* inputs,         // [1, K] (shared) or [top_k, K] (per-expert)
+    const __nv_bfloat16* packed_weights, // [E, N, K] all experts packed contiguous
+    __nv_bfloat16* outputs,              // [top_k, N]
+    const int* expert_indices,           // [top_k] on device
+    int N, int K, size_t expert_stride,  // stride between experts in bf16 elements
+    int top_k, bool shared_input,
+    cudaStream_t stream = nullptr
+);
+
+// Weighted Expert Reduce: accum[i] = sum_k(weights[k] * outputs[k*hs + i])
+void invoke_weighted_expert_reduce(
+    __nv_bfloat16* accum,                 // [hs] output
+    const __nv_bfloat16* expert_outputs,  // [top_k, hs]
+    const float* expert_weights,          // [top_k] on device
+    int hs, int top_k,
+    cudaStream_t stream = nullptr
+);
+
 } // namespace ops
 } // namespace qwen_thor

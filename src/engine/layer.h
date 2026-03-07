@@ -221,12 +221,15 @@ struct Qwen35Config {
         // MoE workspace after post_norm_out (per T=1):
         //   router_logits[E] + indices[topk*2] + weights[topk*2]
         //   + moe_acc[hs] + shared_gate/up/swiglu[3*shared_is] + gate_scalar[1]
-        //   + expert_gu[2*moe_is] + expert_swiglu[moe_is] + expert_out[hs]
-        // Dense MLP (already counted): 3*is + hs  (is==shared_is for MoE)
+        //   + (batched) expert_gu_all[topk*2*moe_is] + expert_swiglu_all[topk*moe_is]
+        //   + expert_down_all[topk*hs]
+        // Dense MLP (already counted): gate_buf_size+2*is + hs
         // Extra = MoE_total - dense_total
         int moe_total = num_experts + num_experts_per_tok * 4
                       + hidden_size + 3 * shared_expert_intermediate_size + 1
-                      + 2 * moe_intermediate_size + moe_intermediate_size + hidden_size;
+                      + num_experts_per_tok * 2 * moe_intermediate_size
+                      + num_experts_per_tok * moe_intermediate_size
+                      + num_experts_per_tok * hidden_size;
         int dense_total = gate_buf_size() + intermediate_size * 2 + hidden_size;
         return moe_total - dense_total;
     }

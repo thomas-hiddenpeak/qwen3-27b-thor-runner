@@ -990,7 +990,21 @@ void Qwen35Model::forward_decode(
     int lin_idx = 0;
     int fa_idx  = 0;
 
+    // === 可选层级计时 (环境变量 QWEN_LAYER_TIMING=1 启用) ===
+    static bool timing_enabled = !!getenv("QWEN_LAYER_TIMING");
+    static int timing_count = 0;
+    cudaEvent_t ev_start, ev_end;
+    float fa_total_ms = 0, la_total_ms = 0;
+    if (timing_enabled) {
+        cudaEventCreate(&ev_start);
+        cudaEventCreate(&ev_end);
+    }
+
     for (int i = 0; i < config_.num_hidden_layers; ++i) {
+        if (timing_enabled) {
+            cudaEventRecord(ev_start, stream);
+        }
+
         if (config_.is_full_attention(i)) {
             layers_[i].get_full_attn()->forward(
                 hidden_states, pos_ids, kv_manager,
@@ -1015,6 +1029,37 @@ void Qwen35Model::forward_decode(
 
         // 逐层 stream sync — 防止深排队引发 SM110 统一内存 hard-reset
         cudaStreamSynchronize(stream);
+
+        if (timing_enabled) {
+            cudaEventRecord(ev_end, stream);
+            cudaEventSynchronize(ev_end);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, ev_start, ev_end);
+            if (config_.is_full_attention(i))
+                fa_total_ms += ms;
+            else
+                la_total_ms += ms;
+        }
+    }
+
+    if (timing_enabled) {
+        ++timing_count;
+        if (timing_count % 20 == 0) {
+            int n_fa = 0, n_la = 0;
+            for (int i = 0; i < config_.num_hidden_layers; i++)
+                config_.is_full_attention(i) ? n_fa++ : n_la++;
+            fprintf(stderr, "[LayerTiming] step=%d: FullAttn(%d)=%.2fms(%.2f/layer), "
+                            "LinearAttn(%d)=%.2fms(%.2f/layer), Total=%.2fms\n",
+                    timing_count, n_fa, fa_total_ms, n_fa ? fa_total_ms/n_fa : 0.0f,
+                    n_la, la_total_ms, n_la ? la_total_ms/n_la : 0.0f,
+                    fa_total_ms + la_total_ms);
+            fflush(stderr);
+        }
+    }
+
+    if (timing_enabled) {
+        cudaEventDestroy(ev_start);
+        cudaEventDestroy(ev_end);
     }
 }
 

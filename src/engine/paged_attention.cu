@@ -334,13 +334,20 @@ void invoke_paged_attention(
 
     // Split-K 条件: decode 模式 + 上下文足够长
     // decode: num_tokens==1 (单序列) 或 batch_size>1 (batched decode)
-    const int SPLIT_K_THRESHOLD = 512;
+    // SM110a 20 SMs: Q heads <= 16 → 非 split-K 仅 16 blocks, 占用率低
+    // 阈值降低到 64 以提高短上下文的 paged attention 性能
+    const int SPLIT_K_THRESHOLD = 64;
     bool use_split_k = (max_context_len >= SPLIT_K_THRESHOLD) &&
                        (num_tokens == 1 || batch_size > 1);
 
     if (use_split_k) {
         // 计算 partition 参数
-        int partition_size = 256;
+        // 目标: 总 blocks ≥ 20 SMs × 6 blocks/SM = 120, 确保足够占用率        
+        // 对 GQA 少 Q head 场景 (如 16 heads), 需更多 partitions
+        int min_partitions = (120 + num_heads - 1) / num_heads;  // 至少 8 for 16 heads
+        int partition_size = max(32, max_context_len / max(min_partitions, 1));
+        // 对齐到 block_size 的倍数
+        partition_size = ((partition_size + block_size - 1) / block_size) * block_size;
         int num_partitions = (max_context_len + partition_size - 1) / partition_size;
         if (num_partitions > 64) {
             num_partitions = 64;

@@ -139,6 +139,16 @@ static void run_moe_mlp(
     const __nv_bfloat16* post_attn_norm_w = nullptr,
     const __nv_bfloat16* residual_in = nullptr)
 {
+    // MoE MLP 内部细分计时 (QWEN_LAYER_TIMING=1)
+    static bool moe_timing = !!getenv("QWEN_LAYER_TIMING");
+    static int moe_timing_count = 0;
+    static float moe_total_ms = 0, moe_expert_ms = 0, moe_shared_ms = 0, moe_router_ms = 0;
+    cudaEvent_t moe_ev0, moe_ev1, moe_ev2, moe_ev3, moe_ev4;
+    if (moe_timing && num_tokens == 1) {
+        cudaEventCreate(&moe_ev0); cudaEventCreate(&moe_ev1);
+        cudaEventCreate(&moe_ev2); cudaEventCreate(&moe_ev3);
+        cudaEventCreate(&moe_ev4);
+    }
     const int hs        = config.hidden_size;
     const int E         = config.num_experts;
     const int top_k     = config.num_experts_per_tok;
@@ -158,7 +168,7 @@ static void run_moe_mlp(
                                 rms_norm_eps, num_tokens, hs, stream);
     }
 
-    // 2. Workspace pointer layout
+    // 2. Workspace pointer layout (per-token buffers)
     __nv_bfloat16* router_logits = moe_workspace;
     int*   expert_indices  = (int*)(router_logits + num_tokens * E);
     float* expert_weights  = (float*)(expert_indices + num_tokens * top_k);
@@ -167,58 +177,89 @@ static void run_moe_mlp(
     __nv_bfloat16* shared_up_out   = shared_gate_out + num_tokens * shared_is;
     __nv_bfloat16* shared_swiglu_buf = shared_up_out + num_tokens * shared_is;
     __nv_bfloat16* gate_scalar     = shared_swiglu_buf + num_tokens * shared_is;
-    // Fixed scratch (不随 T 缩放)
-    // Align to 8 bf16 elements (16 bytes) for vectorized GEMV stores
-    __nv_bfloat16* expert_gu       = gate_scalar + ((num_tokens + 7) & ~7);
-    __nv_bfloat16* expert_swiglu   = expert_gu + 2 * moe_is;
-    __nv_bfloat16* expert_out      = expert_swiglu + moe_is;
+    // Fixed scratch (不随 T 缩放), aligned to 8 bf16 for vectorized stores
+    __nv_bfloat16* expert_scratch  = gate_scalar + ((num_tokens + 7) & ~7);
 
     // 3. Router: [T, hs] × [hs, E] → [T, E]
+    if (moe_timing && num_tokens == 1) cudaEventRecord(moe_ev0, stream);
     if (num_tokens == 1) {
         ops::invoke_dense_gemv(post_norm_out, moe.router_w, router_logits, E, hs, stream);
     } else {
         ops::invoke_dense_gemm(post_norm_out, moe.router_w, router_logits, num_tokens, E, hs, stream);
     }
 
-    // 4. Top-K selection + Softmax normalization
+    // 4. Top-K selection + Softmax normalization (GPU-resident)
     ops::invoke_moe_router_topk(router_logits, expert_indices, expert_weights,
                                  num_tokens, E, top_k, stream);
 
-    // 5. Copy routing decisions to CPU for expert dispatch
-    std::vector<int>   h_indices(num_tokens * top_k);
-    std::vector<float> h_weights(num_tokens * top_k);
-    cudaMemcpyAsync(h_indices.data(), expert_indices,
-                     num_tokens * top_k * sizeof(int), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(h_weights.data(), expert_weights,
-                     num_tokens * top_k * sizeof(float), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-
-    // 6. Zero accumulator
-    cudaMemsetAsync(moe_acc, 0, num_tokens * hs * sizeof(__nv_bfloat16), stream);
-
-    // 7. Routed expert computation: per-token sequential GEMV
     const size_t gu_stride = (size_t)2 * moe_is * hs;   // bf16 elements per expert gate_up
     const size_t dn_stride = (size_t)hs * moe_is;       // bf16 elements per expert down
-    for (int t = 0; t < num_tokens; ++t) {
-        const __nv_bfloat16* token_in = post_norm_out + t * hs;
-        __nv_bfloat16* token_acc = moe_acc + t * hs;
-        for (int k = 0; k < top_k; ++k) {
-            int eidx = h_indices[t * top_k + k];
-            float w  = h_weights[t * top_k + k];
-            // Gate+Up: [1, hs] × expert_gate_up[eidx] → [1, 2*moe_is]
-            const __nv_bfloat16* egu_w = moe.experts_gate_up_w + eidx * gu_stride;
-            ops::invoke_dense_gemv(token_in, egu_w, expert_gu, 2 * moe_is, hs, stream);
-            // SwiGLU: [1, 2*moe_is] → [1, moe_is]
-            ops::invoke_swiglu_merged(expert_swiglu, expert_gu, 1, moe_is, stream);
-            // Down: [1, moe_is] × expert_down[eidx] → [1, hs]
-            const __nv_bfloat16* edn_w = moe.experts_down_w + eidx * dn_stride;
-            ops::invoke_dense_gemv(expert_swiglu, edn_w, expert_out, hs, moe_is, stream);
-            // Weighted accumulate
-            ops::invoke_scale_add(token_acc, expert_out, w, hs, stream);
+
+    if (num_tokens == 1) {
+        // ============================================================
+        // T=1 快速路径: Grouped Expert GEMV (GPU-resident, 无 D2H/sync)
+        // 4 launches 替代 32 launches + 1 cudaStreamSynchronize
+        // ============================================================
+        if (moe_timing) cudaEventRecord(moe_ev1, stream);
+        __nv_bfloat16* expert_gu_all      = expert_scratch;                              // [top_k, 2*moe_is]
+        __nv_bfloat16* expert_swiglu_all  = expert_gu_all + top_k * 2 * moe_is;         // [top_k, moe_is]
+        __nv_bfloat16* expert_down_all    = expert_swiglu_all + top_k * moe_is;          // [top_k, hs]
+
+        // 5a. Grouped gate_up GEMV: all top_k experts, shared input
+        ops::invoke_grouped_expert_gemv(
+            post_norm_out, moe.experts_gate_up_w, expert_gu_all,
+            expert_indices, 2 * moe_is, hs, gu_stride,
+            top_k, /*shared_input=*/true, stream);
+
+        // 5b. Batched SwiGLU: top_k experts in parallel
+        ops::invoke_swiglu_merged(expert_swiglu_all, expert_gu_all, top_k, moe_is, stream);
+
+        // 5c. Grouped down GEMV: per-expert inputs
+        ops::invoke_grouped_expert_gemv(
+            expert_swiglu_all, moe.experts_down_w, expert_down_all,
+            expert_indices, hs, moe_is, dn_stride,
+            top_k, /*shared_input=*/false, stream);
+
+        // 5d. Weighted reduce: moe_acc = sum_k(weights[k] * expert_down_all[k])
+        ops::invoke_weighted_expert_reduce(moe_acc, expert_down_all, expert_weights,
+                                            hs, top_k, stream);
+    } else {
+        // ============================================================
+        // T>1 路径: 逐 token 顺序 GEMV (保持兼容)
+        // ============================================================
+        __nv_bfloat16* expert_gu     = expert_scratch;
+        __nv_bfloat16* expert_swiglu = expert_gu + 2 * moe_is;
+        __nv_bfloat16* expert_out    = expert_swiglu + moe_is;
+
+        // D2H copy for CPU-side expert dispatch
+        std::vector<int>   h_indices(num_tokens * top_k);
+        std::vector<float> h_weights(num_tokens * top_k);
+        cudaMemcpyAsync(h_indices.data(), expert_indices,
+                         num_tokens * top_k * sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(h_weights.data(), expert_weights,
+                         num_tokens * top_k * sizeof(float), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+
+        cudaMemsetAsync(moe_acc, 0, num_tokens * hs * sizeof(__nv_bfloat16), stream);
+
+        for (int t = 0; t < num_tokens; ++t) {
+            const __nv_bfloat16* token_in = post_norm_out + t * hs;
+            __nv_bfloat16* token_acc = moe_acc + t * hs;
+            for (int k = 0; k < top_k; ++k) {
+                int eidx = h_indices[t * top_k + k];
+                float w  = h_weights[t * top_k + k];
+                const __nv_bfloat16* egu_w = moe.experts_gate_up_w + eidx * gu_stride;
+                ops::invoke_dense_gemv(token_in, egu_w, expert_gu, 2 * moe_is, hs, stream);
+                ops::invoke_swiglu_merged(expert_swiglu, expert_gu, 1, moe_is, stream);
+                const __nv_bfloat16* edn_w = moe.experts_down_w + eidx * dn_stride;
+                ops::invoke_dense_gemv(expert_swiglu, edn_w, expert_out, hs, moe_is, stream);
+                ops::invoke_scale_add(token_acc, expert_out, w, hs, stream);
+            }
         }
     }
 
     // 8. Shared expert MLP: gate + up + SwiGLU
+    if (moe_timing && num_tokens == 1) cudaEventRecord(moe_ev2, stream);
     if (num_tokens == 1) {
         ops::invoke_dense_dual_gemv(post_norm_out, moe.shared_gate_w, moe.shared_up_w,
                                      shared_gate_out, shared_up_out, shared_is, hs, stream);
@@ -240,16 +281,48 @@ static void run_moe_mlp(
                                 gate_scalar, num_tokens, 1, hs, stream);
     }
 
-    // 10. Shared expert down + gated add (per-token: expert_out only [hs])
+    // 10. Shared expert down + gated add
+    // Reuse expert_down_all[0..hs-1] (T=1) or expert_out (T>1) as temp buffer
+    __nv_bfloat16* shared_down_buf = (num_tokens == 1)
+        ? (expert_scratch + top_k * (2 * moe_is + moe_is))  // expert_down_all[0]
+        : (expert_scratch + 2 * moe_is + moe_is);           // expert_out
     for (int t = 0; t < num_tokens; ++t) {
         ops::invoke_dense_gemv(shared_swiglu_buf + t * shared_is, moe.shared_down_w,
-                                expert_out, hs, shared_is, stream);
-        ops::invoke_sigmoid_gated_add(moe_acc + t * hs, expert_out,
+                                shared_down_buf, hs, shared_is, stream);
+        ops::invoke_sigmoid_gated_add(moe_acc + t * hs, shared_down_buf,
                                        gate_scalar + t, hs, stream);
     }
 
     // 11. Final residual: hidden_states += moe_acc
     ops::invoke_add(hidden_states, hidden_states, moe_acc, num_tokens * hs, stream);
+
+    // MoE timing reporting
+    if (moe_timing && num_tokens == 1) {
+        cudaEventRecord(moe_ev3, stream);
+        cudaEventSynchronize(moe_ev3);
+        float ms_router = 0, ms_expert = 0, ms_shared = 0;
+        cudaEventElapsedTime(&ms_router, moe_ev0, moe_ev1);
+        cudaEventElapsedTime(&ms_expert, moe_ev1, moe_ev2);
+        cudaEventElapsedTime(&ms_shared, moe_ev2, moe_ev3);
+        moe_router_ms += ms_router;
+        moe_expert_ms += ms_expert;
+        moe_shared_ms += ms_shared;
+        moe_total_ms += ms_router + ms_expert + ms_shared;
+        moe_timing_count++;
+        // Print every 400 calls (= 10 full decode steps × 40 layers)
+        if (moe_timing_count % 400 == 0) {
+            int steps = moe_timing_count / 400;
+            fprintf(stderr, "[MoETiming] %d steps: router=%.2fms expert=%.2fms shared=%.2fms total=%.2fms (per-layer: r=%.3f e=%.3f s=%.3f t=%.3f)\n",
+                    steps * 10, moe_router_ms / moe_timing_count, moe_expert_ms / moe_timing_count,
+                    moe_shared_ms / moe_timing_count, moe_total_ms / moe_timing_count,
+                    moe_router_ms / moe_timing_count, moe_expert_ms / moe_timing_count,
+                    moe_shared_ms / moe_timing_count, moe_total_ms / moe_timing_count);
+            fflush(stderr);
+        }
+        cudaEventDestroy(moe_ev0); cudaEventDestroy(moe_ev1);
+        cudaEventDestroy(moe_ev2); cudaEventDestroy(moe_ev3);
+        cudaEventDestroy(moe_ev4);
+    }
 }
 
 // ============================================================================

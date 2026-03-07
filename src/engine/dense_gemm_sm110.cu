@@ -1310,5 +1310,123 @@ void invoke_dense_dual_gemv(
         A, B1, B2, C1, C2, N, K);
 }
 
+// ============================================================================
+// Grouped Expert GEMV — 单次 launch 计算 top_k 个 expert 的 GEMV
+// Grid: (ceil(N/8), top_k), Block: 256 (8 warps)
+// shared_input=true: 所有 expert 共享 inputs[0..K-1] (gate_up 投影)
+// shared_input=false: 每个 expert 使用 inputs[rank*K..(rank+1)*K-1] (down 投影)
+// ============================================================================
+__global__ void grouped_expert_gemv_kernel(
+    const __nv_bfloat16* __restrict__ inputs,
+    const __nv_bfloat16* __restrict__ packed_weights,
+    __nv_bfloat16* __restrict__ outputs,
+    const int* __restrict__ expert_indices,
+    int N, int K, size_t expert_stride,
+    bool shared_input)
+{
+    constexpr int WARP_SIZE = 32;
+    constexpr int WARPS_PER_BLOCK = 8;
+
+    extern __shared__ __nv_bfloat16 s_A[];
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x & (WARP_SIZE - 1);
+    int out_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    int expert_rank = blockIdx.y;
+
+    // Load input to SMEM (shared across warps in this block)
+    const __nv_bfloat16* input = shared_input ? inputs : (inputs + expert_rank * K);
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        s_A[i] = input[i];
+    }
+    __syncthreads();
+
+    if (out_idx >= N) return;
+
+    int expert_id = expert_indices[expert_rank];
+    const __nv_bfloat16* b_col = packed_weights + expert_id * expert_stride + (size_t)out_idx * K;
+
+    float sum = 0.0f;
+    int k8 = K / 8;
+    const float4* s_A_v4 = reinterpret_cast<const float4*>(s_A);
+    const float4* b_col_v4 = reinterpret_cast<const float4*>(b_col);
+
+    for (int i = lane_id; i < k8; i += WARP_SIZE) {
+        float4 a4 = s_A_v4[i];
+        float4 b4 = b_col_v4[i];
+        const __nv_bfloat162* a2 = reinterpret_cast<const __nv_bfloat162*>(&a4);
+        const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&b4);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float2 af = __bfloat1622float2(a2[j]);
+            float2 bf = __bfloat1622float2(b2[j]);
+            sum += af.x * bf.x + af.y * bf.y;
+        }
+    }
+
+    int k_tail = k8 * 8;
+    for (int k = k_tail + lane_id; k < K; k += WARP_SIZE) {
+        sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k]);
+    }
+
+    #pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, mask);
+    }
+
+    if (lane_id == 0) {
+        outputs[expert_rank * N + out_idx] = __float2bfloat16(sum);
+    }
+}
+
+void invoke_grouped_expert_gemv(
+    const __nv_bfloat16* inputs,
+    const __nv_bfloat16* packed_weights,
+    __nv_bfloat16* outputs,
+    const int* expert_indices,
+    int N, int K, size_t expert_stride,
+    int top_k, bool shared_input,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK = 256;
+    constexpr int WARPS = BLOCK / 32;
+    dim3 grid((N + WARPS - 1) / WARPS, top_k);
+    size_t smem = K * sizeof(__nv_bfloat16);
+    grouped_expert_gemv_kernel<<<grid, BLOCK, smem, stream>>>(
+        inputs, packed_weights, outputs, expert_indices,
+        N, K, expert_stride, shared_input);
+}
+
+// ============================================================================
+// Weighted Expert Reduce: accum[i] = sum_k(weights[k] * outputs[k*hs + i])
+// 将 top_k 个 expert 的加权输出合并为单个向量
+// ============================================================================
+__global__ void weighted_expert_reduce_kernel(
+    __nv_bfloat16* __restrict__ accum,
+    const __nv_bfloat16* __restrict__ expert_outputs,
+    const float* __restrict__ expert_weights,
+    int hs, int top_k)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hs) return;
+    float sum = 0.f;
+    for (int k = 0; k < top_k; k++)
+        sum += expert_weights[k] * __bfloat162float(expert_outputs[k * hs + idx]);
+    accum[idx] = __float2bfloat16(sum);
+}
+
+void invoke_weighted_expert_reduce(
+    __nv_bfloat16* accum,
+    const __nv_bfloat16* expert_outputs,
+    const float* expert_weights,
+    int hs, int top_k,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK = 256;
+    int blocks = (hs + BLOCK - 1) / BLOCK;
+    weighted_expert_reduce_kernel<<<blocks, BLOCK, 0, stream>>>(
+        accum, expert_outputs, expert_weights, hs, top_k);
+}
+
 } // namespace ops
 } // namespace qwen_thor
