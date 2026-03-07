@@ -5,6 +5,9 @@
 #include "streaming_attention.h"
 #include <memory>
 #include <vector>
+#include <string>
+#include <fstream>
+#include <sstream>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
@@ -12,10 +15,10 @@ namespace qwen_thor {
 namespace core {
 
 // ============================================================================
-// Qwen3.5-27B 模型配置
-// 架构: 64层混合 (48层 Linear Attention Gated DeltaNet + 16层 Full Attention GQA)
-//   layer_idx % 4 == 3 → full_attention  (layers 3, 7, 11, ..., 63)
-//   layer_idx % 4 != 3 → linear_attention (所有其他层)
+// Qwen3.5 模型配置 (支持 4B / 9B / 27B 等多规模变体)
+// 架构: N层混合 (Linear Attention Gated DeltaNet + Full Attention GQA)
+//   layer_idx % full_attention_interval == (full_attention_interval-1) → full_attention
+//   其余 → linear_attention
 // ============================================================================
 struct Qwen35Config {
     // -- 基础 --
@@ -25,6 +28,7 @@ struct Qwen35Config {
     int vocab_size           = 248320;
     float rms_norm_eps       = 1e-6f;
     std::string model_dir    = "/home/rm01/models/dev/llm/Qwen/Qwen3.5-27B";
+    bool tie_word_embeddings = false;  // 4B: true (lm_head 共享 embed_tokens)
 
     // -- Full Attention (GQA) --
     int num_attention_heads  = 24;     // Q heads
@@ -33,6 +37,7 @@ struct Qwen35Config {
     float rope_theta         = 10000000.0f;   // 1e7
     // partial_rotary_factor=0.25: 只旋转 head_dim*0.25 = 64 维
     int rope_rotary_dim      = 64;
+    int full_attention_interval = 4;   // 每 N 层一个 full_attention
 
     // -- Linear Attention (Gated DeltaNet) --
     int linear_num_key_heads   = 16;
@@ -42,15 +47,117 @@ struct Qwen35Config {
     int linear_conv_kernel_dim = 4;
 
     // -- 层类型判断 --
-    // layers 3, 7, 11, ..., 63 是 full_attention
     bool is_full_attention(int layer_idx) const {
-        return (layer_idx % 4) == 3;
+        return (layer_idx % full_attention_interval) == (full_attention_interval - 1);
     }
     int num_full_attn_layers() const {
         int count = 0;
         for (int i = 0; i < num_hidden_layers; i++)
             if (is_full_attention(i)) count++;
         return count;
+    }
+
+    // -- 从模型目录的 config.json 加载配置 --
+    bool load_from_model_dir(const std::string& dir) {
+        std::string path = dir + "/config.json";
+        std::ifstream f(path);
+        if (!f.is_open()) return false;
+        std::stringstream ss;
+        ss << f.rdbuf();
+        std::string json = ss.str();
+
+        // 找到 "text_config" 块
+        auto tc_pos = json.find("\"text_config\"");
+        std::string section = (tc_pos != std::string::npos) ? json.substr(tc_pos) : json;
+
+        auto get_int = [&](const std::string& key) -> int {
+            std::string pat = "\"" + key + "\"";
+            auto p = section.find(pat);
+            if (p == std::string::npos) return -1;
+            p = section.find(':', p + pat.size());
+            if (p == std::string::npos) return -1;
+            p++;
+            while (p < section.size() && (section[p] == ' ' || section[p] == '\t')) p++;
+            return std::atoi(section.c_str() + p);
+        };
+        auto get_float = [&](const std::string& key) -> float {
+            std::string pat = "\"" + key + "\"";
+            auto p = section.find(pat);
+            if (p == std::string::npos) return -1.0f;
+            p = section.find(':', p + pat.size());
+            if (p == std::string::npos) return -1.0f;
+            p++;
+            while (p < section.size() && (section[p] == ' ' || section[p] == '\t')) p++;
+            return std::atof(section.c_str() + p);
+        };
+        auto get_bool = [&](const std::string& key, const std::string& src) -> int {
+            std::string pat = "\"" + key + "\"";
+            auto p = src.find(pat);
+            if (p == std::string::npos) return -1;
+            p = src.find(':', p + pat.size());
+            if (p == std::string::npos) return -1;
+            p++;
+            while (p < src.size() && (src[p] == ' ' || src[p] == '\t')) p++;
+            if (src.substr(p, 4) == "true") return 1;
+            if (src.substr(p, 5) == "false") return 0;
+            return -1;
+        };
+
+        int v;
+        float fv;
+        if ((v = get_int("hidden_size"))          > 0) hidden_size = v;
+        if ((v = get_int("intermediate_size"))    > 0) intermediate_size = v;
+        if ((v = get_int("num_hidden_layers"))     > 0) num_hidden_layers = v;
+        if ((v = get_int("vocab_size"))            > 0) vocab_size = v;
+        if ((v = get_int("num_attention_heads"))   > 0) num_attention_heads = v;
+        if ((v = get_int("num_key_value_heads"))   > 0) num_key_value_heads = v;
+        if ((v = get_int("head_dim"))              > 0) head_dim = v;
+        if ((v = get_int("full_attention_interval")) > 0) full_attention_interval = v;
+        if ((v = get_int("linear_num_key_heads"))  > 0) linear_num_key_heads = v;
+        if ((v = get_int("linear_key_head_dim"))   > 0) linear_key_head_dim = v;
+        if ((v = get_int("linear_num_value_heads")) > 0) linear_num_value_heads = v;
+        if ((v = get_int("linear_value_head_dim")) > 0) linear_value_head_dim = v;
+        if ((v = get_int("linear_conv_kernel_dim")) > 0) linear_conv_kernel_dim = v;
+        if ((fv = get_float("rms_norm_eps"))        > 0) rms_norm_eps = fv;
+
+        // partial_rotary_factor → rope_rotary_dim
+        float prf = get_float("partial_rotary_factor");
+        if (prf > 0) rope_rotary_dim = (int)(head_dim * prf);
+
+        // rope_theta (在 rope_parameters 子块中)
+        auto rp_pos = section.find("\"rope_parameters\"");
+        if (rp_pos != std::string::npos) {
+            std::string rp_section = section.substr(rp_pos);
+            std::string pat = "\"rope_theta\"";
+            auto p = rp_section.find(pat);
+            if (p != std::string::npos) {
+                p = rp_section.find(':', p + pat.size());
+                if (p != std::string::npos) {
+                    p++;
+                    while (p < rp_section.size() && (rp_section[p] == ' ' || rp_section[p] == '\t')) p++;
+                    rope_theta = std::atof(rp_section.c_str() + p);
+                }
+            }
+        }
+
+        // tie_word_embeddings (在顶层 JSON 中)
+        v = get_bool("tie_word_embeddings", json);
+        if (v >= 0) tie_word_embeddings = (v == 1);
+
+        model_dir = dir;
+
+        fprintf(stderr, "[Config] Loaded from %s:\n"
+                "  hidden_size=%d, intermediate_size=%d, num_layers=%d\n"
+                "  num_attn_heads=%d, num_kv_heads=%d, head_dim=%d\n"
+                "  linear: nkh=%d, kd=%d, nv=%d, vd=%d\n"
+                "  full_attn_interval=%d, tie_word_embeddings=%s\n",
+                path.c_str(),
+                hidden_size, intermediate_size, num_hidden_layers,
+                num_attention_heads, num_key_value_heads, head_dim,
+                linear_num_key_heads, linear_key_head_dim,
+                linear_num_value_heads, linear_value_head_dim,
+                full_attention_interval, tie_word_embeddings ? "true" : "false");
+        return true;
     }
 
     // -- EOS Token IDs --

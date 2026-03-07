@@ -533,13 +533,19 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
             gate_up_total += bytes;
         }
         std::cerr << "      Merged Gate+Up: " << (gate_up_total >> 20)
-                  << " MB (64 layers, net zero)" << std::endl;
+                  << " MB (" << config_.num_hidden_layers << " layers, net zero)" << std::endl;
     }
 
-    // 3. 全局权重
+    // 3. 全局権重
     embed_tokens_w_ = get_ptr("model.language_model.embed_tokens.weight");
     norm_w_         = get_ptr("model.language_model.norm.weight");
     lm_head_w_      = get_ptr("lm_head.weight");
+
+    // tie_word_embeddings: lm_head 共享 embed_tokens 权重 (4B 模型)
+    if (!lm_head_w_ && config_.tie_word_embeddings && embed_tokens_w_) {
+        lm_head_w_ = embed_tokens_w_;
+        std::cerr << "  [Weight] tie_word_embeddings: lm_head shares embed_tokens" << std::endl;
+    }
 
     if (!embed_tokens_w_ || !norm_w_ || !lm_head_w_) {
         throw std::runtime_error("Missing essential global weights "
@@ -657,6 +663,7 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
 
         if (patch_w && patch_b && pos_w) {
             VisionConfig vcfg;  // uses defaults matching Qwen3.5
+            vcfg.out_hidden_size = config_.hidden_size;  // match text model
             vision_encoder_ = std::make_unique<VisionEncoder>(vcfg);
             vision_encoder_->set_patch_embed_weights(patch_w, patch_b);
             vision_encoder_->set_pos_embed_weight(pos_w);

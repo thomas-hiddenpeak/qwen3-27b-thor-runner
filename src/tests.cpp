@@ -2402,10 +2402,15 @@ void bench_chunked_prefill() {
     printf("  %s\n", std::string(72, '-').c_str());
 
     {
-        // Qwen3.5-27B real params
-        const int NLin = 48;
-        const size_t SSM_PER_LAYER = (size_t)16 * 128 * 384 * sizeof(__nv_bfloat16);  // 1.5 MB
-        const size_t CONV_PER_LAYER = (size_t)10240 * 3 * sizeof(__nv_bfloat16);   // 60 KB
+        // Qwen3.5-27B real params (use config for correctness)
+        core::Qwen35Config cfg;
+        const int NLin = cfg.num_hidden_layers - cfg.num_full_attn_layers();
+        const int nkh = cfg.linear_num_key_heads;
+        const int kd  = cfg.linear_key_head_dim;
+        const int v_per_kh = cfg.lin_v_per_kh();
+        const int in_qkv = cfg.lin_qk_dim() * 2 + cfg.lin_v_dim();
+        const size_t SSM_PER_LAYER = (size_t)nkh * kd * v_per_kh * sizeof(__nv_bfloat16);
+        const size_t CONV_PER_LAYER = (size_t)in_qkv * 3 * sizeof(__nv_bfloat16);
 
         int prompt_lens[] = {512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 204800, 262144};
         int n_pl = sizeof(prompt_lens) / sizeof(prompt_lens[0]);
@@ -2422,8 +2427,10 @@ void bench_chunked_prefill() {
         }
 
         printf("\n  Activation memory per chunk (max_chunk_size=4096):\n");
-        int ws_full  = 4*5120 + 12288 + 6144 + 2*1024 + 3*17408;
-        int ws_lin   = 5120 + 10240 + 6144 + 16 + 2048 + 6144 + 5120 + 5120 + 3*17408 + 5120 + 32;
+        int ws_full  = cfg.full_attn_workspace_elems_t1();
+        int hs = cfg.hidden_size, is = cfg.intermediate_size;
+        int ws_lin   = hs + in_qkv + cfg.lin_v_dim() + nkh + cfg.lin_qk_dim()
+                     + cfg.lin_v_dim() + hs + hs + 3*is + hs + nkh*2;
         size_t ws_per_tok = std::max(ws_full, ws_lin);
         double act_mb_4k = ws_per_tok * 4096.0 * sizeof(__nv_bfloat16) / (1024.0 * 1024);
         double act_mb_8k = ws_per_tok * 8192.0 * sizeof(__nv_bfloat16) / (1024.0 * 1024);
@@ -2431,8 +2438,8 @@ void bench_chunked_prefill() {
                ws_per_tok, ws_per_tok * sizeof(__nv_bfloat16) / 1024.0);
         printf("    chunk=4096:       %.1f MB activation\n", act_mb_4k);
         printf("    chunk=8192:       %.1f MB activation\n", act_mb_8k);
-        printf("    hidden_states:    4096 x 5120 x 2B = %.1f MB\n",
-               4096.0 * 5120 * 2 / (1024.0 * 1024));
+        printf("    hidden_states:    4096 x %d x 2B = %.1f MB\n",
+               hs, 4096.0 * hs * 2 / (1024.0 * 1024));
         printf("    → Chunked prefill: 128K prompt 总内存 = KV(8 GB) + SSM(144 MB) + Act(%.0f MB)\n",
                act_mb_4k);
         printf("    → Unchunked:       128K prompt 总内存 = KV(8 GB) + SSM(144 MB) + Act(%.0f MB) ← OOM!\n",

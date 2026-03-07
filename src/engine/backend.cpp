@@ -323,6 +323,13 @@ static void check_memory_budget(const BackendConfig& config, const core::Qwen35C
 
 InferenceBackend::InferenceBackend(const BackendConfig& config)
     : config_(config) {
+    // 从模型目录的 config.json 加载模型架构参数
+    if (!model_config_.load_from_model_dir(config_.model_dir)) {
+        fprintf(stderr, "[Backend] Warning: config.json not found in %s, using 27B defaults\n",
+                config_.model_dir.c_str());
+        model_config_.model_dir = config_.model_dir;
+    }
+
     config_.print();
     auto cache_config = config_.to_cache_config();
     cache_config.print();
