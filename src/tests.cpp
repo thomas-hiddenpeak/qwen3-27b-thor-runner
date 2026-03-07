@@ -1,6 +1,16 @@
 // tests.cpp — 单元测试集合
 //
-// 通过 qwen3-27b-thor test 调用, 入口函数: run_tests()
+// 测试框架:
+//   qwen3-27b-thor test                    运行所有 unit 测试
+//   qwen3-27b-thor test --list             列出所有可用测试
+//   qwen3-27b-thor test --filter gemm      运行名称含 "gemm" 的测试
+//   qwen3-27b-thor test --category unit    只运行 unit 类别
+//   qwen3-27b-thor test --all              运行所有测试 (含 integration/benchmark)
+//
+// 类别:
+//   unit         — 快速, 不需要模型权重, <10s
+//   integration  — 需要模型权重, 加载慢, ~60s
+//   benchmark    — 性能测试, 输出数字, >60s
 
 // test cleanup 用 system("rm -rf ..."), 返回值无需检查
 #pragma GCC diagnostic ignored "-Wunused-result"
@@ -32,8 +42,48 @@
 #include <unordered_map>
 #include <filesystem>
 #include <cstdlib>
+#include <functional>
+#include <sstream>
 
 using namespace qwen_thor;
+
+// ============================================================================
+// 测试框架 — 轻量级注册/过滤/计时/汇总
+// ============================================================================
+
+enum class TestCategory { UNIT, INTEGRATION, BENCHMARK };
+
+static const char* category_name(TestCategory cat) {
+    switch (cat) {
+        case TestCategory::UNIT:        return "unit";
+        case TestCategory::INTEGRATION: return "integration";
+        case TestCategory::BENCHMARK:   return "benchmark";
+    }
+    return "unknown";
+}
+
+struct TestEntry {
+    std::string name;
+    TestCategory category;
+    std::function<void()> func;
+};
+
+struct TestResult {
+    std::string name;
+    TestCategory category;
+    bool passed;
+    double elapsed_ms;
+    std::string error;
+};
+
+static std::vector<TestEntry>& test_registry() {
+    static std::vector<TestEntry> reg;
+    return reg;
+}
+
+static void register_test(const char* name, TestCategory cat, std::function<void()> fn) {
+    test_registry().push_back({name, cat, std::move(fn)});
+}
 
 namespace {
 
@@ -2468,32 +2518,127 @@ void bench_chunked_prefill() {
 int run_tests(int argc, char** argv) {
     g_test_model_dir = resolve_test_model_dir(argc, argv);
 
-    std::cout << "========================================" << std::endl;
-    std::cout << "  Qwen3.5-27B Thor Unit Tests           " << std::endl;
-    std::cout << "========================================\n" << std::endl;
-    std::cout << "Model dir: " << g_test_model_dir << "\n" << std::endl;
+    // --- 注册所有测试 ---
+    register_test("unified_allocator",  TestCategory::UNIT,        test_unified_allocator);
+    register_test("safetensors_loader", TestCategory::UNIT,        test_safetensors_loader);
+    register_test("kv_cache_manager",   TestCategory::UNIT,        test_kv_cache_manager);
+    register_test("ipc_shm_queue",      TestCategory::UNIT,        test_ipc_shm_queue);
+    register_test("dense_gemm",         TestCategory::UNIT,        test_dense_gemm);
+    register_test("light_ops",          TestCategory::UNIT,        test_light_ops);
+    register_test("paged_attention",    TestCategory::UNIT,        test_paged_attention);
+    register_test("qwen_layer",         TestCategory::UNIT,        test_qwen_layer);
+    register_test("cache_engine",       TestCategory::UNIT,        test_cache_engine);
+    register_test("kv_swapper",         TestCategory::INTEGRATION, test_kv_swapper);
+    register_test("concurrent_swap",    TestCategory::INTEGRATION, test_concurrent_swap);
+    register_test("chunked_prefill",    TestCategory::UNIT,        test_chunked_prefill);
+    register_test("qwen_model",         TestCategory::INTEGRATION, test_qwen_model);
+    register_test("inference_engine",   TestCategory::INTEGRATION, test_inference_engine);
+    register_test("swap_256k_bench",    TestCategory::BENCHMARK,   test_swap_256k_benchmark);
+    register_test("chunked_prefill_bench", TestCategory::BENCHMARK, bench_chunked_prefill);
 
-    try {
-        test_unified_allocator();
-        test_safetensors_loader();
-        test_kv_cache_manager();
-        test_ipc_shm_queue();
-        test_dense_gemm();
-        test_light_ops();
-        test_paged_attention();
-        test_qwen_layer();
-        test_cache_engine();
-        test_kv_swapper();
-        test_chunked_prefill();
-        test_inference_engine();
-    } catch (const std::exception& e) {
-        std::cerr << "Test Error: " << e.what() << std::endl;
-        return 1;
+    // --- 解析 CLI 参数 ---
+    std::string filter;
+    std::string category_filter;
+    bool list_only = false;
+    bool run_all = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--list")                              { list_only = true; }
+        else if (arg == "--all")                          { run_all = true; }
+        else if (arg == "--filter" && i + 1 < argc)       { filter = argv[++i]; }
+        else if (arg == "--category" && i + 1 < argc)     { category_filter = argv[++i]; }
     }
 
-    std::cout << "\n========================================" << std::endl;
-    std::cout << "  All tests passed!" << std::endl;
+    // --- 筛选测试 ---
+    std::vector<const TestEntry*> selected;
+    for (const auto& t : test_registry()) {
+        // --category 过滤
+        if (!category_filter.empty() && category_filter != category_name(t.category))
+            continue;
+        // 默认只运行 unit, --all 运行全部
+        if (category_filter.empty() && !run_all && t.category != TestCategory::UNIT)
+            continue;
+        // --filter 子串匹配
+        if (!filter.empty() && t.name.find(filter) == std::string::npos)
+            continue;
+        selected.push_back(&t);
+    }
+
+    // --- --list: 仅列出 ---
+    if (list_only) {
+        printf("\n  %-28s  %s\n", "Test Name", "Category");
+        printf("  %-28s  %s\n", "----------------------------", "------------");
+        for (const auto* t : selected) {
+            printf("  %-28s  %s\n", t->name.c_str(), category_name(t->category));
+        }
+        printf("\n  Total: %zu tests\n\n", selected.size());
+        return 0;
+    }
+
+    // --- 运行 ---
+    std::cout << "========================================" << std::endl;
+    std::cout << "  Qwen3.5-27B Thor Test Runner          " << std::endl;
     std::cout << "========================================\n" << std::endl;
-    return 0;
+    std::cout << "Model dir: " << g_test_model_dir << std::endl;
+    std::cout << "Tests:     " << selected.size() << " / " << test_registry().size() << "\n" << std::endl;
+
+    std::vector<TestResult> results;
+    results.reserve(selected.size());
+
+    for (const auto* t : selected) {
+        printf("▶ [%s] %s ... ", category_name(t->category), t->name.c_str());
+        fflush(stdout);
+
+        TestResult r;
+        r.name = t->name;
+        r.category = t->category;
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        try {
+            t->func();
+            r.passed = true;
+        } catch (const std::exception& e) {
+            r.passed = false;
+            r.error = e.what();
+        } catch (...) {
+            r.passed = false;
+            r.error = "unknown exception";
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        r.elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        if (r.passed) {
+            printf("PASS (%.1f ms)\n", r.elapsed_ms);
+        } else {
+            printf("FAIL (%.1f ms)\n", r.elapsed_ms);
+            if (!r.error.empty())
+                printf("  └─ %s\n", r.error.c_str());
+        }
+        results.push_back(std::move(r));
+    }
+
+    // --- 汇总 ---
+    int passed = 0, failed = 0;
+    double total_ms = 0;
+    for (const auto& r : results) {
+        if (r.passed) ++passed; else ++failed;
+        total_ms += r.elapsed_ms;
+    }
+
+    printf("\n  ========================================================\n");
+    printf("  %-6s  %-13s  %-28s  %s\n", "Status", "Category", "Test Name", "Time");
+    printf("  %-6s  %-13s  %-28s  %s\n", "------", "-------------", "----------------------------", "--------");
+    for (const auto& r : results) {
+        printf("  %-6s  %-13s  %-28s  %.1f ms\n",
+               r.passed ? "PASS" : "FAIL",
+               category_name(r.category),
+               r.name.c_str(),
+               r.elapsed_ms);
+    }
+    printf("  ========================================================\n");
+    printf("  Total: %d passed, %d failed, %.1f ms\n\n", passed, failed, total_ms);
+
+    return failed > 0 ? 1 : 0;
 }
 
