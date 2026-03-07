@@ -179,9 +179,40 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
             }
         } else {
             // Original BF16 path
-            __nv_bfloat16* gate = get_ptr(p + "mlp.gate_proj.weight");
-            __nv_bfloat16* up   = get_ptr(p + "mlp.up_proj.weight");
-            __nv_bfloat16* down = get_ptr(p + "mlp.down_proj.weight");
+            __nv_bfloat16* gate = nullptr;
+            __nv_bfloat16* up   = nullptr;
+            __nv_bfloat16* down = nullptr;
+
+            // MoE: bind router + packed experts + shared expert
+            if (config_.is_moe) {
+                auto find_ptr = [&](const std::string& key) -> __nv_bfloat16* {
+                    auto it = tensor_map.find(key);
+                    return it != tensor_map.end() ? it->second : nullptr;
+                };
+                MoEWeights moe;
+                moe.router_w = get_ptr(p + "mlp.gate.weight");
+                // Packed 3D expert tensors (no .weight suffix in safetensors)
+                moe.experts_gate_up_w = find_ptr(p + "mlp.experts.gate_up_proj");
+                moe.experts_down_w    = find_ptr(p + "mlp.experts.down_proj");
+                if (!moe.experts_gate_up_w)
+                    std::cerr << "Warning: tensor not found: " << p << "mlp.experts.gate_up_proj" << std::endl;
+                if (!moe.experts_down_w)
+                    std::cerr << "Warning: tensor not found: " << p << "mlp.experts.down_proj" << std::endl;
+                moe.shared_gate_w        = get_ptr(p + "mlp.shared_expert.gate_proj.weight");
+                moe.shared_up_w          = get_ptr(p + "mlp.shared_expert.up_proj.weight");
+                moe.shared_down_w        = get_ptr(p + "mlp.shared_expert.down_proj.weight");
+                moe.shared_expert_gate_w = get_ptr(p + "mlp.shared_expert_gate.weight");
+
+                if (config_.is_full_attention(i)) {
+                    layers_[i].get_full_attn()->set_moe_weights(moe);
+                } else {
+                    layers_[i].get_linear_attn()->set_moe_weights(moe);
+                }
+            } else {
+                gate = get_ptr(p + "mlp.gate_proj.weight");
+                up   = get_ptr(p + "mlp.up_proj.weight");
+                down = get_ptr(p + "mlp.down_proj.weight");
+            }
 
             if (config_.is_full_attention(i)) {
                 layers_[i].get_full_attn()->set_weights(
@@ -450,6 +481,9 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
         // Saves 64 cuBLAS launches per T>1 step (MTP verify T=4)
         size_t gate_up_total = 0;
         for (int i = 0; i < config_.num_hidden_layers; ++i) {
+            // MoE layers use packed expert weights — no dense gate/up to merge
+            if (config_.is_moe) continue;
+
             std::string p = "model.language_model.layers." + std::to_string(i) + ".";
             __nv_bfloat16* gate_w = tensor_map[p + "mlp.gate_proj.weight"];
             __nv_bfloat16* up_w   = tensor_map[p + "mlp.up_proj.weight"];
@@ -576,9 +610,10 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
         __nv_bfloat16* mtp_o  = mtp_get(mp + "self_attn.o_proj.weight");
         __nv_bfloat16* mtp_qn = mtp_get(mp + "self_attn.q_norm.weight");
         __nv_bfloat16* mtp_kn = mtp_get(mp + "self_attn.k_norm.weight");
-        __nv_bfloat16* mtp_gp = mtp_get(mp + "mlp.gate_proj.weight");
-        __nv_bfloat16* mtp_up = mtp_get(mp + "mlp.up_proj.weight");
-        __nv_bfloat16* mtp_dp = mtp_get(mp + "mlp.down_proj.weight");
+        // Dense MLP: only used for non-MoE models
+        __nv_bfloat16* mtp_gp = config_.is_moe ? nullptr : mtp_get(mp + "mlp.gate_proj.weight");
+        __nv_bfloat16* mtp_up = config_.is_moe ? nullptr : mtp_get(mp + "mlp.up_proj.weight");
+        __nv_bfloat16* mtp_dp = config_.is_moe ? nullptr : mtp_get(mp + "mlp.down_proj.weight");
         __nv_bfloat16* mtp_in = mtp_get(mp + "input_layernorm.weight");
         __nv_bfloat16* mtp_pn = mtp_get(mp + "post_attention_layernorm.weight");
 
@@ -624,8 +659,51 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
                 mtp_release(mtp_v);
             }
 
-            // Merge MTP Gate+Up weights: [2*is, hs]
-            {
+            // MoE MTP: pack individual expert weights + bind shared expert
+            if (config_.is_moe) {
+                const int E      = config_.num_experts;
+                const int moe_is = config_.moe_intermediate_size;
+                const int hs     = config_.hidden_size;
+
+                // Pack individual experts into contiguous gate_up [E, 2*moe_is, hs] and down [E, hs, moe_is]
+                size_t gu_elems = (size_t)E * 2 * moe_is * hs;
+                size_t dn_elems = (size_t)E * hs * moe_is;
+                __nv_bfloat16* packed_gu = nullptr;
+                __nv_bfloat16* packed_dn = nullptr;
+                cudaMalloc(&packed_gu, gu_elems * sizeof(__nv_bfloat16));
+                cudaMalloc(&packed_dn, dn_elems * sizeof(__nv_bfloat16));
+                device_weights_.push_back(packed_gu);
+                device_weights_.push_back(packed_dn);
+
+                for (int e = 0; e < E; ++e) {
+                    std::string ep = mp + "mlp.experts." + std::to_string(e) + ".";
+                    auto* gw = mtp_get(ep + "gate_proj.weight");
+                    auto* uw = mtp_get(ep + "up_proj.weight");
+                    auto* dw = mtp_get(ep + "down_proj.weight");
+                    size_t gu_off = (size_t)e * 2 * moe_is * hs;
+                    if (gw) cudaMemcpy(packed_gu + gu_off, gw,
+                                       (size_t)moe_is * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+                    if (uw) cudaMemcpy(packed_gu + gu_off + (size_t)moe_is * hs, uw,
+                                       (size_t)moe_is * hs * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+                    size_t dn_off = (size_t)e * hs * moe_is;
+                    if (dw) cudaMemcpy(packed_dn + dn_off, dw,
+                                       (size_t)hs * moe_is * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+                }
+
+                MoEWeights moe;
+                moe.router_w             = mtp_get(mp + "mlp.gate.weight");
+                moe.experts_gate_up_w    = packed_gu;
+                moe.experts_down_w       = packed_dn;
+                moe.shared_gate_w        = mtp_get(mp + "mlp.shared_expert.gate_proj.weight");
+                moe.shared_up_w          = mtp_get(mp + "mlp.shared_expert.up_proj.weight");
+                moe.shared_down_w        = mtp_get(mp + "mlp.shared_expert.down_proj.weight");
+                moe.shared_expert_gate_w = mtp_get(mp + "mlp.shared_expert_gate.weight");
+                mtp_layer_->set_moe_weights(moe);
+
+                std::cerr << "[Model] MTP module loaded (MoE: " << E << " experts packed, "
+                          << "QKV merged, speculative decoding enabled)" << std::endl;
+            } else {
+                // Dense MTP: Merge Gate+Up weights: [2*is, hs]
                 const int is = config_.intermediate_size;
                 const int hs = config_.hidden_size;
                 size_t bytes = (size_t)2 * is * hs * sizeof(__nv_bfloat16);
@@ -639,10 +717,10 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
                 mtp_layer_->set_merged_gate_up(merged);
                 mtp_release(mtp_gp);
                 mtp_release(mtp_up);
-            }
 
-            std::cerr << "[Model] MTP module loaded (1 transformer layer, "
-                      << "QKV+GateUp merged, speculative decoding enabled)" << std::endl;
+                std::cerr << "[Model] MTP module loaded (1 transformer layer, "
+                          << "QKV+GateUp merged, speculative decoding enabled)" << std::endl;
+            }
         } else {
             std::cerr << "[Model] No MTP weights found, speculative decoding disabled" << std::endl;
         }

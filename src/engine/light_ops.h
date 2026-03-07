@@ -170,5 +170,25 @@ void invoke_deinterleave_gemm_3way(
 void invoke_swiglu_merged(__nv_bfloat16* out, const __nv_bfloat16* merged_gateup,
                            int num_tokens, int intermediate_size, cudaStream_t stream = 0);
 
+// ============================================================================
+// MoE (Mixture of Experts) 辅助算子
+// ============================================================================
+
+// MoE Router Top-K: 从 logits [T, E] 中选出 top_k 个 expert, Softmax 归一化
+// expert_indices: [T, top_k] int32, expert_weights: [T, top_k] float32
+void invoke_moe_router_topk(const __nv_bfloat16* logits, int* expert_indices,
+                             float* expert_weights, int num_tokens,
+                             int num_experts, int top_k, cudaStream_t stream = 0);
+
+// Scaled accumulate: out[i] += scale * in[i], element-wise
+void invoke_scale_add(__nv_bfloat16* out, const __nv_bfloat16* in, float scale,
+                      int n, cudaStream_t stream = 0);
+
+// Sigmoid-gated accumulate: out[i] += sigmoid(gate[0]) * in[i]
+// gate is a single BF16 scalar on device, applied broadcast to all n elements
+void invoke_sigmoid_gated_add(__nv_bfloat16* out, const __nv_bfloat16* in,
+                               const __nv_bfloat16* gate_scalar, int n,
+                               cudaStream_t stream = 0);
+
 } // namespace ops
 } // namespace qwen_thor

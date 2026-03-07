@@ -46,6 +46,13 @@ struct Qwen35Config {
     int linear_value_head_dim  = 128;
     int linear_conv_kernel_dim = 4;
 
+    // -- MoE (Mixture of Experts) --
+    bool is_moe = false;
+    int num_experts = 0;
+    int num_experts_per_tok = 0;
+    int moe_intermediate_size = 0;
+    int shared_expert_intermediate_size = 0;
+
     // -- 层类型判断 --
     bool is_full_attention(int layer_idx) const {
         return (layer_idx % full_attention_interval) == (full_attention_interval - 1);
@@ -120,6 +127,14 @@ struct Qwen35Config {
         if ((v = get_int("linear_conv_kernel_dim")) > 0) linear_conv_kernel_dim = v;
         if ((fv = get_float("rms_norm_eps"))        > 0) rms_norm_eps = fv;
 
+        // MoE fields
+        if ((v = get_int("num_experts")) > 0) { num_experts = v; is_moe = true; }
+        if ((v = get_int("num_experts_per_tok")) > 0) num_experts_per_tok = v;
+        if ((v = get_int("moe_intermediate_size")) > 0) moe_intermediate_size = v;
+        if ((v = get_int("shared_expert_intermediate_size")) > 0) shared_expert_intermediate_size = v;
+        // MoE models have no dense MLP; use shared_expert_intermediate_size for workspace compat
+        if (is_moe && moe_intermediate_size > 0) intermediate_size = shared_expert_intermediate_size;
+
         // partial_rotary_factor → rope_rotary_dim
         float prf = get_float("partial_rotary_factor");
         if (prf > 0) rope_rotary_dim = (int)(head_dim * prf);
@@ -157,6 +172,11 @@ struct Qwen35Config {
                 linear_num_key_heads, linear_key_head_dim,
                 linear_num_value_heads, linear_value_head_dim,
                 full_attention_interval, tie_word_embeddings ? "true" : "false");
+        if (is_moe) {
+            fprintf(stderr, "  MoE: %d experts, top-%d, moe_is=%d, shared_is=%d\n",
+                    num_experts, num_experts_per_tok, moe_intermediate_size,
+                    shared_expert_intermediate_size);
+        }
         return true;
     }
 
@@ -188,8 +208,39 @@ struct Qwen35Config {
         return hidden_size + q_proj_dim() + kv_dim() * 2 + q_dim()
              + hidden_size * 3 + intermediate_size * 3;
     }
+
+    // MoE 额外 workspace 元素数 (bf16 words, 加到 ws_per_tok 上)
+    // 用于替代 dense MLP 的 3*is+hs 部分, 差额即 moe_extra
+    int moe_workspace_extra_t1() const {
+        if (!is_moe) return 0;
+        // MoE workspace after post_norm_out (per T=1):
+        //   router_logits[E] + indices[topk*2] + weights[topk*2]
+        //   + moe_acc[hs] + shared_gate/up/swiglu[3*shared_is] + gate_scalar[1]
+        //   + expert_gu[2*moe_is] + expert_swiglu[moe_is] + expert_out[hs]
+        // Dense MLP (already counted): 3*is + hs  (is==shared_is for MoE)
+        // Extra = MoE_total - dense_total
+        int moe_total = num_experts + num_experts_per_tok * 4
+                      + hidden_size + 3 * shared_expert_intermediate_size + 1
+                      + 2 * moe_intermediate_size + moe_intermediate_size + hidden_size;
+        int dense_total = 3 * intermediate_size + hidden_size;
+        return moe_total - dense_total;
+    }
 };
 
+
+// ============================================================================
+// MoE 权重集合: 路由器 + packed experts + 共享专家 + 共享专家门控
+// ============================================================================
+struct MoEWeights {
+    __nv_bfloat16* router_w = nullptr;              // [num_experts, hidden_size]
+    __nv_bfloat16* experts_gate_up_w = nullptr;     // [num_experts, 2*moe_is, hs] packed contiguous
+    __nv_bfloat16* experts_down_w = nullptr;        // [num_experts, hs, moe_is] packed contiguous
+    __nv_bfloat16* shared_gate_w = nullptr;          // [shared_is, hs]
+    __nv_bfloat16* shared_up_w = nullptr;            // [shared_is, hs]
+    __nv_bfloat16* shared_down_w = nullptr;          // [hs, shared_is]
+    __nv_bfloat16* shared_expert_gate_w = nullptr;   // [1, hs]
+    bool valid() const { return router_w != nullptr; }
+};
 
 // ============================================================================
 // NVFP4 量化权重: FP4 E2M1 packed + F8_E4M3 per-group scale + F32 global scale
@@ -320,6 +371,12 @@ public:
     void set_merged_fp4_gate_up(const QuantizedWeight& merged) {
         gate_up_qw_merged_ = merged;
     }
+
+    // MoE weights (replaces dense MLP when active)
+    MoEWeights moe_;
+    void set_moe_weights(const MoEWeights& moe) { moe_ = moe; }
+    bool is_moe() const { return moe_.valid(); }
+    const MoEWeights& get_moe() const { return moe_; }
 };
 
 // ============================================================================
@@ -447,6 +504,12 @@ public:
     void set_merged_fp4_qkv_z(const QuantizedWeight& merged) {
         qkv_z_qw_merged_ = merged;
     }
+
+    // MoE weights (replaces dense MLP when active)
+    MoEWeights moe_;
+    void set_moe_weights(const MoEWeights& moe) { moe_ = moe; }
+    bool is_moe() const { return moe_.valid(); }
+    const MoEWeights& get_moe() const { return moe_; }
 };
 
 // ============================================================================

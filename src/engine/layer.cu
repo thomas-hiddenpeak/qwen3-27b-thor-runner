@@ -111,6 +111,147 @@ static void run_mlp(
 }
 
 // ============================================================================
+// Helper: MoE MLP (Router + TopK Experts + Shared Expert + Gating)
+// 两种层类型共用 — 替代 run_mlp 当 is_moe() 为 true 时
+//
+// Workspace layout after post_norm_out[T*hs]:
+//   router_logits  [T * E]          bf16
+//   expert_indices [T * top_k]      int32
+//   expert_weights [T * top_k]      float32
+//   moe_acc        [T * hs]         bf16  -- 路由专家 + 共享专家的累加器
+//   shared_gate_out [T * shared_is] bf16
+//   shared_up_out   [T * shared_is] bf16
+//   shared_swiglu   [T * shared_is] bf16
+//   gate_scalar     [T]             bf16
+//   expert_gu       [2 * moe_is]    bf16  -- 复用 buffer (每次单 token)
+//   expert_swiglu   [moe_is]        bf16
+//   expert_out      [hs]            bf16
+// ============================================================================
+static void run_moe_mlp(
+    __nv_bfloat16* hidden_states,      // [T, hs] in-place residual
+    __nv_bfloat16* post_norm_out,      // [T, hs] workspace
+    __nv_bfloat16* moe_workspace,      // workspace starting after post_norm_out[T*hs]
+    const MoEWeights& moe,
+    const Qwen35Config& config,
+    float rms_norm_eps,
+    int num_tokens,
+    cudaStream_t stream,
+    const __nv_bfloat16* post_attn_norm_w = nullptr,
+    const __nv_bfloat16* residual_in = nullptr)
+{
+    const int hs        = config.hidden_size;
+    const int E         = config.num_experts;
+    const int top_k     = config.num_experts_per_tok;
+    const int moe_is    = config.moe_intermediate_size;
+    const int shared_is = config.shared_expert_intermediate_size;
+
+    // 1. Fused residual + post-attention RMSNorm
+    if (residual_in && post_attn_norm_w) {
+        ops::invoke_fused_add_rmsnorm(post_norm_out, hidden_states, residual_in,
+                                       post_attn_norm_w, rms_norm_eps,
+                                       num_tokens, hs, stream);
+    } else {
+        if (residual_in)
+            ops::invoke_add(hidden_states, hidden_states, residual_in, num_tokens * hs, stream);
+        if (post_attn_norm_w)
+            ops::invoke_rmsnorm(post_norm_out, hidden_states, post_attn_norm_w,
+                                rms_norm_eps, num_tokens, hs, stream);
+    }
+
+    // 2. Workspace pointer layout
+    __nv_bfloat16* router_logits = moe_workspace;
+    int*   expert_indices  = (int*)(router_logits + num_tokens * E);
+    float* expert_weights  = (float*)(expert_indices + num_tokens * top_k);
+    __nv_bfloat16* moe_acc = (__nv_bfloat16*)(expert_weights + num_tokens * top_k);
+    __nv_bfloat16* shared_gate_out = moe_acc + num_tokens * hs;
+    __nv_bfloat16* shared_up_out   = shared_gate_out + num_tokens * shared_is;
+    __nv_bfloat16* shared_swiglu_buf = shared_up_out + num_tokens * shared_is;
+    __nv_bfloat16* gate_scalar     = shared_swiglu_buf + num_tokens * shared_is;
+    // Fixed scratch (不随 T 缩放)
+    __nv_bfloat16* expert_gu       = gate_scalar + num_tokens;
+    __nv_bfloat16* expert_swiglu   = expert_gu + 2 * moe_is;
+    __nv_bfloat16* expert_out      = expert_swiglu + moe_is;
+
+    // 3. Router: [T, hs] × [hs, E] → [T, E]
+    if (num_tokens == 1) {
+        ops::invoke_dense_gemv(post_norm_out, moe.router_w, router_logits, E, hs, stream);
+    } else {
+        ops::invoke_dense_gemm(post_norm_out, moe.router_w, router_logits, num_tokens, E, hs, stream);
+    }
+
+    // 4. Top-K selection + Softmax normalization
+    ops::invoke_moe_router_topk(router_logits, expert_indices, expert_weights,
+                                 num_tokens, E, top_k, stream);
+
+    // 5. Copy routing decisions to CPU for expert dispatch
+    std::vector<int>   h_indices(num_tokens * top_k);
+    std::vector<float> h_weights(num_tokens * top_k);
+    cudaMemcpyAsync(h_indices.data(), expert_indices,
+                     num_tokens * top_k * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_weights.data(), expert_weights,
+                     num_tokens * top_k * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    // 6. Zero accumulator
+    cudaMemsetAsync(moe_acc, 0, num_tokens * hs * sizeof(__nv_bfloat16), stream);
+
+    // 7. Routed expert computation: per-token sequential GEMV
+    const size_t gu_stride = (size_t)2 * moe_is * hs;   // bf16 elements per expert gate_up
+    const size_t dn_stride = (size_t)hs * moe_is;       // bf16 elements per expert down
+    for (int t = 0; t < num_tokens; ++t) {
+        const __nv_bfloat16* token_in = post_norm_out + t * hs;
+        __nv_bfloat16* token_acc = moe_acc + t * hs;
+        for (int k = 0; k < top_k; ++k) {
+            int eidx = h_indices[t * top_k + k];
+            float w  = h_weights[t * top_k + k];
+            // Gate+Up: [1, hs] × expert_gate_up[eidx] → [1, 2*moe_is]
+            const __nv_bfloat16* egu_w = moe.experts_gate_up_w + eidx * gu_stride;
+            ops::invoke_dense_gemv(token_in, egu_w, expert_gu, 2 * moe_is, hs, stream);
+            // SwiGLU: [1, 2*moe_is] → [1, moe_is]
+            ops::invoke_swiglu_merged(expert_swiglu, expert_gu, 1, moe_is, stream);
+            // Down: [1, moe_is] × expert_down[eidx] → [1, hs]
+            const __nv_bfloat16* edn_w = moe.experts_down_w + eidx * dn_stride;
+            ops::invoke_dense_gemv(expert_swiglu, edn_w, expert_out, hs, moe_is, stream);
+            // Weighted accumulate
+            ops::invoke_scale_add(token_acc, expert_out, w, hs, stream);
+        }
+    }
+
+    // 8. Shared expert MLP: gate + up + SwiGLU
+    if (num_tokens == 1) {
+        ops::invoke_dense_dual_gemv(post_norm_out, moe.shared_gate_w, moe.shared_up_w,
+                                     shared_gate_out, shared_up_out, shared_is, hs, stream);
+    } else {
+        ops::invoke_dense_gemm(post_norm_out, moe.shared_gate_w, shared_gate_out,
+                                num_tokens, shared_is, hs, stream);
+        ops::invoke_dense_gemm(post_norm_out, moe.shared_up_w, shared_up_out,
+                                num_tokens, shared_is, hs, stream);
+    }
+    ops::invoke_swiglu(shared_swiglu_buf, shared_gate_out, shared_up_out,
+                        num_tokens, shared_is, stream);
+
+    // 9. Shared expert gate scalar: [T, hs] × [hs, 1] → [T, 1]
+    if (num_tokens == 1) {
+        ops::invoke_dense_gemv(post_norm_out, moe.shared_expert_gate_w,
+                                gate_scalar, 1, hs, stream);
+    } else {
+        ops::invoke_dense_gemm(post_norm_out, moe.shared_expert_gate_w,
+                                gate_scalar, num_tokens, 1, hs, stream);
+    }
+
+    // 10. Shared expert down + gated add (per-token: expert_out only [hs])
+    for (int t = 0; t < num_tokens; ++t) {
+        ops::invoke_dense_gemv(shared_swiglu_buf + t * shared_is, moe.shared_down_w,
+                                expert_out, hs, shared_is, stream);
+        ops::invoke_sigmoid_gated_add(moe_acc + t * hs, expert_out,
+                                       gate_scalar + t, hs, stream);
+    }
+
+    // 11. Final residual: hidden_states += moe_acc
+    ops::invoke_add(hidden_states, hidden_states, moe_acc, num_tokens * hs, stream);
+}
+
+// ============================================================================
 // Qwen35FullAttnLayer
 // ============================================================================
 Qwen35FullAttnLayer::Qwen35FullAttnLayer(const Qwen35Config& config, int layer_idx)
@@ -413,15 +554,21 @@ void Qwen35FullAttnLayer::forward(
         ops::invoke_dense_gemm(attn_out, o_proj_w_, o_proj_out, num_tokens, hs, q_dim, stream);
     }
 
-    // 8+9. Residual + MLP (RMSNorm + Gate/Up + SiLU + Down + Residual)
-    run_mlp(hidden_states, post_norm_out, gate_buf, up_out, swiglu_out, down_out,
-            gate_proj_w_, up_proj_w_, down_proj_w_,
-            config_.rms_norm_eps, num_tokens, hs, is, stream,
-            post_attention_layernorm_w_, o_proj_out,
-            quantized_ ? &gate_qw_ : nullptr,
-            quantized_ ? &up_qw_ : nullptr,
-            quantized_ ? &down_qw_ : nullptr,
-            quantized_ ? &gate_up_qw_merged_ : nullptr);
+    // 8+9. Residual + MLP
+    if (is_moe()) {
+        run_moe_mlp(hidden_states, post_norm_out, post_norm_out + num_tokens * hs,
+                    moe_, config_, config_.rms_norm_eps, num_tokens, stream,
+                    post_attention_layernorm_w_, o_proj_out);
+    } else {
+        run_mlp(hidden_states, post_norm_out, gate_buf, up_out, swiglu_out, down_out,
+                gate_proj_w_, up_proj_w_, down_proj_w_,
+                config_.rms_norm_eps, num_tokens, hs, is, stream,
+                post_attention_layernorm_w_, o_proj_out,
+                quantized_ ? &gate_qw_ : nullptr,
+                quantized_ ? &up_qw_ : nullptr,
+                quantized_ ? &down_qw_ : nullptr,
+                quantized_ ? &gate_up_qw_merged_ : nullptr);
+    }
 }
 
 // ============================================================================
@@ -620,15 +767,21 @@ void Qwen35LinearAttnLayer::forward(
         ops::invoke_dense_gemm(y_ssm, out_proj_w_, out_proj_buf, num_tokens, hs, lin_v, stream);
     }
 
-    // 10+11. Residual + MLP (RMSNorm + Gate/Up + SiLU + Down + Residual)
-    run_mlp(hidden_states, post_norm_out, gate_out, up_out, swiglu_out, down_out,
-            gate_proj_w_, up_proj_w_, down_proj_w_,
-            config_.rms_norm_eps, num_tokens, hs, is, stream,
-            post_attention_layernorm_w_, out_proj_buf,
-            quantized_ ? &gate_qw_ : nullptr,
-            quantized_ ? &up_qw_ : nullptr,
-            quantized_ ? &down_qw_ : nullptr,
-            quantized_ ? &gate_up_qw_merged_ : nullptr);
+    // 10+11. Residual + MLP
+    if (is_moe()) {
+        run_moe_mlp(hidden_states, post_norm_out, post_norm_out + num_tokens * hs,
+                    moe_, config_, config_.rms_norm_eps, num_tokens, stream,
+                    post_attention_layernorm_w_, out_proj_buf);
+    } else {
+        run_mlp(hidden_states, post_norm_out, gate_out, up_out, swiglu_out, down_out,
+                gate_proj_w_, up_proj_w_, down_proj_w_,
+                config_.rms_norm_eps, num_tokens, hs, is, stream,
+                post_attention_layernorm_w_, out_proj_buf,
+                quantized_ ? &gate_qw_ : nullptr,
+                quantized_ ? &up_qw_ : nullptr,
+                quantized_ ? &down_qw_ : nullptr,
+                quantized_ ? &gate_up_qw_merged_ : nullptr);
+    }
 }
 
 // ============================================================================

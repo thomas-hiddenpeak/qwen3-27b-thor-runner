@@ -1586,5 +1586,124 @@ void invoke_swiglu_merged(__nv_bfloat16* out, const __nv_bfloat16* merged_gateup
         out, merged_gateup, num_tokens, intermediate_size);
 }
 
+// ============================================================================
+// MoE Router Top-K: logits [T, E] → top_k indices + softmax weights per token
+// ============================================================================
+__global__ void moe_router_topk_kernel(
+    const __nv_bfloat16* __restrict__ logits,  // [T, E]
+    int* __restrict__ expert_indices,           // [T, top_k]
+    float* __restrict__ expert_weights,         // [T, top_k]
+    int num_experts, int top_k)
+{
+    int t = blockIdx.x;  // token index
+    const __nv_bfloat16* row = logits + t * num_experts;
+    int* out_idx = expert_indices + t * top_k;
+    float* out_wt = expert_weights + t * top_k;
+
+    // Load all logits into registers/local mem (E ≤ 256, fits easily)
+    // Use thread 0 to do sequential top-k (E is small)
+    if (threadIdx.x != 0) return;
+
+    // Initialize top-k with -inf
+    float top_vals[16];  // max top_k = 16
+    int top_ids[16];
+    for (int k = 0; k < top_k; k++) {
+        top_vals[k] = -1e30f;
+        top_ids[k] = 0;
+    }
+
+    // Scan all experts, maintain top-k
+    for (int e = 0; e < num_experts; e++) {
+        float val = __bfloat162float(row[e]);
+        // Check if this value is larger than the smallest in top-k
+        int min_k = 0;
+        float min_val = top_vals[0];
+        for (int k = 1; k < top_k; k++) {
+            if (top_vals[k] < min_val) {
+                min_val = top_vals[k];
+                min_k = k;
+            }
+        }
+        if (val > min_val) {
+            top_vals[min_k] = val;
+            top_ids[min_k] = e;
+        }
+    }
+
+    // Softmax normalization over selected top-k logits
+    float max_val = top_vals[0];
+    for (int k = 1; k < top_k; k++)
+        max_val = fmaxf(max_val, top_vals[k]);
+    float sum_exp = 0.f;
+    for (int k = 0; k < top_k; k++) {
+        top_vals[k] = expf(top_vals[k] - max_val);
+        sum_exp += top_vals[k];
+    }
+    float inv_sum = 1.f / sum_exp;
+    for (int k = 0; k < top_k; k++) {
+        out_idx[k] = top_ids[k];
+        out_wt[k] = top_vals[k] * inv_sum;
+    }
+}
+
+void invoke_moe_router_topk(const __nv_bfloat16* logits, int* expert_indices,
+                             float* expert_weights, int num_tokens,
+                             int num_experts, int top_k, cudaStream_t stream)
+{
+    // Each token is one block, single thread does top-k (E ≤ 256)
+    moe_router_topk_kernel<<<num_tokens, 1, 0, stream>>>(
+        logits, expert_indices, expert_weights, num_experts, top_k);
+}
+
+// ============================================================================
+// Scaled accumulate: out[i] += scale * in[i]
+// ============================================================================
+__global__ void scale_add_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ in,
+    float scale, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float val = __bfloat162float(out[idx]) + scale * __bfloat162float(in[idx]);
+    out[idx] = __float2bfloat16(val);
+}
+
+void invoke_scale_add(__nv_bfloat16* out, const __nv_bfloat16* in, float scale,
+                      int n, cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    scale_add_kernel<<<blocks, threads, 0, stream>>>(out, in, scale, n);
+}
+
+// ============================================================================
+// Sigmoid-gated accumulate: out[i] += sigmoid(gate[0]) * in[i]
+// gate_scalar is a single BF16 value on device
+// ============================================================================
+__global__ void sigmoid_gated_add_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ in,
+    const __nv_bfloat16* __restrict__ gate_scalar,
+    int n)
+{
+    float gate = __bfloat162float(gate_scalar[0]);
+    float sig = 1.f / (1.f + expf(-gate));
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float val = __bfloat162float(out[idx]) + sig * __bfloat162float(in[idx]);
+    out[idx] = __float2bfloat16(val);
+}
+
+void invoke_sigmoid_gated_add(__nv_bfloat16* out, const __nv_bfloat16* in,
+                               const __nv_bfloat16* gate_scalar, int n,
+                               cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    sigmoid_gated_add_kernel<<<blocks, threads, 0, stream>>>(out, in, gate_scalar, n);
+}
+
 } // namespace ops
 } // namespace qwen_thor

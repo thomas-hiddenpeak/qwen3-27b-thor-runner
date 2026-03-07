@@ -145,6 +145,12 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
 
     size_t ws_full   = (size_t)(4*hs + qp_dim + q_dim + 2*kv_dim + 3*is);
     size_t ws_linear = (size_t)(hs + in_qkv + lin_v + nkh + qk + lin_v + hs + hs + 3*is + hs + nkh*2);
+    // MoE layers need extra workspace for router/experts/shared_expert buffers
+    if (config_.is_moe) {
+        int moe_extra = config_.moe_workspace_extra_t1();
+        ws_full   += moe_extra;
+        ws_linear += moe_extra;
+    }
     size_t ws_per_tok = std::max(ws_full, ws_linear);
     cudaMalloc(&d_workspace_, ws_per_tok * max_tokens * sizeof(__nv_bfloat16));
 
