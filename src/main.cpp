@@ -96,10 +96,15 @@ static void print_usage() {
     printf("    --no-stats            Disable performance statistics display\n\n");
     printf("  Bench Options:\n");
     printf("    --warmup <N>          Warmup decode steps (default: 5)\n");
-    printf("    --decode <N>          Measured decode steps (default: 30)\n");
-    printf("    --prompt-len <N>      Prompt length in tokens (default: 64)\n");
-    printf("    --batch <N>           Batch size (default: 1)\n");
+    printf("    --decode <N>          Measured decode steps (default: 50)\n");
+    printf("    --prompt-len <N[,N]>  Prompt length(s), comma-separated (default: 17)\n");
+    printf("    --batch <N[,N]>       Batch size(s), comma-separated (default: 1)\n");
+    printf("    --iterations <N>      Independent iterations per config (default: 1)\n");
+    printf("    --prefill-repeat <N>  Prefill repeats per iteration (default: 3)\n");
+    printf("    --json <FILE>         Output structured JSON results\n");
     printf("    --csv                 Output in CSV format\n");
+    printf("    --per-step            Print per-step timing details\n");
+    printf("    --no-graph            Disable CUDA Graph for per-phase timing\n");
     printf("    --nsys                Enable NVTX annotations for nsys profiling\n\n");
     printf("  Examples:\n");
     printf("    # Start API server with 8GB KV cache + SSD caching\n");
@@ -108,8 +113,10 @@ static void print_usage() {
     printf("    qwen3-27b-thor chat --kv-cache-gb 4\n\n");
     printf("    # Load from unified config file\n");
     printf("    qwen3-27b-thor serve --config configs/config.conf\n\n");
-    printf("    # Run benchmarks\n");
-    printf("    qwen3-27b-thor bench --decode 50 --prompt-len 512 --batch 4\n\n");
+    printf("    # Run benchmarks (single config, backward-compatible)\n");
+    printf("    qwen3-27b-thor bench --decode 50 --no-graph\n\n");
+    printf("    # Parameter sweep with JSON output\n");
+    printf("    qwen3-27b-thor bench --batch 1,2,4 --prompt-len 64,256 --iterations 3 --json results.json\n\n");
     printf("    # SM110a hardware primitives probe\n");
     printf("    qwen3-27b-thor probe\n\n");
 }
