@@ -176,13 +176,21 @@ private:
     bool quantized_ = false;
     // Self-Attention 投影 (q/k/v/o)
     QuantizedWeight q_qw_, k_qw_, v_qw_, o_qw_;
+    // 合并后的 FP4 QKV 投影 (同层 Q/K/V global_scale 相同 → 可直接 concat)
+    QuantizedWeight qkv_qw_merged_;  // [qp_dim+kv_dim*2, K]
     // MLP 投影 (gate/up/down)
     QuantizedWeight gate_qw_, up_qw_, down_qw_;
+    // 合并后的 FP4 Gate+Up 投影 (同层 gate/up global_scale 相同)
+    QuantizedWeight gate_up_qw_merged_;  // [2*is, K]
 
 public:
     bool is_quantized() const { return quantized_; }
+    QuantizedWeight& get_q_qw() { return q_qw_; }
+    QuantizedWeight& get_k_qw() { return k_qw_; }
+    QuantizedWeight& get_v_qw() { return v_qw_; }
+    QuantizedWeight& get_gate_qw() { return gate_qw_; }
+    QuantizedWeight& get_up_qw() { return up_qw_; }
 
-    // 设置量化自注意力权重 (不合并 QKV — global_scale 各不同)
     void set_quantized_attn(
         const QuantizedWeight& q, const QuantizedWeight& k,
         const QuantizedWeight& v, const QuantizedWeight& o) {
@@ -190,11 +198,20 @@ public:
         q_qw_ = q; k_qw_ = k; v_qw_ = v; o_qw_ = o;
     }
 
-    // 设置量化 MLP 权重 (不合并 gate+up — global_scale 各不同)
     void set_quantized_mlp(
         const QuantizedWeight& gate, const QuantizedWeight& up,
         const QuantizedWeight& down) {
         gate_qw_ = gate; up_qw_ = up; down_qw_ = down;
+    }
+
+    // FP4 QKV 合并: Q[qp,K] + K[kv,K] + V[kv,K] → [qp+kv*2, K]
+    void set_merged_fp4_qkv(const QuantizedWeight& merged) {
+        qkv_qw_merged_ = merged;
+    }
+
+    // FP4 Gate+Up 合并: gate[is,K] + up[is,K] → [2*is, K]
+    void set_merged_fp4_gate_up(const QuantizedWeight& merged) {
+        gate_up_qw_merged_ = merged;
     }
 };
 
@@ -283,6 +300,8 @@ private:
 
 public:
     bool is_quantized() const { return quantized_; }
+    QuantizedWeight& get_gate_qw() { return gate_qw_; }
+    QuantizedWeight& get_up_qw() { return up_qw_; }
 
     void set_quantized_mlp(
         const QuantizedWeight& gate, const QuantizedWeight& up,
@@ -296,6 +315,12 @@ public:
         gate_up_merged_w_ = merged;
         gate_proj_w_ = merged;
         up_proj_w_ = merged + (size_t)config_.intermediate_size * config_.hidden_size;
+    }
+
+    // FP4 Gate+Up 合并 (merge packed+scale, 共享 global_scale)
+    QuantizedWeight gate_up_qw_merged_;
+    void set_merged_fp4_gate_up(const QuantizedWeight& merged) {
+        gate_up_qw_merged_ = merged;
     }
 };
 

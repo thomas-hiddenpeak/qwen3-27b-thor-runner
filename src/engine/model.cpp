@@ -286,7 +286,60 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
                 auto kit = tensor_map.find(p + "self_attn.k_proj.weight");
                 auto vit = tensor_map.find(p + "self_attn.v_proj.weight");
                 if (qit == tensor_map.end() || kit == tensor_map.end() || vit == tensor_map.end()) {
-                    // NVFP4: self-attn projections are quantized, skip QKV merge
+                    // NVFP4: self-attn projections are quantized — merge FP4 QKV instead
+                    auto* fa = layers_[i].get_full_attn();
+                    if (fa->is_quantized()) {
+                        auto& qq = fa->get_q_qw();
+                        auto& kq = fa->get_k_qw();
+                        auto& vq = fa->get_v_qw();
+                        if (qq.valid() && kq.valid() && vq.valid()) {
+                            int merged_N = qq.N + kq.N + vq.N;  // 14336
+                            int K = qq.K;
+                            // Concat packed [N, K/2]
+                            size_t pk_bytes = (size_t)merged_N * (K / 2);
+                            uint8_t* merged_packed = nullptr;
+                            cudaMalloc(&merged_packed, pk_bytes);
+                            cudaMemcpy(merged_packed,
+                                       qq.packed, (size_t)qq.N * (K / 2), cudaMemcpyDeviceToDevice);
+                            cudaMemcpy(merged_packed + (size_t)qq.N * (K / 2),
+                                       kq.packed, (size_t)kq.N * (K / 2), cudaMemcpyDeviceToDevice);
+                            cudaMemcpy(merged_packed + (size_t)(qq.N + kq.N) * (K / 2),
+                                       vq.packed, (size_t)vq.N * (K / 2), cudaMemcpyDeviceToDevice);
+                            // Concat scale [N, K/16]
+                            size_t sc_bytes = (size_t)merged_N * (K / 16);
+                            uint8_t* merged_scale = nullptr;
+                            cudaMalloc(&merged_scale, sc_bytes);
+                            cudaMemcpy(merged_scale,
+                                       qq.scale, (size_t)qq.N * (K / 16), cudaMemcpyDeviceToDevice);
+                            cudaMemcpy(merged_scale + (size_t)qq.N * (K / 16),
+                                       kq.scale, (size_t)kq.N * (K / 16), cudaMemcpyDeviceToDevice);
+                            cudaMemcpy(merged_scale + (size_t)(qq.N + kq.N) * (K / 16),
+                                       vq.scale, (size_t)vq.N * (K / 16), cudaMemcpyDeviceToDevice);
+
+                            core::QuantizedWeight merged_qw;
+                            merged_qw.packed = merged_packed;
+                            merged_qw.scale = merged_scale;
+                            merged_qw.global_scale = qq.global_scale;  // same for Q/K/V
+                            merged_qw.N = merged_N;
+                            merged_qw.K = K;
+                            fa->set_merged_fp4_qkv(merged_qw);
+
+                            // Release original separate buffers
+                            cudaFree(qq.packed); cudaFree(qq.scale);
+                            cudaFree(kq.packed); cudaFree(kq.scale);
+                            cudaFree(vq.packed); cudaFree(vq.scale);
+                            kq.packed = nullptr; kq.scale = nullptr;
+                            vq.packed = nullptr; vq.scale = nullptr;
+                            qq.packed = merged_packed;
+                            qq.scale = merged_scale;
+                            qq.N = merged_N;  // q_qw_ now aliases merged
+
+                            // Track new allocations
+                            device_weights_.push_back(merged_packed);
+                            device_weights_.push_back(merged_scale);
+                            merged_total += pk_bytes + sc_bytes;
+                        }
+                    }
                     continue;
                 }
                 __nv_bfloat16* q_w = qit->second;
@@ -352,7 +405,66 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
             std::string p = "model.language_model.layers." + std::to_string(i) + ".";
             __nv_bfloat16* gate_w = tensor_map[p + "mlp.gate_proj.weight"];
             __nv_bfloat16* up_w   = tensor_map[p + "mlp.up_proj.weight"];
-            if (!gate_w || !up_w) continue;
+            if (!gate_w || !up_w) {
+                // NVFP4: merge FP4 gate+up packed+scale
+                core::QuantizedWeight* gq = nullptr;
+                core::QuantizedWeight* uq = nullptr;
+                if (config_.is_full_attention(i)) {
+                    auto* fa = layers_[i].get_full_attn();
+                    gq = &fa->get_gate_qw();
+                    uq = &fa->get_up_qw();
+                } else {
+                    auto* la = layers_[i].get_linear_attn();
+                    gq = &la->get_gate_qw();
+                    uq = &la->get_up_qw();
+                }
+                if (gq->valid() && uq->valid()) {
+                    int merged_N = gq->N + uq->N;  // 2*is
+                    int K = gq->K;
+                    // Concat packed [N, K/2]
+                    size_t pk_bytes = (size_t)merged_N * (K / 2);
+                    uint8_t* merged_packed = nullptr;
+                    cudaMalloc(&merged_packed, pk_bytes);
+                    cudaMemcpy(merged_packed,
+                               gq->packed, (size_t)gq->N * (K / 2), cudaMemcpyDeviceToDevice);
+                    cudaMemcpy(merged_packed + (size_t)gq->N * (K / 2),
+                               uq->packed, (size_t)uq->N * (K / 2), cudaMemcpyDeviceToDevice);
+                    // Concat scale [N, K/16]
+                    size_t sc_bytes = (size_t)merged_N * (K / 16);
+                    uint8_t* merged_scale = nullptr;
+                    cudaMalloc(&merged_scale, sc_bytes);
+                    cudaMemcpy(merged_scale,
+                               gq->scale, (size_t)gq->N * (K / 16), cudaMemcpyDeviceToDevice);
+                    cudaMemcpy(merged_scale + (size_t)gq->N * (K / 16),
+                               uq->scale, (size_t)uq->N * (K / 16), cudaMemcpyDeviceToDevice);
+
+                    core::QuantizedWeight merged_qw;
+                    merged_qw.packed = merged_packed;
+                    merged_qw.scale = merged_scale;
+                    merged_qw.global_scale = gq->global_scale;
+                    merged_qw.N = merged_N;
+                    merged_qw.K = K;
+
+                    if (config_.is_full_attention(i)) {
+                        layers_[i].get_full_attn()->set_merged_fp4_gate_up(merged_qw);
+                    } else {
+                        layers_[i].get_linear_attn()->set_merged_fp4_gate_up(merged_qw);
+                    }
+
+                    // Release original separate buffers
+                    cudaFree(gq->packed); cudaFree(gq->scale);
+                    cudaFree(uq->packed); cudaFree(uq->scale);
+                    uq->packed = nullptr; uq->scale = nullptr;
+                    gq->packed = merged_packed;
+                    gq->scale = merged_scale;
+                    gq->N = merged_N;
+
+                    device_weights_.push_back(merged_packed);
+                    device_weights_.push_back(merged_scale);
+                    gate_up_total += pk_bytes + sc_bytes;
+                }
+                continue;
+            }
 
             int is = config_.intermediate_size;
             int hs = config_.hidden_size;

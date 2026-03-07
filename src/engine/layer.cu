@@ -40,7 +40,8 @@ static void run_mlp(
     const __nv_bfloat16* residual_in = nullptr,
     const QuantizedWeight* gate_qw = nullptr,
     const QuantizedWeight* up_qw = nullptr,
-    const QuantizedWeight* down_qw = nullptr)
+    const QuantizedWeight* down_qw = nullptr,
+    const QuantizedWeight* gate_up_qw_merged = nullptr)
 {
     // 可选: fused residual + RMSNorm (单 kernel 替代 add + rmsnorm)
     if (residual_in && post_attn_norm_w) {
@@ -59,18 +60,28 @@ static void run_mlp(
 
     // Gate + Up projections: [T, hs] × [hs, is] → [T, is] (各一次)
     bool use_fp4 = (gate_qw && gate_qw->valid());
+    bool fp4_merged = (gate_up_qw_merged && gate_up_qw_merged->valid());
     if (num_tokens == 1) {
-        if (use_fp4) {
+        if (fp4_merged) {
+            // Merged FP4 gate+up: single GEMV → [2*is], then fused SwiGLU
+            ops::invoke_fp4_gemv(post_norm_out, *gate_up_qw_merged, gate_out, stream);
+            ops::invoke_swiglu_merged(swiglu_out, gate_out, 1, is, stream);
+        } else if (use_fp4) {
             ops::invoke_fp4_dual_gemv(post_norm_out, *gate_qw, *up_qw,
                                       gate_out, up_out, stream);
+            ops::invoke_swiglu(swiglu_out, gate_out, up_out, 1, is, stream);
         } else {
             // Decode 路径: dual GEMV — 1 kernel 同时完成 gate + up, A 只加载一次
             ops::invoke_dense_dual_gemv(post_norm_out, gate_proj_w, up_proj_w,
                                          gate_out, up_out, is, hs, stream);
+            ops::invoke_swiglu(swiglu_out, gate_out, up_out, 1, is, stream);
         }
-        ops::invoke_swiglu(swiglu_out, gate_out, up_out, 1, is, stream);
+    } else if (fp4_merged) {
+        // T>1 merged FP4 gate+up: single GEMM → [T, 2*is], then fused SwiGLU
+        ops::invoke_fp4_gemm(post_norm_out, *gate_up_qw_merged, gate_out, num_tokens, stream);
+        ops::invoke_swiglu_merged(swiglu_out, gate_out, num_tokens, is, stream);
     } else if (use_fp4) {
-        // T>1 FP4 GEMM path (no gate+up merge)
+        // T>1 non-merged FP4: separate gate + up GEMM
         ops::invoke_fp4_gemm(post_norm_out, *gate_qw, gate_out, num_tokens, stream);
         ops::invoke_fp4_gemm(post_norm_out, *up_qw,   up_out,   num_tokens, stream);
         ops::invoke_swiglu(swiglu_out, gate_out, up_out, num_tokens, is, stream);
@@ -177,17 +188,32 @@ void Qwen35FullAttnLayer::forward(
     //   T>1: Separate RMSNorm + GEMM
     //   NVFP4: Separate RMSNorm + individual FP4 GEMV/GEMM (no merge)
     if (quantized_) {
-        // NVFP4 path: separate RMSNorm, then individual FP4 GEMV/GEMM for Q/K/V
+        // NVFP4 path: separate RMSNorm, then FP4 QKV projection
         ops::invoke_rmsnorm(norm_out, hidden_states, input_layernorm_w_,
                             config_.rms_norm_eps, num_tokens, hs, stream);
-        if (num_tokens == 1) {
-            ops::invoke_fp4_gemv(norm_out, q_qw_, qg_proj, stream);
-            ops::invoke_fp4_gemv(norm_out, k_qw_, k,       stream);
-            ops::invoke_fp4_gemv(norm_out, v_qw_, v,       stream);
+        if (qkv_qw_merged_.valid()) {
+            // Merged FP4 QKV: [qp_dim+kv_dim*2, hs] single GEMV/GEMM
+            if (num_tokens == 1) {
+                // T=1: qg_proj→k→v contiguous in workspace, single GEMV fills all
+                ops::invoke_fp4_gemv(norm_out, qkv_qw_merged_, qg_proj, stream);
+            } else {
+                // T>1: GEMM into temp (gate_buf), then deinterleave to qg_proj/k/v
+                int merged_N = qp_dim + kv_dim * 2;
+                ops::invoke_fp4_gemm(norm_out, qkv_qw_merged_, gate_buf, num_tokens, stream);
+                ops::invoke_deinterleave_gemm_3way(qg_proj, k, v, gate_buf,
+                    num_tokens, merged_N, qp_dim, qp_dim + kv_dim, stream);
+            }
         } else {
-            ops::invoke_fp4_gemm(norm_out, q_qw_, qg_proj, num_tokens, stream);
-            ops::invoke_fp4_gemm(norm_out, k_qw_, k,       num_tokens, stream);
-            ops::invoke_fp4_gemm(norm_out, v_qw_, v,       num_tokens, stream);
+            // Non-merged FP4: separate Q/K/V
+            if (num_tokens == 1) {
+                ops::invoke_fp4_gemv(norm_out, q_qw_, qg_proj, stream);
+                ops::invoke_fp4_gemv(norm_out, k_qw_, k,       stream);
+                ops::invoke_fp4_gemv(norm_out, v_qw_, v,       stream);
+            } else {
+                ops::invoke_fp4_gemm(norm_out, q_qw_, qg_proj, num_tokens, stream);
+                ops::invoke_fp4_gemm(norm_out, k_qw_, k,       num_tokens, stream);
+                ops::invoke_fp4_gemm(norm_out, v_qw_, v,       num_tokens, stream);
+            }
         }
     } else if (num_tokens == 1 && qkv_merged_w_) {
         ops::invoke_dense_gemv_with_rmsnorm(
@@ -394,7 +420,8 @@ void Qwen35FullAttnLayer::forward(
             post_attention_layernorm_w_, o_proj_out,
             quantized_ ? &gate_qw_ : nullptr,
             quantized_ ? &up_qw_ : nullptr,
-            quantized_ ? &down_qw_ : nullptr);
+            quantized_ ? &down_qw_ : nullptr,
+            quantized_ ? &gate_up_qw_merged_ : nullptr);
 }
 
 // ============================================================================
@@ -564,7 +591,8 @@ void Qwen35LinearAttnLayer::forward(
             post_attention_layernorm_w_, out_proj_buf,
             quantized_ ? &gate_qw_ : nullptr,
             quantized_ ? &up_qw_ : nullptr,
-            quantized_ ? &down_qw_ : nullptr);
+            quantized_ ? &down_qw_ : nullptr,
+            quantized_ ? &gate_up_qw_merged_ : nullptr);
 }
 
 // ============================================================================
