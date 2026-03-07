@@ -201,12 +201,17 @@ struct Qwen35Config {
         return (linear_num_value_heads / linear_num_key_heads) * linear_value_head_dim;
     }
 
+    // gate_buf 同时用于 dense MLP gate 输出 [is] 和 attn_gate [q_dim]
+    // MoE 模型: is=512 远小于 q_dim=4096, 必须取 max 防止 attn_gate 溢出到 up_out
+    // (T>1 时 chunked/prefill attention 用 up_out 当 workspace, 会覆盖溢出的 attn_gate)
+    int gate_buf_size() const { return std::max(intermediate_size, q_dim()); }
+
     // FullAttn 层 T=1 workspace 元素数 (bf16)
     // norm_out[hs] + qg_proj[qp_dim] + k[kv_dim] + v[kv_dim] + attn_out[q_dim]
-    // + o_proj_out[hs] + post_norm_out[hs] + gate_buf[is] + up_out[is] + swiglu_out[is] + down_out[hs]
+    // + o_proj_out[hs] + post_norm_out[hs] + gate_buf[gate_buf_size] + up_out[is] + swiglu_out[is] + down_out[hs]
     int full_attn_workspace_elems_t1() const {
         return hidden_size + q_proj_dim() + kv_dim() * 2 + q_dim()
-             + hidden_size * 3 + intermediate_size * 3;
+             + hidden_size * 3 + gate_buf_size() + intermediate_size * 2;
     }
 
     // MoE 额外 workspace 元素数 (bf16 words, 加到 ws_per_tok 上)
@@ -222,7 +227,7 @@ struct Qwen35Config {
         int moe_total = num_experts + num_experts_per_tok * 4
                       + hidden_size + 3 * shared_expert_intermediate_size + 1
                       + 2 * moe_intermediate_size + moe_intermediate_size + hidden_size;
-        int dense_total = 3 * intermediate_size + hidden_size;
+        int dense_total = gate_buf_size() + intermediate_size * 2 + hidden_size;
         return moe_total - dense_total;
     }
 };

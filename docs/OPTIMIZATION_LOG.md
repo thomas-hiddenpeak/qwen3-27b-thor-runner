@@ -4193,4 +4193,58 @@ Jetson ATS 统一内存的 coherence protocol 在 managed memory 上额外开销
 - [ ] FP4 QKV merge (需处理不同 global_scale)
 - [ ] FP4 Dual GEMV gate+up 效率验证
 
+---
+
+## MoE MTP Buffer Overflow 修复 (2025-07-11)
+
+### 问题
+
+MoE 模型 (Qwen3.5-35B-A3B) 的 MTP 投机解码完全失效, 接受率 0%, 纯开销导致性能退化。
+
+**修复前 MTP sweep (MoE B=1)**:
+
+| MTP | tok/s | Accept Rate | Avg tok/step |
+|-----|-------|-------------|--------------|
+| OFF | 20.0 | - | 1.0 |
+| d=1 | 14.3 | 0% | 1.0 |
+| d=2 | 11.3 | 0% | 1.0 |
+| d=3 | 9.4 | 0% | 1.0 |
+
+### 根因分析
+
+`FullAttnLayer::forward()` 的 workspace 布局中, `gate_buf` 被双用:
+1. MLP 阶段: 存 gate activation `[T, intermediate_size]`
+2. Attention 阶段: 存 `attn_gate` (GQA sigmoid gating) `[T, q_dim]`
+
+对于稠密模型: `intermediate_size=17408 > q_dim=6144`, gate_buf 足够大, 不溢出。
+
+对于 MoE 模型: `intermediate_size=512` (shared_expert) 但 `q_dim=4096` (16 heads × 256 dim), **attn_gate 需要 4096 元素但只有 512 的空间**, 溢出 3584 元素到相邻的 `up_out` buffer。
+
+- T=1 decode: paged attention 不使用 `up_out` 作 workspace → 溢出数据未被覆盖 → decode 正常
+- T>1 (MTP verify, T=N+1): chunked prefill attention 使用 `up_out` → 覆盖溢出数据 → `sigmoid_mul(attn_out, attn_gate)` 读取损坏数据 → garbage hidden states → 所有 draft token 被拒绝
+
+### 修复
+
+引入 `gate_buf_size() = max(intermediate_size, q_dim())`:
+- [layer.h](../src/engine/layer.h): 新增 `gate_buf_size()`, 更新 `full_attn_workspace_elems_t1()` 和 `moe_workspace_extra_t1()`
+- [layer.cu](../src/engine/layer.cu): `up_out = gate_buf + T * gate_buf_sz` (原为 `T * is`)
+- [engine.cpp](../src/engine/engine.cpp): workspace 分配使用 `gate_bs` 替代 `is`
+
+对稠密模型: `gate_buf_size() = max(17408, 6144) = 17408`, 行为不变。
+
+### 修复后 MTP sweep (MoE B=1)
+
+| MTP | tok/s (avg) | Accept Rate | Avg tok/step | vs OFF |
+|-----|-------------|-------------|--------------|--------|
+| OFF | 18.8 | - | 1.0 | baseline |
+| d=1 | **22.1** | **73%** | 1.71 | **+17.6%** |
+| d=2 | 21.7 | 59% | 2.15 | +15.4% |
+| d=3 | 18.5 | 41% | 2.22 | -1.6% |
+
+**关键结论**:
+- d=1 为 MoE 最佳配置: 73% 接受率, +17.6% 加速
+- d=2 略逊于 d=1: 虽然 avg tok/step 更高 (2.15 vs 1.71), 但额外 draft/verify 的 MoE routing 开销抵消了收益
+- d=3 对 MoE 模型无收益: 256-expert routing 在 draft chain 中开销过大
+- 与稠密模型对比: 稠密模型 d=3 最优 (draft 开销低), MoE 模型 d=1 最优 (draft 开销高)
+
 **累计 MTP 提速**: +51% (5.1 → 7.7-7.8 tok/s)

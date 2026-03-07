@@ -313,6 +313,10 @@ void Qwen35FullAttnLayer::forward(
     const int hd       = config_.head_dim;
     const int rot_d    = config_.rope_rotary_dim;
 
+    // gate_buf 同时存放 attn_gate [q_dim] 和 dense MLP gate [is]
+    // MoE 模型 is << q_dim, 用 gate_buf_size = max(is, q_dim) 防止溢出到 up_out
+    const int gate_buf_sz = config_.gate_buf_size();
+
     __nv_bfloat16* norm_out      = workspace;
     __nv_bfloat16* qg_proj       = norm_out   + num_tokens * hs;     // [T, 2*q_dim] = Q + Gate
     __nv_bfloat16* k             = qg_proj    + num_tokens * qp_dim;
@@ -320,8 +324,8 @@ void Qwen35FullAttnLayer::forward(
     __nv_bfloat16* attn_out      = v          + num_tokens * kv_dim;
     __nv_bfloat16* o_proj_out    = attn_out   + num_tokens * q_dim;
     __nv_bfloat16* post_norm_out = o_proj_out + num_tokens * hs;
-    __nv_bfloat16* gate_buf      = post_norm_out + num_tokens * hs;  // renamed from gate_out for MLP
-    __nv_bfloat16* up_out        = gate_buf   + num_tokens * is;
+    __nv_bfloat16* gate_buf      = post_norm_out + num_tokens * hs;  // attn_gate + dense MLP gate
+    __nv_bfloat16* up_out        = gate_buf   + num_tokens * gate_buf_sz;
     __nv_bfloat16* swiglu_out    = up_out     + num_tokens * is;
     __nv_bfloat16* down_out      = swiglu_out + num_tokens * is;
 

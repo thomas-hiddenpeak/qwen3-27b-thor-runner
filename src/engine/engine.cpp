@@ -143,18 +143,20 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
     const int nkh    = config_.linear_num_key_heads;   // 16
     const int in_qkv = 2 * qk + lin_v;                // 10240
 
-    size_t ws_full   = (size_t)(4*hs + qp_dim + q_dim + 2*kv_dim + 3*is);
-    size_t ws_linear = (size_t)(hs + in_qkv + lin_v + nkh + qk + lin_v + hs + hs + 3*is + hs + nkh*2);
+    const int gate_bs = config_.gate_buf_size();      // max(is, q_dim) for attn_gate safety
+
+    size_t ws_full   = (size_t)(4*hs + qp_dim + q_dim + 2*kv_dim + gate_bs + 2*is);
+    size_t ws_linear = (size_t)(hs + in_qkv + lin_v + nkh + qk + lin_v + hs + hs + gate_bs + 2*is + hs + nkh*2);
     // MoE layers need extra workspace for router/experts/shared_expert buffers
     if (config_.is_moe) {
         int moe_extra = config_.moe_workspace_extra_t1();
         ws_full   += moe_extra;
         ws_linear += moe_extra;
         // LinearAttn T>1 merged GEMM writes (in_qkv+lin_v) into gate_out area as temp
-        // For MoE, MLP area (3*is) is tiny → merged temp may overflow
+        // For MoE, MLP area is tiny → merged temp may overflow
         // Ensure post_norm_out tail has room for max(moe_workspace, merged_temp)
         int merged_temp_need = in_qkv + (int)lin_v;
-        int post_norm_area = 3 * is + hs + nkh * 2 + moe_extra;
+        int post_norm_area = gate_bs + 2 * is + hs + nkh * 2 + moe_extra;
         if (merged_temp_need > post_norm_area) {
             ws_linear += (merged_temp_need - post_norm_area);
         }
