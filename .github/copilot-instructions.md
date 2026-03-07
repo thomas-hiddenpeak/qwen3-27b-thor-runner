@@ -1,8 +1,8 @@
-# Qwen3.5-27B CUDA Inference Engine — Copilot 项目指令
+# Qwen3.5 CUDA Inference Engine — Copilot 项目指令
 
 ## 项目概述
 
-运行在 NVIDIA Jetson AGX Thor (SM110a Blackwell) 上的 Qwen3.5-27B 推理引擎。C++17 / CUDA，BF16 精度，目标是极致性能与稳定。
+运行在 NVIDIA Jetson AGX Thor (SM110a Blackwell) 上的 Qwen3.5 推理引擎。支持 27B/9B/4B 模型，BF16 + NVFP4 (W4A16) 精度。C++17 / CUDA，目标是极致性能与稳定。
 
 ## 硬件规格 (Jetson AGX Thor)
 
@@ -56,17 +56,19 @@
 
 ```
 src/
-├── main.cpp              — 统一入口 (serve/chat/bench/test 子命令)
-├── tests.cpp             — 单元测试集合
-├── benchmark.cpp         — 性能评估 (--warmup/--decode/--batch/--csv)
+├── main.cpp              — 统一入口 (serve/chat/bench/test/probe/version 子命令)
+├── tests.cpp             — 测试框架 (16 tests, 3 categories, --list/--filter/--category/--all)
+├── benchmark.cpp         — 性能评估 (参数扫描/多迭代/统计/JSON输出)
 ├── engine/
 │   ├── engine.h/cpp      — 推理引擎: prefill/decode 循环, 连续批处理, MTP
 │   ├── backend.h/cpp     — 独立后端接口 (线程安全, 与传输层解耦)
 │   ├── model.h/cpp       — 64 层 forward, safetensors 权重加载, MTP 模块
 │   ├── layer.h/cu        — Qwen35Config, FullAttn/LinearAttn 层实现
 │   ├── light_ops.h/cu    — 融合算子 (RMSNorm, RoPE, SiLU, Conv1d, DeltaNet, GPU Sampling)
-│   ├── dense_gemm.h      — GEMM/GEMV 接口
+│   ├── dense_gemm.h      — GEMM/GEMV 接口 (BF16)
 │   ├── dense_gemm_sm110.cu — CUTLASS SM110 GEMM + 散列 GEMV + Dual GEMV + GEMV+Add
+│   ├── dense_gemm_fp4.h  — NVFP4 GEMM/GEMV 接口
+│   ├── dense_gemm_fp4_sm110.cu — FP4 E2M1 GEMV V2 (SMEM LUT + 向量化读取)
 │   ├── gdn_umma_sm110.cu/h — GDN WY 分块 Prefill Kernel
 │   ├── paged_attention.h/cpp/cu — KV Cache 管理 + Paged/Split-K/Chunked Attention
 │   ├── streaming_attention.h/cu — GPU+SSD 混合 Streaming Attention
@@ -144,7 +146,7 @@ src/
 
 ## 绝对禁止
 
-- **不做量化** (INT8/INT4/FP4/MX 等)
+- **不做进一步量化** (INT8/INT4/MX 等, NVFP4 已实现)
 - **不做剪枝**
 - **不引入外部 draft model** (仅用模型自带 MTP)
 - **不许说"已达极致"** — 距理论峰值 273 GB/s 还有 ~20%
@@ -173,6 +175,11 @@ src/
 - ✅ MTP Partial Accept (d=3, 逐位置 verify + SSM/Conv checkpoint), +21.6%
 - ✅ Batched Argmax (verify 路径 4 sync → 1 sync), sample 37→7ms
 - ✅ GPU-Resident MTP Draft Chain (3 sync → 1, pre-alloc blocks), +18.5%
+- ✅ NVFP4 (W4A16) 推理支持 (FP4 E2M1 GEMV V2, SMEM LUT, 向量化读取)
+- ✅ FP4 QKV/GateUp 投影合并, NVFP4 decode +17% over BF16
+- ✅ 多模型支持 (27B/9B/4B, config.json 自动检测架构)
+- ✅ Benchmark 重构 (参数扫描/多迭代/95% CI/JSON)
+- ✅ Test 框架 (16 tests, 3 categories, --list/--filter/--category/--all)
 - ❌ GDN SMEM caching (occupancy drop, reverted)
 - ❌ Dual GEMV + SwiGLU fusion (block count halved, +4.6%, reverted)
 
@@ -196,8 +203,12 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc)
 # 运行 (推荐使用统一配置文件 configs/config.conf):
 #   ./build/qwen3-27b-thor serve --config configs/config.conf
 #   ./build/qwen3-27b-thor chat  --config configs/config.conf
-#   ./build/qwen3-27b-thor bench --decode 30
-#   ./build/qwen3-27b-thor test
+#   ./build/qwen3-27b-thor bench --decode 30 --batch 1,2,4 --iterations 3 --json results.json
+#   ./build/qwen3-27b-thor test --list
+#   ./build/qwen3-27b-thor test --all
+# 多模型 (自动从 config.json 检测架构):
+#   ./build/qwen3-27b-thor serve --config configs/4b.conf
+#   ./build/qwen3-27b-thor serve --config configs/nvfp4.conf
 # 也可单独覆盖 serve 配置:
 #   ./build/qwen3-27b-thor serve --config configs/config.conf --serve-config configs/serve.conf
 ```
