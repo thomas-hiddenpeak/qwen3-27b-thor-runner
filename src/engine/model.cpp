@@ -245,6 +245,13 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
                 layers_[i].get_full_attn()->set_quantized_mlp(gate_qw, up_qw, down_qw);
             } else {
                 layers_[i].get_linear_attn()->set_quantized_mlp(gate_qw, up_qw, down_qw);
+                // LinearAttn 投影 FP4 (Kbenkhaled 模型有, Sehyo 模型无)
+                auto qkv_qw = make_qw(p + "linear_attn.in_proj_qkv");
+                auto z_qw   = make_qw(p + "linear_attn.in_proj_z");
+                auto out_qw = make_qw(p + "linear_attn.out_proj");
+                if (qkv_qw.valid()) {
+                    layers_[i].get_linear_attn()->set_quantized_attn(qkv_qw, z_qw, out_qw);
+                }
             }
         }
         std::cerr << "[Model] NVFP4 quantized weights bound ("
@@ -370,6 +377,45 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
                 __nv_bfloat16* z_w = tensor_map[p + "linear_attn.in_proj_z.weight"];
                 __nv_bfloat16* a_w = tensor_map[p + "linear_attn.in_proj_a.weight"];
                 __nv_bfloat16* b_w = tensor_map[p + "linear_attn.in_proj_b.weight"];
+                if (!qkv_w || !z_w) {
+                    // FP4 attn model: merge FP4 QKV+Z if both available
+                    auto* la = layers_[i].get_linear_attn();
+                    auto& qkv_qw = la->get_qkv_qw();
+                    auto& z_qw = la->get_z_qw();
+                    if (qkv_qw.valid() && z_qw.valid()) {
+                        int merged_N = qkv_qw.N + z_qw.N;  // 10240 + 6144 = 16384
+                        int K = qkv_qw.K;
+                        // Concat packed [N, K/2]
+                        size_t pk_bytes = (size_t)merged_N * (K / 2);
+                        uint8_t* mp = nullptr;
+                        cudaMalloc(&mp, pk_bytes);
+                        cudaMemcpy(mp, qkv_qw.packed, (size_t)qkv_qw.N * (K / 2), cudaMemcpyDeviceToDevice);
+                        cudaMemcpy(mp + (size_t)qkv_qw.N * (K / 2), z_qw.packed, (size_t)z_qw.N * (K / 2), cudaMemcpyDeviceToDevice);
+                        // Concat scale [N, K/16]
+                        size_t sc_bytes = (size_t)merged_N * (K / 16);
+                        uint8_t* ms = nullptr;
+                        cudaMalloc(&ms, sc_bytes);
+                        cudaMemcpy(ms, qkv_qw.scale, (size_t)qkv_qw.N * (K / 16), cudaMemcpyDeviceToDevice);
+                        cudaMemcpy(ms + (size_t)qkv_qw.N * (K / 16), z_qw.scale, (size_t)z_qw.N * (K / 16), cudaMemcpyDeviceToDevice);
+
+                        core::QuantizedWeight mqw;
+                        mqw.packed = mp; mqw.scale = ms;
+                        mqw.global_scale = qkv_qw.global_scale;
+                        mqw.N = merged_N; mqw.K = K;
+                        la->set_merged_fp4_qkv_z(mqw);
+
+                        // Release originals, redirect qkv_qw to merged sub-region
+                        cudaFree(qkv_qw.packed); cudaFree(qkv_qw.scale);
+                        cudaFree(z_qw.packed); cudaFree(z_qw.scale);
+                        z_qw.packed = nullptr; z_qw.scale = nullptr;
+                        qkv_qw.packed = mp; qkv_qw.scale = ms;
+                        qkv_qw.N = merged_N;
+                        device_weights_.push_back(mp);
+                        device_weights_.push_back(ms);
+                        merged_total += pk_bytes + sc_bytes;
+                    }
+                    continue;
+                }
 
                 int in_qkv_dim = config_.lin_qk_dim() * 2 + lin_v;  // 10240
                 int merged_N = in_qkv_dim + lin_v + nv * 2;  // 16480

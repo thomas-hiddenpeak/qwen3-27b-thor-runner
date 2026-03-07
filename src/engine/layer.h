@@ -294,20 +294,33 @@ private:
     __nv_bfloat16* input_layernorm_w_          = nullptr;
     __nv_bfloat16* post_attention_layernorm_w_ = nullptr;
 
-    // NVFP4 量化权重 — 仅 MLP 被量化, Linear Attn 投影保持 BF16
+    // NVFP4 量化权重 — MLP 始终被量化; 部分模型 Linear Attn 投影也量化
     bool quantized_ = false;
     QuantizedWeight gate_qw_, up_qw_, down_qw_;
+    // LinearAttn 投影 FP4 (Kbenkhaled 模型)
+    QuantizedWeight in_proj_qkv_qw_, in_proj_z_qw_, out_proj_qw_;
+    // 合并后的 FP4 QKV+Z 投影 [in_qkv+lin_v, K]
+    QuantizedWeight qkv_z_qw_merged_;
 
 public:
     bool is_quantized() const { return quantized_; }
     QuantizedWeight& get_gate_qw() { return gate_qw_; }
     QuantizedWeight& get_up_qw() { return up_qw_; }
+    QuantizedWeight& get_qkv_qw() { return in_proj_qkv_qw_; }
+    QuantizedWeight& get_z_qw() { return in_proj_z_qw_; }
 
     void set_quantized_mlp(
         const QuantizedWeight& gate, const QuantizedWeight& up,
         const QuantizedWeight& down) {
         quantized_ = true;
         gate_qw_ = gate; up_qw_ = up; down_qw_ = down;
+    }
+
+    void set_quantized_attn(
+        const QuantizedWeight& qkv, const QuantizedWeight& z,
+        const QuantizedWeight& out) {
+        quantized_ = true;
+        in_proj_qkv_qw_ = qkv; in_proj_z_qw_ = z; out_proj_qw_ = out;
     }
 
     // 设置合并后的 Gate+Up 权重 (T>1 GEMM 优化: 2 launches → 1)
@@ -321,6 +334,11 @@ public:
     QuantizedWeight gate_up_qw_merged_;
     void set_merged_fp4_gate_up(const QuantizedWeight& merged) {
         gate_up_qw_merged_ = merged;
+    }
+
+    // FP4 QKV+Z 合并: in_proj_qkv[in_qkv,K] + in_proj_z[lin_v,K] → [in_qkv+lin_v, K]
+    void set_merged_fp4_qkv_z(const QuantizedWeight& merged) {
+        qkv_z_qw_merged_ = merged;
     }
 };
 

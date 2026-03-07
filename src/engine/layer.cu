@@ -475,8 +475,9 @@ void Qwen35LinearAttnLayer::forward(
     __nv_bfloat16* conv_state_checkpoint,
     int num_checkpoints)
 {
-    if (!in_proj_qkv_w_) return;
+    if (!in_proj_qkv_w_ && !in_proj_qkv_qw_.valid()) return;
 
+    const bool attn_fp4 = in_proj_qkv_qw_.valid();
     const int hs     = config_.hidden_size;
     const int is     = config_.intermediate_size;
     const int nkh    = config_.linear_num_key_heads;     // 16
@@ -505,13 +506,42 @@ void Qwen35LinearAttnLayer::forward(
     __nv_bfloat16*  down_out      = swiglu_out    + num_tokens * is;
 
     // 1+2. Input RMSNorm + All projections (QKV + ZAB)
-    //   T=1 + super-merged: Fused RMSNorm in SMEM + GEMV (saves 1 launch)
-    //   Otherwise: separate RMSNorm + GEMV/GEMM
+    //   T=1 + BF16 super-merged: Fused RMSNorm in SMEM + GEMV (saves 1 launch)
+    //   FP4 attn (Kbenkhaled): separate RMSNorm + FP4 GEMV/GEMM for QKV/Z + BF16 for A/B
+    //   Otherwise: separate RMSNorm + BF16 GEMV/GEMM
     if (num_tokens == 1 && all_proj_merged_w_) {
         // Fused: RMSNorm in SMEM + super-merged GEMV (N=16480), no norm_out GMEM I/O
         ops::invoke_dense_gemv_with_rmsnorm(
             hidden_states, input_layernorm_w_, config_.rms_norm_eps,
             all_proj_merged_w_, qkv_out, in_qkv + lin_v + nv * 2, hs, stream);
+    } else if (attn_fp4) {
+        // FP4 attn path: separate RMSNorm + FP4 GEMV/GEMM for QKV/Z, BF16 for A/B
+        ops::invoke_rmsnorm(norm_out, hidden_states, input_layernorm_w_,
+                            config_.rms_norm_eps, num_tokens, hs, stream);
+        if (num_tokens == 1) {
+            if (qkv_z_qw_merged_.valid()) {
+                // Merged FP4 QKV+Z: single GEMV for both (saves 1 launch)
+                ops::invoke_fp4_gemv(norm_out, qkv_z_qw_merged_, qkv_out, stream);
+            } else {
+                ops::invoke_fp4_gemv(norm_out, in_proj_qkv_qw_, qkv_out, stream);
+                ops::invoke_fp4_gemv(norm_out, in_proj_z_qw_,   z_out,   stream);
+            }
+            ops::invoke_dense_gemv(norm_out, in_proj_a_w_, a_out_f16, nv, hs, stream);
+            ops::invoke_dense_gemv(norm_out, in_proj_b_w_, beta_out,  nv, hs, stream);
+        } else {
+            if (qkv_z_qw_merged_.valid()) {
+                // Merged FP4 QKV+Z: single GEMM, then split
+                int qkv_z_N = in_qkv + lin_v;  // 16384
+                ops::invoke_fp4_gemm(norm_out, qkv_z_qw_merged_, gate_out, num_tokens, stream);
+                ops::invoke_deinterleave_gemm_3way(qkv_out, z_out, z_out, gate_out,
+                    num_tokens, qkv_z_N, in_qkv, qkv_z_N, stream);
+            } else {
+                ops::invoke_fp4_gemm(norm_out, in_proj_qkv_qw_, qkv_out, num_tokens, stream);
+                ops::invoke_fp4_gemm(norm_out, in_proj_z_qw_,   z_out,   num_tokens, stream);
+            }
+            ops::invoke_dense_gemm(norm_out, in_proj_a_w_, a_out_f16, num_tokens, nv, hs, stream);
+            ops::invoke_dense_gemm(norm_out, in_proj_b_w_, beta_out,  num_tokens, nv, hs, stream);
+        }
     } else {
         ops::invoke_rmsnorm(norm_out, hidden_states, input_layernorm_w_,
                             config_.rms_norm_eps, num_tokens, hs, stream);
@@ -578,7 +608,13 @@ void Qwen35LinearAttnLayer::forward(
     }
 
     // 9. Output Projection
-    if (num_tokens == 1) {
+    if (out_proj_qw_.valid()) {
+        if (num_tokens == 1) {
+            ops::invoke_fp4_gemv(y_ssm, out_proj_qw_, out_proj_buf, stream);
+        } else {
+            ops::invoke_fp4_gemm(y_ssm, out_proj_qw_, out_proj_buf, num_tokens, stream);
+        }
+    } else if (num_tokens == 1) {
         ops::invoke_dense_gemv(y_ssm, out_proj_w_, out_proj_buf, hs, lin_v, stream);
     } else {
         ops::invoke_dense_gemm(y_ssm, out_proj_w_, out_proj_buf, num_tokens, hs, lin_v, stream);
