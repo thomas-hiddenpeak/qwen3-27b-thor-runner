@@ -518,8 +518,6 @@ static BenchResult run_single_bench(
     size_t ws_per_tok = std::max(ws_full, ws_linear);
     size_t ws_total = ws_per_tok * max_tokens + (size_t)batch_size * config.vocab_size + (size_t)batch_size * hs;
     cudaMalloc(&d_workspace, ws_total * sizeof(__nv_bfloat16));
-    // Zero-init workspace so atomic counters (used by fused router kernel) start at 0
-    cudaMemset(d_workspace, 0, ws_total * sizeof(__nv_bfloat16));
 
     // SSM/Conv states per request
     size_t ssm_sz = (size_t)nkh * config.linear_key_head_dim * config.lin_v_per_kh() * sizeof(__nv_bfloat16);
@@ -1062,16 +1060,37 @@ int run_benchmark(int argc, char** argv) {
     int num_full_attn_layers = config.num_full_attn_layers();
     int n_linear_layers = config.num_hidden_layers - num_full_attn_layers;
 
-    size_t la_params = (size_t)in_qkv * hs + (lin_v + 2*nv) * hs + hs * lin_v
-                       + (size_t)is_dim * hs + is_dim * hs + hs * is_dim;
-    size_t fa_params = (size_t)(qp_dim + 2*kv_dim) * hs + hs * config.q_dim()
-                       + (size_t)is_dim * hs + is_dim * hs + hs * is_dim;
+    // MLP weight params per layer: MoE vs dense
+    size_t mlp_params_per_layer;
+    if (config.is_moe) {
+        const int moe_is = config.moe_intermediate_size;
+        const int shared_is = config.shared_expert_intermediate_size;
+        const int top_k = config.num_experts_per_tok;
+        const int E = config.num_experts;
+        // Per-step reads: router (full) + top_k active experts + shared expert
+        mlp_params_per_layer = (size_t)E * hs                           // router
+                             + (size_t)top_k * 2 * moe_is * hs          // expert gate+up
+                             + (size_t)top_k * hs * moe_is              // expert down
+                             + (size_t)2 * shared_is * hs               // shared gate+up
+                             + (size_t)hs * shared_is                   // shared down
+                             + (size_t)hs;                              // shared_expert_gate
+    } else {
+        mlp_params_per_layer = (size_t)is_dim * hs + is_dim * hs + hs * is_dim;
+    }
+
+    size_t la_attn_params = (size_t)in_qkv * hs + (lin_v + 2*nv) * hs + hs * lin_v;
+    size_t fa_attn_params = (size_t)(qp_dim + 2*kv_dim) * hs + hs * config.q_dim();
+    size_t la_params = la_attn_params + mlp_params_per_layer;
+    size_t fa_params = fa_attn_params + mlp_params_per_layer;
     size_t total_weight_bytes = (n_linear_layers * la_params + num_full_attn_layers * fa_params
                                  + (size_t)config.vocab_size * hs) * 2;
 
     if (model_has_quantized_weights) {
         printf("      Weight size estimate: %.1f MB (dense BF16 equivalent, bandwidth disabled)\n\n",
                (float)total_weight_bytes / 1e6);
+    } else if (config.is_moe) {
+        printf("      Weight size estimate: %.1f MB (MoE per-step active weights, top-%d of %d experts)\n\n",
+               (float)total_weight_bytes / 1e6, config.num_experts_per_tok, config.num_experts);
     } else {
         printf("      Weight size estimate: %.1f MB (dense BF16 path)\n\n",
                (float)total_weight_bytes / 1e6);
@@ -1160,7 +1179,7 @@ int run_benchmark(int argc, char** argv) {
              printf("║      Weight BW:         N/A  (quantized weight path)         ║\n");
              printf("║      Mean BW:           N/A                                  ║\n");
          }
-         printf("║      Weight estimate:   %6.1f MB (dense BF16 equivalent)     ║\n",
+         printf("║      Weight estimate:   %6.1f MB (per-step active weights)   ║\n",
              r.weight_bytes / 1e6f);
         printf("║                                                                ║\n");
         printf("╠══════════════════════════════════════════════════════════════════╣\n");
