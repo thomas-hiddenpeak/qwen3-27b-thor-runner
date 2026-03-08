@@ -257,9 +257,12 @@ struct BenchResult {
     int decode_steps;
     int warmup_steps;
     bool cuda_graph;
+    bool cuda_graph_requested = false;
+    bool cuda_graph_active = false;
     bool decode_phase_aggregated = false;
     bool prefill_serialized = true;
     bool bandwidth_valid = true;
+    std::string cuda_graph_status;
 
     // Prefill
     Stats prefill_ttft;
@@ -281,6 +284,11 @@ struct BenchResult {
 
 static const char* decode_phase_mode_label(const BenchResult& r) {
     return r.decode_phase_aggregated ? "graph_aggregated" : "separate";
+}
+
+static std::string cuda_graph_status_for(const BenchConfig& cfg) {
+    if (cfg.no_graph) return "disabled_by_flag";
+    return "disabled_not_graph_safe";
 }
 
 // ============================================================================
@@ -346,6 +354,9 @@ static void write_json(const std::string& path, const std::vector<BenchResult>& 
         ofs << "      \"decode_steps\": " << r.decode_steps << ",\n";
         ofs << "      \"warmup_steps\": " << r.warmup_steps << ",\n";
         ofs << "      \"cuda_graph\": " << (r.cuda_graph ? "true" : "false") << ",\n";
+        ofs << "      \"cuda_graph_requested\": " << (r.cuda_graph_requested ? "true" : "false") << ",\n";
+        ofs << "      \"cuda_graph_active\": " << (r.cuda_graph_active ? "true" : "false") << ",\n";
+        ofs << "      \"cuda_graph_status\": \"" << json_escape(r.cuda_graph_status) << "\",\n";
         ofs << "      \"decode_phase_mode\": \"" << decode_phase_mode_label(r) << "\",\n";
         ofs << "      \"prefill_mode\": \"" << (r.prefill_serialized ? "serialized_single_request" : "batched") << "\",\n";
         ofs << "      \"weight_bytes_bf16_estimate\": " << std::fixed << std::setprecision(0) << r.weight_bytes << ",\n";
@@ -430,7 +441,10 @@ static BenchResult run_single_bench(
     result.warmup_steps = cfg.warmup_steps;
     result.weight_bytes = (float)total_weight_bytes;
     result.bandwidth_valid = bandwidth_valid;
-    result.cuda_graph   = false;
+    result.cuda_graph_requested = !cfg.no_graph;
+    result.cuda_graph_active = false;
+    result.cuda_graph_status = cuda_graph_status_for(cfg);
+    result.cuda_graph = result.cuda_graph_active;
 
     const int hs = config.hidden_size;
     const int is = config.intermediate_size;

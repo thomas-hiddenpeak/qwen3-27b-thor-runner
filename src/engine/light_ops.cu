@@ -1589,6 +1589,116 @@ void invoke_swiglu_merged(__nv_bfloat16* out, const __nv_bfloat16* merged_gateup
 // ============================================================================
 // MoE Router Top-K: logits [T, E] → top_k indices + softmax weights per token
 // ============================================================================
+
+// Fused Router GEMV + Top-K: multi-block GEMV, last block does top-K
+// Phase 1: scattered GEMV (same parallelism as standalone gemv_kernel_scattered)
+// Phase 2: atomic counter determines last block, which does sequential top-K
+// Saves 1 kernel launch + inter-kernel pipeline bubble per layer
+__global__ void moe_router_gemv_topk_kernel(
+    const __nv_bfloat16* __restrict__ hidden_state,  // [K]
+    const __nv_bfloat16* __restrict__ router_weight,  // [E, K]
+    float* __restrict__ logits_buf,                    // [E] global workspace
+    int* __restrict__ expert_indices,                  // [top_k]
+    float* __restrict__ expert_weights,                // [top_k]
+    int* __restrict__ block_done_counter,              // [1] atomic counter (init 0)
+    int E, int K, int top_k)
+{
+    constexpr int WARP_SIZE = 32;
+
+    extern __shared__ __nv_bfloat16 s_hidden[];  // [K]
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x & (WARP_SIZE - 1);
+    int num_blocks = gridDim.x;
+    int out_idx = blockIdx.x + warp_id * num_blocks;  // scattered
+
+    // Phase 1a: Load hidden_state → SMEM
+    for (int i = threadIdx.x; i < K; i += blockDim.x)
+        s_hidden[i] = hidden_state[i];
+    __syncthreads();
+
+    // Phase 1b: GEMV — scattered warp mapping
+    if (out_idx < E) {
+        const __nv_bfloat16* b_col = router_weight + (size_t)out_idx * K;
+        float sum = 0.0f;
+
+        int k8 = K / 8;
+        const float4* s_v4 = reinterpret_cast<const float4*>(s_hidden);
+        const float4* b_v4 = reinterpret_cast<const float4*>(b_col);
+
+        for (int i = lane_id; i < k8; i += WARP_SIZE) {
+            float4 a4 = s_v4[i];
+            float4 b4 = b_v4[i];
+            const __nv_bfloat162* a2 = reinterpret_cast<const __nv_bfloat162*>(&a4);
+            const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&b4);
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float2 af = __bfloat1622float2(a2[j]);
+                float2 bf = __bfloat1622float2(b2[j]);
+                sum += af.x * bf.x + af.y * bf.y;
+            }
+        }
+
+        #pragma unroll
+        for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1)
+            sum += __shfl_xor_sync(0xffffffff, sum, mask);
+
+        if (lane_id == 0) {
+            logits_buf[out_idx] = sum;
+            __threadfence();  // each writer fences its own store
+        }
+    }
+
+    __syncthreads();  // ensure all warps' fences complete
+
+    // Phase 2: Last block does top-K + softmax
+    if (threadIdx.x == 0) {
+        int prev = atomicAdd(block_done_counter, 1);
+        if (prev == num_blocks - 1) {
+            // We are the last block — all logits ready
+            *block_done_counter = 0;  // reset for next call (stream-ordered)
+
+            float top_vals[16];
+            int top_ids[16];
+            for (int k = 0; k < top_k; k++) {
+                top_vals[k] = -1e30f;
+                top_ids[k] = 0;
+            }
+
+            for (int e = 0; e < E; e++) {
+                float val = logits_buf[e];
+                int min_k = 0;
+                float min_val = top_vals[0];
+                for (int k = 1; k < top_k; k++) {
+                    if (top_vals[k] < min_val) {
+                        min_val = top_vals[k];
+                        min_k = k;
+                    }
+                }
+                if (val > min_val) {
+                    top_vals[min_k] = val;
+                    top_ids[min_k] = e;
+                }
+            }
+
+            float max_val = top_vals[0];
+            for (int k = 1; k < top_k; k++)
+                max_val = fmaxf(max_val, top_vals[k]);
+            float sum_exp = 0.f;
+            for (int k = 0; k < top_k; k++) {
+                top_vals[k] = expf(top_vals[k] - max_val);
+                sum_exp += top_vals[k];
+            }
+            float inv_sum = 1.f / sum_exp;
+            for (int k = 0; k < top_k; k++) {
+                expert_indices[k] = top_ids[k];
+                expert_weights[k] = top_vals[k] * inv_sum;
+            }
+        }
+    }
+}
+
+// Legacy per-token top-K kernel for T>1 path
 __global__ void moe_router_topk_kernel(
     const __nv_bfloat16* __restrict__ logits,  // [T, E]
     int* __restrict__ expert_indices,           // [T, top_k]
@@ -1655,6 +1765,25 @@ void invoke_moe_router_topk(const __nv_bfloat16* logits, int* expert_indices,
         logits, expert_indices, expert_weights, num_experts, top_k);
 }
 
+void invoke_moe_router_gemv_topk(
+    const __nv_bfloat16* hidden_state,
+    const __nv_bfloat16* router_weight,
+    float* logits_buf,
+    int* expert_indices, float* expert_weights,
+    int* block_done_counter,
+    int num_experts, int K, int top_k, cudaStream_t stream)
+{
+    // Multi-block scattered GEMV + last-block top-K
+    constexpr int THREADS = 256;
+    constexpr int WARPS = THREADS / 32;
+    int blocks = (num_experts + WARPS - 1) / WARPS;
+    size_t smem_bytes = K * sizeof(__nv_bfloat16);
+    moe_router_gemv_topk_kernel<<<blocks, THREADS, smem_bytes, stream>>>(
+        hidden_state, router_weight, logits_buf,
+        expert_indices, expert_weights, block_done_counter,
+        num_experts, K, top_k);
+}
+
 // ============================================================================
 // Scaled accumulate: out[i] += scale * in[i]
 // ============================================================================
@@ -1696,6 +1825,50 @@ __global__ void sigmoid_gated_add_kernel(
     out[idx] = __float2bfloat16(val);
 }
 
+// Fused version: compute gate scalar dot product inline, then sigmoid-gated add
+// Eliminates the separate N=1 GEMV launch for shared_expert_gate
+// Gate scalar = dot(hidden_state, gate_weight) over K elements
+// Launched as 1 block × 256 threads (n and K are both small, typically 2048)
+__global__ void sigmoid_gated_add_with_dot_kernel(
+    __nv_bfloat16* __restrict__ out,            // [n] moe_acc (read+write)
+    const __nv_bfloat16* __restrict__ in,       // [n] shared_down output
+    const __nv_bfloat16* __restrict__ hidden,   // [K] post_norm_out
+    const __nv_bfloat16* __restrict__ gate_w,   // [K] shared_expert_gate weight
+    int n, int K)
+{
+    // Phase 1: Cooperative dot product → sigmoid
+    float dot_sum = 0.0f;
+    for (int i = threadIdx.x; i < K; i += blockDim.x)
+        dot_sum += __bfloat162float(hidden[i]) * __bfloat162float(gate_w[i]);
+
+    // Warp reduce
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        dot_sum += __shfl_down_sync(0xffffffff, dot_sum, offset);
+
+    __shared__ float s_warp_sums[8];
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x & 31;
+    if (lane == 0) s_warp_sums[warp_id] = dot_sum;
+    __syncthreads();
+
+    __shared__ float s_gate_sig;
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < (int)(blockDim.x / 32); w++)
+            total += s_warp_sums[w];
+        s_gate_sig = 1.f / (1.f + expf(-total));
+    }
+    __syncthreads();
+
+    // Phase 2: Sigmoid-gated add
+    float sig = s_gate_sig;
+    for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
+        float val = __bfloat162float(out[idx]) + sig * __bfloat162float(in[idx]);
+        out[idx] = __float2bfloat16(val);
+    }
+}
+
 void invoke_sigmoid_gated_add(__nv_bfloat16* out, const __nv_bfloat16* in,
                                const __nv_bfloat16* gate_scalar, int n,
                                cudaStream_t stream)
@@ -1703,6 +1876,16 @@ void invoke_sigmoid_gated_add(__nv_bfloat16* out, const __nv_bfloat16* in,
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     sigmoid_gated_add_kernel<<<blocks, threads, 0, stream>>>(out, in, gate_scalar, n);
+}
+
+void invoke_sigmoid_gated_add_with_dot(
+    __nv_bfloat16* out, const __nv_bfloat16* in,
+    const __nv_bfloat16* hidden, const __nv_bfloat16* gate_w,
+    int n, int K, cudaStream_t stream)
+{
+    // Single block, 256 threads: dot product + sigmoid-gated add
+    sigmoid_gated_add_with_dot_kernel<<<1, 256, 0, stream>>>(
+        out, in, hidden, gate_w, n, K);
 }
 
 } // namespace ops

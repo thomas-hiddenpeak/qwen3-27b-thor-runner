@@ -180,6 +180,15 @@ void invoke_moe_router_topk(const __nv_bfloat16* logits, int* expert_indices,
                              float* expert_weights, int num_tokens,
                              int num_experts, int top_k, cudaStream_t stream = 0);
 
+// Fused Router GEMV + Top-K: single kernel (T=1 only)
+// Multi-block scattered GEMV, last block does top-K via atomic counter
+// Requires: logits_buf[E] workspace, block_done_counter[1] init to 0
+void invoke_moe_router_gemv_topk(
+    const __nv_bfloat16* hidden_state, const __nv_bfloat16* router_weight,
+    float* logits_buf, int* expert_indices, float* expert_weights,
+    int* block_done_counter,
+    int num_experts, int K, int top_k, cudaStream_t stream = 0);
+
 // Scaled accumulate: out[i] += scale * in[i], element-wise
 void invoke_scale_add(__nv_bfloat16* out, const __nv_bfloat16* in, float scale,
                       int n, cudaStream_t stream = 0);
@@ -189,6 +198,13 @@ void invoke_scale_add(__nv_bfloat16* out, const __nv_bfloat16* in, float scale,
 void invoke_sigmoid_gated_add(__nv_bfloat16* out, const __nv_bfloat16* in,
                                const __nv_bfloat16* gate_scalar, int n,
                                cudaStream_t stream = 0);
+
+// Fused sigmoid-gated add with inline dot product (eliminates N=1 gate_scalar GEMV)
+// gate = sigmoid(dot(hidden, gate_w)), then out[i] += gate * in[i]
+void invoke_sigmoid_gated_add_with_dot(
+    __nv_bfloat16* out, const __nv_bfloat16* in,
+    const __nv_bfloat16* hidden, const __nv_bfloat16* gate_w,
+    int n, int K, cudaStream_t stream = 0);
 
 } // namespace ops
 } // namespace qwen_thor

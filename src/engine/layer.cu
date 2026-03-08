@@ -180,17 +180,24 @@ static void run_moe_mlp(
     // Fixed scratch (不随 T 缩放), aligned to 8 bf16 for vectorized stores
     __nv_bfloat16* expert_scratch  = gate_scalar + ((num_tokens + 7) & ~7);
 
-    // 3. Router: [T, hs] × [hs, E] → [T, E]
+    // 3. Router: [T, hs] × [hs, E] → [T, E] + Top-K selection
     if (moe_timing && num_tokens == 1) cudaEventRecord(moe_ev0, stream);
     if (num_tokens == 1) {
-        ops::invoke_dense_gemv(post_norm_out, moe.router_w, router_logits, E, hs, stream);
+        // Fused router GEMV + top-K: multi-block scattered GEMV + last-block top-K
+        // Reuse router_logits as float logits workspace (E×4 bytes, overlaps into expert_indices
+        // region which is only written AFTER top-K reads all logits — safe)
+        float* fused_logits = reinterpret_cast<float*>(router_logits);
+        // Atomic counter carved from gate_scalar region (unused in T=1 fused path)
+        int* block_counter = reinterpret_cast<int*>(gate_scalar);
+        cudaMemsetAsync(block_counter, 0, sizeof(int), stream);
+        ops::invoke_moe_router_gemv_topk(post_norm_out, moe.router_w,
+                                          fused_logits, expert_indices, expert_weights,
+                                          block_counter, E, hs, top_k, stream);
     } else {
         ops::invoke_dense_gemm(post_norm_out, moe.router_w, router_logits, num_tokens, E, hs, stream);
+        ops::invoke_moe_router_topk(router_logits, expert_indices, expert_weights,
+                                     num_tokens, E, top_k, stream);
     }
-
-    // 4. Top-K selection + Softmax normalization (GPU-resident)
-    ops::invoke_moe_router_topk(router_logits, expert_indices, expert_weights,
-                                 num_tokens, E, top_k, stream);
 
     const size_t gu_stride = (size_t)2 * moe_is * hs;   // bf16 elements per expert gate_up
     const size_t dn_stride = (size_t)hs * moe_is;       // bf16 elements per expert down
@@ -272,25 +279,27 @@ static void run_moe_mlp(
     ops::invoke_swiglu(shared_swiglu_buf, shared_gate_out, shared_up_out,
                         num_tokens, shared_is, stream);
 
-    // 9. Shared expert gate scalar: [T, hs] × [hs, 1] → [T, 1]
+    // 9-10. Shared expert down + gate scalar + gated add
+    __nv_bfloat16* shared_down_buf = (num_tokens == 1)
+        ? (expert_scratch + top_k * (2 * moe_is + moe_is))
+        : (expert_scratch + 2 * moe_is + moe_is);
     if (num_tokens == 1) {
-        ops::invoke_dense_gemv(post_norm_out, moe.shared_expert_gate_w,
-                                gate_scalar, 1, hs, stream);
+        // T=1: down GEMV, then fused gate_scalar dot + sigmoid_gated_add (2→1 launch)
+        ops::invoke_dense_gemv(shared_swiglu_buf, moe.shared_down_w,
+                                shared_down_buf, hs, shared_is, stream);
+        ops::invoke_sigmoid_gated_add_with_dot(
+            moe_acc, shared_down_buf, post_norm_out, moe.shared_expert_gate_w,
+            hs, hs, stream);
     } else {
+        // T>1: separate gate_scalar GEMM + per-token down GEMV + sigmoid_gated_add
         ops::invoke_dense_gemm(post_norm_out, moe.shared_expert_gate_w,
                                 gate_scalar, num_tokens, 1, hs, stream);
-    }
-
-    // 10. Shared expert down + gated add
-    // Reuse expert_down_all[0..hs-1] (T=1) or expert_out (T>1) as temp buffer
-    __nv_bfloat16* shared_down_buf = (num_tokens == 1)
-        ? (expert_scratch + top_k * (2 * moe_is + moe_is))  // expert_down_all[0]
-        : (expert_scratch + 2 * moe_is + moe_is);           // expert_out
-    for (int t = 0; t < num_tokens; ++t) {
-        ops::invoke_dense_gemv(shared_swiglu_buf + t * shared_is, moe.shared_down_w,
-                                shared_down_buf, hs, shared_is, stream);
-        ops::invoke_sigmoid_gated_add(moe_acc + t * hs, shared_down_buf,
-                                       gate_scalar + t, hs, stream);
+        for (int t = 0; t < num_tokens; ++t) {
+            ops::invoke_dense_gemv(shared_swiglu_buf + t * shared_is, moe.shared_down_w,
+                                    shared_down_buf, hs, shared_is, stream);
+            ops::invoke_sigmoid_gated_add(moe_acc + t * hs, shared_down_buf,
+                                           gate_scalar + t, hs, stream);
+        }
     }
 
     // 11. Final residual: hidden_states += moe_acc
