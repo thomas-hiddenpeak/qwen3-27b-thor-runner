@@ -252,14 +252,37 @@ Qwen3.5 uses a hybrid attention architecture with DeltaNet SSM + Full Attention:
 
 ## Performance
 
-Measured on Jetson AGX Thor (MAXN, Qwen3.5-27B BF16, MTP d=3, KV cache 8 GB):
+Measured on Jetson AGX Thor (MAXN, single request, non-thinking mode).
 
-| Metric | Value |
-|--------|-------|
-| Decode throughput (single request) | ~4.4 tok/s (~227 GB/s, 83% peak) |
-| MTP accept rate | ~70% (d=3, partial accept) |
-| MTP throughput boost | +27.5% over single-token decode |
-| NVFP4 decode boost | +17% over BF16 |
+MTP speculative decoding is enabled by default when the model has MTP weights (`mtp_mode=auto`).
+
+### Decode Throughput
+
+| Model | Precision | MTP | tok/s | Accept Rate | Avg tok/step | BW (GB/s) |
+|-------|-----------|-----|-------|-------------|-------------|-----------|
+| Qwen3.5-27B | BF16 | off | 4.4 | — | 1.0 | 227 (83%) |
+| Qwen3.5-27B | BF16 | d=3 | **8.7** | 93% | 3.8 | — |
+| Qwen3.5-27B | NVFP4 | off | 10.1 | — | 1.0 | — |
+| Qwen3.5-27B | NVFP4 | d=3 | **16.9** | 87% | 3.6 | — |
+| Qwen3.5-9B | BF16 | off | 13.9 | — | 1.0 | 221 (81%) |
+| Qwen3.5-9B | BF16 | d=3 | **27.0** | 91% | 3.7 | — |
+| Qwen3.5-4B | BF16 | off | 25.2 | — | 1.0 | 212 (78%) |
+| Qwen3.5-4B | BF16 | d=3 | **37.8** | 67% | 3.0 | — |
+| Qwen3.5-35B-A3B | MoE | off | 31.0 | — | 1.0 | — |
+| Qwen3.5-35B-A3B | MoE | d=1 | **38.2** | 99% | 2.0 | — |
+
+> MTP accept rate varies with content. Values above measured with structured output (counting task, non-thinking mode).
+> MoE model uses d=1 (optimal); dense models use d=3.
+
+### MTP Speedup Summary
+
+| Model | MTP off | MTP on | Boost |
+|-------|---------|--------|-------|
+| 27B BF16 | 4.4 tok/s | 8.7 tok/s | **+98%** |
+| 27B NVFP4 | 10.1 tok/s | 16.9 tok/s | **+67%** |
+| 9B BF16 | 13.9 tok/s | 27.0 tok/s | **+94%** |
+| 4B BF16 | 25.2 tok/s | 37.8 tok/s | **+50%** |
+| 35B MoE | 31.0 tok/s | 38.2 tok/s | **+23%** |
 
 Key optimizations applied:
 - **GEMV/GEMM**: Scattered GEMV, Dual GEMV, GEMV+Add fusion, CUTLASS SM110 GEMM
