@@ -17,6 +17,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include "pdl.h"
+#include "tma_utils.h"
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
@@ -202,13 +203,38 @@ gdn_wy_prefill_kernel(
     float* scratch  = beta_v + CHUNK_SIZE;                  // [CS] temp        64
     float* ikk_t    = scratch + CHUNK_SIZE;                 // [CS, CS]       4096
     float* qk_sc    = ikk_t + CHUNK_SIZE * CHUNK_SIZE;     // [CS, CS]       4096
+    // Mbarrier for TMA (8-byte aligned, placed after all float arrays)
+    uint64_t* tma_mbar = reinterpret_cast<uint64_t*>(qk_sc + CHUNK_SIZE * CHUNK_SIZE);
 
     float q_scale = rsqrtf((float)kd);
     int ss_base = h_v * kd * vd;
 
-    // Load initial state S[kd, vd] -> S_smem[kd, vd_pad] (BF16 GMEM -> FP32 SMEM)
-    for (int i = 0; i < kd; i++)
-        S_smem[i * vd_pad + j] = __bfloat162float(ssm_state[ss_base + i * vd + j]);
+    // TMA load SSM state: 32KB BF16 contiguous → in-place expand to FP32 padded
+    const int state_bytes = kd * vd * (int)sizeof(__nv_bfloat16);  // 32768
+    if (threadIdx.x == 0) {
+        tma_mbar_init(tma_mbar);
+    }
+    __syncthreads();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("fence.mbarrier_init.release.cluster;\n" :::);
+#endif
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        tma_mbar_expect_tx(tma_mbar, (uint32_t)state_bytes);
+        tma_bulk_g2s(&ssm_state[ss_base], smem, tma_mbar, (uint32_t)state_bytes);
+    }
+    tma_mbar_wait(tma_mbar, 0);
+    __syncthreads();
+    // In-place BF16→FP32 expansion with padding (backwards to avoid overwrite)
+    // Row 0 handled separately: cross-warp write-read race on same SMEM region
+    {
+        const __nv_bfloat16* raw_bf16 = reinterpret_cast<const __nv_bfloat16*>(smem);
+        for (int i = kd - 1; i >= 1; i--)
+            S_smem[i * vd_pad + j] = __bfloat162float(raw_bf16[i * vd + j]);
+        float row0_val = __bfloat162float(raw_bf16[j]);
+        __syncthreads();
+        S_smem[j] = row0_val;
+    }
     __syncthreads();
 
     int num_chunks = (num_tokens + CHUNK_SIZE - 1) / CHUNK_SIZE;
@@ -388,9 +414,17 @@ gdn_wy_prefill_kernel(
 
     } // end chunk loop
 
-    // Write final state (FP32 SMEM -> BF16 GMEM)
-    for (int i = 0; i < kd; i++)
-        ssm_state[ss_base + i * vd + j] = __float2bfloat16(S_smem[i * vd_pad + j]);
+    // TMA store: FP32 padded → pack BF16 contiguous in-place, then bulk copy SMEM→GMEM
+    {
+        __nv_bfloat16* raw_bf16 = reinterpret_cast<__nv_bfloat16*>(smem);
+        for (int i = 0; i < kd; i++)
+            raw_bf16[i * vd + j] = __float2bfloat16(S_smem[i * vd_pad + j]);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int state_bytes_out = kd * vd * (int)sizeof(__nv_bfloat16);
+        tma_bulk_s2g(smem, &ssm_state[ss_base], (uint32_t)state_bytes_out);
+    }
     PDL_SIGNAL();
 }
 
@@ -425,12 +459,12 @@ void invoke_gdn_wy_prefill(
 
     // SMEM: S[kd, vd_pad] + K_hat[CS, kd_pad] + Q_hat[CS, kd_pad]
     //       + alpha_cl + alpha_cp + beta_v + scratch (4 * CS)
-    //       + ikk_t[CS, CS] + qk_sc[CS, CS]
+    //       + ikk_t[CS, CS] + qk_sc[CS, CS] + mbarrier[8B]
     size_t smem_floats = (size_t)(kd * vd_pad)
                        + 2 * CHUNK_SIZE * kd_pad
                        + 4 * CHUNK_SIZE
                        + 2 * CHUNK_SIZE * CHUNK_SIZE;
-    size_t smem_bytes = smem_floats * sizeof(float);
+    size_t smem_bytes = smem_floats * sizeof(float) + sizeof(uint64_t);
 
     cudaError_t err = cudaFuncSetAttribute(
         gdn_wy_prefill_kernel,
