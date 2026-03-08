@@ -126,29 +126,31 @@ void invoke_dense_gemm_add(
     cudaStream_t stream = nullptr
 );
 
-// Grouped Expert GEMV: 单次 launch 计算 top_k 个 expert 的 GEMV
-// shared_input=true: all experts share the same input (gate_up projection)
-// shared_input=false: per-expert inputs at inputs[rank*K] (down projection)
+// Grouped Expert GEMV: 单次 launch 计算 num_tokens × top_k 个 expert 的 GEMV
+// shared_input=true: 每个 token 的 top_k experts 共享该 token 的 inputs (gate_up projection)
+// shared_input=false: per-assignment inputs at inputs[assign_idx*K] (down projection)
 void invoke_grouped_expert_gemv(
-    const __nv_bfloat16* inputs,         // [1, K] (shared) or [top_k, K] (per-expert)
+    const __nv_bfloat16* inputs,         // [T, K] (shared) or [T*top_k, K] (per-assignment)
     const __nv_bfloat16* packed_weights, // [E, N, K] all experts packed contiguous
-    __nv_bfloat16* outputs,              // [top_k, N]
-    const int* expert_indices,           // [top_k] on device
+    __nv_bfloat16* outputs,              // [T*top_k, N]
+    const int* expert_indices,           // [T*top_k] on device
     int N, int K, size_t expert_stride,  // stride between experts in bf16 elements
     int top_k, bool shared_input,
-    cudaStream_t stream = nullptr
+    cudaStream_t stream = nullptr,
+    int num_tokens = 1
 );
 
 // Fused SwiGLU + Grouped Expert Down GEMV
-// gate_up_outputs[top_k, 2*K] → SwiGLU in SMEM → GEMV → outputs[top_k, N]
+// gate_up_outputs[T*top_k, 2*K] → SwiGLU in SMEM → GEMV → outputs[T*top_k, N]
 void invoke_grouped_expert_gemv_swiglu(
-    const __nv_bfloat16* gate_up_outputs,  // [top_k, 2*K]
+    const __nv_bfloat16* gate_up_outputs,  // [T*top_k, 2*K]
     const __nv_bfloat16* packed_weights,   // [E, N, K] expert down weights
-    __nv_bfloat16* outputs,                // [top_k, N]
-    const int* expert_indices,             // [top_k] on device
+    __nv_bfloat16* outputs,                // [T*top_k, N]
+    const int* expert_indices,             // [T*top_k] on device
     int N, int K, size_t expert_stride,
     int top_k,
-    cudaStream_t stream = nullptr
+    cudaStream_t stream = nullptr,
+    int num_tokens = 1
 );
 
 // Fused SwiGLU + GEMV for shared expert down projection
@@ -162,13 +164,14 @@ void invoke_dense_gemv_swiglu(
     cudaStream_t stream = nullptr
 );
 
-// Weighted Expert Reduce: accum[i] = sum_k(weights[k] * outputs[k*hs + i])
+// Weighted Expert Reduce: accum[t*hs+i] = sum_k(weights[t*topk+k] * outputs[(t*topk+k)*hs + i])
 void invoke_weighted_expert_reduce(
-    __nv_bfloat16* accum,                 // [hs] output
-    const __nv_bfloat16* expert_outputs,  // [top_k, hs]
-    const float* expert_weights,          // [top_k] on device
+    __nv_bfloat16* accum,                 // [T, hs] output
+    const __nv_bfloat16* expert_outputs,  // [T*top_k, hs]
+    const float* expert_weights,          // [T, top_k] on device
     int hs, int top_k,
-    cudaStream_t stream = nullptr
+    cudaStream_t stream = nullptr,
+    int num_tokens = 1
 );
 
 } // namespace ops

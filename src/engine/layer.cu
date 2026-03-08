@@ -123,9 +123,11 @@ static void run_mlp(
 //   shared_up_out   [T * shared_is] bf16
 //   shared_swiglu   [T * shared_is] bf16
 //   gate_scalar     [T]             bf16
-//   expert_gu       [2 * moe_is]    bf16  -- 复用 buffer (每次单 token)
-//   expert_swiglu   [moe_is]        bf16
-//   expert_out      [hs]            bf16
+//   T=1: expert_gu_all   [topk * 2*moe_is]          bf16
+//        expert_swiglu    [topk * moe_is] (gap)      bf16
+//        expert_down_all  [topk * hs]                bf16
+//   T>1: expert_gu_all   [T*topk * 2*moe_is]        bf16
+//        expert_down_all  [T*topk * hs]              bf16
 // ============================================================================
 static void run_moe_mlp(
     __nv_bfloat16* hidden_states,      // [T, hs] in-place residual
@@ -242,42 +244,32 @@ static void run_moe_mlp(
             hidden_states, hs, hs, top_k, stream);
     } else {
         // ============================================================
-        // T>1 路径: 逐 token 顺序 GEMV (保持兼容)
+        // T>1 路径: Batched Grouped Expert GEMV (GPU-resident, 无 D2H/sync)
+        // 所有 token × top_k expert assignments 在单次 kernel launch 中完成
         // ============================================================
-        __nv_bfloat16* expert_gu     = expert_scratch;
-        __nv_bfloat16* expert_swiglu = expert_gu + 2 * moe_is;
-        __nv_bfloat16* expert_out    = expert_swiglu + moe_is;
+        __nv_bfloat16* expert_gu_all      = expert_scratch;                              // [T*top_k, 2*moe_is]
+        __nv_bfloat16* expert_down_all    = expert_gu_all + (size_t)num_tokens * top_k * 2 * moe_is;  // [T*top_k, hs]
 
-        // D2H copy for CPU-side expert dispatch
-        std::vector<int>   h_indices(num_tokens * top_k);
-        std::vector<float> h_weights(num_tokens * top_k);
-        cudaMemcpyAsync(h_indices.data(), expert_indices,
-                         num_tokens * top_k * sizeof(int), cudaMemcpyDeviceToHost, stream);
-        cudaMemcpyAsync(h_weights.data(), expert_weights,
-                         num_tokens * top_k * sizeof(float), cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream);
+        // 5a. Batched grouped gate_up GEMV: all T*top_k assignments
+        ops::invoke_grouped_expert_gemv(
+            post_norm_out, moe.experts_gate_up_w, expert_gu_all,
+            expert_indices, 2 * moe_is, hs, gu_stride,
+            top_k, /*shared_input=*/true, stream, num_tokens);
 
-        cudaMemsetAsync(moe_acc, 0, num_tokens * hs * sizeof(__nv_bfloat16), stream);
+        // 5b+5c. Fused SwiGLU + Batched grouped down GEMV
+        ops::invoke_grouped_expert_gemv_swiglu(
+            expert_gu_all, moe.experts_down_w, expert_down_all,
+            expert_indices, hs, moe_is, dn_stride,
+            top_k, stream, num_tokens);
 
-        for (int t = 0; t < num_tokens; ++t) {
-            const __nv_bfloat16* token_in = post_norm_out + t * hs;
-            __nv_bfloat16* token_acc = moe_acc + t * hs;
-            for (int k = 0; k < top_k; ++k) {
-                int eidx = h_indices[t * top_k + k];
-                float w  = h_weights[t * top_k + k];
-                const __nv_bfloat16* egu_w = moe.experts_gate_up_w + eidx * gu_stride;
-                ops::invoke_dense_gemv(token_in, egu_w, expert_gu, 2 * moe_is, hs, stream);
-                ops::invoke_swiglu_merged(expert_swiglu, expert_gu, 1, moe_is, stream);
-                const __nv_bfloat16* edn_w = moe.experts_down_w + eidx * dn_stride;
-                ops::invoke_dense_gemv(expert_swiglu, edn_w, expert_out, hs, moe_is, stream);
-                ops::invoke_scale_add(token_acc, expert_out, w, hs, stream);
-            }
-        }
+        // 5d. Batched weighted expert reduce: moe_acc[T, hs] = sum_k(w[t,k] * expert_down[t*topk+k, hs])
+        ops::invoke_weighted_expert_reduce(
+            moe_acc, expert_down_all, expert_weights,
+            hs, top_k, stream, num_tokens);
     }
 
     // Shared expert MLP (T>1 only — T=1 handled above with fused_moe_final)
     if (num_tokens > 1) {
-        __nv_bfloat16* shared_down_buf = expert_scratch + 2 * moe_is + moe_is;
         ops::invoke_dense_gemm(post_norm_out, moe.shared_gate_w, shared_gate_out,
                                 num_tokens, shared_is, hs, stream);
         ops::invoke_dense_gemm(post_norm_out, moe.shared_up_w, shared_up_out,
@@ -286,10 +278,14 @@ static void run_moe_mlp(
                             num_tokens, shared_is, stream);
         ops::invoke_dense_gemm(post_norm_out, moe.shared_expert_gate_w,
                                 gate_scalar, num_tokens, 1, hs, stream);
+        // Shared expert down projection: GEMM [T, shared_is] × [shared_is, hs] → [T, hs]
+        // shared_down_buf needs [T, hs] — reuse expert_gu_all area (no longer needed)
+        __nv_bfloat16* shared_down_buf = expert_scratch;  // reuse, large enough
+        ops::invoke_dense_gemm(shared_swiglu_buf, moe.shared_down_w, shared_down_buf,
+                                num_tokens, hs, shared_is, stream);
+        // Per-token sigmoid-gated add + residual
         for (int t = 0; t < num_tokens; ++t) {
-            ops::invoke_dense_gemv(shared_swiglu_buf + t * shared_is, moe.shared_down_w,
-                                    shared_down_buf, hs, shared_is, stream);
-            ops::invoke_sigmoid_gated_add(moe_acc + t * hs, shared_down_buf,
+            ops::invoke_sigmoid_gated_add(moe_acc + t * hs, shared_down_buf + t * hs,
                                            gate_scalar + t, hs, stream);
         }
         // T>1 residual add
