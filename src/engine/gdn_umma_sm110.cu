@@ -227,10 +227,10 @@ gdn_wy_prefill_kernel(
             float bias  = dt_bias ? __bfloat162float(dt_bias[h_v]) : 0.f;
             float a_l   = A_log   ? A_log[h_v] : 0.f;
             float ab    = a_val + bias;
-            float dt_v  = (ab > 20.f) ? ab : log1pf(expf(ab));
-            float alpha = expf(-dt_v * expf(a_l));
-            alpha_cl[j] = log2f(fmaxf(alpha, 1e-10f));
-            beta_v[j]   = 1.0f / (1.0f + expf(-__bfloat162float(beta_raw[tidx])));
+            float dt_v  = (ab > 20.f) ? ab : log1pf(exp2f(ab * 1.4426950408889634f));
+            // Direct log2-scale: log2(exp(-dt_v * exp(a_l))) = -dt_v * exp(a_l) * LOG2E
+            alpha_cl[j] = fmaxf((-dt_v * exp2f(a_l * 1.4426950408889634f)) * 1.4426950408889634f, -33.2193f);
+            beta_v[j]   = 1.0f / (1.0f + exp2f(-__bfloat162float(beta_raw[tidx]) * 1.4426950408889634f));
         }
         __syncthreads();
 

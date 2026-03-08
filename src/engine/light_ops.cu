@@ -24,6 +24,9 @@
 namespace qwen_thor {
 namespace ops {
 
+// exp2f-based fast exp: exp(x) = exp2(x * LOG2E)
+static constexpr float LOG2E = 1.4426950408889634f;
+
 // ----------------------------------------------------------------------------
 // Warp Reduce 辅助函数
 // ----------------------------------------------------------------------------
@@ -166,7 +169,7 @@ void invoke_rope(__nv_bfloat16* q, __nv_bfloat16* k, const int* pos_ids, int num
 // ----------------------------------------------------------------------------
 // silu(x) = x * sigmoid(x)
 __device__ __forceinline__ float silu(float x) {
-    return x / (1.0f + expf(-x));
+    return x / (1.0f + exp2f(-x * LOG2E));
 }
 
 __global__ void swiglu_kernel(__nv_bfloat16* out, const __nv_bfloat16* gate, const __nv_bfloat16* up, int total_elements) {
@@ -575,7 +578,7 @@ __global__ void causal_conv1d_prefill_parallel_kernel(
     }
 
     // SiLU activation
-    float silu_out = acc / (1.f + expf(-acc));
+    float silu_out = acc / (1.f + exp2f(-acc * LOG2E));
     output[t * token_stride + ch] = __float2bfloat16(silu_out);
 }
 
@@ -632,7 +635,7 @@ __global__ void causal_conv1d_kernel(__nv_bfloat16* x_io,
                 acc += h_val * w_val;
             }
             acc += cur * __bfloat162float(conv_w[ch * conv_k + hist]);
-            float silu_out = acc / (1.f + expf(-acc));
+            float silu_out = acc / (1.f + exp2f(-acc * LOG2E));
             x_io[t * token_stride + ch] = __float2bfloat16(silu_out);
             for (int k = 0; k < hist - 1; k++) {
                 conv_state[ch * hist + k] = conv_state[ch * hist + k + 1];
@@ -661,7 +664,7 @@ __global__ void causal_conv1d_kernel(__nv_bfloat16* x_io,
     for (int t = 0; t < num_tokens; t++) {
         float cur = __bfloat162float(x_io[t * token_stride + ch]);
         float acc = buf0 * w[0] + buf1 * w[1] + buf2 * w[2] + cur * w[3];
-        float silu_out = acc / (1.f + expf(-acc));
+        float silu_out = acc / (1.f + exp2f(-acc * LOG2E));
         x_io[t * token_stride + ch] = __float2bfloat16(silu_out);
         // 滑动窗口 (全在寄存器中)
         buf0 = buf1;
@@ -824,9 +827,9 @@ gated_delta_net_prefill_kernel(
         float bias  = dt_bias ? __bfloat162float(dt_bias[h_v]) : 0.f;
         float a_l   = A_log   ? A_log[h_v]                    : 0.f;
         float ab    = a_val + bias;
-        float dt_v  = (ab > 20.f) ? ab : log1pf(expf(ab));
-        float alpha_v = expf(-dt_v * expf(a_l));
-        float beta_v = 1.0f / (1.0f + expf(-__bfloat162float(beta_raw[t * nv + h_v])));
+        float dt_v  = (ab > 20.f) ? ab : log1pf(exp2f(ab * LOG2E));
+        float alpha_v = exp2f((-dt_v * exp2f(a_l * LOG2E)) * LOG2E);
+        float beta_v = 1.0f / (1.0f + exp2f(-__bfloat162float(beta_raw[t * nv + h_v]) * LOG2E));
 
         int v_base = t * token_stride + h_v * vd;
         float kS_j = 0.f;
@@ -948,10 +951,10 @@ __global__ void gated_delta_net_kernel(
         float bias  = dt_bias ? __bfloat162float(dt_bias[h_v]) : 0.f;
         float a_l   = A_log   ? A_log[h_v]                    : 0.f;
         float ab    = a_val + bias;
-        float dt_v  = (ab > 20.f) ? ab : log1pf(expf(ab));
-        float alpha_v = expf(-dt_v * expf(a_l));
+        float dt_v  = (ab > 20.f) ? ab : log1pf(exp2f(ab * LOG2E));
+        float alpha_v = exp2f((-dt_v * exp2f(a_l * LOG2E)) * LOG2E);
 
-        float beta_v = 1.0f / (1.0f + expf(-__bfloat162float(beta_raw[t * nv + h_v])));
+        float beta_v = 1.0f / (1.0f + exp2f(-__bfloat162float(beta_raw[t * nv + h_v]) * LOG2E));
 
         int v_base = t * token_stride + h_v * vd;
 
@@ -1061,8 +1064,8 @@ __global__ void sigmoid_mul_kernel(
         for (int j = 0; j < 4; j++) {
             float2 af = __bfloat1622float2(a2[j]);
             float2 bf = __bfloat1622float2(b2[j]);
-            float sig0 = 1.0f / (1.0f + expf(-bf.x));
-            float sig1 = 1.0f / (1.0f + expf(-bf.y));
+            float sig0 = 1.0f / (1.0f + exp2f(-bf.x * LOG2E));
+            float sig1 = 1.0f / (1.0f + exp2f(-bf.y * LOG2E));
             o2[j] = __floats2bfloat162_rn(af.x * sig0, af.y * sig1);
         }
         reinterpret_cast<float4*>(out)[idx] = o4;
@@ -1072,7 +1075,7 @@ __global__ void sigmoid_mul_kernel(
         for (int i = n8 * 8; i < n; i++) {
             float av = __bfloat162float(a[i]);
             float bv = __bfloat162float(b[i]);
-            out[i] = __float2bfloat16(av / (1.0f + expf(-bv)));
+            out[i] = __float2bfloat16(av / (1.0f + exp2f(-bv * LOG2E)));
         }
     }
 }
@@ -1358,7 +1361,7 @@ __global__ void fused_norm_silu_gate_kernel(
         float normalized = y_val * inv_rms * w;  // plain weight (not centered)
 
         float z_val = __bfloat162float(z_out[off + i]);
-        float silu_z = z_val / (1.f + expf(-z_val));
+        float silu_z = z_val / (1.f + exp2f(-z_val * LOG2E));
 
         y_ssm[off + i] = __float2bfloat16(normalized * silu_z);
     }
@@ -1580,8 +1583,8 @@ __global__ void swiglu_merged_kernel(
             float gv1 = __bfloat162float(g2[j].y);
             float uv0 = __bfloat162float(u2[j].x);
             float uv1 = __bfloat162float(u2[j].y);
-            float sg0 = gv0 / (1.f + expf(-gv0));
-            float sg1 = gv1 / (1.f + expf(-gv1));
+            float sg0 = gv0 / (1.f + exp2f(-gv0 * LOG2E));
+            float sg1 = gv1 / (1.f + exp2f(-gv1 * LOG2E));
             o2[j] = __floats2bfloat162_rn(sg0 * uv0, sg1 * uv1);
         }
 
@@ -1699,7 +1702,7 @@ __global__ void moe_router_gemv_topk_kernel(
                 max_val = fmaxf(max_val, top_vals[k]);
             float sum_exp = 0.f;
             for (int k = 0; k < top_k; k++) {
-                top_vals[k] = expf(top_vals[k] - max_val);
+                top_vals[k] = exp2f((top_vals[k] - max_val) * LOG2E);
                 sum_exp += top_vals[k];
             }
             float inv_sum = 1.f / sum_exp;
@@ -1759,7 +1762,7 @@ __global__ void moe_router_topk_kernel(
         max_val = fmaxf(max_val, top_vals[k]);
     float sum_exp = 0.f;
     for (int k = 0; k < top_k; k++) {
-        top_vals[k] = expf(top_vals[k] - max_val);
+        top_vals[k] = exp2f((top_vals[k] - max_val) * LOG2E);
         sum_exp += top_vals[k];
     }
     float inv_sum = 1.f / sum_exp;
@@ -1830,7 +1833,7 @@ __global__ void sigmoid_gated_add_kernel(
     int n)
 {
     float gate = __bfloat162float(gate_scalar[0]);
-    float sig = 1.f / (1.f + expf(-gate));
+    float sig = 1.f / (1.f + exp2f(-gate * LOG2E));
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -1881,7 +1884,7 @@ __global__ void fused_moe_final_kernel(
         float total = 0.0f;
         for (int w = 0; w < (int)(blockDim.x / 32); w++)
             total += s_warp_sums[w];
-        s_gate_sig = 1.f / (1.f + expf(-total));
+        s_gate_sig = 1.f / (1.f + exp2f(-total * LOG2E));
     }
     __syncthreads();
 
