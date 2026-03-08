@@ -3,6 +3,9 @@
 #include <iostream>
 #include <cublas_v2.h>
 
+// exp2f-based fast exp: exp(x) = exp2(x * LOG2E)
+static constexpr float LOG2E = 1.4426950408889634f;
+
 // Warp/Block reduce helpers (for gemv_rmsnorm_kernel)
 template <typename T>
 __inline__ __device__ T gemv_warpReduceSum(T val) {
@@ -1060,7 +1063,7 @@ __global__ void gemv_sigmoid_mul_kernel(
     for (int i = threadIdx.x; i < K; i += blockDim.x) {
         float v = __bfloat162float(attn_out[i]);
         float g = __bfloat162float(attn_gate[i]);
-        float sig = 1.0f / (1.0f + expf(-g));
+        float sig = 1.0f / (1.0f + exp2f(-g * LOG2E));
         s_A[i] = __float2bfloat16(v * sig);
     }
     __syncthreads();
@@ -1520,7 +1523,7 @@ __global__ void grouped_expert_gemv_swiglu_kernel(
     for (int i = threadIdx.x; i < K; i += blockDim.x) {
         float gate = __bfloat162float(s_A[i]);
         float up = __bfloat162float(s_A[K + i]);
-        float silu_val = gate / (1.0f + expf(-gate));
+        float silu_val = gate / (1.0f + exp2f(-gate * LOG2E));
         s_A[i] = __float2bfloat16(silu_val * up);
     }
     __syncthreads();
@@ -1606,7 +1609,7 @@ __global__ void gemv_swiglu_kernel(
     for (int i = threadIdx.x; i < K; i += blockDim.x) {
         float g = __bfloat162float(gate_out[i]);
         float u = __bfloat162float(up_out[i]);
-        float silu_val = g / (1.0f + expf(-g));
+        float silu_val = g / (1.0f + exp2f(-g * LOG2E));
         s_A[i] = __float2bfloat16(silu_val * u);
     }
     __syncthreads();

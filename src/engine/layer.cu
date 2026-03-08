@@ -675,7 +675,7 @@ __global__ void silu_gate_kernel(__nv_bfloat16* y, const __nv_bfloat16* z, int n
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         float zv = __bfloat162float(z[idx]);
-        float zg = zv / (1.f + expf(-zv));
+        float zg = zv / (1.f + exp2f(-zv * 1.4426950408889634f));
         y[idx]   = __float2bfloat16(__bfloat162float(y[idx]) * zg);
     }
 }

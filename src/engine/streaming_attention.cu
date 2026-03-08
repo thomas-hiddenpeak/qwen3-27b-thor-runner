@@ -8,6 +8,9 @@
 
 #include "streaming_attention.h"
 #include <cuda_bf16.h>
+
+// exp2f-based fast exp: exp(x) = exp2(x * LOG2E)
+static constexpr float LOG2E = 1.4426950408889634f;
 #include <float.h>
 
 namespace qwen_thor {
@@ -115,8 +118,8 @@ __global__ void paged_attention_partial_kernel(
             final_qk = s_qk_parts[0];
 
             float m_i_new  = fmaxf(m_i, final_qk);
-            float exp_qk   = expf(final_qk - m_i_new);
-            float exp_diff = expf(m_i       - m_i_new);
+            float exp_qk   = exp2f((final_qk - m_i_new) * LOG2E);
+            float exp_diff = exp2f((m_i       - m_i_new) * LOG2E);
 
             l_i = l_i * exp_diff + exp_qk;
 
@@ -185,8 +188,8 @@ __global__ void merge_attention_kernel(
     }
 
     float m_new = fmaxf(m1_val, m2_val);
-    float scale1 = expf(m1_val - m_new);
-    float scale2 = expf(m2_val - m_new);
+    float scale1 = exp2f((m1_val - m_new) * LOG2E);
+    float scale2 = exp2f((m2_val - m_new) * LOG2E);
 
     int off = token_idx * (num_heads * head_dim) + head_idx * head_dim + d;
     float a1 = __bfloat162float(out1[off]);

@@ -19,6 +19,9 @@
 #include <cstring>
 #include <chrono>
 
+// exp2f-based fast exp: exp(x) = exp2(x * LOG2E)
+static constexpr float LOG2E = 1.4426950408889634f;
+
 namespace qwen_thor {
 namespace core {
 
@@ -258,7 +261,7 @@ __global__ void softmax_kernel(float* __restrict__ scores, int seq_len)
     // Compute exp and sum
     float sum = 0.0f;
     for (int i = threadIdx.x; i < seq_len; i += blockDim.x) {
-        float v = expf(row_ptr[i] - max_val);
+        float v = exp2f((row_ptr[i] - max_val) * LOG2E);
         row_ptr[i] = v;
         sum += v;
     }
@@ -667,7 +670,7 @@ vision_flash_attention_kernel(
 
             // Online softmax update (rescale only when max changes)
             if (s > m) {
-                float corr = expf(m - s);
+                float corr = exp2f((m - s) * LOG2E);
                 #pragma unroll
                 for (int d = 0; d < 72; d++)
                     acc[d] *= corr;
@@ -675,7 +678,7 @@ vision_flash_attention_kernel(
                 m = s;
             }
 
-            float p = expf(s - m);
+            float p = exp2f((s - m) * LOG2E);
             #pragma unroll
             for (int d = 0; d < 72; d++)
                 acc[d] += p * __bfloat162float(V_smem[j][d]);
