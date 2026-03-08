@@ -7,6 +7,20 @@
 // exp2f-based fast exp: exp(x) = exp2(x * LOG2E)
 static constexpr float LOG2E = 1.4426950408889634f;
 
+// f32x2 SIMD FMA: 2 FMAs per instruction on SM110a (1.97× throughput vs scalar)
+// Accumulates {a.x*b.x, a.y*b.y} into packed pair using fma.rn.f32x2
+__device__ __forceinline__ void f32x2_fma(uint64_t& acc, const float2& a, const float2& b) {
+    asm volatile("fma.rn.f32x2 %0, %1, %2, %0;"
+        : "+l"(acc)
+        : "l"(reinterpret_cast<const uint64_t&>(a)),
+          "l"(reinterpret_cast<const uint64_t&>(b)));
+}
+__device__ __forceinline__ float f32x2_reduce(uint64_t acc) {
+    float2 v;
+    memcpy(&v, &acc, 8);
+    return v.x + v.y;
+}
+
 // Warp/Block reduce helpers (for gemv_rmsnorm_kernel)
 template <typename T>
 __inline__ __device__ T gemv_warpReduceSum(T val) {
@@ -568,9 +582,9 @@ __global__ void gemv_kernel(const __nv_bfloat16* __restrict__ A,
     if (out_idx >= N) return;
 
     const __nv_bfloat16* b_col = B + (size_t)out_idx * K;
-    float sum = 0.0f;
+    uint64_t sum_pair = 0;
 
-    // --- 主循环: float4 向量化 (每次读 8 个 BF16) ---
+    // --- 主循环: float4 向量化 (每次读 8 个 BF16) + f32x2 FMA ---
     int k8 = K / 8;
     const float4* s_A_v4 = reinterpret_cast<const float4*>(s_A);
     const float4* b_col_v4 = reinterpret_cast<const float4*>(b_col);
@@ -586,11 +600,12 @@ __global__ void gemv_kernel(const __nv_bfloat16* __restrict__ A,
         for (int j = 0; j < 4; j++) {
             float2 af = __bfloat1622float2(a2[j]);
             float2 bf = __bfloat1622float2(b2[j]);
-            sum += af.x * bf.x + af.y * bf.y;
+            f32x2_fma(sum_pair, af, bf);
         }
     }
 
     // --- 标量尾部处理 (K % 8 != 0 的情况) ---
+    float sum = f32x2_reduce(sum_pair);
     int k_tail_start = k8 * 8;
     for (int k = k_tail_start + lane_id; k < K; k += WARP_SIZE) {
         sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k]);
@@ -630,7 +645,8 @@ __global__ void gemv_kernel_tiled(const __nv_bfloat16* __restrict__ A,
     if (out_idx >= N) return;
 
     const __nv_bfloat16* b_col = B + (size_t)out_idx * K;
-    float sum = 0.0f;
+    uint64_t sum_pair = 0;
+    float sum_tail = 0.0f;
 
     for (int k_start = 0; k_start < K; k_start += tile_k) {
         int tile_end = min(k_start + tile_k, K);
@@ -642,7 +658,7 @@ __global__ void gemv_kernel_tiled(const __nv_bfloat16* __restrict__ A,
         }
         __syncthreads();
 
-        // float4 向量化主循环
+        // float4 向量化主循环 + f32x2 FMA
         int t8 = tile_len / 8;
         const float4* s_A_v4 = reinterpret_cast<const float4*>(s_A);
         const float4* b_tile_v4 = reinterpret_cast<const float4*>(b_col + k_start);
@@ -656,17 +672,19 @@ __global__ void gemv_kernel_tiled(const __nv_bfloat16* __restrict__ A,
             for (int j = 0; j < 4; j++) {
                 float2 af = __bfloat1622float2(a2[j]);
                 float2 bf = __bfloat1622float2(b2[j]);
-                sum += af.x * bf.x + af.y * bf.y;
+                f32x2_fma(sum_pair, af, bf);
             }
         }
 
         // 尾部处理
         int tail_start = t8 * 8;
         for (int k = tail_start + lane_id; k < tile_len; k += WARP_SIZE) {
-            sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k_start + k]);
+            sum_tail += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k_start + k]);
         }
         __syncthreads();  // 下一轮 tile 前的同步
     }
+
+    float sum = f32x2_reduce(sum_pair) + sum_tail;
 
     // Warp shuffle reduce
     #pragma unroll
@@ -712,7 +730,7 @@ __global__ void gemv_kernel_scattered(
     if (out_idx >= N) return;
 
     const __nv_bfloat16* b_col = B + (size_t)out_idx * K;
-    float sum = 0.0f;
+    uint64_t sum_pair = 0;
 
     int k8 = K / 8;
     const float4* s_A_v4 = reinterpret_cast<const float4*>(s_A);
@@ -727,10 +745,11 @@ __global__ void gemv_kernel_scattered(
         for (int j = 0; j < 4; j++) {
             float2 af = __bfloat1622float2(a2[j]);
             float2 bf = __bfloat1622float2(b2[j]);
-            sum += af.x * bf.x + af.y * bf.y;
+            f32x2_fma(sum_pair, af, bf);
         }
     }
 
+    float sum = f32x2_reduce(sum_pair);
     int k_tail_start = k8 * 8;
     for (int k = k_tail_start + lane_id; k < K; k += WARP_SIZE)
         sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k]);
@@ -772,7 +791,8 @@ __global__ void gemv_kernel_scattered_tiled(
     if (out_idx >= N) return;
 
     const __nv_bfloat16* b_col = B + (size_t)out_idx * K;
-    float sum = 0.0f;
+    uint64_t sum_pair = 0;
+    float sum_tail = 0.0f;
 
     for (int k_start = 0; k_start < K; k_start += tile_k) {
         int tile_end = min(k_start + tile_k, K);
@@ -796,15 +816,17 @@ __global__ void gemv_kernel_scattered_tiled(
             for (int j = 0; j < 4; j++) {
                 float2 af = __bfloat1622float2(a2[j]);
                 float2 bf = __bfloat1622float2(b2[j]);
-                sum += af.x * bf.x + af.y * bf.y;
+                f32x2_fma(sum_pair, af, bf);
             }
         }
 
         int tail_start = t8 * 8;
         for (int k = tail_start + lane_id; k < tile_len; k += WARP_SIZE)
-            sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k_start + k]);
+            sum_tail += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k_start + k]);
         __syncthreads();
     }
+
+    float sum = f32x2_reduce(sum_pair) + sum_tail;
 
     #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1)
@@ -849,7 +871,7 @@ __global__ void gemv_kernel_scattered_add(
     if (out_idx >= N) return;
 
     const __nv_bfloat16* b_col = B + (size_t)out_idx * K;
-    float sum = 0.0f;
+    uint64_t sum_pair = 0;
 
     int k8 = K / 8;
     const float4* s_A_v4 = reinterpret_cast<const float4*>(s_A);
@@ -864,10 +886,11 @@ __global__ void gemv_kernel_scattered_add(
         for (int j = 0; j < 4; j++) {
             float2 af = __bfloat1622float2(a2[j]);
             float2 bf = __bfloat1622float2(b2[j]);
-            sum += af.x * bf.x + af.y * bf.y;
+            f32x2_fma(sum_pair, af, bf);
         }
     }
 
+    float sum = f32x2_reduce(sum_pair);
     int k_tail_start = k8 * 8;
     for (int k = k_tail_start + lane_id; k < K; k += WARP_SIZE)
         sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k]);
@@ -902,7 +925,7 @@ __global__ void gemv_kernel_add(const __nv_bfloat16* __restrict__ A,
     if (out_idx >= N) return;
 
     const __nv_bfloat16* b_col = B + (size_t)out_idx * K;
-    float sum = 0.0f;
+    uint64_t sum_pair = 0;
     int k8 = K / 8;
     const float4* s_A_v4 = reinterpret_cast<const float4*>(s_A);
     const float4* b_col_v4 = reinterpret_cast<const float4*>(b_col);
@@ -916,9 +939,10 @@ __global__ void gemv_kernel_add(const __nv_bfloat16* __restrict__ A,
         for (int j = 0; j < 4; j++) {
             float2 af = __bfloat1622float2(a2[j]);
             float2 bf = __bfloat1622float2(b2[j]);
-            sum += af.x * bf.x + af.y * bf.y;
+            f32x2_fma(sum_pair, af, bf);
         }
     }
+    float sum = f32x2_reduce(sum_pair);
     int k_tail_start = k8 * 8;
     for (int k = k_tail_start + lane_id; k < K; k += WARP_SIZE)
         sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k]);
@@ -948,7 +972,8 @@ __global__ void gemv_kernel_tiled_add(const __nv_bfloat16* __restrict__ A,
     if (out_idx >= N) return;
 
     const __nv_bfloat16* b_col = B + (size_t)out_idx * K;
-    float sum = 0.0f;
+    uint64_t sum_pair = 0;
+    float sum_tail = 0.0f;
 
     for (int k_start = 0; k_start < K; k_start += tile_k) {
         int tile_end = min(k_start + tile_k, K);
@@ -969,14 +994,16 @@ __global__ void gemv_kernel_tiled_add(const __nv_bfloat16* __restrict__ A,
             for (int j = 0; j < 4; j++) {
                 float2 af = __bfloat1622float2(a2[j]);
                 float2 bf = __bfloat1622float2(b2[j]);
-                sum += af.x * bf.x + af.y * bf.y;
+                f32x2_fma(sum_pair, af, bf);
             }
         }
         int tail_start = t8 * 8;
         for (int k = tail_start + lane_id; k < tile_len; k += WARP_SIZE)
-            sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k_start + k]);
+            sum_tail += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k_start + k]);
         __syncthreads();
     }
+
+    float sum = f32x2_reduce(sum_pair) + sum_tail;
 
     #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1)
@@ -1006,7 +1033,8 @@ __global__ void gemv_kernel_scattered_tiled_add(
     if (out_idx >= N) return;
 
     const __nv_bfloat16* b_col = B + (size_t)out_idx * K;
-    float sum = 0.0f;
+    uint64_t sum_pair = 0;
+    float sum_tail = 0.0f;
 
     for (int k_start = 0; k_start < K; k_start += tile_k) {
         int tile_end = min(k_start + tile_k, K);
@@ -1027,14 +1055,16 @@ __global__ void gemv_kernel_scattered_tiled_add(
             for (int j = 0; j < 4; j++) {
                 float2 af = __bfloat1622float2(a2[j]);
                 float2 bf = __bfloat1622float2(b2[j]);
-                sum += af.x * bf.x + af.y * bf.y;
+                f32x2_fma(sum_pair, af, bf);
             }
         }
         int tail_start = t8 * 8;
         for (int k = tail_start + lane_id; k < tile_len; k += WARP_SIZE)
-            sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k_start + k]);
+            sum_tail += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k_start + k]);
         __syncthreads();
     }
+
+    float sum = f32x2_reduce(sum_pair) + sum_tail;
 
     #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1)
@@ -1082,7 +1112,7 @@ __global__ void gemv_sigmoid_mul_kernel(
     if (out_idx >= N) return;
 
     const __nv_bfloat16* b_col = B + (size_t)out_idx * K;
-    float sum = 0.0f;
+    uint64_t sum_pair = 0;
 
     int k8 = K / 8;
     const float4* s_A_v4 = reinterpret_cast<const float4*>(s_A);
@@ -1097,10 +1127,11 @@ __global__ void gemv_sigmoid_mul_kernel(
         for (int j = 0; j < 4; j++) {
             float2 af = __bfloat1622float2(a2[j]);
             float2 bf = __bfloat1622float2(b2[j]);
-            sum += af.x * bf.x + af.y * bf.y;
+            f32x2_fma(sum_pair, af, bf);
         }
     }
 
+    float sum = f32x2_reduce(sum_pair);
     int k_tail_start = k8 * 8;
     for (int k = k_tail_start + lane_id; k < K; k += WARP_SIZE) {
         sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k]);
@@ -1173,7 +1204,7 @@ __global__ void gemv_rmsnorm_kernel(
     if (out_idx >= N) return;
 
     const __nv_bfloat16* b_col = B + (size_t)out_idx * K;
-    float sum = 0.0f;
+    uint64_t sum_pair = 0;
 
     int k8 = K / 8;
     const float4* s_A_v4 = reinterpret_cast<const float4*>(s_A);
@@ -1188,10 +1219,11 @@ __global__ void gemv_rmsnorm_kernel(
         for (int j = 0; j < 4; j++) {
             float2 af = __bfloat1622float2(a2[j]);
             float2 bf = __bfloat1622float2(b2[j]);
-            sum += af.x * bf.x + af.y * bf.y;
+            f32x2_fma(sum_pair, af, bf);
         }
     }
 
+    float sum = f32x2_reduce(sum_pair);
     int k_tail_start = k8 * 8;
     for (int k = k_tail_start + lane_id; k < K; k += WARP_SIZE) {
         sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k]);
@@ -1356,7 +1388,7 @@ __global__ void dual_gemv_kernel(const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* b_col = is_second
         ? (B2 + (size_t)out_idx * K)
         : (B1 + (size_t)out_idx * K);
-    float sum = 0.0f;
+    uint64_t sum_pair = 0;
 
     int k8 = K / 8;
     const float4* s_A_v4 = reinterpret_cast<const float4*>(s_A);
@@ -1373,10 +1405,11 @@ __global__ void dual_gemv_kernel(const __nv_bfloat16* __restrict__ A,
         for (int j = 0; j < 4; j++) {
             float2 af = __bfloat1622float2(a2[j]);
             float2 bf = __bfloat1622float2(b2[j]);
-            sum += af.x * bf.x + af.y * bf.y;
+            f32x2_fma(sum_pair, af, bf);
         }
     }
 
+    float sum = f32x2_reduce(sum_pair);
     int k_tail_start = k8 * 8;
     for (int k = k_tail_start + lane_id; k < K; k += WARP_SIZE) {
         sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k]);
@@ -1455,7 +1488,7 @@ __global__ void grouped_expert_gemv_kernel(
     int expert_id = expert_indices[assign_idx];
     const __nv_bfloat16* b_col = packed_weights + expert_id * expert_stride + (size_t)out_idx * K;
 
-    float sum = 0.0f;
+    uint64_t sum_pair = 0;
     int k8 = K / 8;
     const float4* s_A_v4 = reinterpret_cast<const float4*>(s_A);
     const float4* b_col_v4 = reinterpret_cast<const float4*>(b_col);
@@ -1469,10 +1502,11 @@ __global__ void grouped_expert_gemv_kernel(
         for (int j = 0; j < 4; j++) {
             float2 af = __bfloat1622float2(a2[j]);
             float2 bf = __bfloat1622float2(b2[j]);
-            sum += af.x * bf.x + af.y * bf.y;
+            f32x2_fma(sum_pair, af, bf);
         }
     }
 
+    float sum = f32x2_reduce(sum_pair);
     int k_tail = k8 * 8;
     for (int k = k_tail + lane_id; k < K; k += WARP_SIZE) {
         sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k]);
@@ -1551,7 +1585,7 @@ __global__ void grouped_expert_gemv_swiglu_kernel(
     int expert_id = expert_indices[assign_idx];
     const __nv_bfloat16* b_col = packed_weights + expert_id * expert_stride + (size_t)out_idx * K;
 
-    float sum = 0.0f;
+    uint64_t sum_pair = 0;
     int k8 = K / 8;
     const float4* s_v4 = reinterpret_cast<const float4*>(s_A);
     const float4* b_v4 = reinterpret_cast<const float4*>(b_col);
@@ -1565,10 +1599,11 @@ __global__ void grouped_expert_gemv_swiglu_kernel(
         for (int j = 0; j < 4; j++) {
             float2 af = __bfloat1622float2(a2[j]);
             float2 bf = __bfloat1622float2(b2[j]);
-            sum += af.x * bf.x + af.y * bf.y;
+            f32x2_fma(sum_pair, af, bf);
         }
     }
 
+    float sum = f32x2_reduce(sum_pair);
     int k_tail = k8 * 8;
     for (int k = k_tail + lane_id; k < K; k += WARP_SIZE) {
         sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k]);
@@ -1638,7 +1673,7 @@ __global__ void gemv_swiglu_kernel(
 
     const __nv_bfloat16* b_col = weight + (size_t)out_idx * K;
 
-    float sum = 0.0f;
+    uint64_t sum_pair = 0;
     int k8 = K / 8;
     const float4* s_v4 = reinterpret_cast<const float4*>(s_A);
     const float4* b_v4 = reinterpret_cast<const float4*>(b_col);
@@ -1652,10 +1687,11 @@ __global__ void gemv_swiglu_kernel(
         for (int j = 0; j < 4; j++) {
             float2 af = __bfloat1622float2(a2[j]);
             float2 bf = __bfloat1622float2(b2[j]);
-            sum += af.x * bf.x + af.y * bf.y;
+            f32x2_fma(sum_pair, af, bf);
         }
     }
 
+    float sum = f32x2_reduce(sum_pair);
     int k_tail = k8 * 8;
     for (int k = k_tail + lane_id; k < K; k += WARP_SIZE) {
         sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k]);
