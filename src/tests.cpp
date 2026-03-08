@@ -44,6 +44,7 @@
 #include <cstdlib>
 #include <functional>
 #include <sstream>
+#include <cctype>
 
 using namespace qwen_thor;
 
@@ -68,12 +69,16 @@ struct TestEntry {
     std::function<void()> func;
 };
 
+enum class TestStatus { PASS, FAIL, SKIP };
+
 struct TestResult {
     std::string name;
     TestCategory category;
-    bool passed;
+    TestStatus status = TestStatus::PASS;
     double elapsed_ms;
     std::string error;
+    std::string captured_stdout;
+    std::string captured_stderr;
 };
 
 static std::vector<TestEntry>& test_registry() {
@@ -83,6 +88,76 @@ static std::vector<TestEntry>& test_registry() {
 
 static void register_test(const char* name, TestCategory cat, std::function<void()> fn) {
     test_registry().push_back({name, cat, std::move(fn)});
+}
+
+static std::string trim_copy(const std::string& input) {
+    size_t begin = 0;
+    while (begin < input.size() && std::isspace(static_cast<unsigned char>(input[begin]))) begin++;
+    size_t end = input.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(input[end - 1]))) end--;
+    return input.substr(begin, end - begin);
+}
+
+static bool line_has_marker(const std::string& line, const std::vector<std::string>& markers) {
+    for (const auto& marker : markers) {
+        if (line.find(marker) != std::string::npos) return true;
+    }
+    return false;
+}
+
+static std::string extract_marked_line(const std::string& text,
+                                       const std::vector<std::string>& markers) {
+    std::istringstream iss(text);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (line_has_marker(line, markers)) {
+            return trim_copy(line);
+        }
+    }
+    return "";
+}
+
+static TestStatus infer_status_from_output(const std::string& stdout_text,
+                                           const std::string& stderr_text,
+                                           std::string* diagnostic) {
+    static const std::vector<std::string> fail_markers = {
+        "FAIL:",
+        "ERROR:",
+        "failed:",
+        "Error loading",
+        "Error in ",
+        "TIMEOUT:"
+    };
+    static const std::vector<std::string> skip_markers = {
+        "SKIP:",
+        "skipped",
+        " skipped "
+    };
+
+    std::string fail_line = extract_marked_line(stderr_text, fail_markers);
+    if (fail_line.empty()) fail_line = extract_marked_line(stdout_text, fail_markers);
+    if (!fail_line.empty()) {
+        if (diagnostic) *diagnostic = fail_line;
+        return TestStatus::FAIL;
+    }
+
+    std::string skip_line = extract_marked_line(stdout_text, skip_markers);
+    if (skip_line.empty()) skip_line = extract_marked_line(stderr_text, skip_markers);
+    if (!skip_line.empty()) {
+        if (diagnostic) *diagnostic = skip_line;
+        return TestStatus::SKIP;
+    }
+
+    return TestStatus::PASS;
+}
+
+static const char* status_name(TestStatus status) {
+    switch (status) {
+        case TestStatus::PASS: return "PASS";
+        case TestStatus::FAIL: return "FAIL";
+        case TestStatus::SKIP: return "SKIP";
+    }
+    return "UNKNOWN";
 }
 
 namespace {
@@ -2518,6 +2593,8 @@ void bench_chunked_prefill() {
 int run_tests(int argc, char** argv) {
     g_test_model_dir = resolve_test_model_dir(argc, argv);
 
+    test_registry().clear();
+
     // --- 注册所有测试 ---
     register_test("unified_allocator",  TestCategory::UNIT,        test_unified_allocator);
     register_test("safetensors_loader", TestCategory::UNIT,        test_safetensors_loader);
@@ -2594,22 +2671,50 @@ int run_tests(int argc, char** argv) {
         r.name = t->name;
         r.category = t->category;
 
+        std::ostringstream captured_stdout;
+        std::ostringstream captured_stderr;
+        std::streambuf* old_cout = std::cout.rdbuf(captured_stdout.rdbuf());
+        std::streambuf* old_cerr = std::cerr.rdbuf(captured_stderr.rdbuf());
+
         auto t0 = std::chrono::high_resolution_clock::now();
         try {
             t->func();
-            r.passed = true;
         } catch (const std::exception& e) {
-            r.passed = false;
+            r.status = TestStatus::FAIL;
             r.error = e.what();
         } catch (...) {
-            r.passed = false;
+            r.status = TestStatus::FAIL;
             r.error = "unknown exception";
         }
         auto t1 = std::chrono::high_resolution_clock::now();
         r.elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-        if (r.passed) {
+        std::cout.rdbuf(old_cout);
+        std::cerr.rdbuf(old_cerr);
+        r.captured_stdout = captured_stdout.str();
+        r.captured_stderr = captured_stderr.str();
+
+        if (r.status != TestStatus::FAIL) {
+            std::string inferred_error;
+            r.status = infer_status_from_output(r.captured_stdout, r.captured_stderr, &inferred_error);
+            if (!inferred_error.empty()) {
+                r.error = inferred_error;
+            }
+        }
+
+        if (!r.captured_stdout.empty()) {
+            printf("\n%s", r.captured_stdout.c_str());
+            if (r.captured_stdout.back() != '\n') printf("\n");
+        }
+        if (!r.captured_stderr.empty()) {
+            fprintf(stderr, "%s", r.captured_stderr.c_str());
+            if (r.captured_stderr.back() != '\n') fprintf(stderr, "\n");
+        }
+
+        if (r.status == TestStatus::PASS) {
             printf("PASS (%.1f ms)\n", r.elapsed_ms);
+        } else if (r.status == TestStatus::SKIP) {
+            printf("SKIP (%.1f ms)\n", r.elapsed_ms);
         } else {
             printf("FAIL (%.1f ms)\n", r.elapsed_ms);
             if (!r.error.empty())
@@ -2619,10 +2724,12 @@ int run_tests(int argc, char** argv) {
     }
 
     // --- 汇总 ---
-    int passed = 0, failed = 0;
+    int passed = 0, failed = 0, skipped = 0;
     double total_ms = 0;
     for (const auto& r : results) {
-        if (r.passed) ++passed; else ++failed;
+        if (r.status == TestStatus::PASS) ++passed;
+        else if (r.status == TestStatus::SKIP) ++skipped;
+        else ++failed;
         total_ms += r.elapsed_ms;
     }
 
@@ -2631,13 +2738,14 @@ int run_tests(int argc, char** argv) {
     printf("  %-6s  %-13s  %-28s  %s\n", "------", "-------------", "----------------------------", "--------");
     for (const auto& r : results) {
         printf("  %-6s  %-13s  %-28s  %.1f ms\n",
-               r.passed ? "PASS" : "FAIL",
+             status_name(r.status),
                category_name(r.category),
                r.name.c_str(),
                r.elapsed_ms);
     }
     printf("  ========================================================\n");
-    printf("  Total: %d passed, %d failed, %.1f ms\n\n", passed, failed, total_ms);
+        printf("  Total: %d passed, %d skipped, %d failed, %.1f ms\n\n",
+            passed, skipped, failed, total_ms);
 
     return failed > 0 ? 1 : 0;
 }
