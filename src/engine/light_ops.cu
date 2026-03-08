@@ -1827,24 +1827,32 @@ __global__ void sigmoid_gated_add_kernel(
 
 // Fused version: compute gate scalar dot product inline, then sigmoid-gated add
 // Eliminates the separate N=1 GEMV launch for shared_expert_gate
-// Gate scalar = dot(hidden_state, gate_weight) over K elements
-// Then: out[i] += sigmoid(gate_scalar) * in[i]
-// If residual != nullptr: residual[i] += out[i] (final value)
-// Launched as 1 block × 256 threads (n and K are both small, typically 2048)
-__global__ void sigmoid_gated_add_with_dot_kernel(
-    __nv_bfloat16* __restrict__ out,            // [n] moe_acc (read+write)
-    const __nv_bfloat16* __restrict__ in,       // [n] shared_down output
-    const __nv_bfloat16* __restrict__ hidden,   // [K] post_norm_out
-    const __nv_bfloat16* __restrict__ gate_w,   // [K] shared_expert_gate weight
-    __nv_bfloat16* __restrict__ residual,       // [n] hidden_states (optional, may be nullptr)
-    int n, int K)
+// Fused: weighted_reduce + gate_scalar_dot + sigmoid_gated_add + residual
+// Phase 0: out[i] = sum_k(expert_weights[k] * expert_outputs[k*n + i])
+// Phase 1: gate = sigmoid(dot(hidden, gate_w))
+// Phase 2: out[i] += gate * shared_down[i]
+// Phase 3: if residual != null: residual[i] += out[i]
+// Single block × 256 threads. Handles n up to ~4096. top_k ≤ 16.
+__global__ void fused_moe_final_kernel(
+    __nv_bfloat16* __restrict__ out,               // [n] moe_acc (write)
+    const __nv_bfloat16* __restrict__ expert_outputs,  // [top_k, n] expert down results
+    const float* __restrict__ expert_weights,      // [top_k]
+    const __nv_bfloat16* __restrict__ shared_down, // [n] shared expert down output
+    const __nv_bfloat16* __restrict__ hidden,      // [K] post_norm_out for gate dot
+    const __nv_bfloat16* __restrict__ gate_w,      // [K] shared_expert_gate weight
+    __nv_bfloat16* __restrict__ residual,          // [n] hidden_states (optional)
+    int n, int K, int top_k)
 {
+    // Load expert_weights into shared memory (small, ≤16 floats)
+    __shared__ float s_ew[16];
+    if (threadIdx.x < top_k)
+        s_ew[threadIdx.x] = expert_weights[threadIdx.x];
+
     // Phase 1: Cooperative dot product → sigmoid
     float dot_sum = 0.0f;
     for (int i = threadIdx.x; i < K; i += blockDim.x)
         dot_sum += __bfloat162float(hidden[i]) * __bfloat162float(gate_w[i]);
 
-    // Warp reduce
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
         dot_sum += __shfl_down_sync(0xffffffff, dot_sum, offset);
@@ -1864,11 +1872,18 @@ __global__ void sigmoid_gated_add_with_dot_kernel(
     }
     __syncthreads();
 
-    // Phase 2: Sigmoid-gated add + optional residual
     float sig = s_gate_sig;
+
+    // Phase 0+2+3 fused: weighted_reduce + sigmoid_gated_add + residual
     for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
-        float val = __bfloat162float(out[idx]) + sig * __bfloat162float(in[idx]);
+        // Weighted expert reduce
+        float val = 0.0f;
+        for (int k = 0; k < top_k; k++)
+            val += s_ew[k] * __bfloat162float(expert_outputs[k * n + idx]);
+        // Sigmoid-gated add of shared expert
+        val += sig * __bfloat162float(shared_down[idx]);
         out[idx] = __float2bfloat16(val);
+        // Residual add
         if (residual) {
             float r = __bfloat162float(residual[idx]) + val;
             residual[idx] = __float2bfloat16(r);
@@ -1885,15 +1900,17 @@ void invoke_sigmoid_gated_add(__nv_bfloat16* out, const __nv_bfloat16* in,
     sigmoid_gated_add_kernel<<<blocks, threads, 0, stream>>>(out, in, gate_scalar, n);
 }
 
-void invoke_sigmoid_gated_add_with_dot(
-    __nv_bfloat16* out, const __nv_bfloat16* in,
+void invoke_fused_moe_final(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* expert_outputs, const float* expert_weights,
+    const __nv_bfloat16* shared_down,
     const __nv_bfloat16* hidden, const __nv_bfloat16* gate_w,
     __nv_bfloat16* residual,
-    int n, int K, cudaStream_t stream)
+    int n, int K, int top_k, cudaStream_t stream)
 {
-    // Single block, 256 threads: dot product + sigmoid-gated add + optional residual
-    sigmoid_gated_add_with_dot_kernel<<<1, 256, 0, stream>>>(
-        out, in, hidden, gate_w, residual, n, K);
+    fused_moe_final_kernel<<<1, 256, 0, stream>>>(
+        out, expert_outputs, expert_weights, shared_down,
+        hidden, gate_w, residual, n, K, top_k);
 }
 
 } // namespace ops

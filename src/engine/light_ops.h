@@ -199,14 +199,16 @@ void invoke_sigmoid_gated_add(__nv_bfloat16* out, const __nv_bfloat16* in,
                                const __nv_bfloat16* gate_scalar, int n,
                                cudaStream_t stream = 0);
 
-// Fused sigmoid-gated add with inline dot product + optional residual
-// gate = sigmoid(dot(hidden, gate_w)), then out[i] += gate * in[i]
-// If residual != nullptr: residual[i] += out[i]
-void invoke_sigmoid_gated_add_with_dot(
-    __nv_bfloat16* out, const __nv_bfloat16* in,
+// Fused MoE final: weighted_reduce + gate_dot + sigmoid_gated_add + residual
+// Single kernel replaces: invoke_weighted_expert_reduce
+//                         + invoke_sigmoid_gated_add_with_dot (2→1 launches)
+void invoke_fused_moe_final(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* expert_outputs, const float* expert_weights,
+    const __nv_bfloat16* shared_down,
     const __nv_bfloat16* hidden, const __nv_bfloat16* gate_w,
     __nv_bfloat16* residual,
-    int n, int K, cudaStream_t stream = 0);
+    int n, int K, int top_k, cudaStream_t stream = 0);
 
 } // namespace ops
 } // namespace qwen_thor

@@ -227,9 +227,19 @@ static void run_moe_mlp(
             expert_indices, hs, moe_is, dn_stride,
             top_k, stream);
 
-        // 5d. Weighted reduce: moe_acc = sum_k(weights[k] * expert_down_all[k])
-        ops::invoke_weighted_expert_reduce(moe_acc, expert_down_all, expert_weights,
-                                            hs, top_k, stream);
+        // 6-7. Shared expert MLP + fused final
+        if (moe_timing) cudaEventRecord(moe_ev2, stream);
+        __nv_bfloat16* shared_down_buf = expert_scratch + top_k * (2 * moe_is + moe_is);
+        // T=1: dual GEMV for gate+up, then fused SwiGLU+down GEMV,
+        // then fused weighted_reduce + gate_scalar + sigmoid_gated_add + residual
+        ops::invoke_dense_dual_gemv(post_norm_out, moe.shared_gate_w, moe.shared_up_w,
+                                     shared_gate_out, shared_up_out, shared_is, hs, stream);
+        ops::invoke_dense_gemv_swiglu(shared_gate_out, shared_up_out, moe.shared_down_w,
+                                       shared_down_buf, hs, shared_is, stream);
+        ops::invoke_fused_moe_final(
+            moe_acc, expert_down_all, expert_weights,
+            shared_down_buf, post_norm_out, moe.shared_expert_gate_w,
+            hidden_states, hs, hs, top_k, stream);
     } else {
         // ============================================================
         // T>1 路径: 逐 token 顺序 GEMV (保持兼容)
@@ -265,24 +275,9 @@ static void run_moe_mlp(
         }
     }
 
-    // 8. Shared expert MLP: gate + up + SwiGLU
-    if (moe_timing && num_tokens == 1) cudaEventRecord(moe_ev2, stream);
-    // 9-10. Shared expert down + gate scalar + gated add + residual
-    __nv_bfloat16* shared_down_buf = (num_tokens == 1)
-        ? (expert_scratch + top_k * (2 * moe_is + moe_is))
-        : (expert_scratch + 2 * moe_is + moe_is);
-    if (num_tokens == 1) {
-        // T=1: dual GEMV for gate+up, then fused SwiGLU+down GEMV (3→2 launches),
-        // then fused gate_scalar + sigmoid_gated_add + residual
-        ops::invoke_dense_dual_gemv(post_norm_out, moe.shared_gate_w, moe.shared_up_w,
-                                     shared_gate_out, shared_up_out, shared_is, hs, stream);
-        ops::invoke_dense_gemv_swiglu(shared_gate_out, shared_up_out, moe.shared_down_w,
-                                       shared_down_buf, hs, shared_is, stream);
-        ops::invoke_sigmoid_gated_add_with_dot(
-            moe_acc, shared_down_buf, post_norm_out, moe.shared_expert_gate_w,
-            hidden_states, hs, hs, stream);
-    } else {
-        // T>1: separate paths
+    // Shared expert MLP (T>1 only — T=1 handled above with fused_moe_final)
+    if (num_tokens > 1) {
+        __nv_bfloat16* shared_down_buf = expert_scratch + 2 * moe_is + moe_is;
         ops::invoke_dense_gemm(post_norm_out, moe.shared_gate_w, shared_gate_out,
                                 num_tokens, shared_is, hs, stream);
         ops::invoke_dense_gemm(post_norm_out, moe.shared_up_w, shared_up_out,
