@@ -4247,4 +4247,39 @@ MoE 模型 (Qwen3.5-35B-A3B) 的 MTP 投机解码完全失效, 接受率 0%, 纯
 - d=3 对 MoE 模型无收益: 256-expert routing 在 draft chain 中开销过大
 - 与稠密模型对比: 稠密模型 d=3 最优 (draft 开销低), MoE 模型 d=1 最优 (draft 开销高)
 
+---
+
+## FA4 启发: exp2f + LOG2E 一致性优化
+
+**日期**: 2025-07-23
+**Commits**: `0f27191`, `6f29346`, `ff45d8d`
+
+### 背景
+
+分析 FlashAttention-4 (SM100 Blackwell) 代码后, 发现其全面使用 `exp2(x * log2(e))` 模式替代 `exp(x)`, 并将 `softmax_scale * log2(e)` 预乘到 Q 加载中, 使所有 attention 计算在 log2 尺度下进行。
+
+### 实施
+
+1. **expf → exp2f** (paged_attention.cu): 13 处 softmax `expf` → `exp2f(... * LOG2E)`
+2. **sm_scale × LOG2E 预乘** (paged_attention.cu): 4 个 Q 加载点合并 `sm_scale * LOG2E`, 13 处 `exp2f(x * LOG2E)` → `exp2f(x)`, 去除 decode inner loop 每 KV token 的 1 个 FMA
+3. **全面 exp2f 一致性** (light_ops.cu + gdn_umma_sm110.cu): ~22 处 SiLU/sigmoid/softplus/DeltaNet alpha 转为 exp2f; GDN UMMA alpha 链式计算简化 (省 2 个 transcendental)
+
+### 结果 (B=1, 27B BF16, 30 decode, MTP off)
+
+| 阶段 | ITL (ms) | Forward (ms) | BW (GB/s) |
+|------|----------|-------------|-----------|
+| 基线 | 229.81 | 218.65 | 223.0 |
+| + exp2f | 227.96 | 217.03 | 224.8 |
+| + LOG2E 预乘 | 227.62 | 216.56 | 225.1 |
+| + light_ops exp2f | 227.26 | 216.34 | 225.5 |
+
+**总计**: ITL -2.55ms (**-1.1%**), BW +2.5 GB/s
+
+### 分析
+
+- Decode 是 bandwidth-bound (~51 GB 权重 / 216ms = 225 GB/s), softmax 计算占比 <1%
+- exp2f 的优势在计算密集路径更显著; 对 BW-bound decode 改进天然有限
+- Prefill (T≥256) 中 softmax 占比更高, 但当前 benchmark 用 17 tokens 无法单独测量
+- light_ops 变更对 decode 无额外贡献 (SiLU/DeltaNet 在 BW-bound kernel 中, exp 指令被 memload 掩盖)
+
 **累计 MTP 提速**: +51% (5.1 → 7.7-7.8 tok/s)
