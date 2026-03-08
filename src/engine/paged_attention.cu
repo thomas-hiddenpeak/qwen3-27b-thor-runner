@@ -30,6 +30,10 @@ namespace ops {
 
 #define WARP_SIZE 32
 
+// Fast exp via base-2: exp(x) = exp2(x * log2(e))
+// exp2f maps directly to GPU hardware instruction, faster than expf
+static constexpr float LOG2E = 1.4426950408889634f;
+
 __global__ void paged_attention_kernel(
     __nv_bfloat16*       out,
     const __nv_bfloat16* q,
@@ -123,8 +127,8 @@ __global__ void paged_attention_kernel(
             final_qk = s_qk_parts[0];
 
             float m_i_new  = fmaxf(m_i, final_qk);
-            float exp_qk   = expf(final_qk - m_i_new);
-            float exp_diff = expf(m_i       - m_i_new);
+            float exp_qk   = exp2f((final_qk - m_i_new) * LOG2E);
+            float exp_diff = exp2f((m_i       - m_i_new) * LOG2E);
 
             l_i = l_i * exp_diff + exp_qk;
 
@@ -254,8 +258,8 @@ __global__ void paged_attention_split_k_kernel(
         // Online softmax + V accumulation
         float v_val = __bfloat162float(v_cache[kv_off]);
         float m_new = fmaxf(m_i, score);
-        float exp_diff = expf(m_i - m_new);
-        float exp_s   = expf(score - m_new);
+        float exp_diff = exp2f((m_i - m_new) * LOG2E);
+        float exp_s   = exp2f((score - m_new) * LOG2E);
         acc = acc * exp_diff + exp_s * v_val;
         l_i = l_i * exp_diff + exp_s;
         m_i = m_new;
@@ -300,8 +304,8 @@ __global__ void paged_attention_merge_kernel(
 
         float o_p = partial_out[(base + p) * head_dim + d];
         float m_new = fmaxf(m, m_p);
-        float a = expf(m - m_new);
-        float b = expf(m_p - m_new);
+        float a = exp2f((m - m_new) * LOG2E);
+        float b = exp2f((m_p - m_new) * LOG2E);
         acc = acc * a + o_p * b;
         l   = l * a + l_p * b;
         m   = m_new;
@@ -526,7 +530,7 @@ __global__ void causal_softmax_interleaved_kernel(
     // Pass 2: sum of exp
     float thread_sum = 0.0f;
     for (int i = tid; i < valid_len; i += blockDim.x) {
-        thread_sum += expf(__bfloat162float(row_data[i]) - max_val);
+        thread_sum += exp2f((__bfloat162float(row_data[i]) - max_val) * LOG2E);
     }
     smem[tid] = thread_sum;
     __syncthreads();
@@ -538,7 +542,7 @@ __global__ void causal_softmax_interleaved_kernel(
 
     // Pass 3: normalize valid positions
     for (int i = tid; i < valid_len; i += blockDim.x) {
-        float v = expf(__bfloat162float(row_data[i]) - max_val) * inv_sum;
+        float v = exp2f((__bfloat162float(row_data[i]) - max_val) * LOG2E) * inv_sum;
         row_data[i] = __float2bfloat16(v);
     }
     // Zero invalid positions (including padding)
@@ -626,12 +630,12 @@ fused_prefill_attention_kernel(
 
         // 4. Online softmax + value accumulation
         if (score > max_score) {
-            float rescale = expf(max_score - score);
+            float rescale = exp2f((max_score - score) * LOG2E);
             o_acc = o_acc * rescale + v_d;
             sum_exp = sum_exp * rescale + 1.0f;
             max_score = score;
         } else {
-            float w = expf(score - max_score);
+            float w = exp2f((score - max_score) * LOG2E);
             o_acc += w * v_d;
             sum_exp += w;
         }
@@ -803,7 +807,7 @@ __global__ void tiled_causal_softmax_kernel(
     // Pass 2: exp + sum
     float thread_sum = 0.0f;
     for (int j = tid; j < valid_end; j += blockDim.x) {
-        float p = expf(__bfloat162float(row_data[j]) - max_val);
+        float p = exp2f((__bfloat162float(row_data[j]) - max_val) * LOG2E);
         row_data[j] = __float2bfloat16(p);
         thread_sum += p;
     }
@@ -841,8 +845,8 @@ __global__ void merge_attention_tile_kernel(
     float m_old = m[row];
     float m_t = m_tile[row];
     float m_new = fmaxf(m_old, m_t);
-    float alpha = expf(m_old - m_new);
-    float beta  = expf(m_t - m_new);
+    float alpha = exp2f((m_old - m_new) * LOG2E);
+    float beta  = exp2f((m_t - m_new) * LOG2E);
 
     int off = row * hd + d;
     acc[off] = acc[off] * alpha + __bfloat162float(O_tile[off]) * beta;
