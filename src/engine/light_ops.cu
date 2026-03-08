@@ -1828,12 +1828,15 @@ __global__ void sigmoid_gated_add_kernel(
 // Fused version: compute gate scalar dot product inline, then sigmoid-gated add
 // Eliminates the separate N=1 GEMV launch for shared_expert_gate
 // Gate scalar = dot(hidden_state, gate_weight) over K elements
+// Then: out[i] += sigmoid(gate_scalar) * in[i]
+// If residual != nullptr: residual[i] += out[i] (final value)
 // Launched as 1 block × 256 threads (n and K are both small, typically 2048)
 __global__ void sigmoid_gated_add_with_dot_kernel(
     __nv_bfloat16* __restrict__ out,            // [n] moe_acc (read+write)
     const __nv_bfloat16* __restrict__ in,       // [n] shared_down output
     const __nv_bfloat16* __restrict__ hidden,   // [K] post_norm_out
     const __nv_bfloat16* __restrict__ gate_w,   // [K] shared_expert_gate weight
+    __nv_bfloat16* __restrict__ residual,       // [n] hidden_states (optional, may be nullptr)
     int n, int K)
 {
     // Phase 1: Cooperative dot product → sigmoid
@@ -1861,11 +1864,15 @@ __global__ void sigmoid_gated_add_with_dot_kernel(
     }
     __syncthreads();
 
-    // Phase 2: Sigmoid-gated add
+    // Phase 2: Sigmoid-gated add + optional residual
     float sig = s_gate_sig;
     for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
         float val = __bfloat162float(out[idx]) + sig * __bfloat162float(in[idx]);
         out[idx] = __float2bfloat16(val);
+        if (residual) {
+            float r = __bfloat162float(residual[idx]) + val;
+            residual[idx] = __float2bfloat16(r);
+        }
     }
 }
 
@@ -1881,11 +1888,12 @@ void invoke_sigmoid_gated_add(__nv_bfloat16* out, const __nv_bfloat16* in,
 void invoke_sigmoid_gated_add_with_dot(
     __nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* hidden, const __nv_bfloat16* gate_w,
+    __nv_bfloat16* residual,
     int n, int K, cudaStream_t stream)
 {
-    // Single block, 256 threads: dot product + sigmoid-gated add
+    // Single block, 256 threads: dot product + sigmoid-gated add + optional residual
     sigmoid_gated_add_with_dot_kernel<<<1, 256, 0, stream>>>(
-        out, in, hidden, gate_w, n, K);
+        out, in, hidden, gate_w, residual, n, K);
 }
 
 } // namespace ops

@@ -188,6 +188,7 @@ static void run_moe_mlp(
         // region which is only written AFTER top-K reads all logits — safe)
         float* fused_logits = reinterpret_cast<float*>(router_logits);
         // Atomic counter carved from gate_scalar region (unused in T=1 fused path)
+        // Must zero before each call: prefill (T>1) writes to this workspace area
         int* block_counter = reinterpret_cast<int*>(gate_scalar);
         cudaMemsetAsync(block_counter, 0, sizeof(int), stream);
         ops::invoke_moe_router_gemv_topk(post_norm_out, moe.router_w,
@@ -218,14 +219,11 @@ static void run_moe_mlp(
             expert_indices, 2 * moe_is, hs, gu_stride,
             top_k, /*shared_input=*/true, stream);
 
-        // 5b. Batched SwiGLU: top_k experts in parallel
-        ops::invoke_swiglu_merged(expert_swiglu_all, expert_gu_all, top_k, moe_is, stream);
-
-        // 5c. Grouped down GEMV: per-expert inputs
-        ops::invoke_grouped_expert_gemv(
-            expert_swiglu_all, moe.experts_down_w, expert_down_all,
+        // 5b+5c. Fused SwiGLU + Grouped down GEMV (eliminates SwiGLU launch)
+        ops::invoke_grouped_expert_gemv_swiglu(
+            expert_gu_all, moe.experts_down_w, expert_down_all,
             expert_indices, hs, moe_is, dn_stride,
-            top_k, /*shared_input=*/false, stream);
+            top_k, stream);
 
         // 5d. Weighted reduce: moe_acc = sum_k(weights[k] * expert_down_all[k])
         ops::invoke_weighted_expert_reduce(moe_acc, expert_down_all, expert_weights,
@@ -279,17 +277,17 @@ static void run_moe_mlp(
     ops::invoke_swiglu(shared_swiglu_buf, shared_gate_out, shared_up_out,
                         num_tokens, shared_is, stream);
 
-    // 9-10. Shared expert down + gate scalar + gated add
+    // 9-10. Shared expert down + gate scalar + gated add + residual
     __nv_bfloat16* shared_down_buf = (num_tokens == 1)
         ? (expert_scratch + top_k * (2 * moe_is + moe_is))
         : (expert_scratch + 2 * moe_is + moe_is);
     if (num_tokens == 1) {
-        // T=1: down GEMV, then fused gate_scalar dot + sigmoid_gated_add (2→1 launch)
+        // T=1: down GEMV, then fused gate_scalar + sigmoid_gated_add + residual (3→1 launch)
         ops::invoke_dense_gemv(shared_swiglu_buf, moe.shared_down_w,
                                 shared_down_buf, hs, shared_is, stream);
         ops::invoke_sigmoid_gated_add_with_dot(
             moe_acc, shared_down_buf, post_norm_out, moe.shared_expert_gate_w,
-            hs, hs, stream);
+            hidden_states, hs, hs, stream);
     } else {
         // T>1: separate gate_scalar GEMM + per-token down GEMV + sigmoid_gated_add
         ops::invoke_dense_gemm(post_norm_out, moe.shared_expert_gate_w,
@@ -300,10 +298,9 @@ static void run_moe_mlp(
             ops::invoke_sigmoid_gated_add(moe_acc + t * hs, shared_down_buf,
                                            gate_scalar + t, hs, stream);
         }
+        // T>1 residual add
+        ops::invoke_add(hidden_states, hidden_states, moe_acc, num_tokens * hs, stream);
     }
-
-    // 11. Final residual: hidden_states += moe_acc
-    ops::invoke_add(hidden_states, hidden_states, moe_acc, num_tokens * hs, stream);
 
     // MoE timing reporting
     if (moe_timing && num_tokens == 1) {

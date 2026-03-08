@@ -518,6 +518,8 @@ static BenchResult run_single_bench(
     size_t ws_per_tok = std::max(ws_full, ws_linear);
     size_t ws_total = ws_per_tok * max_tokens + (size_t)batch_size * config.vocab_size + (size_t)batch_size * hs;
     cudaMalloc(&d_workspace, ws_total * sizeof(__nv_bfloat16));
+    // Zero-init workspace so atomic counters (used by fused router kernel) start at 0
+    cudaMemset(d_workspace, 0, ws_total * sizeof(__nv_bfloat16));
 
     // SSM/Conv states per request
     size_t ssm_sz = (size_t)nkh * config.linear_key_head_dim * config.lin_v_per_kh() * sizeof(__nv_bfloat16);

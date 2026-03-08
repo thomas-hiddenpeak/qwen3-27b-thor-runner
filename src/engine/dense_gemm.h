@@ -127,6 +127,18 @@ void invoke_grouped_expert_gemv(
     cudaStream_t stream = nullptr
 );
 
+// Fused SwiGLU + Grouped Expert Down GEMV
+// gate_up_outputs[top_k, 2*K] → SwiGLU in SMEM → GEMV → outputs[top_k, N]
+void invoke_grouped_expert_gemv_swiglu(
+    const __nv_bfloat16* gate_up_outputs,  // [top_k, 2*K]
+    const __nv_bfloat16* packed_weights,   // [E, N, K] expert down weights
+    __nv_bfloat16* outputs,                // [top_k, N]
+    const int* expert_indices,             // [top_k] on device
+    int N, int K, size_t expert_stride,
+    int top_k,
+    cudaStream_t stream = nullptr
+);
+
 // Weighted Expert Reduce: accum[i] = sum_k(weights[k] * outputs[k*hs + i])
 void invoke_weighted_expert_reduce(
     __nv_bfloat16* accum,                 // [hs] output

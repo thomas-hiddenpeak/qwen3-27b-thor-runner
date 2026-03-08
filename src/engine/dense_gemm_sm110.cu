@@ -1398,6 +1398,99 @@ void invoke_grouped_expert_gemv(
 }
 
 // ============================================================================
+// Fused SwiGLU + Grouped Expert Down GEMV
+// 读取 gate_up[2*K] → SMEM 内 SwiGLU → GEMV against down_proj
+// 消除独立 SwiGLU kernel launch
+// Grid: (ceil(N/8), top_k), Block: 256 (8 warps), SMEM: 2*K bf16
+// ============================================================================
+__global__ void grouped_expert_gemv_swiglu_kernel(
+    const __nv_bfloat16* __restrict__ gate_up_outputs,  // [top_k, 2*K]
+    const __nv_bfloat16* __restrict__ packed_weights,    // [E, N, K] expert down weights
+    __nv_bfloat16* __restrict__ outputs,                 // [top_k, N]
+    const int* __restrict__ expert_indices,
+    int N, int K, size_t expert_stride)
+{
+    constexpr int WARP_SIZE = 32;
+
+    extern __shared__ __nv_bfloat16 s_A[];  // [2*K]
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x & (WARP_SIZE - 1);
+    int out_idx = blockIdx.x * 8 + warp_id;
+    int expert_rank = blockIdx.y;
+
+    // Load gate+up (2*K elements) into SMEM
+    const __nv_bfloat16* input = gate_up_outputs + expert_rank * 2 * K;
+    for (int i = threadIdx.x; i < 2 * K; i += blockDim.x)
+        s_A[i] = input[i];
+    __syncthreads();
+
+    // Apply SwiGLU in-place: s_A[i] = silu(s_A[i]) * s_A[K+i]
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        float gate = __bfloat162float(s_A[i]);
+        float up = __bfloat162float(s_A[K + i]);
+        float silu_val = gate / (1.0f + expf(-gate));
+        s_A[i] = __float2bfloat16(silu_val * up);
+    }
+    __syncthreads();
+
+    if (out_idx >= N) return;
+
+    int expert_id = expert_indices[expert_rank];
+    const __nv_bfloat16* b_col = packed_weights + expert_id * expert_stride + (size_t)out_idx * K;
+
+    float sum = 0.0f;
+    int k8 = K / 8;
+    const float4* s_v4 = reinterpret_cast<const float4*>(s_A);
+    const float4* b_v4 = reinterpret_cast<const float4*>(b_col);
+
+    for (int i = lane_id; i < k8; i += WARP_SIZE) {
+        float4 a4 = s_v4[i];
+        float4 b4 = b_v4[i];
+        const __nv_bfloat162* a2 = reinterpret_cast<const __nv_bfloat162*>(&a4);
+        const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&b4);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float2 af = __bfloat1622float2(a2[j]);
+            float2 bf = __bfloat1622float2(b2[j]);
+            sum += af.x * bf.x + af.y * bf.y;
+        }
+    }
+
+    int k_tail = k8 * 8;
+    for (int k = k_tail + lane_id; k < K; k += WARP_SIZE) {
+        sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k]);
+    }
+
+    #pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, mask);
+    }
+
+    if (lane_id == 0) {
+        outputs[expert_rank * N + out_idx] = __float2bfloat16(sum);
+    }
+}
+
+void invoke_grouped_expert_gemv_swiglu(
+    const __nv_bfloat16* gate_up_outputs,
+    const __nv_bfloat16* packed_weights,
+    __nv_bfloat16* outputs,
+    const int* expert_indices,
+    int N, int K, size_t expert_stride,
+    int top_k,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK = 256;
+    constexpr int WARPS = BLOCK / 32;
+    dim3 grid((N + WARPS - 1) / WARPS, top_k);
+    size_t smem = 2 * K * sizeof(__nv_bfloat16);
+    grouped_expert_gemv_swiglu_kernel<<<grid, BLOCK, smem, stream>>>(
+        gate_up_outputs, packed_weights, outputs, expert_indices,
+        N, K, expert_stride);
+}
+
+// ============================================================================
 // Weighted Expert Reduce: accum[i] = sum_k(weights[k] * outputs[k*hs + i])
 // 将 top_k 个 expert 的加权输出合并为单个向量
 // ============================================================================

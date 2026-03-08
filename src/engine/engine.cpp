@@ -163,6 +163,8 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
     }
     size_t ws_per_tok = std::max(ws_full, ws_linear);
     cudaMalloc(&d_workspace_, ws_per_tok * max_tokens * sizeof(__nv_bfloat16));
+    // Zero-init workspace so atomic counters (used by fused router kernel) start at 0
+    cudaMemset(d_workspace_, 0, ws_per_tok * max_tokens * sizeof(__nv_bfloat16));
 
     // 6. 计算并缓存 SSM/Conv 尺寸 (MTP checkpoint 和 swap 需要)
     {
