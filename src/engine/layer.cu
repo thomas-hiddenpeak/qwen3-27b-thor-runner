@@ -187,13 +187,15 @@ static void run_moe_mlp(
         // Reuse router_logits as float logits workspace (E×4 bytes, overlaps into expert_indices
         // region which is only written AFTER top-K reads all logits — safe)
         float* fused_logits = reinterpret_cast<float*>(router_logits);
-        // Atomic counter carved from gate_scalar region (unused in T=1 fused path)
-        // Must zero before each call: prefill (T>1) writes to this workspace area
-        int* block_counter = reinterpret_cast<int*>(gate_scalar);
-        cudaMemsetAsync(block_counter, 0, sizeof(int), stream);
+        // Persistent atomic counter — allocated once, reset by kernel after each call
+        static int* s_block_counter = nullptr;
+        if (!s_block_counter) {
+            cudaMalloc(&s_block_counter, sizeof(int));
+            cudaMemset(s_block_counter, 0, sizeof(int));
+        }
         ops::invoke_moe_router_gemv_topk(post_norm_out, moe.router_w,
                                           fused_logits, expert_indices, expert_weights,
-                                          block_counter, E, hs, top_k, stream);
+                                          s_block_counter, E, hs, top_k, stream);
     } else {
         ops::invoke_dense_gemm(post_norm_out, moe.router_w, router_logits, num_tokens, E, hs, stream);
         ops::invoke_moe_router_topk(router_logits, expert_indices, expert_weights,
