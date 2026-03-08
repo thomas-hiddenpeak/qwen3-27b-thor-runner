@@ -943,19 +943,15 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             int last_chunk_len = prefill_tokens % max_chunk_size_;
             if (last_chunk_len == 0) last_chunk_len = max_chunk_size_;
             last_chunk_len = std::min(last_chunk_len, prefill_tokens);
-            profiler_.begin("final_norm", compute_stream_);
-            __nv_bfloat16* norm_out = d_workspace_;
-            ops::invoke_rmsnorm(norm_out,
-                                d_hidden_states_ + (last_chunk_len - 1) * config_.hidden_size,
-                                model_->get_norm_weight(), config_.rms_norm_eps,
-                                1, config_.hidden_size, compute_stream_);
-            profiler_.end("final_norm", compute_stream_);
 
-            // 7. LM Head (计算最后一个 token 的 logits)
+            // 7. Fused Final Norm + LM Head (RMSNorm in SMEM → GEMV, 省 1 launch + 1 GMEM pass)
             profiler_.begin("lm_head", compute_stream_);
             int vocab_size = config_.vocab_size;
-            __nv_bfloat16* logits = norm_out + config_.hidden_size;
-            ops::invoke_dense_gemv(norm_out, model_->get_lm_head(), logits, vocab_size, config_.hidden_size, compute_stream_);
+            __nv_bfloat16* logits = d_workspace_;
+            ops::invoke_dense_gemv_with_rmsnorm(
+                d_hidden_states_ + (last_chunk_len - 1) * config_.hidden_size,
+                model_->get_norm_weight(), config_.rms_norm_eps,
+                model_->get_lm_head(), logits, vocab_size, config_.hidden_size, compute_stream_);
             profiler_.end("lm_head", compute_stream_);
             
             // 8. 采样
@@ -1453,18 +1449,14 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 }
             }
 
-            // 5. Final Norm + LM Head + Sample (T=1)
-
-            profiler_.begin("final_norm", compute_stream_);
-            __nv_bfloat16* norm_out = d_workspace_;
-            ops::invoke_rmsnorm(norm_out, d_hidden_states_, model_->get_norm_weight(),
-                                config_.rms_norm_eps, 1, hs, compute_stream_);
-            profiler_.end("final_norm", compute_stream_);
+            // 5. Fused Final Norm + LM Head + Sample (T=1)
+            // RMSNorm in SMEM → GEMV, 省 1 launch + 1 GMEM pass
 
             profiler_.begin("lm_head", compute_stream_);
-            __nv_bfloat16* logits = norm_out + hs;
-            ops::invoke_dense_gemv(norm_out, model_->get_lm_head(), logits,
-                                   vocab_size, hs, compute_stream_);
+            __nv_bfloat16* logits = d_workspace_;
+            ops::invoke_dense_gemv_with_rmsnorm(
+                d_hidden_states_, model_->get_norm_weight(), config_.rms_norm_eps,
+                model_->get_lm_head(), logits, vocab_size, hs, compute_stream_);
             profiler_.end("lm_head", compute_stream_);
 
             profiler_.begin("sample", compute_stream_);

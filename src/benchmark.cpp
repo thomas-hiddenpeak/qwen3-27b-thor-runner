@@ -104,8 +104,8 @@ struct Stats {
         return (n % 2 == 0) ? (s[n/2 - 1] + s[n/2]) * 0.5f : s[n/2];
     }
 
-    float min_val() const { return *std::min_element(samples.begin(), samples.end()); }
-    float max_val() const { return *std::max_element(samples.begin(), samples.end()); }
+    float min_val() const { return samples.empty() ? 0 : *std::min_element(samples.begin(), samples.end()); }
+    float max_val() const { return samples.empty() ? 0 : *std::max_element(samples.begin(), samples.end()); }
 
     float percentile(float p) const {
         if (samples.empty()) return 0;
@@ -257,6 +257,9 @@ struct BenchResult {
     int decode_steps;
     int warmup_steps;
     bool cuda_graph;
+    bool decode_phase_aggregated = false;
+    bool prefill_serialized = true;
+    bool bandwidth_valid = true;
 
     // Prefill
     Stats prefill_ttft;
@@ -275,6 +278,10 @@ struct BenchResult {
     // Derived (computed after measurement)
     float weight_bytes = 0;
 };
+
+static const char* decode_phase_mode_label(const BenchResult& r) {
+    return r.decode_phase_aggregated ? "graph_aggregated" : "separate";
+}
 
 // ============================================================================
 // 辅助: JSON 字符串转义
@@ -339,12 +346,15 @@ static void write_json(const std::string& path, const std::vector<BenchResult>& 
         ofs << "      \"decode_steps\": " << r.decode_steps << ",\n";
         ofs << "      \"warmup_steps\": " << r.warmup_steps << ",\n";
         ofs << "      \"cuda_graph\": " << (r.cuda_graph ? "true" : "false") << ",\n";
-        ofs << "      \"weight_bytes\": " << std::fixed << std::setprecision(0) << r.weight_bytes << ",\n";
+        ofs << "      \"decode_phase_mode\": \"" << decode_phase_mode_label(r) << "\",\n";
+        ofs << "      \"prefill_mode\": \"" << (r.prefill_serialized ? "serialized_single_request" : "batched") << "\",\n";
+        ofs << "      \"weight_bytes_bf16_estimate\": " << std::fixed << std::setprecision(0) << r.weight_bytes << ",\n";
+        ofs << "      \"bandwidth_valid\": " << (r.bandwidth_valid ? "true" : "false") << ",\n";
 
         // Derived metrics
         float itl = r.decode_total.median();
         float decode_tps = (itl > 0) ? (float)r.batch_size * 1000.0f / itl : 0;
-        float bw = (itl > 0) ? r.weight_bytes / (itl / 1000.0f) / 1e9f : 0;
+        float bw = (itl > 0 && r.bandwidth_valid) ? r.weight_bytes / (itl / 1000.0f) / 1e9f : 0;
         float ttft = r.prefill_ttft.median();
         float prefill_tps = (ttft > 0) ? (float)r.prompt_len * 1000.0f / ttft : 0;
 
@@ -352,9 +362,13 @@ static void write_json(const std::string& path, const std::vector<BenchResult>& 
         ofs << "      \"itl_ci95_ms\": " << r.decode_total.ci95() << ",\n";
         ofs << "      \"itl_cv_pct\": " << r.decode_total.cv_pct() << ",\n";
         ofs << "      \"decode_tok_per_sec\": " << std::setprecision(2) << decode_tps << ",\n";
-        ofs << "      \"bw_GBs\": " << std::setprecision(1) << bw << ",\n";
+        if (r.bandwidth_valid) {
+            ofs << "      \"bw_GBs\": " << std::setprecision(1) << bw << ",\n";
+        } else {
+            ofs << "      \"bw_GBs\": null,\n";
+        }
         ofs << "      \"ttft_median_ms\": " << std::setprecision(3) << ttft << ",\n";
-        ofs << "      \"prefill_tok_per_sec\": " << std::setprecision(1) << prefill_tps << ",\n";
+        ofs << "      \"single_request_prefill_tok_per_sec\": " << std::setprecision(1) << prefill_tps << ",\n";
 
         // Detailed stats
         auto write_section = [&](const char* name, const Stats& st) {
@@ -405,7 +419,8 @@ static BenchResult run_single_bench(
     int batch_size,
     int prompt_len,
     int iteration,
-    size_t total_weight_bytes)
+    size_t total_weight_bytes,
+    bool bandwidth_valid)
 {
     BenchResult result;
     result.batch_size   = batch_size;
@@ -414,7 +429,8 @@ static BenchResult run_single_bench(
     result.decode_steps = cfg.decode_steps;
     result.warmup_steps = cfg.warmup_steps;
     result.weight_bytes = (float)total_weight_bytes;
-    result.cuda_graph   = !cfg.no_graph;
+    result.bandwidth_valid = bandwidth_valid;
+    result.cuda_graph   = false;
 
     const int hs = config.hidden_size;
     const int is = config.intermediate_size;
@@ -453,7 +469,7 @@ static BenchResult run_single_bench(
     int num_kv_blocks = capacity.gpu_kv_blocks;
 
     // Capacity check
-    int total_kv_tokens_needed = batch_size * (prompt_len + cfg.decode_steps);
+    int total_kv_tokens_needed = batch_size * (prompt_len + 1 + cfg.warmup_steps + cfg.decode_steps);
     int total_kv_blocks_needed = (total_kv_tokens_needed + 15) / 16;
     if (total_kv_blocks_needed > num_kv_blocks) {
         printf("  ⚠ WARNING: need %d KV blocks but only have %d — results may be inaccurate\n",
@@ -465,8 +481,9 @@ static BenchResult run_single_bench(
         core::DataType::FP16, allocator, num_full_attn_layers);
 
     // Allocate buffers
+    int total_decode_steps = cfg.warmup_steps + cfg.decode_steps;
     int max_tokens = std::max(prompt_len + 64, batch_size);
-    int max_kv_blks_per_seq = ((prompt_len + cfg.decode_steps + 15) / 16) + 4;
+    int max_kv_blks_per_seq = ((prompt_len + 1 + total_decode_steps + 15) / 16) + 4;
 
     __nv_bfloat16* d_hidden_states = nullptr;
     int* d_pos_ids = nullptr;
@@ -625,15 +642,13 @@ static BenchResult run_single_bench(
                                d_workspace, stream);
                 pf_forward.record_stop(stream);
 
-                // Final norm + lm_head + argmax
+                // Fused Final norm + lm_head + argmax
                 pf_lmhead.record_start(stream);
-                __nv_bfloat16* norm_out_pf = d_workspace;
-                __nv_bfloat16* logits_pf = norm_out_pf + hs;
-                ops::invoke_rmsnorm(norm_out_pf,
-                                    d_hidden_states + (prompt_len - 1) * hs,
-                                    model->get_norm_weight(), config.rms_norm_eps, 1, hs, stream);
-                ops::invoke_dense_gemv(norm_out_pf, model->get_lm_head(), logits_pf,
-                                       config.vocab_size, hs, stream);
+                __nv_bfloat16* logits_pf = d_workspace;
+                ops::invoke_dense_gemv_with_rmsnorm(
+                    d_hidden_states + (prompt_len - 1) * hs,
+                    model->get_norm_weight(), config.rms_norm_eps,
+                    model->get_lm_head(), logits_pf, config.vocab_size, hs, stream);
                 ops::invoke_argmax(logits_pf, d_argmax_result, config.vocab_size, stream);
                 pf_lmhead.record_stop(stream);
 
@@ -662,7 +677,7 @@ static BenchResult run_single_bench(
     }
 
     // ---- Decode benchmark ----
-    int total_steps = cfg.warmup_steps + cfg.decode_steps;
+    int total_steps = total_decode_steps;
     const int fixed_max_blks = max_kv_blks_per_seq;
 
     std::vector<int> h_token_ids(batch_size);
@@ -670,10 +685,9 @@ static BenchResult run_single_bench(
     std::vector<int> h_ctx_lens(batch_size);
     std::vector<int> h_block_tables_flat(batch_size * fixed_max_blks, 0);
 
-    // CUDA Graph
-    cudaGraph_t decode_graph = nullptr;
-    cudaGraphExec_t decode_graph_exec = nullptr;
-    bool graph_captured = false;
+    if (!cfg.no_graph) {
+        printf("    [graph] disabled: forward_decode has per-layer cudaStreamSynchronize, current path is not graph-safe\n");
+    }
 
     __nv_bfloat16* norm_out_graph = d_workspace + ws_per_tok * max_tokens;
     __nv_bfloat16* logits_graph = norm_out_graph + batch_size * hs;
@@ -724,91 +738,46 @@ static BenchResult run_single_bench(
         cudaMemcpyAsync(d_context_lens, h_ctx_lens.data(), batch_size * sizeof(int),
                         cudaMemcpyHostToDevice, stream);
 
-        if (graph_captured) {
-            t_forward.record_start(stream);
-            cudaGraphLaunch(decode_graph_exec, stream);
-            t_forward.record_stop(stream);
+        // Forward
+        nvtx_push("forward");
+        t_forward.record_start(stream);
+        model->forward_decode(d_hidden_states, d_pos_ids, *kv_manager,
+                       d_block_tables, d_context_lens,
+                       fixed_max_blks, max_ctx,
+                       batch_size,
+                       d_ssm_ptrs, d_conv_ptrs,
+                       d_workspace, stream);
+        t_forward.record_stop(stream);
+        nvtx_pop();
 
-            t_norm.record_start(stream); t_norm.record_stop(stream);
-            t_lmhead.record_start(stream); t_lmhead.record_stop(stream);
-            t_sample.record_start(stream); t_sample.record_stop(stream);
+        // Fused Final Norm + LM Head (B=1: RMSNorm in SMEM → GEMV, B>1: separate)
+        nvtx_push("final_norm_lm_head");
+        t_norm.record_start(stream);
+        if (batch_size == 1) {
+            t_norm.record_stop(stream);  // norm time ≈ 0 (fused into lm_head)
+            t_lmhead.record_start(stream);
+            ops::invoke_dense_gemv_with_rmsnorm(
+                d_hidden_states, model->get_norm_weight(), config.rms_norm_eps,
+                model->get_lm_head(), logits_graph, config.vocab_size, hs, stream);
+            t_lmhead.record_stop(stream);
         } else {
-            // Forward
-            nvtx_push("forward");
-            t_forward.record_start(stream);
-            model->forward_decode(d_hidden_states, d_pos_ids, *kv_manager,
-                           d_block_tables, d_context_lens,
-                           fixed_max_blks, max_ctx,
-                           batch_size,
-                           d_ssm_ptrs, d_conv_ptrs,
-                           d_workspace, stream);
-            t_forward.record_stop(stream);
-            nvtx_pop();
-
-            // Final norm
-            nvtx_push("final_norm");
-            t_norm.record_start(stream);
             ops::invoke_rmsnorm(norm_out_graph, d_hidden_states, model->get_norm_weight(),
                                 config.rms_norm_eps, batch_size, hs, stream);
             t_norm.record_stop(stream);
-            nvtx_pop();
-
-            // LM Head
-            nvtx_push("lm_head");
             t_lmhead.record_start(stream);
-            if (batch_size == 1) {
-                ops::invoke_dense_gemv(norm_out_graph, model->get_lm_head(), logits_graph,
-                                       config.vocab_size, hs, stream);
-            } else {
-                ops::invoke_dense_gemm(norm_out_graph, model->get_lm_head(), logits_graph,
-                                       batch_size, config.vocab_size, hs, stream);
-            }
+            ops::invoke_dense_gemm(norm_out_graph, model->get_lm_head(), logits_graph,
+                                   batch_size, config.vocab_size, hs, stream);
             t_lmhead.record_stop(stream);
-            nvtx_pop();
-
-            // Argmax
-            nvtx_push("sample");
-            t_sample.record_start(stream);
-            ops::invoke_batched_argmax(logits_graph, d_argmax_result, config.vocab_size,
-                                       batch_size, stream);
-            t_sample.record_stop(stream);
-            nvtx_pop();
-
-            // Capture CUDA Graph after last warmup step
-            if (is_warmup && step == cfg.warmup_steps - 1 && !cfg.no_graph) {
-                cudaStreamSynchronize(stream);
-
-                cudaStream_t capture_stream;
-                cudaStreamCreate(&capture_stream);
-                cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
-
-                model->forward_decode(d_hidden_states, d_pos_ids, *kv_manager,
-                               d_block_tables, d_context_lens,
-                               fixed_max_blks, max_ctx,
-                               batch_size,
-                               d_ssm_ptrs, d_conv_ptrs,
-                               d_workspace, capture_stream);
-
-                ops::invoke_rmsnorm(norm_out_graph, d_hidden_states, model->get_norm_weight(),
-                                    config.rms_norm_eps, batch_size, hs, capture_stream);
-
-                if (batch_size == 1) {
-                    ops::invoke_dense_gemv(norm_out_graph, model->get_lm_head(), logits_graph,
-                                           config.vocab_size, hs, capture_stream);
-                } else {
-                    ops::invoke_dense_gemm(norm_out_graph, model->get_lm_head(), logits_graph,
-                                           batch_size, config.vocab_size, hs, capture_stream);
-                }
-
-                ops::invoke_batched_argmax(logits_graph, d_argmax_result, config.vocab_size,
-                                           batch_size, capture_stream);
-
-                cudaStreamEndCapture(capture_stream, &decode_graph);
-                cudaGraphInstantiate(&decode_graph_exec, decode_graph, 0);
-                cudaStreamDestroy(capture_stream);
-                graph_captured = true;
-            }
         }
+        nvtx_pop();
+
+        // Argmax
+        nvtx_push("sample");
+        t_sample.record_start(stream);
+        ops::invoke_batched_argmax(logits_graph, d_argmax_result, config.vocab_size,
+                                   batch_size, stream);
+        t_sample.record_stop(stream);
+        nvtx_pop();
 
         t_total.record_stop(stream);
         float ms_total   = t_total.elapsed_ms();
@@ -848,8 +817,6 @@ static BenchResult run_single_bench(
     }
 
     // ---- Cleanup ----
-    if (decode_graph_exec) cudaGraphExecDestroy(decode_graph_exec);
-    if (decode_graph) cudaGraphDestroy(decode_graph);
     for (auto& req : requests) {
         for (auto* p : req.ssm_states)  cudaFree(p);
         for (auto* p : req.conv_states) cudaFree(p);
@@ -874,7 +841,7 @@ static void print_single_result(const BenchResult& r) {
     float itl_ci = r.decode_total.ci95();
     float itl_cv = r.decode_total.cv_pct();
     float decode_tps = (itl > 0) ? (float)r.batch_size * 1000.0f / itl : 0;
-    float bw = (itl > 0) ? r.weight_bytes / (itl / 1000.0f) / 1e9f : 0;
+    float bw = (itl > 0 && r.bandwidth_valid) ? r.weight_bytes / (itl / 1000.0f) / 1e9f : 0;
     float ttft = r.prefill_ttft.median();
     float ttft_ci = r.prefill_ttft.ci95();
     float prefill_tps = (ttft > 0) ? (float)r.prompt_len * 1000.0f / ttft : 0;
@@ -884,20 +851,30 @@ static void print_single_result(const BenchResult& r) {
            r.batch_size, r.prompt_len, r.iteration,
            r.cuda_graph ? "ON " : "OFF", r.warmup_steps, r.decode_steps);
     printf("    ├────────────────────────────────────────────────────────────┤\n");
-    printf("    │ TTFT:  %7.1f ms ±%.1f  (N=%d, CV=%.1f%%)                 │\n",
+        printf("    │ Single-req TTFT: %6.1f ms ±%.1f  (N=%d, CV=%.1f%%)       │\n",
            ttft, ttft_ci, r.prefill_ttft.count(), r.prefill_ttft.cv_pct());
-    printf("    │        prefill tok/s: %.0f                                │\n", prefill_tps);
+        printf("    │        prefill tok/s: %.0f  (serialized across batch)     │\n", prefill_tps);
     printf("    │        embed=%.1fms  fwd=%.1fms  lmhead=%.1fms             │\n",
            r.prefill_embed.median(), r.prefill_forward.median(), r.prefill_lmhead.median());
     printf("    │ ITL:   %7.2f ms ±%.2f  (N=%d, CV=%.1f%%)                 │\n",
            itl, itl_ci, r.decode_total.count(), itl_cv);
     printf("    │        p95=%.2f  p99=%.2f  trimmed=%.2f                   │\n",
            r.decode_total.p95(), r.decode_total.p99(), r.decode_total.trimmed_mean());
-    printf("    │ Decode tok/s: %.2f   BW: %.1f GB/s (peak=273)             │\n",
-           decode_tps, bw);
-    printf("    │ Phase:  fwd=%.2f  embed=%.2f  norm=%.2f  lm=%.2f  samp=%.2f│\n",
-           r.decode_forward.median(), r.decode_embed.median(), r.decode_norm.median(),
-           r.decode_lmhead.median(), r.decode_sample.median());
+        if (r.bandwidth_valid) {
+         printf("    │ Decode tok/s: %.2f   BW: %.1f GB/s (peak=273)             │\n",
+             decode_tps, bw);
+        } else {
+         printf("    │ Decode tok/s: %.2f   BW: N/A (quantized weight path)      │\n",
+             decode_tps);
+        }
+        if (r.decode_phase_aggregated) {
+         printf("    │ Phase:  graph_body=%.2f  embed=%.2f  mode=aggregated      │\n",
+             r.decode_forward.median(), r.decode_embed.median());
+        } else {
+         printf("    │ Phase:  fwd=%.2f  embed=%.2f  norm=%.2f  lm=%.2f  samp=%.2f│\n",
+             r.decode_forward.median(), r.decode_embed.median(), r.decode_norm.median(),
+             r.decode_lmhead.median(), r.decode_sample.median());
+        }
     printf("    └────────────────────────────────────────────────────────────┘\n");
 }
 
@@ -911,18 +888,24 @@ static void print_sweep_summary(const std::vector<BenchResult>& results, size_t 
     printf("╔══════════════════════════════════════════════════════════════════════════════╗\n");
     printf("║  Sweep Summary                                                             ║\n");
     printf("╠═══════╦═══════╦═══════╦══════════╦════════╦════════╦═══════╦═══════╦════════╣\n");
-    printf("║ Batch ║Prompt ║ Iter  ║ TTFT(ms) ║ITL(ms) ║tok/s   ║BW GB/s║CV(%%) ║±CI95ms║\n");
+    printf("║ Batch ║Prompt ║ Iter  ║S-TTFT(ms)║ITL(ms) ║tok/s   ║BW GB/s║CV(%%) ║±CI95ms║\n");
     printf("╠═══════╬═══════╬═══════╬══════════╬════════╬════════╬═══════╬═══════╬════════╣\n");
 
     for (const auto& r : results) {
         float itl = r.decode_total.median();
         float tps = (itl > 0) ? (float)r.batch_size * 1000.0f / itl : 0;
-        float bw = (itl > 0) ? r.weight_bytes / (itl / 1000.0f) / 1e9f : 0;
+        float bw = (itl > 0 && r.bandwidth_valid) ? r.weight_bytes / (itl / 1000.0f) / 1e9f : -1.0f;
         float ttft = r.prefill_ttft.median();
 
-        printf("║ %5d ║ %5d ║ %5d ║ %8.1f ║%7.2f ║%7.2f ║%6.1f ║%5.1f ║ %5.2f ║\n",
-               r.batch_size, r.prompt_len, r.iteration,
-               ttft, itl, tps, bw, r.decode_total.cv_pct(), r.decode_total.ci95());
+        if (r.bandwidth_valid) {
+            printf("║ %5d ║ %5d ║ %5d ║ %8.1f ║%7.2f ║%7.2f ║%6.1f ║%5.1f ║ %5.2f ║\n",
+                   r.batch_size, r.prompt_len, r.iteration,
+                   ttft, itl, tps, bw, r.decode_total.cv_pct(), r.decode_total.ci95());
+        } else {
+            printf("║ %5d ║ %5d ║ %5d ║ %8.1f ║%7.2f ║%7.2f ║   N/A ║%5.1f ║ %5.2f ║\n",
+                   r.batch_size, r.prompt_len, r.iteration,
+                   ttft, itl, tps, r.decode_total.cv_pct(), r.decode_total.ci95());
+        }
     }
 
     printf("╚═══════╩═══════╩═══════╩══════════╩════════╩════════╩═══════╩═══════╩════════╝\n");
@@ -933,28 +916,34 @@ static void print_sweep_summary(const std::vector<BenchResult>& results, size_t 
 // ============================================================================
 static void print_csv(const std::vector<BenchResult>& results) {
     printf("\n--- CSV ---\n");
-    printf("batch_size,prompt_len,iteration,ttft_median_ms,ttft_ci95_ms,ttft_cv_pct,"
-           "prefill_tok_per_sec,itl_median_ms,itl_p95_ms,itl_p99_ms,itl_ci95_ms,itl_cv_pct,"
-           "itl_trimmed_mean_ms,decode_tok_per_sec,bw_GBs,weight_MB,"
-           "fwd_ms,embed_ms,norm_ms,lmhead_ms,sample_ms\n");
+    printf("batch_size,prompt_len,iteration,prefill_mode,decode_phase_mode,"
+        "single_req_ttft_median_ms,single_req_ttft_ci95_ms,single_req_ttft_cv_pct,"
+        "single_req_prefill_tok_per_sec,itl_median_ms,itl_p95_ms,itl_p99_ms,itl_ci95_ms,itl_cv_pct,"
+        "itl_trimmed_mean_ms,decode_tok_per_sec,bw_GBs,weight_bf16_estimate_MB,"
+        "graph_or_forward_ms,embed_ms,norm_ms,lmhead_ms,sample_ms\n");
 
     for (const auto& r : results) {
         float itl = r.decode_total.median();
         float tps = (itl > 0) ? (float)r.batch_size * 1000.0f / itl : 0;
-        float bw = (itl > 0) ? r.weight_bytes / (itl / 1000.0f) / 1e9f : 0;
+     float bw = (itl > 0 && r.bandwidth_valid) ? r.weight_bytes / (itl / 1000.0f) / 1e9f : -1.0f;
         float ttft = r.prefill_ttft.median();
         float prefill_tps = (ttft > 0) ? (float)r.prompt_len * 1000.0f / ttft : 0;
 
-        printf("%d,%d,%d,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.1f,"
-               "%.2f,%.2f,%.2f,%.2f,%.2f\n",
+     printf("%d,%d,%d,%s,%s,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,",
                r.batch_size, r.prompt_len, r.iteration,
-               ttft, r.prefill_ttft.ci95(), r.prefill_ttft.cv_pct(),
+         r.prefill_serialized ? "serialized_single_request" : "batched",
+         decode_phase_mode_label(r),
+         ttft, r.prefill_ttft.ci95(), r.prefill_ttft.cv_pct(),
                prefill_tps,
                itl, r.decode_total.p95(), r.decode_total.p99(),
-               r.decode_total.ci95(), r.decode_total.cv_pct(), r.decode_total.trimmed_mean(),
-               tps, bw, r.weight_bytes / 1e6f,
-               r.decode_forward.median(), r.decode_embed.median(),
-               r.decode_norm.median(), r.decode_lmhead.median(), r.decode_sample.median());
+         r.decode_total.ci95(), r.decode_total.cv_pct(), r.decode_total.trimmed_mean(),
+         tps);
+     if (r.bandwidth_valid) printf("%.1f,", bw);
+     else printf("N/A,");
+     printf("%.1f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+         r.weight_bytes / 1e6f,
+         r.decode_forward.median(), r.decode_embed.median(),
+         r.decode_norm.median(), r.decode_lmhead.median(), r.decode_sample.median());
     }
 }
 
@@ -985,7 +974,8 @@ int run_benchmark(int argc, char** argv) {
               << "  Iterations    : " << cfg.iterations << "\n"
               << "  Prefill repeat: " << cfg.prefill_repeat << "\n"
               << "  KV Cache GB   : " << cfg.kv_cache_gb   << "\n"
-              << "  CUDA Graph    : " << (cfg.no_graph ? "OFF" : "ON") << "\n"
+              << "  CUDA Graph req: " << (cfg.no_graph ? "OFF" : "ON") << "\n"
+              << "  CUDA Graph act: OFF (decode path not graph-safe)\n"
               << "  NVTX markers  : " << (cfg.nsys_mode ? "ON" : "OFF") << "\n"
               << "  Total configs : " << total_configs << "\n"
               << "  JSON output   : " << (cfg.json_output.empty() ? "(none)" : cfg.json_output) << "\n"
@@ -1035,6 +1025,14 @@ int run_benchmark(int argc, char** argv) {
     }
     nvtx_pop();
 
+    bool model_has_quantized_weights = false;
+    for (int layer_idx = 0; layer_idx < model->num_layers(); ++layer_idx) {
+        if (model->get_layer(layer_idx).is_quantized()) {
+            model_has_quantized_weights = true;
+            break;
+        }
+    }
+
     // Compute total weight bytes
     const int hs = config.hidden_size;
     const int is_dim = config.intermediate_size;
@@ -1055,7 +1053,13 @@ int run_benchmark(int argc, char** argv) {
     size_t total_weight_bytes = (n_linear_layers * la_params + num_full_attn_layers * fa_params
                                  + (size_t)config.vocab_size * hs) * 2;
 
-    printf("      Weight size: %.1f MB (BF16)\n\n", (float)total_weight_bytes / 1e6);
+    if (model_has_quantized_weights) {
+        printf("      Weight size estimate: %.1f MB (dense BF16 equivalent, bandwidth disabled)\n\n",
+               (float)total_weight_bytes / 1e6);
+    } else {
+        printf("      Weight size estimate: %.1f MB (dense BF16 path)\n\n",
+               (float)total_weight_bytes / 1e6);
+    }
 
     // ========================================================================
     // 2. Run sweep
@@ -1071,7 +1075,8 @@ int run_benchmark(int argc, char** argv) {
                        config_idx, total_configs, bs, pl, iter + 1, cfg.iterations);
 
                 auto result = run_single_bench(cfg, config, model.get(), stream,
-                                               bs, pl, iter + 1, total_weight_bytes);
+                                               bs, pl, iter + 1, total_weight_bytes,
+                                               !model_has_quantized_weights);
 
                 print_single_result(result);
                 all_results.push_back(std::move(result));
@@ -1092,8 +1097,8 @@ int run_benchmark(int argc, char** argv) {
         float itl_p99 = r.decode_total.p99();
         float decode_tps = (float)r.batch_size * 1000.0f / itl;
         float decode_tps_mean = (float)r.batch_size * 1000.0f / r.decode_total.mean();
-        float bw_median = r.weight_bytes / (itl / 1000.0f) / 1e9f;
-        float bw_mean = r.weight_bytes / (r.decode_total.mean() / 1000.0f) / 1e9f;
+        float bw_median = (r.bandwidth_valid && itl > 0) ? r.weight_bytes / (itl / 1000.0f) / 1e9f : 0;
+        float bw_mean = (r.bandwidth_valid && r.decode_total.mean() > 0) ? r.weight_bytes / (r.decode_total.mean() / 1000.0f) / 1e9f : 0;
         float ttft = r.prefill_ttft.median();
         float ttft_p95 = r.prefill_ttft.p95();
         float ttft_p99 = r.prefill_ttft.p99();
@@ -1104,15 +1109,16 @@ int run_benchmark(int argc, char** argv) {
         printf("║        Standard LLM Inference Metrics (batch=%d, prompt=%d)  ║\n", r.batch_size, r.prompt_len);
         printf("╠══════════════════════════════════════════════════════════════════╣\n");
         printf("║                                                                ║\n");
-        printf("║  ▸ TTFT (Time To First Token)                                  ║\n");
+        printf("║  ▸ Single-Request TTFT                                          ║\n");
         printf("║      Median:  %8.1f ms ±%.1f  (N=%d, CV=%.1f%%)               ║\n",
                ttft, r.prefill_ttft.ci95(), r.prefill_ttft.count(), r.prefill_ttft.cv_pct());
         printf("║      P95:     %8.1f ms                                      ║\n", ttft_p95);
         printf("║      P99:     %8.1f ms                                      ║\n", ttft_p99);
         printf("║                                                                ║\n");
-        printf("║  ▸ Prefill Throughput                                          ║\n");
-        printf("║      Prefill tok/s:   %7.0f  (%d tokens / %.1f ms)            ║\n",
+         printf("║  ▸ Prefill Throughput                                          ║\n");
+         printf("║      Single-req tok/s: %7.0f  (%d tokens / %.1f ms)            ║\n",
                prefill_tps, r.prompt_len, ttft);
+         printf("║      Mode: serialized per request across batch                 ║\n");
         printf("║      Breakdown:  embed=%.1fms  fwd=%.1fms  lmhead=%.1fms       ║\n",
                r.prefill_embed.median(), r.prefill_forward.median(),
                r.prefill_lmhead.median());
@@ -1131,10 +1137,15 @@ int run_benchmark(int argc, char** argv) {
         printf("║      tok/s (mean):   %8.2f                                   ║\n", decode_tps_mean);
         printf("║                                                                ║\n");
         printf("║  ▸ Memory Bandwidth                                           ║\n");
-        printf("║      Weight BW (median): %6.1f GB/s  (peak=273 GB/s)         ║\n", bw_median);
-        printf("║      Weight BW (mean):   %6.1f GB/s                          ║\n", bw_mean);
-        printf("║      Weight size:        %6.1f MB (BF16)                     ║\n",
-               r.weight_bytes / 1e6f);
+         if (r.bandwidth_valid) {
+             printf("║      Weight BW (median): %6.1f GB/s  (peak=273 GB/s)         ║\n", bw_median);
+             printf("║      Weight BW (mean):   %6.1f GB/s                          ║\n", bw_mean);
+         } else {
+             printf("║      Weight BW:         N/A  (quantized weight path)         ║\n");
+             printf("║      Mean BW:           N/A                                  ║\n");
+         }
+         printf("║      Weight estimate:   %6.1f MB (dense BF16 equivalent)     ║\n",
+             r.weight_bytes / 1e6f);
         printf("║                                                                ║\n");
         printf("╠══════════════════════════════════════════════════════════════════╣\n");
         printf("║  Decode Phase Breakdown                                        ║\n");
@@ -1144,24 +1155,34 @@ int run_benchmark(int argc, char** argv) {
         printf("║  │ Total    │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
                r.decode_total.mean(), r.decode_total.median(), r.decode_total.min_val(),
                r.decode_total.max_val(), r.decode_total.p95());
-        printf("║  │ Forward  │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
-               r.decode_forward.mean(), r.decode_forward.median(), r.decode_forward.min_val(),
-               r.decode_forward.max_val(), r.decode_forward.p95());
-        printf("║  │ Embed    │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
-               r.decode_embed.mean(), r.decode_embed.median(), r.decode_embed.min_val(),
-               r.decode_embed.max_val(), r.decode_embed.p95());
-        printf("║  │ Norm     │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
-               r.decode_norm.mean(), r.decode_norm.median(), r.decode_norm.min_val(),
-               r.decode_norm.max_val(), r.decode_norm.p95());
-        printf("║  │ LM Head  │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
-               r.decode_lmhead.mean(), r.decode_lmhead.median(), r.decode_lmhead.min_val(),
-               r.decode_lmhead.max_val(), r.decode_lmhead.p95());
-        printf("║  │ Sample   │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
-               r.decode_sample.mean(), r.decode_sample.median(), r.decode_sample.min_val(),
-               r.decode_sample.max_val(), r.decode_sample.p95());
+         printf("║  │ Embed    │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
+             r.decode_embed.mean(), r.decode_embed.median(), r.decode_embed.min_val(),
+             r.decode_embed.max_val(), r.decode_embed.p95());
+         if (r.decode_phase_aggregated) {
+             printf("║  │ GraphBody│%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
+                 r.decode_forward.mean(), r.decode_forward.median(), r.decode_forward.min_val(),
+                 r.decode_forward.max_val(), r.decode_forward.p95());
+             printf("║  │ Norm     │   N/A  │   N/A  │   N/A  │  N/A  │  N/A │        ║\n");
+             printf("║  │ LM Head  │   N/A  │   N/A  │   N/A  │  N/A  │  N/A │        ║\n");
+             printf("║  │ Sample   │   N/A  │   N/A  │   N/A  │  N/A  │  N/A │        ║\n");
+         } else {
+             printf("║  │ Forward  │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
+                 r.decode_forward.mean(), r.decode_forward.median(), r.decode_forward.min_val(),
+                 r.decode_forward.max_val(), r.decode_forward.p95());
+             printf("║  │ Norm     │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
+                 r.decode_norm.mean(), r.decode_norm.median(), r.decode_norm.min_val(),
+                 r.decode_norm.max_val(), r.decode_norm.p95());
+             printf("║  │ LM Head  │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
+                 r.decode_lmhead.mean(), r.decode_lmhead.median(), r.decode_lmhead.min_val(),
+                 r.decode_lmhead.max_val(), r.decode_lmhead.p95());
+             printf("║  │ Sample   │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
+                 r.decode_sample.mean(), r.decode_sample.median(), r.decode_sample.min_val(),
+                 r.decode_sample.max_val(), r.decode_sample.p95());
+         }
         printf("║  └──────────┴────────┴────────┴────────┴───────┴──────┘        ║\n");
-        printf("║  Config: %d warmup + %d decode steps, CUDA Graph: %s           ║\n",
-               r.warmup_steps, r.decode_steps, r.cuda_graph ? "ON" : "OFF");
+         printf("║  Config: %d warmup + %d decode steps, CUDA Graph: %s           ║\n",
+             r.warmup_steps, r.decode_steps, r.cuda_graph ? "ON" : "OFF");
+         printf("║  Decode phase mode: %-42s║\n", decode_phase_mode_label(r));
         printf("║  Prefill: %d repeats, N=%d total measurements                  ║\n",
                cfg.prefill_repeat, r.prefill_ttft.count());
         printf("╚══════════════════════════════════════════════════════════════════╝\n");

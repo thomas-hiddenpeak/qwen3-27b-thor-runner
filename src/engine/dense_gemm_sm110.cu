@@ -1055,7 +1055,9 @@ __global__ void gemv_rmsnorm_kernel(
 
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x & (WARP_SIZE - 1);
-    int out_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    // 散列映射: 同 block 的 warp 访问远端行, 分散 DRAM bank 冲突
+    int num_blocks = (N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    int out_idx = blockIdx.x + warp_id * num_blocks;
 
     // Phase 1: Load hidden_states → SMEM + compute sum-of-squares
     float sum_sq = 0.0f;
@@ -1153,19 +1155,15 @@ void invoke_dense_gemv(
 
     // SM110 Thor: 228 KB shared/SM, 48 KB/block 硬件上限
     constexpr size_t SMEM_BLOCK_LIMIT = 48 * 1024;  // 48 KB = Thor hardware limit per block
-    constexpr int SCATTER_K_THRESHOLD = 8192;
     constexpr int TILE_K = 4096;
 
     if (smem_bytes <= SMEM_BLOCK_LIMIT) {
-        // 全 K 放入 shared memory: 优先散列映射 (8 warps, 无 tiling 开销)
-        // 微基准 (K=17408): scattered 225.7 GB/s vs scattered_tiled 212.7 GB/s (+6.1%)
+        // 全 K 放入 shared memory: 始终使用散列映射减少 DRAM bank 冲突
+        // 同 block 的 warp 访问远端行, 分散 DRAM bank 压力
+        // K=2048 (MoE) 和 K=5120+ (dense) 均受益: 行更短 → bank 冲突更密集
         int blocks = (N + WARPS_8W - 1) / WARPS_8W;
-        if (K > SCATTER_K_THRESHOLD) {
-            gemv_kernel_scattered<<<blocks, BLOCK_THREADS_8W, smem_bytes, stream>>>(
-                A, B, C, N, K);
-        } else {
-            gemv_kernel<<<blocks, BLOCK_THREADS_8W, smem_bytes, stream>>>(A, B, C, N, K);
-        }
+        gemv_kernel_scattered<<<blocks, BLOCK_THREADS_8W, smem_bytes, stream>>>(
+            A, B, C, N, K);
     } else {
         // K 太大无法放入单 block smem → 散列 + K 分块 (4 warps)
         int blocks = (N + WARPS_4W - 1) / WARPS_4W;
@@ -1191,10 +1189,10 @@ void invoke_dense_gemv_add(
     size_t smem_bytes = K * sizeof(__nv_bfloat16);
 
     constexpr size_t SMEM_BLOCK_LIMIT = 48 * 1024;
-    constexpr int SCATTER_K_THRESHOLD = 8192;
+    constexpr int TILED_K_THRESHOLD = 8192;  // K > 8192: tiled 更优 (12 vs 6 blocks/SM)
     constexpr int TILE_K = 4096;
 
-    if (K > SCATTER_K_THRESHOLD) {
+    if (K > TILED_K_THRESHOLD) {
         // K > 8192: 散列 + K 分块 (4 warps, tile_k=4096, smem=8KB)
         // 实测比 scattered_add (8 warps, 34KB smem) 更快:
         //   12 blocks/SM vs 6 blocks/SM → 更好的调度 + 更大 L1
@@ -1202,16 +1200,17 @@ void invoke_dense_gemv_add(
         size_t tiled_smem = TILE_K * sizeof(__nv_bfloat16);
         gemv_kernel_scattered_tiled_add<<<blocks, BLOCK_THREADS_4W, tiled_smem, stream>>>(
             A, B, C, residual, N, K, TILE_K);
-    } else if (smem_bytes > SMEM_BLOCK_LIMIT) {
+    } else if (smem_bytes <= SMEM_BLOCK_LIMIT) {
+        // K ≤ 8192: 全 K 放入 SMEM, 散列映射减少 DRAM bank 冲突
         int blocks = (N + WARPS_8W - 1) / WARPS_8W;
-        int tile_k = 4096;
-        size_t tiled_smem = tile_k * sizeof(__nv_bfloat16);
-        gemv_kernel_tiled_add<<<blocks, BLOCK_THREADS_8W, tiled_smem, stream>>>(
-            A, B, C, residual, N, K, tile_k);
-    } else {
-        int blocks = (N + WARPS_8W - 1) / WARPS_8W;
-        gemv_kernel_add<<<blocks, BLOCK_THREADS_8W, smem_bytes, stream>>>(
+        gemv_kernel_scattered_add<<<blocks, BLOCK_THREADS_8W, smem_bytes, stream>>>(
             A, B, C, residual, N, K);
+    } else {
+        // K ≤ 8192 but smem > SMEM_BLOCK_LIMIT (不应触发)
+        int blocks = (N + WARPS_4W - 1) / WARPS_4W;
+        size_t tiled_smem = TILE_K * sizeof(__nv_bfloat16);
+        gemv_kernel_scattered_tiled_add<<<blocks, BLOCK_THREADS_4W, tiled_smem, stream>>>(
+            A, B, C, residual, N, K, TILE_K);
     }
 }
 
@@ -1240,7 +1239,8 @@ __global__ void dual_gemv_kernel(const __nv_bfloat16* __restrict__ A,
     int blocks_per_output = (N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
     bool is_second = (blockIdx.x >= blocks_per_output);
     int local_block = is_second ? (blockIdx.x - blocks_per_output) : blockIdx.x;
-    int out_idx = local_block * WARPS_PER_BLOCK + warp_id;
+    // 散列映射: 同 block 的 warp 访问远端行
+    int out_idx = local_block + warp_id * blocks_per_output;
 
     // 协作加载 A 到 shared memory
     for (int i = threadIdx.x; i < K; i += blockDim.x) {
