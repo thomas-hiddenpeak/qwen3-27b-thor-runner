@@ -41,8 +41,9 @@ void invoke_per_head_rmsnorm(__nv_bfloat16* out, const __nv_bfloat16* x,
                               cudaStream_t stream = 0, bool centered = false);
 
 // 写入 Paged KV Cache (支持 batched decode)
-// batch_size=1 → prefill (所有 token 同一序列, 用 start_pos)
-// batch_size>1 → batched decode (每 token 不同序列, 用 seq_positions)
+// batch_size=1 → prefill (所有 token 同一序列, 用 start_pos 或 context_lens)
+// batch_size>1 → batched decode (每 token 不同序列, 用 seq_positions 或 context_lens)
+// context_lens: if provided, kernel computes positions inline (context_lens[i] - num_tokens)
 void invoke_write_kv_cache(__nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
                             const __nv_bfloat16* k, const __nv_bfloat16* v,
                             const int* block_tables,
@@ -50,7 +51,8 @@ void invoke_write_kv_cache(__nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
                             int num_kv_heads, int head_dim,
                             int block_size, int max_num_blocks_per_seq,
                             cudaStream_t stream = 0, int batch_size = 1,
-                            const int* seq_positions = nullptr);
+                            const int* seq_positions = nullptr,
+                            const int* context_lens = nullptr);
 
 // 因果短卷积 (causal conv1d)
 // token_stride: 元素步长（= channels 独立布局; = in_qkv 交叉布局）

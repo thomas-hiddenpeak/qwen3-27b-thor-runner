@@ -441,7 +441,8 @@ void invoke_rope_partial(__nv_bfloat16* q, __nv_bfloat16* k, const int* pos_ids,
 __global__ void write_kv_cache_kernel(__nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
                                        const __nv_bfloat16* k, const __nv_bfloat16* v,
                                        const int* block_tables,
-                                       const int* seq_positions,  // [batch_size] 每个序列的写入位置
+                                       const int* seq_positions,  // [batch_size] 每个序列的写入位置 (NULL if context_lens provided)
+                                       const int* context_lens,   // [batch_size] 每个序列的上下文长度 (NULL if seq_positions provided)
                                        int num_tokens,
                                        int num_kv_heads, int head_dim,
                                        int block_size, int max_num_blocks_per_seq,
@@ -456,11 +457,13 @@ __global__ void write_kv_cache_kernel(__nv_bfloat16* k_cache, __nv_bfloat16* v_c
     if (batch_size <= 1) {
         // Prefill 模式: 所有 token 属于序列 0
         seq_idx = 0;
-        pos = seq_positions[0] + token_idx;
+        pos = context_lens ? (context_lens[0] - num_tokens + token_idx)
+                           : (seq_positions[0] + token_idx);
     } else {
         // Batched decode: token i 来自序列 i
         seq_idx = token_idx;
-        pos = seq_positions[seq_idx];
+        pos = context_lens ? (context_lens[seq_idx] - 1)
+                           : seq_positions[seq_idx];
     }
 
     int block_idx      = pos / block_size;
@@ -482,13 +485,23 @@ void invoke_write_kv_cache(__nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
                             int num_kv_heads, int head_dim,
                             int block_size, int max_num_blocks_per_seq,
                             cudaStream_t stream, int batch_size,
-                            const int* seq_positions) {
+                            const int* seq_positions,
+                            const int* context_lens) {
     dim3 blocks(num_tokens, num_kv_heads);
     int  threads = std::min(head_dim, 256);
 
-    // 向后兼容: 如果没有提供 seq_positions, 使用 start_pos 创建临时数组
+    // Priority: context_lens > seq_positions > start_pos (legacy)
     int* d_seq_pos = nullptr;
     bool need_free = false;
+    if (context_lens) {
+        // Kernel will compute positions from context_lens inline
+        write_kv_cache_kernel<<<blocks, threads, 0, stream>>>(
+            k_cache, v_cache, k, v, block_tables,
+            nullptr, context_lens, num_tokens, num_kv_heads, head_dim,
+            block_size, max_num_blocks_per_seq,
+            batch_size <= 0 ? 1 : batch_size);
+        return;
+    }
     if (seq_positions) {
         d_seq_pos = const_cast<int*>(seq_positions);
     } else {
@@ -500,7 +513,7 @@ void invoke_write_kv_cache(__nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
 
     write_kv_cache_kernel<<<blocks, threads, 0, stream>>>(
         k_cache, v_cache, k, v, block_tables,
-        d_seq_pos, num_tokens, num_kv_heads, head_dim,
+        d_seq_pos, nullptr, num_tokens, num_kv_heads, head_dim,
         block_size, max_num_blocks_per_seq,
         batch_size <= 0 ? 1 : batch_size);
 

@@ -65,6 +65,18 @@ void invoke_dense_gemv_with_rmsnorm(
     cudaStream_t stream = nullptr
 );
 
+// Fused Sigmoid-Mul + GEMV: attn_out *= sigmoid(attn_gate) in SMEM, then GEMV
+// Eliminates sigmoid_mul kernel launch + GMEM write+read of gated output
+// 仅用于 T=1 decode, K 必须能装入 SMEM (K*2 ≤ 48KB)
+void invoke_dense_gemv_with_sigmoid_mul(
+    const __nv_bfloat16* attn_out,   // [1, K] attention output
+    const __nv_bfloat16* attn_gate,  // [1, K] gate values (before sigmoid)
+    const __nv_bfloat16* B,          // [K, N] o_proj weight
+    __nv_bfloat16* C,                // [1, N] output
+    int N, int K,
+    cudaStream_t stream = nullptr
+);
+
 // 辅助函数：针对 M=1 的矩阵向量乘法 (GEMV)
 // 用于 Decode 阶段和 LM Head
 void invoke_dense_gemv(

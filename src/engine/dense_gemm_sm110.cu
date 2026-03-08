@@ -1034,6 +1034,76 @@ __global__ void gemv_kernel_scattered_tiled_add(
 }
 
 // ----------------------------------------------------------------------------
+// Fused Sigmoid-Mul + GEMV: attn_out *= sigmoid(attn_gate) in SMEM, then GEMV
+// Eliminates sigmoid_mul kernel launch + GMEM write+read of gated attn output
+// 限制: K <= 24576 (smem 48KB limit / 2 bytes) 且 M=1 (T=1 decode only)
+// 线程布局: Grid(ceil(N/8)), Block(256 = 8 warps), Dynamic SMEM = K*sizeof(BF16)
+// ----------------------------------------------------------------------------
+__global__ void gemv_sigmoid_mul_kernel(
+    const __nv_bfloat16* __restrict__ attn_out,
+    const __nv_bfloat16* __restrict__ attn_gate,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    int N, int K)
+{
+    constexpr int WARP_SIZE = 32;
+    constexpr int WARPS_PER_BLOCK = 8;
+
+    extern __shared__ __nv_bfloat16 s_A[];  // [K] will hold gated attn output
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x & (WARP_SIZE - 1);
+    int num_blocks = (N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    int out_idx = blockIdx.x + warp_id * num_blocks;
+
+    // Phase 1: Load attn_out, apply sigmoid(attn_gate) * attn_out → SMEM
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        float v = __bfloat162float(attn_out[i]);
+        float g = __bfloat162float(attn_gate[i]);
+        float sig = 1.0f / (1.0f + expf(-g));
+        s_A[i] = __float2bfloat16(v * sig);
+    }
+    __syncthreads();
+
+    // Phase 2: Standard scattered GEMV from SMEM
+    if (out_idx >= N) return;
+
+    const __nv_bfloat16* b_col = B + (size_t)out_idx * K;
+    float sum = 0.0f;
+
+    int k8 = K / 8;
+    const float4* s_A_v4 = reinterpret_cast<const float4*>(s_A);
+    const float4* b_col_v4 = reinterpret_cast<const float4*>(b_col);
+
+    for (int i = lane_id; i < k8; i += WARP_SIZE) {
+        float4 a4 = s_A_v4[i];
+        float4 b4 = b_col_v4[i];
+        const __nv_bfloat162* a2 = reinterpret_cast<const __nv_bfloat162*>(&a4);
+        const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&b4);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float2 af = __bfloat1622float2(a2[j]);
+            float2 bf = __bfloat1622float2(b2[j]);
+            sum += af.x * bf.x + af.y * bf.y;
+        }
+    }
+
+    int k_tail_start = k8 * 8;
+    for (int k = k_tail_start + lane_id; k < K; k += WARP_SIZE) {
+        sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k]);
+    }
+
+    #pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, mask);
+    }
+
+    if (lane_id == 0) {
+        C[out_idx] = __float2bfloat16(sum);
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Fused RMSNorm + GEMV: Input RMSNorm 在 SMEM 内完成后直接开始 GEMV
 // 省去 norm_out 的 GMEM write+read + 1 kernel launch
 // RMSNorm 使用 centered weight: out = x * rsqrt(var+eps) * (1+w)
@@ -1137,6 +1207,22 @@ void invoke_dense_gemv_with_rmsnorm(
     size_t smem_bytes = K * sizeof(__nv_bfloat16);
     gemv_rmsnorm_kernel<<<blocks, BLOCK_THREADS, smem_bytes, stream>>>(
         hidden_states, norm_weight, eps, B, C, N, K);
+}
+
+void invoke_dense_gemv_with_sigmoid_mul(
+    const __nv_bfloat16* attn_out,
+    const __nv_bfloat16* attn_gate,
+    const __nv_bfloat16* B,
+    __nv_bfloat16* C,
+    int N, int K,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK_THREADS = 256;
+    constexpr int WARPS_PER_BLOCK = BLOCK_THREADS / 32;
+    int blocks = (N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    size_t smem_bytes = K * sizeof(__nv_bfloat16);
+    gemv_sigmoid_mul_kernel<<<blocks, BLOCK_THREADS, smem_bytes, stream>>>(
+        attn_out, attn_gate, B, C, N, K);
 }
 
 void invoke_dense_gemv(

@@ -505,17 +505,14 @@ void Qwen35FullAttnLayer::forward(
                                     kv_manager.get_block_size(), max_num_blocks_per_seq,
                                     stream, batch_size, seq_positions);
     } else {
-        // Single sequence: write start = context_lens[0] - num_tokens
-        // For decode (T=1): start = context_len - 1 (the new token's position)
-        // For prefill (T>1): start = context_len - T (chunk's first position)
-        int* seq_positions = reinterpret_cast<int*>(down_out + num_tokens * hs);
-        compute_write_start_kernel<<<1, 1, 0, stream>>>(
-            seq_positions, context_lens, num_tokens);
+        // Single sequence: kernel computes positions from context_lens inline
+        // For decode (T=1): pos = context_len - 1
+        // For prefill (T>1): pos = context_len - num_tokens + token_idx
         ops::invoke_write_kv_cache(k_cache, v_cache, k, v,
                                     block_tables, 0 /*unused*/, num_tokens,
                                     num_kv, hd,
                                     kv_manager.get_block_size(), max_num_blocks_per_seq,
-                                    stream, 1, seq_positions);
+                                    stream, 1, nullptr, context_lens);
     }
 
     // 6. Attention
@@ -615,20 +612,21 @@ void Qwen35FullAttnLayer::forward(
             batch_size);
     }
 
-    // 6b. Apply attention output gate: attn_out *= sigmoid(attn_gate)
-    ops::invoke_sigmoid_mul(attn_out, attn_out, attn_gate, num_tokens * q_dim, stream);
-
-    // 7. O Projection
-
+    // 6b+7. Fused attention gate + O Projection
     if (quantized_) {
+        // FP4: sigmoid_mul separate, then quantized GEMV
+        ops::invoke_sigmoid_mul(attn_out, attn_out, attn_gate, num_tokens * q_dim, stream);
         if (num_tokens == 1) {
             ops::invoke_fp4_gemv(attn_out, o_qw_, o_proj_out, stream);
         } else {
             ops::invoke_fp4_gemm(attn_out, o_qw_, o_proj_out, num_tokens, stream);
         }
     } else if (num_tokens == 1) {
-        ops::invoke_dense_gemv(attn_out, o_proj_w_, o_proj_out, hs, q_dim, stream);
+        // BF16 T=1: fuse sigmoid_mul into o_proj GEMV (in SMEM)
+        ops::invoke_dense_gemv_with_sigmoid_mul(attn_out, attn_gate, o_proj_w_, o_proj_out, hs, q_dim, stream);
     } else {
+        // BF16 T>1: separate sigmoid_mul + GEMM
+        ops::invoke_sigmoid_mul(attn_out, attn_out, attn_gate, num_tokens * q_dim, stream);
         ops::invoke_dense_gemm(attn_out, o_proj_w_, o_proj_out, num_tokens, hs, q_dim, stream);
     }
 
