@@ -3,6 +3,7 @@
 #include "dense_gemm.h"
 #include "dense_gemm_fp4.h"
 #include "streaming_attention.h"
+#include "pdl.h"
 #include <cmath>
 #include <vector>
 #include <stdexcept>
@@ -344,14 +345,18 @@ void Qwen35FullAttnLayer::set_weights(
 // Helper kernel: compute KV write start positions
 // Batched decode: each sequence writes 1 token at position context_lens[i] - 1
 __global__ void compute_write_positions_kernel(int* positions, const int* context_lens, int n) {
+    PDL_WAIT();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) positions[i] = context_lens[i] - 1;
+    PDL_SIGNAL();
 }
 // Single-sequence prefill/decode: write T tokens starting at context_lens[0] - T
 // For decode (T=1): same as context_lens[0] - 1
 // For prefill (T>1): correctly places chunk at [context_len-T, context_len-1]
 __global__ void compute_write_start_kernel(int* positions, const int* context_lens, int num_tokens) {
+    PDL_WAIT();
     if (threadIdx.x == 0) positions[0] = context_lens[0] - num_tokens;
+    PDL_SIGNAL();
 }
 
 void Qwen35FullAttnLayer::forward(
@@ -493,7 +498,7 @@ void Qwen35FullAttnLayer::forward(
         // Batched decode: compute per-sequence write positions from context_lens
         // Place seq_positions int array at end of workspace (after down_out)
         int* seq_positions = reinterpret_cast<int*>(down_out + num_tokens * hs);
-        compute_write_positions_kernel<<<1, batch_size, 0, stream>>>(
+        PDL_LAUNCH(compute_write_positions_kernel, 1, batch_size, 0, stream,
             seq_positions, context_lens, batch_size);
         ops::invoke_write_kv_cache(k_cache, v_cache, k, v,
                                     block_tables, 0 /*unused*/, num_tokens,
@@ -672,12 +677,14 @@ void Qwen35LinearAttnLayer::set_weights(
 
 // Tiny device lambda as file-scope __global__ function
 __global__ void silu_gate_kernel(__nv_bfloat16* y, const __nv_bfloat16* z, int n) {
+    PDL_WAIT();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         float zv = __bfloat162float(z[idx]);
         float zg = zv / (1.f + exp2f(-zv * 1.4426950408889634f));
         y[idx]   = __float2bfloat16(__bfloat162float(y[idx]) * zg);
     }
+    PDL_SIGNAL();
 }
 
 void Qwen35LinearAttnLayer::forward(
@@ -823,7 +830,7 @@ void Qwen35LinearAttnLayer::forward(
                                          config_.rms_norm_eps, num_tokens, nv, vd, stream);
     } else {
         int total = num_tokens * lin_v;
-        silu_gate_kernel<<<(total+255)/256, 256, 0, stream>>>(y_ssm, z_out, total);
+        PDL_LAUNCH(silu_gate_kernel, (total+255)/256, 256, 0, stream, y_ssm, z_out, total);
     }
 
     // 9. Output Projection

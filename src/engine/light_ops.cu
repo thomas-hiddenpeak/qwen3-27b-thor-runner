@@ -1,5 +1,6 @@
 #include "light_ops.h"
 #include "gdn_umma_sm110.h"
+#include "pdl.h"
 #include <cuda_bf16.h>
 #include <stdio.h>
 #include <algorithm>
@@ -66,6 +67,7 @@ __inline__ __device__ T blockReduceSum(T val) {
 // hidden_size 是 8 的倍数，使用 float4 向量化加载
 // x 值在 Pass 1 读取后缓存在寄存器/shared memory, Pass 2 不重读
 __global__ void rmsnorm_kernel(__nv_bfloat16* out, const __nv_bfloat16* x, const __nv_bfloat16* weight, float eps, int hidden_size) {
+    PDL_WAIT();
     int token_idx = blockIdx.x;
     int tid = threadIdx.x;
     
@@ -105,13 +107,14 @@ __global__ void rmsnorm_kernel(__nv_bfloat16* out, const __nv_bfloat16* x, const
         float w = __bfloat162float(weight[i]);
         out_row[i] = __float2bfloat16(r_cache[e] * inv_rms * (1.0f + w));
     }
+    PDL_SIGNAL();
 }
 
 void invoke_rmsnorm(__nv_bfloat16* out, const __nv_bfloat16* x, const __nv_bfloat16* weight, float eps, int num_tokens, int hidden_size, cudaStream_t stream) {
     // 每个 token 分配一个 block，每个 block 256 个线程
     int threads = 256;
     int blocks = num_tokens;
-    rmsnorm_kernel<<<blocks, threads, 0, stream>>>(out, x, weight, eps, hidden_size);
+    PDL_LAUNCH(rmsnorm_kernel, blocks, threads, 0, stream, out, x, weight, eps, hidden_size);
 }
 
 // ----------------------------------------------------------------------------
@@ -119,6 +122,7 @@ void invoke_rmsnorm(__nv_bfloat16* out, const __nv_bfloat16* x, const __nv_bfloa
 // ----------------------------------------------------------------------------
 // 每个线程处理一个 head 的一对 (dim_i, dim_i+1)
 __global__ void rope_kernel(__nv_bfloat16* q, __nv_bfloat16* k, const int* pos_ids, int num_tokens, int num_heads, int num_kv_heads, int head_dim, float base) {
+    PDL_WAIT();
     int token_idx = blockIdx.x;
     int head_idx = blockIdx.y;
     int dim_idx = threadIdx.x * 2; // 每次处理 2 个维度
@@ -153,6 +157,7 @@ __global__ void rope_kernel(__nv_bfloat16* q, __nv_bfloat16* k, const int* pos_i
         k[k_offset]     = __float2bfloat16(k0 * cos_val - k1 * sin_val);
         k[k_offset + 1] = __float2bfloat16(k1 * cos_val + k0 * sin_val);
     }
+    PDL_SIGNAL();
 }
 
 void invoke_rope(__nv_bfloat16* q, __nv_bfloat16* k, const int* pos_ids, int num_tokens, int num_heads, int num_kv_heads, int head_dim, float base, cudaStream_t stream) {
@@ -161,7 +166,7 @@ void invoke_rope(__nv_bfloat16* q, __nv_bfloat16* k, const int* pos_ids, int num
     // 每个线程处理 2 个维度
     dim3 threads(head_dim / 2); 
     
-    rope_kernel<<<blocks, threads, 0, stream>>>(q, k, pos_ids, num_tokens, num_heads, num_kv_heads, head_dim, base);
+    PDL_LAUNCH(rope_kernel, blocks, threads, 0, stream, q, k, pos_ids, num_tokens, num_heads, num_kv_heads, head_dim, base);
 }
 
 // ----------------------------------------------------------------------------
@@ -173,6 +178,7 @@ __device__ __forceinline__ float silu(float x) {
 }
 
 __global__ void swiglu_kernel(__nv_bfloat16* out, const __nv_bfloat16* gate, const __nv_bfloat16* up, int total_elements) {
+    PDL_WAIT();
     int n8 = total_elements / 8;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n8) {
@@ -199,6 +205,7 @@ __global__ void swiglu_kernel(__nv_bfloat16* out, const __nv_bfloat16* gate, con
             out[i] = __float2bfloat16(silu(g) * u);
         }
     }
+    PDL_SIGNAL();
 }
 
 void invoke_swiglu(__nv_bfloat16* out, const __nv_bfloat16* gate, const __nv_bfloat16* up, int num_tokens, int intermediate_size, cudaStream_t stream) {
@@ -207,13 +214,14 @@ void invoke_swiglu(__nv_bfloat16* out, const __nv_bfloat16* gate, const __nv_bfl
     int n8 = total_elements / 8;
     int blocks = (n8 + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
-    swiglu_kernel<<<blocks, threads, 0, stream>>>(out, gate, up, total_elements);
+    PDL_LAUNCH(swiglu_kernel, blocks, threads, 0, stream, out, gate, up, total_elements);
 }
 
 // ----------------------------------------------------------------------------
 // Embedding Lookup
 // ----------------------------------------------------------------------------
 __global__ void embedding_lookup_kernel(__nv_bfloat16* out, const int* tokens, const __nv_bfloat16* embedding_table, int num_tokens, int hidden_size) {
+    PDL_WAIT();
     int token_idx = blockIdx.x;
     if (token_idx < num_tokens) {
         int token_id = tokens[token_idx];
@@ -221,18 +229,20 @@ __global__ void embedding_lookup_kernel(__nv_bfloat16* out, const int* tokens, c
             out[token_idx * hidden_size + i] = embedding_table[token_id * hidden_size + i];
         }
     }
+    PDL_SIGNAL();
 }
 
 void invoke_embedding_lookup(__nv_bfloat16* out, const int* tokens, const __nv_bfloat16* embedding_table, int num_tokens, int hidden_size, cudaStream_t stream) {
     int threads = std::min(hidden_size, 1024);
     dim3 blocks(num_tokens);
-    embedding_lookup_kernel<<<blocks, threads, 0, stream>>>(out, tokens, embedding_table, num_tokens, hidden_size);
+    PDL_LAUNCH(embedding_lookup_kernel, blocks, threads, 0, stream, out, tokens, embedding_table, num_tokens, hidden_size);
 }
 
 // ----------------------------------------------------------------------------
 // element-wise add (vectorized float4 = 8×BF16 per thread)
 // ----------------------------------------------------------------------------
 __global__ void add_kernel(__nv_bfloat16* out, const __nv_bfloat16* a, const __nv_bfloat16* b, int n) {
+    PDL_WAIT();
     int n8 = n / 8;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n8) {
@@ -255,13 +265,14 @@ __global__ void add_kernel(__nv_bfloat16* out, const __nv_bfloat16* a, const __n
         for (int i = n8 * 8; i < n; i++)
             out[i] = __float2bfloat16(__bfloat162float(a[i]) + __bfloat162float(b[i]));
     }
+    PDL_SIGNAL();
 }
 void invoke_add(__nv_bfloat16* out, const __nv_bfloat16* a, const __nv_bfloat16* b, int n, cudaStream_t stream) {
     int threads = 256;
     int n8 = n / 8;
     int blocks = (n8 + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
-    add_kernel<<<blocks, threads, 0, stream>>>(out, a, b, n);
+    PDL_LAUNCH(add_kernel, blocks, threads, 0, stream, out, a, b, n);
 }
 
 // ----------------------------------------------------------------------------
@@ -278,6 +289,7 @@ __global__ void fused_add_rmsnorm_kernel(
     float eps,
     int hidden_size)
 {
+    PDL_WAIT();
     int token_idx = blockIdx.x;
     int tid = threadIdx.x;
 
@@ -317,6 +329,7 @@ __global__ void fused_add_rmsnorm_kernel(
         float w = __bfloat162float(weight[i]);
         out_row[i] = __float2bfloat16(r * inv_rms * (1.0f + w));
     }
+    PDL_SIGNAL();
 }
 
 void invoke_fused_add_rmsnorm(
@@ -326,7 +339,7 @@ void invoke_fused_add_rmsnorm(
 {
     int threads = 256;
     int blocks = num_tokens;
-    fused_add_rmsnorm_kernel<<<blocks, threads, 0, stream>>>(
+    PDL_LAUNCH(fused_add_rmsnorm_kernel, blocks, threads, 0, stream,
         norm_out, residual, bias, weight, eps, hidden_size);
 }
 
@@ -335,13 +348,15 @@ void invoke_fused_add_rmsnorm(
 // BF16 与 FP32 动态范围相同，无需裁剪
 // ----------------------------------------------------------------------------
 __global__ void f32_to_bf16_kernel(const float* src, __nv_bfloat16* dst, size_t n) {
+    PDL_WAIT();
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) dst[idx] = __float2bfloat16(src[idx]);
+    PDL_SIGNAL();
 }
 void invoke_f32_to_bf16(const float* src, __nv_bfloat16* dst, size_t n, cudaStream_t stream) {
     int threads = 256;
     int blocks = (int)((n + threads - 1) / threads);
-    f32_to_bf16_kernel<<<blocks, threads, 0, stream>>>(src, dst, n);
+    PDL_LAUNCH(f32_to_bf16_kernel, blocks, threads, 0, stream, src, dst, n);
 }
 
 // ----------------------------------------------------------------------------
@@ -350,6 +365,7 @@ void invoke_f32_to_bf16(const float* src, __nv_bfloat16* dst, size_t n, cudaStre
 // ----------------------------------------------------------------------------
 __global__ void per_head_rmsnorm_kernel(__nv_bfloat16* out, const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                          float eps, int num_heads, int head_dim, bool centered) {
+    PDL_WAIT();
     // blockIdx.x = token, blockIdx.y = head
     int token = blockIdx.x;
     int head  = blockIdx.y;
@@ -376,13 +392,14 @@ __global__ void per_head_rmsnorm_kernel(__nv_bfloat16* out, const __nv_bfloat16*
         float scale = centered ? (1.0f + w) : w;
         dst[i] = __float2bfloat16(v * inv_rms * scale);
     }
+    PDL_SIGNAL();
 }
 void invoke_per_head_rmsnorm(__nv_bfloat16* out, const __nv_bfloat16* x, const __nv_bfloat16* weight,
                               float eps, int num_tokens, int num_heads, int head_dim,
                               cudaStream_t stream, bool centered) {
     dim3 blocks(num_tokens, num_heads);
     int threads = std::min(head_dim, 256);
-    per_head_rmsnorm_kernel<<<blocks, threads, 0, stream>>>(out, x, weight, eps, num_heads, head_dim, centered);
+    PDL_LAUNCH(per_head_rmsnorm_kernel, blocks, threads, 0, stream, out, x, weight, eps, num_heads, head_dim, centered);
 }
 
 // ----------------------------------------------------------------------------
@@ -393,6 +410,7 @@ void invoke_per_head_rmsnorm(__nv_bfloat16* out, const __nv_bfloat16* x, const _
 __global__ void rope_partial_kernel(__nv_bfloat16* q, __nv_bfloat16* k, const int* pos_ids,
                                      int num_q_heads, int num_kv_heads,
                                      int head_dim, int rotary_dim, float base) {
+    PDL_WAIT();
     // blockIdx.x = token, blockIdx.y = head (max of q/kv heads)
     // Uses half-rotation pairing: pair (d, d + rotary_dim/2), matching HF rotate_half
     int token    = blockIdx.x;
@@ -425,6 +443,7 @@ __global__ void rope_partial_kernel(__nv_bfloat16* q, __nv_bfloat16* k, const in
         k[off + dim_pair]            = __float2bfloat16(x0 * cos_v - x1 * sin_v);
         k[off + dim_pair + half_rot] = __float2bfloat16(x1 * cos_v + x0 * sin_v);
     }
+    PDL_SIGNAL();
 }
 void invoke_rope_partial(__nv_bfloat16* q, __nv_bfloat16* k, const int* pos_ids,
                           int num_tokens, int num_q_heads, int num_kv_heads,
@@ -432,7 +451,7 @@ void invoke_rope_partial(__nv_bfloat16* q, __nv_bfloat16* k, const int* pos_ids,
                           float base, cudaStream_t stream) {
     dim3 blocks(num_tokens, std::max(num_q_heads, num_kv_heads));
     int threads = rotary_dim / 2;  // pairs in rotary_dim
-    rope_partial_kernel<<<blocks, threads, 0, stream>>>(
+    PDL_LAUNCH(rope_partial_kernel, blocks, threads, 0, stream,
         q, k, pos_ids, num_q_heads, num_kv_heads, head_dim, rotary_dim, base);
 }
 
@@ -450,6 +469,7 @@ __global__ void write_kv_cache_kernel(__nv_bfloat16* k_cache, __nv_bfloat16* v_c
                                        int num_kv_heads, int head_dim,
                                        int block_size, int max_num_blocks_per_seq,
                                        int batch_size) {
+    PDL_WAIT();
     int token_idx = blockIdx.x;
     int kv_head   = blockIdx.y;
     int d         = threadIdx.x;
@@ -480,6 +500,7 @@ __global__ void write_kv_cache_kernel(__nv_bfloat16* k_cache, __nv_bfloat16* v_c
 
     k_cache[dst] = k[src];
     v_cache[dst] = v[src];
+    PDL_SIGNAL();
 }
 void invoke_write_kv_cache(__nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
                             const __nv_bfloat16* k, const __nv_bfloat16* v,
@@ -498,7 +519,7 @@ void invoke_write_kv_cache(__nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
     bool need_free = false;
     if (context_lens) {
         // Kernel will compute positions from context_lens inline
-        write_kv_cache_kernel<<<blocks, threads, 0, stream>>>(
+        PDL_LAUNCH(write_kv_cache_kernel, blocks, threads, 0, stream,
             k_cache, v_cache, k, v, block_tables,
             nullptr, context_lens, num_tokens, num_kv_heads, head_dim,
             block_size, max_num_blocks_per_seq,
@@ -514,7 +535,7 @@ void invoke_write_kv_cache(__nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
         need_free = true;
     }
 
-    write_kv_cache_kernel<<<blocks, threads, 0, stream>>>(
+    PDL_LAUNCH(write_kv_cache_kernel, blocks, threads, 0, stream,
         k_cache, v_cache, k, v, block_tables,
         d_seq_pos, nullptr, num_tokens, num_kv_heads, head_dim,
         block_size, max_num_blocks_per_seq,
@@ -548,9 +569,10 @@ __global__ void causal_conv1d_prefill_parallel_kernel(
     int num_tokens, int channels, int conv_k,
     int token_stride)
 {
+    PDL_WAIT();
     int ch = blockIdx.x * blockDim.x + threadIdx.x;
     int t  = blockIdx.y;
-    if (ch >= channels || t >= num_tokens) return;
+    if (ch >= channels || t >= num_tokens) { PDL_SIGNAL(); return; }
 
     int hist = conv_k - 1;  // 3
 
@@ -580,6 +602,7 @@ __global__ void causal_conv1d_prefill_parallel_kernel(
     // SiLU activation
     float silu_out = acc / (1.f + exp2f(-acc * LOG2E));
     output[t * token_stride + ch] = __float2bfloat16(silu_out);
+    PDL_SIGNAL();
 }
 
 // 更新 conv_state: 写入最后 hist=3 个 input 值
@@ -589,8 +612,9 @@ __global__ void causal_conv1d_update_state_kernel(
     int num_tokens, int channels, int conv_k,
     int token_stride)
 {
+    PDL_WAIT();
     int ch = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ch >= channels) return;
+    if (ch >= channels) { PDL_SIGNAL(); return; }
 
     int hist = conv_k - 1;
     // conv_state[ch, k] = input[num_tokens - hist + k, ch]
@@ -602,6 +626,7 @@ __global__ void causal_conv1d_update_state_kernel(
         }
         // 如果 src_t < 0, state 保持不变 (num_tokens < hist 的罕见情况)
     }
+    PDL_SIGNAL();
 }
 
 // ---- Decode: 寄存器优化版 ----
@@ -615,8 +640,9 @@ __global__ void causal_conv1d_kernel(__nv_bfloat16* x_io,
                                       int token_stride, int batch_size,
                                       __nv_bfloat16* conv_state_checkpoint,
                                       int num_checkpoints) {
+    PDL_WAIT();
     int ch = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ch >= channels) return;
+    if (ch >= channels) { PDL_SIGNAL(); return; }
 
     int hist = conv_k - 1;
 
@@ -685,6 +711,7 @@ __global__ void causal_conv1d_kernel(__nv_bfloat16* x_io,
     conv_state[ch * hist + 0] = __float2bfloat16(buf0);
     conv_state[ch * hist + 1] = __float2bfloat16(buf1);
     conv_state[ch * hist + 2] = __float2bfloat16(buf2);
+    PDL_SIGNAL();
 }
 void invoke_causal_conv1d(__nv_bfloat16* x_io, __nv_bfloat16* conv_state,
                            const __nv_bfloat16* conv_w,
@@ -710,20 +737,20 @@ void invoke_causal_conv1d(__nv_bfloat16* x_io, __nv_bfloat16* conv_state,
         // 并行 kernel: Grid (ceil(channels/256), num_tokens)
         int threads = 256;
         dim3 grid((channels + threads - 1) / threads, num_tokens);
-        causal_conv1d_prefill_parallel_kernel<<<grid, threads, 0, stream>>>(
+        PDL_LAUNCH(causal_conv1d_prefill_parallel_kernel, grid, threads, 0, stream,
             x_io, s_conv_input_copy, conv_state, conv_w,
             num_tokens, channels, conv_k, token_stride);
 
         // 更新 conv_state (最后 hist=3 个 input)
         int blocks = (channels + threads - 1) / threads;
-        causal_conv1d_update_state_kernel<<<blocks, threads, 0, stream>>>(
+        PDL_LAUNCH(causal_conv1d_update_state_kernel, blocks, threads, 0, stream,
             conv_state, s_conv_input_copy,
             num_tokens, channels, conv_k, token_stride);
     } else {
         // Decode 路径 (T=1 或 batched decode): 寄存器优化串行 kernel
         int threads = 256;
         int blocks  = (channels + threads - 1) / threads;
-        causal_conv1d_kernel<<<blocks, threads, 0, stream>>>(
+        PDL_LAUNCH(causal_conv1d_kernel, blocks, threads, 0, stream,
             x_io, conv_state_ptrs, conv_state,
             conv_w, num_tokens, channels, conv_k, token_stride, batch_size,
             conv_state_checkpoint, num_checkpoints);
@@ -776,6 +803,7 @@ gated_delta_net_prefill_kernel(
     __nv_bfloat16* ssm_state_checkpoint,
     int num_checkpoints)
 {
+    PDL_WAIT();
     int h_v = blockIdx.x;
     int h_k = h_v / nv_per_kh;
     int nv  = nkh_x_nvpkh;
@@ -865,6 +893,7 @@ gated_delta_net_prefill_kernel(
 
     for (int i = 0; i < kd; i++)
         ssm_state[ss_base + i * vd + j] = __float2bfloat16(S_smem[i * vd_pad + j]);
+    PDL_SIGNAL();
 }
 
 // ---- Decode 版 (batch_size > 1): 独立 block per (batch, value_head) ----
@@ -882,6 +911,7 @@ __global__ void gated_delta_net_kernel(
     int num_tokens, int kd, int nv_per_kh, int vd,
     int token_stride, int batch_size, int nkh_x_nvpkh)
 {
+    PDL_WAIT();
     // blockIdx.x layout:
     //   batch_size <= 1: blockIdx.x = h_v (0..nkh*nv_per_kh-1), loop over num_tokens
     //   batch_size > 1:  blockIdx.x = batch_idx * nkh_x_nvpkh + h_v, process 1 token
@@ -981,6 +1011,7 @@ __global__ void gated_delta_net_kernel(
         y_out[y_base + j] = __float2bfloat16(y_j);
         __syncthreads();
     }
+    PDL_SIGNAL();
 }
 
 void invoke_gated_delta_net(const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
@@ -1027,7 +1058,7 @@ void invoke_gated_delta_net(const __nv_bfloat16* q, const __nv_bfloat16* k, cons
             return;
         }
 
-        gated_delta_net_prefill_kernel<<<grid, threads, smem_bytes, stream>>>(
+        PDL_LAUNCH(gated_delta_net_prefill_kernel, grid, threads, smem_bytes, stream,
             q, k, v, a_raw, dt_bias, A_log, beta_raw,
             ssm_state, y_out,
             num_tokens, kd, nv_per_kh, vd, token_stride, nkh_x_nvpkh,
@@ -1037,7 +1068,7 @@ void invoke_gated_delta_net(const __nv_bfloat16* q, const __nv_bfloat16* k, cons
         int threads = std::min(vd, 256);
         int grid = batch_size * nkh_x_nvpkh;
         size_t smem = (size_t)(2 * kd + 2) * sizeof(float);
-        gated_delta_net_kernel<<<grid, threads, smem, stream>>>(
+        PDL_LAUNCH(gated_delta_net_kernel, grid, threads, smem, stream,
             q, k, v, a_raw, dt_bias, A_log, beta_raw,
             ssm_state_ptrs, ssm_state, y_out,
             num_tokens, kd, nv_per_kh, vd, token_stride,
@@ -1051,6 +1082,7 @@ void invoke_gated_delta_net(const __nv_bfloat16* q, const __nv_bfloat16* k, cons
 __global__ void sigmoid_mul_kernel(
     __nv_bfloat16* out, const __nv_bfloat16* a, const __nv_bfloat16* b, int n)
 {
+    PDL_WAIT();
     int n8 = n / 8;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n8) {
@@ -1078,6 +1110,7 @@ __global__ void sigmoid_mul_kernel(
             out[i] = __float2bfloat16(av / (1.0f + exp2f(-bv * LOG2E)));
         }
     }
+    PDL_SIGNAL();
 }
 
 void invoke_sigmoid_mul(__nv_bfloat16* out, const __nv_bfloat16* a, const __nv_bfloat16* b,
@@ -1086,7 +1119,7 @@ void invoke_sigmoid_mul(__nv_bfloat16* out, const __nv_bfloat16* a, const __nv_b
     int n8 = n / 8;
     int blocks = (n8 + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
-    sigmoid_mul_kernel<<<blocks, threads, 0, stream>>>(out, a, b, n);
+    PDL_LAUNCH(sigmoid_mul_kernel, blocks, threads, 0, stream, out, a, b, n);
 }
 
 // ----------------------------------------------------------------------------
@@ -1100,6 +1133,7 @@ __global__ void deinterleave_qgate_kernel(
     __nv_bfloat16* q_out, __nv_bfloat16* gate_out, const __nv_bfloat16* qg_in,
     int num_tokens, int num_heads, int head_dim)
 {
+    PDL_WAIT();
     // Each thread handles one element
     int total = num_tokens * num_heads * head_dim;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1116,6 +1150,7 @@ __global__ void deinterleave_qgate_kernel(
 
     q_out[idx]    = qg_in[src_offset + d];
     gate_out[idx] = qg_in[src_offset + hd + d];
+    PDL_SIGNAL();
 }
 
 void invoke_deinterleave_qgate(__nv_bfloat16* q_out, __nv_bfloat16* gate_out,
@@ -1125,7 +1160,7 @@ void invoke_deinterleave_qgate(__nv_bfloat16* q_out, __nv_bfloat16* gate_out,
     int total = num_tokens * num_heads * head_dim;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    deinterleave_qgate_kernel<<<blocks, threads, 0, stream>>>(
+    PDL_LAUNCH(deinterleave_qgate_kernel, blocks, threads, 0, stream,
         q_out, gate_out, qg_in, num_tokens, num_heads, head_dim);
 }
 
@@ -1143,6 +1178,7 @@ __global__ void fused_deinterleave_q_rmsnorm_kernel(
     const __nv_bfloat16* qg_in, const __nv_bfloat16* q_norm_weight,
     float eps, int num_heads, int head_dim)
 {
+    PDL_WAIT();
     int token = blockIdx.x;
     int head  = blockIdx.y;
     int tid   = threadIdx.x;
@@ -1176,6 +1212,7 @@ __global__ void fused_deinterleave_q_rmsnorm_kernel(
         float w = __bfloat162float(q_norm_weight[d]);
         q_out[dst_base + d] = __float2bfloat16(q_val * inv_rms * (1.0f + w));
     }
+    PDL_SIGNAL();
 }
 
 void invoke_fused_deinterleave_q_rmsnorm(
@@ -1186,7 +1223,7 @@ void invoke_fused_deinterleave_q_rmsnorm(
 {
     dim3 blocks(num_tokens, num_heads);
     int threads = std::min(head_dim, 256);
-    fused_deinterleave_q_rmsnorm_kernel<<<blocks, threads, 0, stream>>>(
+    PDL_LAUNCH(fused_deinterleave_q_rmsnorm_kernel, blocks, threads, 0, stream,
         q_out, gate_out, qg_in, q_norm_weight, eps, num_heads, head_dim);
 }
 
@@ -1206,6 +1243,7 @@ __global__ void fused_qk_norm_rope_kernel(
     float eps, int num_q, int num_kv,
     int head_dim, int rotary_dim, float rope_base)
 {
+    PDL_WAIT();
     int token = blockIdx.x;
     int idx   = blockIdx.y;  // [0, num_q): Q head, [num_q, num_q+num_kv): K head
     int tid   = threadIdx.x;
@@ -1304,6 +1342,7 @@ __global__ void fused_qk_norm_rope_kernel(
             }
         }
     }
+    PDL_SIGNAL();
 }
 
 void invoke_fused_qk_norm_rope(
@@ -1317,7 +1356,7 @@ void invoke_fused_qk_norm_rope(
 {
     dim3 grid(num_tokens, num_q + num_kv);  // (T, 24+4=28)
     int threads = std::min(head_dim, 256);
-    fused_qk_norm_rope_kernel<<<grid, threads, 0, stream>>>(
+    PDL_LAUNCH(fused_qk_norm_rope_kernel, grid, threads, 0, stream,
         q_out, gate_out, qg_in, k, q_norm_w, k_norm_w, pos_ids,
         eps, num_q, num_kv, head_dim, rotary_dim, rope_base);
 }
@@ -1335,6 +1374,7 @@ __global__ void fused_norm_silu_gate_kernel(
     const __nv_bfloat16* weight,
     float eps, int num_heads, int head_dim)
 {
+    PDL_WAIT();
     int token = blockIdx.x;
     int head  = blockIdx.y;
     int tid   = threadIdx.x;
@@ -1365,6 +1405,7 @@ __global__ void fused_norm_silu_gate_kernel(
 
         y_ssm[off + i] = __float2bfloat16(normalized * silu_z);
     }
+    PDL_SIGNAL();
 }
 
 void invoke_fused_norm_silu_gate(
@@ -1376,7 +1417,7 @@ void invoke_fused_norm_silu_gate(
 {
     dim3 grid(num_tokens, num_heads);
     int threads = std::min(head_dim, 256);
-    fused_norm_silu_gate_kernel<<<grid, threads, 0, stream>>>(
+    PDL_LAUNCH(fused_norm_silu_gate_kernel, grid, threads, 0, stream,
         y_ssm, z_out, weight, eps, num_heads, head_dim);
 }
 
@@ -1390,6 +1431,7 @@ void invoke_fused_norm_silu_gate(
 __global__ void argmax_bf16_kernel(const __nv_bfloat16* __restrict__ logits,
                                     int* __restrict__ result_idx, int n)
 {
+    PDL_WAIT();
     __shared__ float s_vals[1024];
     __shared__ int   s_idxs[1024];
 
@@ -1424,12 +1466,13 @@ __global__ void argmax_bf16_kernel(const __nv_bfloat16* __restrict__ logits,
     if (tid == 0) {
         *result_idx = s_idxs[0];
     }
+    PDL_SIGNAL();
 }
 
 void invoke_argmax(const __nv_bfloat16* logits, int* result_idx, int n,
                    cudaStream_t stream) {
     // Single block of 1024 threads — sufficient for n up to ~250K
-    argmax_bf16_kernel<<<1, 1024, 0, stream>>>(logits, result_idx, n);
+    PDL_LAUNCH(argmax_bf16_kernel, 1, 1024, 0, stream, logits, result_idx, n);
 }
 
 // ============================================================================
@@ -1442,6 +1485,7 @@ __global__ void batched_argmax_bf16_kernel(const __nv_bfloat16* __restrict__ log
                                             int* __restrict__ result_idx,
                                             int n, int batch_size)
 {
+    PDL_WAIT();
     __shared__ float s_vals[1024];
     __shared__ int   s_idxs[1024];
 
@@ -1481,14 +1525,15 @@ __global__ void batched_argmax_bf16_kernel(const __nv_bfloat16* __restrict__ log
     if (tid == 0) {
         result_idx[b] = s_idxs[0];
     }
+    PDL_SIGNAL();
 }
 
 void invoke_batched_argmax(const __nv_bfloat16* logits, int* result_idx, int n,
                            int batch_size, cudaStream_t stream) {
     if (batch_size == 1) {
-        argmax_bf16_kernel<<<1, 1024, 0, stream>>>(logits, result_idx, n);
+        PDL_LAUNCH(argmax_bf16_kernel, 1, 1024, 0, stream, logits, result_idx, n);
     } else {
-        batched_argmax_bf16_kernel<<<batch_size, 1024, 0, stream>>>(
+        PDL_LAUNCH(batched_argmax_bf16_kernel, batch_size, 1024, 0, stream,
             logits, result_idx, n, batch_size);
     }
 }
@@ -1506,9 +1551,10 @@ __global__ void deinterleave_3way_kernel(
     const __nv_bfloat16* __restrict__ merged,
     int T, int N_total, int s1, int s2)
 {
+    PDL_WAIT();
     // Each block processes one row (one token)
     int t = blockIdx.x;
-    if (t >= T) return;
+    if (t >= T) { PDL_SIGNAL(); return; }
 
     const __nv_bfloat16* src = merged + (size_t)t * N_total;
     int w1 = s1;
@@ -1534,6 +1580,7 @@ __global__ void deinterleave_3way_kernel(
     for (int i = threadIdx.x * 8; i < w3; i += blockDim.x * 8) {
         *reinterpret_cast<float4*>(dst3 + i) = *reinterpret_cast<const float4*>(src3 + i);
     }
+    PDL_SIGNAL();
 }
 
 void invoke_deinterleave_gemm_3way(
@@ -1545,7 +1592,7 @@ void invoke_deinterleave_gemm_3way(
     int max_width = std::max({split1, split2 - split1, N_total - split2});
     int threads = std::min(256, (max_width / 8 + 31) / 32 * 32);
     if (threads < 32) threads = 32;
-    deinterleave_3way_kernel<<<num_tokens, threads, 0, stream>>>(
+    PDL_LAUNCH(deinterleave_3way_kernel, num_tokens, threads, 0, stream,
         out1, out2, out3, merged, num_tokens, N_total, split1, split2);
 }
 
@@ -1560,9 +1607,10 @@ __global__ void swiglu_merged_kernel(
     const __nv_bfloat16* __restrict__ merged,
     int T, int is)
 {
+    PDL_WAIT();
     // Each block processes one token
     int t = blockIdx.x;
-    if (t >= T) return;
+    if (t >= T) { PDL_SIGNAL(); return; }
 
     const __nv_bfloat16* gate_row = merged + (size_t)t * 2 * is;
     const __nv_bfloat16* up_row   = gate_row + is;
@@ -1590,6 +1638,7 @@ __global__ void swiglu_merged_kernel(
 
         *reinterpret_cast<float4*>(out_row + base) = o4;
     }
+    PDL_SIGNAL();
 }
 
 void invoke_swiglu_merged(__nv_bfloat16* out, const __nv_bfloat16* merged_gateup,
@@ -1598,7 +1647,7 @@ void invoke_swiglu_merged(__nv_bfloat16* out, const __nv_bfloat16* merged_gateup
     // is / 8 iterations per thread, use enough threads to cover
     int threads = std::min(256, (intermediate_size / 8 + 31) / 32 * 32);
     if (threads < 32) threads = 32;
-    swiglu_merged_kernel<<<num_tokens, threads, 0, stream>>>(
+    PDL_LAUNCH(swiglu_merged_kernel, num_tokens, threads, 0, stream,
         out, merged_gateup, num_tokens, intermediate_size);
 }
 
@@ -1619,6 +1668,7 @@ __global__ void moe_router_gemv_topk_kernel(
     int* __restrict__ block_done_counter,              // [1] atomic counter (init 0)
     int E, int K, int top_k)
 {
+    PDL_WAIT();
     constexpr int WARP_SIZE = 32;
 
     extern __shared__ __nv_bfloat16 s_hidden[];  // [K]
@@ -1712,6 +1762,7 @@ __global__ void moe_router_gemv_topk_kernel(
             }
         }
     }
+    PDL_SIGNAL();
 }
 
 // Legacy per-token top-K kernel for T>1 path
@@ -1721,6 +1772,7 @@ __global__ void moe_router_topk_kernel(
     float* __restrict__ expert_weights,         // [T, top_k]
     int num_experts, int top_k)
 {
+    PDL_WAIT();
     int t = blockIdx.x;  // token index
     const __nv_bfloat16* row = logits + t * num_experts;
     int* out_idx = expert_indices + t * top_k;
@@ -1770,6 +1822,7 @@ __global__ void moe_router_topk_kernel(
         out_idx[k] = top_ids[k];
         out_wt[k] = top_vals[k] * inv_sum;
     }
+    PDL_SIGNAL();
 }
 
 void invoke_moe_router_topk(const __nv_bfloat16* logits, int* expert_indices,
@@ -1777,7 +1830,7 @@ void invoke_moe_router_topk(const __nv_bfloat16* logits, int* expert_indices,
                              int num_experts, int top_k, cudaStream_t stream)
 {
     // Each token is one block, single thread does top-k (E ≤ 256)
-    moe_router_topk_kernel<<<num_tokens, 1, 0, stream>>>(
+    PDL_LAUNCH(moe_router_topk_kernel, num_tokens, 1, 0, stream,
         logits, expert_indices, expert_weights, num_experts, top_k);
 }
 
@@ -1794,7 +1847,7 @@ void invoke_moe_router_gemv_topk(
     constexpr int WARPS = THREADS / 32;
     int blocks = (num_experts + WARPS - 1) / WARPS;
     size_t smem_bytes = K * sizeof(__nv_bfloat16);
-    moe_router_gemv_topk_kernel<<<blocks, THREADS, smem_bytes, stream>>>(
+    PDL_LAUNCH(moe_router_gemv_topk_kernel, blocks, THREADS, smem_bytes, stream,
         hidden_state, router_weight, logits_buf,
         expert_indices, expert_weights, block_done_counter,
         num_experts, K, top_k);
@@ -1808,10 +1861,12 @@ __global__ void scale_add_kernel(
     const __nv_bfloat16* __restrict__ in,
     float scale, int n)
 {
+    PDL_WAIT();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
+    if (idx >= n) { PDL_SIGNAL(); return; }
     float val = __bfloat162float(out[idx]) + scale * __bfloat162float(in[idx]);
     out[idx] = __float2bfloat16(val);
+    PDL_SIGNAL();
 }
 
 void invoke_scale_add(__nv_bfloat16* out, const __nv_bfloat16* in, float scale,
@@ -1819,7 +1874,7 @@ void invoke_scale_add(__nv_bfloat16* out, const __nv_bfloat16* in, float scale,
 {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
-    scale_add_kernel<<<blocks, threads, 0, stream>>>(out, in, scale, n);
+    PDL_LAUNCH(scale_add_kernel, blocks, threads, 0, stream, out, in, scale, n);
 }
 
 // ============================================================================
@@ -1832,13 +1887,15 @@ __global__ void sigmoid_gated_add_kernel(
     const __nv_bfloat16* __restrict__ gate_scalar,
     int n)
 {
+    PDL_WAIT();
     float gate = __bfloat162float(gate_scalar[0]);
     float sig = 1.f / (1.f + exp2f(-gate * LOG2E));
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
+    if (idx >= n) { PDL_SIGNAL(); return; }
     float val = __bfloat162float(out[idx]) + sig * __bfloat162float(in[idx]);
     out[idx] = __float2bfloat16(val);
+    PDL_SIGNAL();
 }
 
 // Fused version: compute gate scalar dot product inline, then sigmoid-gated add
@@ -1859,6 +1916,7 @@ __global__ void fused_moe_final_kernel(
     __nv_bfloat16* __restrict__ residual,          // [n] hidden_states (optional)
     int n, int K, int top_k)
 {
+    PDL_WAIT();
     // Load expert_weights into shared memory (small, ≤16 floats)
     __shared__ float s_ew[16];
     if (threadIdx.x < top_k)
@@ -1905,6 +1963,7 @@ __global__ void fused_moe_final_kernel(
             residual[idx] = __float2bfloat16(r);
         }
     }
+    PDL_SIGNAL();
 }
 
 void invoke_sigmoid_gated_add(__nv_bfloat16* out, const __nv_bfloat16* in,
@@ -1913,7 +1972,7 @@ void invoke_sigmoid_gated_add(__nv_bfloat16* out, const __nv_bfloat16* in,
 {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
-    sigmoid_gated_add_kernel<<<blocks, threads, 0, stream>>>(out, in, gate_scalar, n);
+    PDL_LAUNCH(sigmoid_gated_add_kernel, blocks, threads, 0, stream, out, in, gate_scalar, n);
 }
 
 void invoke_fused_moe_final(
@@ -1924,7 +1983,7 @@ void invoke_fused_moe_final(
     __nv_bfloat16* residual,
     int n, int K, int top_k, cudaStream_t stream)
 {
-    fused_moe_final_kernel<<<1, 256, 0, stream>>>(
+    PDL_LAUNCH(fused_moe_final_kernel, 1, 256, 0, stream,
         out, expert_outputs, expert_weights, shared_down,
         hidden, gate_w, residual, n, K, top_k);
 }

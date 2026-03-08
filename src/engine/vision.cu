@@ -11,6 +11,7 @@
 //   - head_dim=72, rotary_dim=36
 
 #include "vision.h"
+#include "pdl.h"
 #include <cuda_bf16.h>
 #include <cmath>
 #include <algorithm>

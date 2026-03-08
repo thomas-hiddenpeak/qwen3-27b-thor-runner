@@ -16,6 +16,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include "pdl.h"
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
@@ -181,6 +182,7 @@ gdn_wy_prefill_kernel(
     int token_stride, int nkh_x_nvpkh,
     __nv_bfloat16* __restrict__ ssm_state_checkpoint)
 {
+    PDL_WAIT();
     const int h_v = blockIdx.x;
     const int h_k = h_v / nv_per_kh;
     const int nv  = nkh_x_nvpkh;
@@ -389,6 +391,7 @@ gdn_wy_prefill_kernel(
     // Write final state (FP32 SMEM -> BF16 GMEM)
     for (int i = 0; i < kd; i++)
         ssm_state[ss_base + i * vd + j] = __float2bfloat16(S_smem[i * vd_pad + j]);
+    PDL_SIGNAL();
 }
 
 // =============================================================================
@@ -441,7 +444,7 @@ void invoke_gdn_wy_prefill(
         return;
     }
 
-    gdn_wy_prefill_kernel<<<grid, threads, smem_bytes, stream>>>(
+    PDL_LAUNCH(gdn_wy_prefill_kernel, grid, threads, smem_bytes, stream,
         q, k, v, a_raw, dt_bias, A_log, beta_raw,
         ssm_state, y_out,
         num_tokens, kd, nv_per_kh, vd, token_stride, nv,

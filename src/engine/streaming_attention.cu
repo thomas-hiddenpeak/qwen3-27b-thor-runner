@@ -7,6 +7,7 @@
 //   3. finalize_attention_kernel: 最终归一化 out = acc / l
 
 #include "streaming_attention.h"
+#include "pdl.h"
 #include <cuda_bf16.h>
 
 // exp2f-based fast exp: exp(x) = exp2(x * LOG2E)
@@ -40,8 +41,7 @@ __global__ void paged_attention_partial_kernel(
     int  block_size,
     int  batch_size,
     int  forced_context_len)       // >0: 全部 token 使用此值 (SSD pass 无 causal masking)
-{
-    int token_idx = blockIdx.x;
+{    PDL_WAIT();    int token_idx = blockIdx.x;
     int head_idx  = blockIdx.y;
     int tid       = threadIdx.x;
 
@@ -140,6 +140,7 @@ __global__ void paged_attention_partial_kernel(
         out_m[ml_offset] = m_i;
         out_l[ml_offset] = l_i;
     }
+    PDL_SIGNAL();
 }
 
 // ==========================================================================
@@ -164,6 +165,7 @@ __global__ void merge_attention_kernel(
     int num_heads,
     int head_dim)
 {
+    PDL_WAIT();
     int token_idx = blockIdx.x;
     int head_idx  = blockIdx.y;
     int d         = threadIdx.x;  // 0..head_dim-1
@@ -200,6 +202,7 @@ __global__ void merge_attention_kernel(
         m1[ml_offset] = m_new;
         l1[ml_offset] = l1_val * scale1 + l2_val * scale2;
     }
+    PDL_SIGNAL();
 }
 
 // ==========================================================================
@@ -213,6 +216,7 @@ __global__ void finalize_attention_kernel(
     int num_heads,
     int head_dim)
 {
+    PDL_WAIT();
     int token_idx = blockIdx.x;
     int head_idx  = blockIdx.y;
     int d         = threadIdx.x;
@@ -222,6 +226,7 @@ __global__ void finalize_attention_kernel(
     float l_val = l[ml_offset];
     float a = __bfloat162float(acc[off]);
     final_out[off] = __float2bfloat16(l_val > 0.0f ? a / l_val : 0.0f);
+    PDL_SIGNAL();
 }
 
 // ==========================================================================
@@ -256,7 +261,7 @@ void invoke_paged_attention_partial(
     int num_warps = head_dim / SA_WARP_SIZE;
     size_t smem_bytes = (size_t)(head_dim + num_warps) * sizeof(float);
 
-    paged_attention_partial_kernel<<<blocks, threads, smem_bytes, stream>>>(
+    PDL_LAUNCH(paged_attention_partial_kernel, blocks, threads, smem_bytes, stream,
         d_out, d_m, d_l,
         q, k_cache, v_cache,
         block_tables, context_lens, max_num_blocks_per_seq,
@@ -279,7 +284,7 @@ void invoke_merge_attention(
 {
     dim3 blocks(num_tokens, num_heads);
     dim3 threads(head_dim);
-    merge_attention_kernel<<<blocks, threads, 0, stream>>>(
+    PDL_LAUNCH(merge_attention_kernel, blocks, threads, 0, stream,
         d_out1, d_m1, d_l1,
         d_out2, d_m2, d_l2,
         num_heads, head_dim);
@@ -296,7 +301,7 @@ void invoke_finalize_attention(
 {
     dim3 blocks(num_tokens, num_heads);
     dim3 threads(head_dim);
-    finalize_attention_kernel<<<blocks, threads, 0, stream>>>(
+    PDL_LAUNCH(finalize_attention_kernel, blocks, threads, 0, stream,
         d_final_out, d_acc, d_l,
         num_heads, head_dim);
 }

@@ -1,4 +1,5 @@
 #include "dense_gemm.h"
+#include "pdl.h"
 #include <stdexcept>
 #include <iostream>
 #include <cublas_v2.h>
@@ -692,6 +693,7 @@ __global__ void gemv_kernel_scattered(
     __nv_bfloat16* __restrict__ C,
     int N, int K)
 {
+    PDL_WAIT();
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_BLOCK = 8;
 
@@ -739,6 +741,7 @@ __global__ void gemv_kernel_scattered(
 
     if (lane_id == 0)
         C[out_idx] = __float2bfloat16(sum);
+    PDL_SIGNAL();
 }
 
 // ----------------------------------------------------------------------------
@@ -755,6 +758,7 @@ __global__ void gemv_kernel_scattered_tiled(
     __nv_bfloat16* __restrict__ C,
     int N, int K, int tile_k)
 {
+    PDL_WAIT();
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_BLOCK = 4;  // 128 threads
 
@@ -808,6 +812,7 @@ __global__ void gemv_kernel_scattered_tiled(
 
     if (lane_id == 0)
         C[out_idx] = __float2bfloat16(sum);
+    PDL_SIGNAL();
 }
 
 // ============================================================================
@@ -826,6 +831,7 @@ __global__ void gemv_kernel_scattered_add(
     const __nv_bfloat16* __restrict__ residual,
     int N, int K)
 {
+    PDL_WAIT();
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_BLOCK = 8;
     extern __shared__ __nv_bfloat16 s_A[];
@@ -872,6 +878,7 @@ __global__ void gemv_kernel_scattered_add(
 
     if (lane_id == 0)
         C[out_idx] = __float2bfloat16(sum + __bfloat162float(residual[out_idx]));
+    PDL_SIGNAL();
 }
 
 __global__ void gemv_kernel_add(const __nv_bfloat16* __restrict__ A,
@@ -986,6 +993,7 @@ __global__ void gemv_kernel_scattered_tiled_add(
     const __nv_bfloat16* __restrict__ residual,
     int N, int K, int tile_k)
 {
+    PDL_WAIT();
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_BLOCK = 4;
     extern __shared__ __nv_bfloat16 s_A[];
@@ -1034,6 +1042,7 @@ __global__ void gemv_kernel_scattered_tiled_add(
 
     if (lane_id == 0)
         C[out_idx] = __float2bfloat16(sum + __bfloat162float(residual[out_idx]));
+    PDL_SIGNAL();
 }
 
 // ----------------------------------------------------------------------------
@@ -1049,6 +1058,7 @@ __global__ void gemv_sigmoid_mul_kernel(
     __nv_bfloat16* __restrict__ C,
     int N, int K)
 {
+    PDL_WAIT();
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_BLOCK = 8;
 
@@ -1104,6 +1114,7 @@ __global__ void gemv_sigmoid_mul_kernel(
     if (lane_id == 0) {
         C[out_idx] = __float2bfloat16(sum);
     }
+    PDL_SIGNAL();
 }
 
 // ----------------------------------------------------------------------------
@@ -1121,6 +1132,7 @@ __global__ void gemv_rmsnorm_kernel(
     __nv_bfloat16* __restrict__ C,
     int N, int K)
 {
+    PDL_WAIT();
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_BLOCK = 8;
 
@@ -1193,6 +1205,7 @@ __global__ void gemv_rmsnorm_kernel(
     if (lane_id == 0) {
         C[out_idx] = __float2bfloat16(sum);
     }
+    PDL_SIGNAL();
 }
 
 void invoke_dense_gemv_with_rmsnorm(
@@ -1208,7 +1221,7 @@ void invoke_dense_gemv_with_rmsnorm(
     constexpr int WARPS_PER_BLOCK = BLOCK_THREADS / 32;
     int blocks = (N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
     size_t smem_bytes = K * sizeof(__nv_bfloat16);
-    gemv_rmsnorm_kernel<<<blocks, BLOCK_THREADS, smem_bytes, stream>>>(
+    PDL_LAUNCH(gemv_rmsnorm_kernel, blocks, BLOCK_THREADS, smem_bytes, stream,
         hidden_states, norm_weight, eps, B, C, N, K);
 }
 
@@ -1224,7 +1237,7 @@ void invoke_dense_gemv_with_sigmoid_mul(
     constexpr int WARPS_PER_BLOCK = BLOCK_THREADS / 32;
     int blocks = (N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
     size_t smem_bytes = K * sizeof(__nv_bfloat16);
-    gemv_sigmoid_mul_kernel<<<blocks, BLOCK_THREADS, smem_bytes, stream>>>(
+    PDL_LAUNCH(gemv_sigmoid_mul_kernel, blocks, BLOCK_THREADS, smem_bytes, stream,
         attn_out, attn_gate, B, C, N, K);
 }
 
@@ -1251,13 +1264,13 @@ void invoke_dense_gemv(
         // 同 block 的 warp 访问远端行, 分散 DRAM bank 压力
         // K=2048 (MoE) 和 K=5120+ (dense) 均受益: 行更短 → bank 冲突更密集
         int blocks = (N + WARPS_8W - 1) / WARPS_8W;
-        gemv_kernel_scattered<<<blocks, BLOCK_THREADS_8W, smem_bytes, stream>>>(
+        PDL_LAUNCH(gemv_kernel_scattered, blocks, BLOCK_THREADS_8W, smem_bytes, stream,
             A, B, C, N, K);
     } else {
         // K 太大无法放入单 block smem → 散列 + K 分块 (4 warps)
         int blocks = (N + WARPS_4W - 1) / WARPS_4W;
         size_t tiled_smem = TILE_K * sizeof(__nv_bfloat16);
-        gemv_kernel_scattered_tiled<<<blocks, BLOCK_THREADS_4W, tiled_smem, stream>>>(
+        PDL_LAUNCH(gemv_kernel_scattered_tiled, blocks, BLOCK_THREADS_4W, tiled_smem, stream,
             A, B, C, N, K, TILE_K);
     }
 }
@@ -1287,18 +1300,18 @@ void invoke_dense_gemv_add(
         //   12 blocks/SM vs 6 blocks/SM → 更好的调度 + 更大 L1
         int blocks = (N + WARPS_4W - 1) / WARPS_4W;
         size_t tiled_smem = TILE_K * sizeof(__nv_bfloat16);
-        gemv_kernel_scattered_tiled_add<<<blocks, BLOCK_THREADS_4W, tiled_smem, stream>>>(
+        PDL_LAUNCH(gemv_kernel_scattered_tiled_add, blocks, BLOCK_THREADS_4W, tiled_smem, stream,
             A, B, C, residual, N, K, TILE_K);
     } else if (smem_bytes <= SMEM_BLOCK_LIMIT) {
         // K ≤ 8192: 全 K 放入 SMEM, 散列映射减少 DRAM bank 冲突
         int blocks = (N + WARPS_8W - 1) / WARPS_8W;
-        gemv_kernel_scattered_add<<<blocks, BLOCK_THREADS_8W, smem_bytes, stream>>>(
+        PDL_LAUNCH(gemv_kernel_scattered_add, blocks, BLOCK_THREADS_8W, smem_bytes, stream,
             A, B, C, residual, N, K);
     } else {
         // K ≤ 8192 but smem > SMEM_BLOCK_LIMIT (不应触发)
         int blocks = (N + WARPS_4W - 1) / WARPS_4W;
         size_t tiled_smem = TILE_K * sizeof(__nv_bfloat16);
-        gemv_kernel_scattered_tiled_add<<<blocks, BLOCK_THREADS_4W, tiled_smem, stream>>>(
+        PDL_LAUNCH(gemv_kernel_scattered_tiled_add, blocks, BLOCK_THREADS_4W, tiled_smem, stream,
             A, B, C, residual, N, K, TILE_K);
     }
 }
@@ -1315,6 +1328,7 @@ __global__ void dual_gemv_kernel(const __nv_bfloat16* __restrict__ A,
                                   __nv_bfloat16* __restrict__ C2,
                                   int N, int K)
 {
+    PDL_WAIT();
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_BLOCK = 8;
 
@@ -1377,6 +1391,7 @@ __global__ void dual_gemv_kernel(const __nv_bfloat16* __restrict__ A,
         __nv_bfloat16* out = is_second ? C2 : C1;
         out[out_idx] = __float2bfloat16(sum);
     }
+    PDL_SIGNAL();
 }
 
 void invoke_dense_dual_gemv(
@@ -1395,7 +1410,7 @@ void invoke_dense_dual_gemv(
     int total_blocks = blocks_per_output * 2;  // 前半 B1, 后半 B2
     size_t smem_bytes = K * sizeof(__nv_bfloat16);
 
-    dual_gemv_kernel<<<total_blocks, BLOCK_THREADS, smem_bytes, stream>>>(
+    PDL_LAUNCH(dual_gemv_kernel, total_blocks, BLOCK_THREADS, smem_bytes, stream,
         A, B1, B2, C1, C2, N, K);
 }
 
@@ -1416,6 +1431,7 @@ __global__ void grouped_expert_gemv_kernel(
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_BLOCK = 8;
 
+    PDL_WAIT();
     extern __shared__ __nv_bfloat16 s_A[];
 
     int warp_id = threadIdx.x / WARP_SIZE;
@@ -1434,7 +1450,7 @@ __global__ void grouped_expert_gemv_kernel(
     }
     __syncthreads();
 
-    if (out_idx >= N) return;
+    if (out_idx >= N) { PDL_SIGNAL(); return; }
 
     int expert_id = expert_indices[assign_idx];
     const __nv_bfloat16* b_col = packed_weights + expert_id * expert_stride + (size_t)out_idx * K;
@@ -1470,6 +1486,7 @@ __global__ void grouped_expert_gemv_kernel(
     if (lane_id == 0) {
         outputs[assign_idx * N + out_idx] = __float2bfloat16(sum);
     }
+    PDL_SIGNAL();
 }
 
 void invoke_grouped_expert_gemv(
@@ -1486,7 +1503,7 @@ void invoke_grouped_expert_gemv(
     constexpr int WARPS = BLOCK / 32;
     dim3 grid((N + WARPS - 1) / WARPS, num_tokens * top_k);
     size_t smem = K * sizeof(__nv_bfloat16);
-    grouped_expert_gemv_kernel<<<grid, BLOCK, smem, stream>>>(
+    PDL_LAUNCH(grouped_expert_gemv_kernel, grid, BLOCK, smem, stream,
         inputs, packed_weights, outputs, expert_indices,
         N, K, expert_stride, shared_input, top_k);
 }
@@ -1506,6 +1523,7 @@ __global__ void grouped_expert_gemv_swiglu_kernel(
 {
     constexpr int WARP_SIZE = 32;
 
+    PDL_WAIT();
     extern __shared__ __nv_bfloat16 s_A[];  // [2*K]
 
     int warp_id = threadIdx.x / WARP_SIZE;
@@ -1528,7 +1546,7 @@ __global__ void grouped_expert_gemv_swiglu_kernel(
     }
     __syncthreads();
 
-    if (out_idx >= N) return;
+    if (out_idx >= N) { PDL_SIGNAL(); return; }
 
     int expert_id = expert_indices[assign_idx];
     const __nv_bfloat16* b_col = packed_weights + expert_id * expert_stride + (size_t)out_idx * K;
@@ -1564,6 +1582,7 @@ __global__ void grouped_expert_gemv_swiglu_kernel(
     if (lane_id == 0) {
         outputs[assign_idx * N + out_idx] = __float2bfloat16(sum);
     }
+    PDL_SIGNAL();
 }
 
 void invoke_grouped_expert_gemv_swiglu(
@@ -1580,7 +1599,7 @@ void invoke_grouped_expert_gemv_swiglu(
     constexpr int WARPS = BLOCK / 32;
     dim3 grid((N + WARPS - 1) / WARPS, num_tokens * top_k);
     size_t smem = 2 * K * sizeof(__nv_bfloat16);
-    grouped_expert_gemv_swiglu_kernel<<<grid, BLOCK, smem, stream>>>(
+    PDL_LAUNCH(grouped_expert_gemv_swiglu_kernel, grid, BLOCK, smem, stream,
         gate_up_outputs, packed_weights, outputs, expert_indices,
         N, K, expert_stride, top_k);
 }
@@ -1599,6 +1618,7 @@ __global__ void gemv_swiglu_kernel(
 {
     constexpr int WARP_SIZE = 32;
 
+    PDL_WAIT();
     extern __shared__ __nv_bfloat16 s_A[];  // [K]
 
     int warp_id = threadIdx.x / WARP_SIZE;
@@ -1614,7 +1634,7 @@ __global__ void gemv_swiglu_kernel(
     }
     __syncthreads();
 
-    if (out_idx >= N) return;
+    if (out_idx >= N) { PDL_SIGNAL(); return; }
 
     const __nv_bfloat16* b_col = weight + (size_t)out_idx * K;
 
@@ -1649,6 +1669,7 @@ __global__ void gemv_swiglu_kernel(
     if (lane_id == 0) {
         output[out_idx] = __float2bfloat16(sum);
     }
+    PDL_SIGNAL();
 }
 
 void invoke_dense_gemv_swiglu(
@@ -1663,7 +1684,7 @@ void invoke_dense_gemv_swiglu(
     constexpr int WARPS = BLOCK / 32;
     int blocks = (N + WARPS - 1) / WARPS;
     size_t smem = K * sizeof(__nv_bfloat16);
-    gemv_swiglu_kernel<<<blocks, BLOCK, smem, stream>>>(
+    PDL_LAUNCH(gemv_swiglu_kernel, blocks, BLOCK, smem, stream,
         gate_out, up_out, weight, output, N, K);
 }
 
@@ -1678,14 +1699,16 @@ __global__ void weighted_expert_reduce_kernel(
     const float* __restrict__ expert_weights,
     int hs, int top_k)
 {
+    PDL_WAIT();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= hs) return;
+    if (idx >= hs) { PDL_SIGNAL(); return; }
     int token_idx = blockIdx.y;
     float sum = 0.f;
     for (int k = 0; k < top_k; k++)
         sum += expert_weights[token_idx * top_k + k]
              * __bfloat162float(expert_outputs[(token_idx * top_k + k) * hs + idx]);
     accum[token_idx * hs + idx] = __float2bfloat16(sum);
+    PDL_SIGNAL();
 }
 
 void invoke_weighted_expert_reduce(
@@ -1698,7 +1721,7 @@ void invoke_weighted_expert_reduce(
 {
     constexpr int BLOCK = 256;
     dim3 grid((hs + BLOCK - 1) / BLOCK, num_tokens);
-    weighted_expert_reduce_kernel<<<grid, BLOCK, 0, stream>>>(
+    PDL_LAUNCH(weighted_expert_reduce_kernel, grid, BLOCK, 0, stream,
         accum, expert_outputs, expert_weights, hs, top_k);
 }
 

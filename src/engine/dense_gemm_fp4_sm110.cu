@@ -10,6 +10,7 @@
 
 #include "dense_gemm_fp4.h"
 #include "layer.h"   // QuantizedWeight
+#include "pdl.h"
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <iostream>
@@ -67,6 +68,7 @@ __global__ void fp4_gemv_kernel(
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_BLOCK = 8;
 
+    PDL_WAIT();
     extern __shared__ char s_mem[];
     float* s_lut = reinterpret_cast<float*>(s_mem);
     __nv_bfloat16* s_A = reinterpret_cast<__nv_bfloat16*>(s_mem + 64);
@@ -84,7 +86,7 @@ __global__ void fp4_gemv_kernel(
         s_A[i] = A[i];
     __syncthreads();
 
-    if (out_idx >= N) return;
+    if (out_idx >= N) { PDL_SIGNAL(); return; }
 
     const int K_half = K >> 1;
     const int K_groups = K >> 4;   // K / 16
@@ -139,6 +141,7 @@ __global__ void fp4_gemv_kernel(
         }
         C[out_idx] = __float2bfloat16(sum);
     }
+    PDL_SIGNAL();
 }
 
 // ============================================================================
@@ -165,6 +168,7 @@ __global__ void fp4_batched_gemv_kernel(
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_BLOCK = 8;
 
+    PDL_WAIT();
     extern __shared__ char s_mem[];
     float* s_lut = reinterpret_cast<float*>(s_mem);
 
@@ -176,7 +180,7 @@ __global__ void fp4_batched_gemv_kernel(
         s_lut[threadIdx.x] = c_fp4_lut[threadIdx.x];
     __syncthreads();
 
-    if (out_idx >= N) return;
+    if (out_idx >= N) { PDL_SIGNAL(); return; }
 
     const int K_half = K >> 1;
     const int K_groups = K >> 4;
@@ -255,6 +259,7 @@ __global__ void fp4_batched_gemv_kernel(
             C[m * N + out_idx] = __float2bfloat16(val);
         }
     }
+    PDL_SIGNAL();
 }
 
 // ============================================================================
@@ -276,6 +281,7 @@ __global__ void fp4_dual_gemv_kernel(
     constexpr int WARP_SIZE = 32;
     constexpr int WARPS_PER_BLOCK = 8;
 
+    PDL_WAIT();
     extern __shared__ char s_mem[];
     float* s_lut = reinterpret_cast<float*>(s_mem);
     __nv_bfloat16* s_A = reinterpret_cast<__nv_bfloat16*>(s_mem + 64);
@@ -294,7 +300,7 @@ __global__ void fp4_dual_gemv_kernel(
         s_A[i] = A[i];
     __syncthreads();
 
-    if (out_idx >= N) return;
+    if (out_idx >= N) { PDL_SIGNAL(); return; }
 
     const int K_half = K >> 1;
     const int K_groups = K >> 4;
@@ -348,6 +354,7 @@ __global__ void fp4_dual_gemv_kernel(
         __nv_bfloat16* out = is_second ? C2 : C1;
         out[out_idx] = __float2bfloat16(sum);
     }
+    PDL_SIGNAL();
 }
 
 // ============================================================================
@@ -370,7 +377,7 @@ void invoke_fp4_gemv(
     int blocks = (N + WARPS - 1) / WARPS;
     size_t smem = FP4_LUT_SMEM + K * sizeof(__nv_bfloat16);
 
-    fp4_gemv_kernel<false><<<blocks, BLOCK_THREADS, smem, stream>>>(
+    PDL_LAUNCH(fp4_gemv_kernel<false>, blocks, BLOCK_THREADS, smem, stream,
         A, W.packed, W.scale, C, nullptr, inv_gs, N, K);
 }
 
@@ -388,7 +395,7 @@ void invoke_fp4_gemv_add(
     int blocks = (N + WARPS - 1) / WARPS;
     size_t smem = FP4_LUT_SMEM + K * sizeof(__nv_bfloat16);
 
-    fp4_gemv_kernel<true><<<blocks, BLOCK_THREADS, smem, stream>>>(
+    PDL_LAUNCH(fp4_gemv_kernel<true>, blocks, BLOCK_THREADS, smem, stream,
         A, W.packed, W.scale, C, residual, inv_gs, N, K);
 }
 
@@ -408,7 +415,7 @@ void invoke_fp4_dual_gemv(
     int total_blocks = blocks_per_output * 2;
     size_t smem = FP4_LUT_SMEM + K * sizeof(__nv_bfloat16);
 
-    fp4_dual_gemv_kernel<<<total_blocks, BLOCK_THREADS, smem, stream>>>(
+    PDL_LAUNCH(fp4_dual_gemv_kernel, total_blocks, BLOCK_THREADS, smem, stream,
         A,
         W1.packed, W1.scale, 1.0f / W1.global_scale,
         W2.packed, W2.scale, 1.0f / W2.global_scale,
@@ -448,9 +455,10 @@ __global__ void fp4_dequant_kernel(
     float inv_global_scale,
     int N, int K)
 {
+    PDL_WAIT();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = N * K;
-    if (idx >= total) return;
+    if (idx >= total) { PDL_SIGNAL(); return; }
 
     int n = idx / K;
     int k = idx % K;
@@ -464,6 +472,7 @@ __global__ void fp4_dequant_kernel(
     float gs = e4m3_to_float(scale[group_idx]) * inv_global_scale;
 
     out[idx] = __float2bfloat16(fp4_val * gs);
+    PDL_SIGNAL();
 }
 
 // Static workspace for dequantized weights (reused across calls)
@@ -513,24 +522,24 @@ static void dispatch_batched_gemv(
     // Dispatch with compile-time MAX_M for loop unrolling
     switch (M) {
         case 1:
-            fp4_batched_gemv_kernel<ADD_RESIDUAL, 1><<<blocks, BLOCK_THREADS, smem, stream>>>(
+            PDL_LAUNCH((fp4_batched_gemv_kernel<ADD_RESIDUAL, 1>), blocks, BLOCK_THREADS, smem, stream,
                 A, W.packed, W.scale, C, residual, inv_gs, M, N, K);
             break;
         case 2:
-            fp4_batched_gemv_kernel<ADD_RESIDUAL, 2><<<blocks, BLOCK_THREADS, smem, stream>>>(
+            PDL_LAUNCH((fp4_batched_gemv_kernel<ADD_RESIDUAL, 2>), blocks, BLOCK_THREADS, smem, stream,
                 A, W.packed, W.scale, C, residual, inv_gs, M, N, K);
             break;
         case 3:
-            fp4_batched_gemv_kernel<ADD_RESIDUAL, 3><<<blocks, BLOCK_THREADS, smem, stream>>>(
+            PDL_LAUNCH((fp4_batched_gemv_kernel<ADD_RESIDUAL, 3>), blocks, BLOCK_THREADS, smem, stream,
                 A, W.packed, W.scale, C, residual, inv_gs, M, N, K);
             break;
         case 4:
-            fp4_batched_gemv_kernel<ADD_RESIDUAL, 4><<<blocks, BLOCK_THREADS, smem, stream>>>(
+            PDL_LAUNCH((fp4_batched_gemv_kernel<ADD_RESIDUAL, 4>), blocks, BLOCK_THREADS, smem, stream,
                 A, W.packed, W.scale, C, residual, inv_gs, M, N, K);
             break;
         default:
             // M=5..8: use MAX_M=8
-            fp4_batched_gemv_kernel<ADD_RESIDUAL, 8><<<blocks, BLOCK_THREADS, smem, stream>>>(
+            PDL_LAUNCH((fp4_batched_gemv_kernel<ADD_RESIDUAL, 8>), blocks, BLOCK_THREADS, smem, stream,
                 A, W.packed, W.scale, C, residual, inv_gs, M, N, K);
             break;
     }
@@ -561,7 +570,7 @@ void invoke_fp4_gemm(
     int total = N * K;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    fp4_dequant_kernel<<<blocks, threads, 0, stream>>>(
+    PDL_LAUNCH(fp4_dequant_kernel, blocks, threads, 0, stream,
         s_dequant_buf, W.packed, W.scale, inv_gs, N, K);
 
     // cuBLAS GEMM: C[M,N] = A[M,K] × W_dequant[K,N]^T
@@ -607,7 +616,7 @@ void invoke_fp4_gemm_add(
     int total = N * K;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    fp4_dequant_kernel<<<blocks, threads, 0, stream>>>(
+    PDL_LAUNCH(fp4_dequant_kernel, blocks, threads, 0, stream,
         s_dequant_buf, W.packed, W.scale, inv_gs, N, K);
 
     // Copy residual to D if they differ

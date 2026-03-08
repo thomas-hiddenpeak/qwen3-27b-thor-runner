@@ -9,6 +9,7 @@
 //   远优于 2048 次 cudaMemcpy (每次 ~10 μs overhead = 20 ms)
 
 #include "cache_kernels.h"
+#include "pdl.h"
 #include <algorithm>
 
 namespace qwen_thor {
@@ -33,9 +34,10 @@ __global__ void extract_kv_from_pages_kernel(
     int num_layers)
 {
     // dst 的扁平索引: [layer, kv, token, head, dim]
+    PDL_WAIT();
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_layers * 2 * num_tokens * num_kv_heads * head_dim;
-    if (tid >= total) return;
+    if (tid >= total) { PDL_SIGNAL(); return; }
 
     // 解码多维索引
     int hd = num_kv_heads * head_dim;
@@ -55,6 +57,7 @@ __global__ void extract_kv_from_pages_kernel(
 
     const __nv_bfloat16* cache = (kv == 0) ? k_cache : v_cache;
     dst[tid] = cache[cache_offset];
+    PDL_SIGNAL();
 }
 
 // ---------------------------------------------------------------------------
@@ -73,9 +76,10 @@ __global__ void inject_kv_to_pages_kernel(
     int num_blocks_per_layer,
     int num_layers)
 {
+    PDL_WAIT();
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_layers * 2 * num_tokens * num_kv_heads * head_dim;
-    if (tid >= total) return;
+    if (tid >= total) { PDL_SIGNAL(); return; }
 
     int hd = num_kv_heads * head_dim;
     int d   = tid % head_dim;
@@ -92,6 +96,7 @@ __global__ void inject_kv_to_pages_kernel(
 
     __nv_bfloat16* cache = (kv == 0) ? k_cache : v_cache;
     cache[cache_offset] = src[tid];
+    PDL_SIGNAL();
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +119,7 @@ void invoke_extract_kv_from_pages(
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
 
-    extract_kv_from_pages_kernel<<<blocks, threads, 0, stream>>>(
+    PDL_LAUNCH(extract_kv_from_pages_kernel, blocks, threads, 0, stream,
         dst, k_cache, v_cache, block_table,
         num_tokens, num_kv_heads, head_dim, block_size,
         num_blocks_per_layer, num_layers);
@@ -137,7 +142,7 @@ void invoke_inject_kv_to_pages(
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
 
-    inject_kv_to_pages_kernel<<<blocks, threads, 0, stream>>>(
+    PDL_LAUNCH(inject_kv_to_pages_kernel, blocks, threads, 0, stream,
         k_cache, v_cache, src, block_table,
         num_tokens, num_kv_heads, head_dim, block_size,
         num_blocks_per_layer, num_layers);

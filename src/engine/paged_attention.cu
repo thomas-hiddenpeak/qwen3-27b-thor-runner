@@ -5,6 +5,7 @@
 
 #include "paged_attention.h"
 #include "dense_gemm.h"
+#include "pdl.h"
 #include <cuda_bf16.h>
 #include <float.h>
 #include <stdio.h>
@@ -52,6 +53,7 @@ __global__ void paged_attention_kernel(
     int  block_size,
     int  batch_size)                  // batch_size==1 → prefill, ==num_tokens → batched decode
 {
+    PDL_WAIT();
     int token_idx = blockIdx.x;
     int head_idx  = blockIdx.y;
     int tid       = threadIdx.x;   // 0 ~ head_dim-1
@@ -145,6 +147,7 @@ __global__ void paged_attention_kernel(
     // ---- 3. 写出结果 ----
     int out_offset = token_idx * (num_heads * head_dim) + head_idx * head_dim + tid;
     out[out_offset] = __float2bfloat16(l_i > 0.0f ? acc / l_i : 0.0f);
+    PDL_SIGNAL();
 }
 
 // --------------------------------------------------------------------------
@@ -183,6 +186,7 @@ __global__ void paged_attention_split_k_kernel(
     int  num_partitions,
     int  partition_size)
 {
+    PDL_WAIT();
     const int token_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
     const int part_idx  = blockIdx.z;
@@ -207,6 +211,7 @@ __global__ void paged_attention_split_k_kernel(
             partial_m[part_off] = -FLT_MAX;
             partial_l[part_off] = 0.0f;
         }
+        PDL_SIGNAL();
         return;
     }
 
@@ -274,6 +279,7 @@ __global__ void paged_attention_split_k_kernel(
         partial_m[part_off] = m_i;
         partial_l[part_off] = l_i;
     }
+    PDL_SIGNAL();
 }
 
 // ==========================================================================
@@ -290,6 +296,7 @@ __global__ void paged_attention_merge_kernel(
     int head_dim,
     int num_partitions)
 {
+    PDL_WAIT();
     const int token_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
     const int d         = threadIdx.x;
@@ -316,6 +323,7 @@ __global__ void paged_attention_merge_kernel(
 
     int off = token_idx * (num_heads * head_dim) + head_idx * head_dim + d;
     out[off] = __float2bfloat16(l > 0.0f ? acc / l : 0.0f);
+    PDL_SIGNAL();
 }
 
 // --------------------------------------------------------------------------
@@ -394,7 +402,7 @@ void invoke_paged_attention(
         int num_warps  = head_dim / WARP_SIZE;
         size_t smem    = (size_t)(head_dim + num_warps) * sizeof(float);
 
-        paged_attention_split_k_kernel<<<grid, head_dim, smem, stream>>>(
+        PDL_LAUNCH(paged_attention_split_k_kernel, grid, head_dim, smem, stream,
             s_partial_out, s_partial_m, s_partial_l,
             q, k_cache, v_cache,
             block_tables, context_lens, max_num_blocks_per_seq,
@@ -404,7 +412,7 @@ void invoke_paged_attention(
 
         // Phase 2: Merge partitions → final BF16 output
         dim3 merge_grid(num_tokens, num_heads);
-        paged_attention_merge_kernel<<<merge_grid, head_dim, 0, stream>>>(
+        PDL_LAUNCH(paged_attention_merge_kernel, merge_grid, head_dim, 0, stream,
             out, s_partial_out, s_partial_m, s_partial_l,
             num_heads, head_dim, num_partitions);
     } else {
@@ -415,7 +423,7 @@ void invoke_paged_attention(
         int    num_warps   = head_dim / WARP_SIZE;
         size_t smem_bytes  = (size_t)(head_dim + num_warps) * sizeof(float);
 
-        paged_attention_kernel<<<blocks, threads, smem_bytes, stream>>>(
+        PDL_LAUNCH(paged_attention_kernel, blocks, threads, smem_bytes, stream,
             out, q, k_cache, v_cache,
             block_tables, context_lens, max_num_blocks_per_seq,
             num_heads, num_kv_heads, sm_scale,
@@ -437,15 +445,17 @@ __global__ void gather_q_group_kernel(
     const __nv_bfloat16* __restrict__ src, // [T, q_dim]
     int T, int hd, int q_dim, int group_start_head, int hpg, float sm_scale)
 {
+    PDL_WAIT();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = hpg * T * hd;
-    if (idx >= total) return;
+    if (idx >= total) { PDL_SIGNAL(); return; }
     int d  = idx % hd;
     int tb = idx / hd;
     int t  = tb / hpg;
     int b  = tb % hpg;
     float val = __bfloat162float(src[t * q_dim + (group_start_head + b) * hd + d]);
     dst[idx] = __float2bfloat16(val * (sm_scale * LOG2E));
+    PDL_SIGNAL();
 }
 
 // Extract one KV head from interleaved [T, kv_dim] to contiguous [T, hd]
@@ -454,11 +464,13 @@ __global__ void extract_kv_head_kernel(
     const __nv_bfloat16* __restrict__ src,  // [T, kv_dim]
     int T, int hd, int kv_dim, int head_idx)
 {
+    PDL_WAIT();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= T * hd) return;
+    if (idx >= T * hd) { PDL_SIGNAL(); return; }
     int t = idx / hd;
     int d = idx % hd;
     dst[idx] = src[t * kv_dim + head_idx * hd + d];
+    PDL_SIGNAL();
 }
 
 // Transpose [T, hd] row-major → [hd, T] row-major (standard, smem-tiled for bank-conflict avoidance)
@@ -467,6 +479,7 @@ __global__ void transpose_bf16_kernel(
     const __nv_bfloat16* __restrict__ src,  // [T, hd] row-major
     int T, int hd)
 {
+    PDL_WAIT();
     __shared__ __nv_bfloat16 tile[32][33]; // +1 for bank-conflict avoidance
     int bx = blockIdx.x * 32; // along T
     int by = blockIdx.y * 32; // along hd
@@ -481,6 +494,7 @@ __global__ void transpose_bf16_kernel(
     // Write tile[tx][ty] to dst[by+ty, bx+tx] = dst transposed
     if ((by + ty) < hd && (bx + tx) < T)
         dst[(by + ty) * T + (bx + tx)] = tile[tx][ty];
+    PDL_SIGNAL();
 }
 
 // Scatter [hpg*T, hd] → [T, q_dim] (reverse of gather_q_group)
@@ -489,14 +503,16 @@ __global__ void scatter_out_group_kernel(
     const __nv_bfloat16* __restrict__ src,  // [hpg*T, hd] contiguous
     int T, int hd, int q_dim, int group_start_head, int hpg)
 {
+    PDL_WAIT();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = hpg * T * hd;
-    if (idx >= total) return;
+    if (idx >= total) { PDL_SIGNAL(); return; }
     int d  = idx % hd;
     int tb = idx / hd;
     int t  = tb / hpg;
     int b  = tb % hpg;
     dst[t * q_dim + (group_start_head + b) * hd + d] = src[idx];
+    PDL_SIGNAL();
 }
 
 // Causal softmax for interleaved Q layout:
@@ -508,6 +524,7 @@ __global__ void causal_softmax_interleaved_kernel(
     int T_padded,  // padded T (cols in score matrix)
     int hpg)       // heads per group
 {
+    PDL_WAIT();
     const int row = blockIdx.x;  // 0..(hpg*T-1)
     const int tid = threadIdx.x;
     const int t = row / hpg;     // actual query token index
@@ -552,6 +569,7 @@ __global__ void causal_softmax_interleaved_kernel(
     for (int i = valid_len + tid; i < T_padded; i += blockDim.x) {
         row_data[i] = __nv_bfloat16(0);
     }
+    PDL_SIGNAL();
 }
 
 // --------------------------------------------------------------------------
@@ -603,6 +621,7 @@ fused_prefill_attention_kernel(
     int T, int q_dim, int kv_dim, int hpg, int hd,
     float sm_scale)
 {
+    PDL_WAIT();
     const int head = blockIdx.x;    // 0..num_heads-1
     const int t    = blockIdx.y;    // query position 0..T-1
     const int d    = threadIdx.x;   // output dimension 0..hd-1
@@ -646,6 +665,7 @@ fused_prefill_attention_kernel(
 
     // 5. Write normalized output
     out[t * q_dim + head * hd + d] = __float2bfloat16(o_acc / sum_exp);
+    PDL_SIGNAL();
 }
 
 // --------------------------------------------------------------------------
@@ -678,13 +698,13 @@ void invoke_prefill_attention(
 
     // 1. Pre-extract K/V heads
     for (int g = 0; g < num_kv_heads; g++) {
-        extract_kv_head_kernel<<<kv_grids, block_sz, 0, stream>>>(
+        PDL_LAUNCH(extract_kv_head_kernel, kv_grids, block_sz, 0, stream,
             k_all + g * T * head_dim, k, T, head_dim, kv_dim, g);
-        extract_kv_head_kernel<<<kv_grids, block_sz, 0, stream>>>(
+        PDL_LAUNCH(extract_kv_head_kernel, kv_grids, block_sz, 0, stream,
             out_grp, v, T, head_dim, kv_dim, g);
         dim3 tp_grid((T + 31) / 32, (head_dim + 31) / 32);
         dim3 tp_block(32, 32);
-        transpose_bf16_kernel<<<tp_grid, tp_block, 0, stream>>>(
+        PDL_LAUNCH(transpose_bf16_kernel, tp_grid, tp_block, 0, stream,
             v_all_t + g * head_dim * T, out_grp, T, head_dim);
     }
 
@@ -697,7 +717,7 @@ void invoke_prefill_attention(
         int q_grids_n = (q_elems + block_sz - 1) / block_sz;
 
         // Gather Q
-        gather_q_group_kernel<<<q_grids_n, block_sz, 0, stream>>>(
+        PDL_LAUNCH(gather_q_group_kernel, q_grids_n, block_sz, 0, stream,
             q_grp, q, T, head_dim, q_dim, g * hpg, hpg, sm_scale);
 
         // Score GEMM
@@ -705,8 +725,8 @@ void invoke_prefill_attention(
                          hpg * T, T, head_dim, stream);
 
         // Softmax
-        causal_softmax_interleaved_kernel<<<hpg * T, sm_threads,
-            sm_threads * sizeof(float), stream>>>(
+        PDL_LAUNCH(causal_softmax_interleaved_kernel, hpg * T, sm_threads,
+            sm_threads * sizeof(float), stream,
             score_buf, T, T, hpg);
 
         // Output GEMM
@@ -714,7 +734,7 @@ void invoke_prefill_attention(
                          hpg * T, head_dim, T, stream);
 
         // Scatter
-        scatter_out_group_kernel<<<q_grids_n, block_sz, 0, stream>>>(
+        PDL_LAUNCH(scatter_out_group_kernel, q_grids_n, block_sz, 0, stream,
             out, out_grp, T, head_dim, q_dim, g * hpg, hpg);
     }
 }
@@ -741,8 +761,9 @@ __global__ void gather_kv_paged_kernel(
     int tile_start, int actual_sz,
     int kv_head, int num_kv_heads, int head_dim, int block_size)
 {
+    PDL_WAIT();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= actual_sz * head_dim) return;
+    if (idx >= actual_sz * head_dim) { PDL_SIGNAL(); return; }
     int pos_in_tile = idx / head_dim;
     int d = idx % head_dim;
     int abs_pos = tile_start + pos_in_tile;
@@ -753,13 +774,16 @@ __global__ void gather_kv_paged_kernel(
     dst[idx] = kv_cache[pb * (block_size * num_kv_heads * head_dim)
                        + slot * (num_kv_heads * head_dim)
                        + kv_head * head_dim + d];
+    PDL_SIGNAL();
 }
 
 // Initialize online softmax state: acc=0, m=-inf, l=0
 __global__ void init_online_softmax_kernel(float* acc, float* m, float* l, int M, int hd) {
+    PDL_WAIT();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < M * hd) acc[idx] = 0.0f;
     if (idx < M) { m[idx] = -FLT_MAX; l[idx] = 0.0f; }
+    PDL_SIGNAL();
 }
 
 // Tiled causal softmax: produce P = exp(S - rowmax), write m_tile and l_tile.
@@ -774,8 +798,9 @@ __global__ void tiled_causal_softmax_kernel(
     int T_q, int hpg,
     int start_pos, int tile_start)
 {
+    PDL_WAIT();
     int row = blockIdx.x;
-    if (row >= M) return;
+    if (row >= M) { PDL_SIGNAL(); return; }
     int tid = threadIdx.x;
 
     int q_idx = row / hpg;
@@ -792,6 +817,7 @@ __global__ void tiled_causal_softmax_kernel(
         if (tid == 0) { m_tile[row] = -FLT_MAX; l_tile[row] = 0.0f; }
         for (int j = tid; j < actual_sz; j += blockDim.x)
             row_data[j] = __float2bfloat16(0.0f);
+        PDL_SIGNAL();
         return;
     }
 
@@ -825,6 +851,7 @@ __global__ void tiled_causal_softmax_kernel(
     }
 
     if (tid == 0) { m_tile[row] = max_val; l_tile[row] = smem[0]; }
+    PDL_SIGNAL();
 }
 
 // Merge tile output into running online softmax state.
@@ -840,10 +867,11 @@ __global__ void merge_attention_tile_kernel(
     const float* __restrict__ l_tile,
     int M, int hd)
 {
+    PDL_WAIT();
     int row = blockIdx.x;
-    if (row >= M) return;
+    if (row >= M) { PDL_SIGNAL(); return; }
     int d = threadIdx.x;
-    if (d >= hd) return;
+    if (d >= hd) { PDL_SIGNAL(); return; }
 
     float m_old = m[row];
     float m_t = m_tile[row];
@@ -858,6 +886,7 @@ __global__ void merge_attention_tile_kernel(
         l[row] = l[row] * alpha + l_tile[row] * beta;
         m[row] = m_new;
     }
+    PDL_SIGNAL();
 }
 
 // Finalize: out[i,d] = acc[i,d] / l[i]
@@ -868,12 +897,14 @@ __global__ void finalize_chunked_softmax_kernel(
     const float* __restrict__ l,
     int M, int hd)
 {
+    PDL_WAIT();
     int row = blockIdx.x;
-    if (row >= M) return;
+    if (row >= M) { PDL_SIGNAL(); return; }
     int d = threadIdx.x;
-    if (d >= hd) return;
+    if (d >= hd) { PDL_SIGNAL(); return; }
     float inv_l = (l[row] > 0.0f) ? 1.0f / l[row] : 0.0f;
     out[row * hd + d] = __float2bfloat16(acc[row * hd + d] * inv_l);
+    PDL_SIGNAL();
 }
 
 // --------------------------------------------------------------------------
@@ -931,12 +962,12 @@ void invoke_chunked_prefill_paged_attention(
     for (int g = 0; g < num_kv_heads; g++) {
         // Gather Q for this group (interleaved [hpg*T_q, hd])
         int q_elems = M * head_dim;
-        gather_q_group_kernel<<<(q_elems + blk - 1) / blk, blk, 0, stream>>>(
+        PDL_LAUNCH(gather_q_group_kernel, (q_elems + blk - 1) / blk, blk, 0, stream,
             q_grp, q, T_q, head_dim, q_dim, g * hpg, hpg, sm_scale);
 
         // Init online softmax state
         int init_elems = M * head_dim;
-        init_online_softmax_kernel<<<(init_elems + blk - 1) / blk, blk, 0, stream>>>(
+        PDL_LAUNCH(init_online_softmax_kernel, (init_elems + blk - 1) / blk, blk, 0, stream,
             acc, m_buf, l_buf, M, head_dim);
 
         // Tile loop over KV positions
@@ -947,7 +978,7 @@ void invoke_chunked_prefill_paged_attention(
             int kv_grids = (kv_elems + blk - 1) / blk;
 
             // Gather K tile from paged cache
-            gather_kv_paged_kernel<<<kv_grids, blk, 0, stream>>>(
+            PDL_LAUNCH(gather_kv_paged_kernel, kv_grids, blk, 0, stream,
                 k_tile, k_cache, block_tables, tile_start, actual_sz,
                 g, num_kv_heads, head_dim, block_size);
 
@@ -957,20 +988,20 @@ void invoke_chunked_prefill_paged_attention(
             invoke_dense_gemm(q_grp, k_tile, score_buf, M, actual_sz, head_dim, stream);
 
             // Tiled causal softmax → P in-place, m_tile, l_tile
-            tiled_causal_softmax_kernel<<<M, sm_threads,
-                sm_threads * sizeof(float), stream>>>(
+            PDL_LAUNCH(tiled_causal_softmax_kernel, M, sm_threads,
+                sm_threads * sizeof(float), stream,
                 score_buf, m_tile_f, l_tile_f,
                 M, actual_sz, T_q, hpg, start_pos, tile_start);
 
             // Gather V tile from paged cache
-            gather_kv_paged_kernel<<<kv_grids, blk, 0, stream>>>(
+            PDL_LAUNCH(gather_kv_paged_kernel, kv_grids, blk, 0, stream,
                 v_tile, v_cache, block_tables, tile_start, actual_sz,
                 g, num_kv_heads, head_dim, block_size);
 
             // Transpose V: [actual_sz, hd] → [hd, actual_sz]
             dim3 tp_grid((actual_sz + 31) / 32, (head_dim + 31) / 32);
             dim3 tp_block(32, 32);
-            transpose_bf16_kernel<<<tp_grid, tp_block, 0, stream>>>(
+            PDL_LAUNCH(transpose_bf16_kernel, tp_grid, tp_block, 0, stream,
                 v_tile_t, v_tile, actual_sz, head_dim);
 
             // Output GEMM: P[M, actual_sz] × V_tile_T → O_tile[M, hd]
@@ -979,18 +1010,18 @@ void invoke_chunked_prefill_paged_attention(
             invoke_dense_gemm(score_buf, v_tile_t, O_tile_buf, M, head_dim, actual_sz, stream);
 
             // Merge into online softmax accumulator
-            merge_attention_tile_kernel<<<M, head_dim, 0, stream>>>(
+            PDL_LAUNCH(merge_attention_tile_kernel, M, head_dim, 0, stream,
                 acc, m_buf, l_buf, O_tile_buf, m_tile_f, l_tile_f, M, head_dim);
         }
 
         // Finalize: out_grp = acc / l (reuse O_tile_buf as out_grp)
         __nv_bfloat16* out_grp = O_tile_buf;
-        finalize_chunked_softmax_kernel<<<M, head_dim, 0, stream>>>(
+        PDL_LAUNCH(finalize_chunked_softmax_kernel, M, head_dim, 0, stream,
             out_grp, acc, l_buf, M, head_dim);
 
         // Scatter back to [T_q, q_dim]
         int q_grids_n = (q_elems + blk - 1) / blk;
-        scatter_out_group_kernel<<<q_grids_n, blk, 0, stream>>>(
+        PDL_LAUNCH(scatter_out_group_kernel, q_grids_n, blk, 0, stream,
             out, out_grp, T_q, head_dim, q_dim, g * hpg, hpg);
     }
 }
