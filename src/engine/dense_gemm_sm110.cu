@@ -1491,6 +1491,88 @@ void invoke_grouped_expert_gemv_swiglu(
 }
 
 // ============================================================================
+// Fused SwiGLU + GEMV: swiglu(gate[K], up[K]) → SMEM → GEMV with weights[N, K]
+// Eliminates separate SwiGLU kernel launch for shared expert path
+// Grid: ceil(N/8), Block: 256, SMEM: K bf16 (SwiGLU result)
+// ============================================================================
+__global__ void gemv_swiglu_kernel(
+    const __nv_bfloat16* __restrict__ gate_out,  // [K]
+    const __nv_bfloat16* __restrict__ up_out,    // [K]
+    const __nv_bfloat16* __restrict__ weight,    // [N, K]
+    __nv_bfloat16* __restrict__ output,          // [N]
+    int N, int K)
+{
+    constexpr int WARP_SIZE = 32;
+
+    extern __shared__ __nv_bfloat16 s_A[];  // [K]
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x & (WARP_SIZE - 1);
+    int out_idx = blockIdx.x * 8 + warp_id;
+
+    // Load gate+up and apply SwiGLU into SMEM
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        float g = __bfloat162float(gate_out[i]);
+        float u = __bfloat162float(up_out[i]);
+        float silu_val = g / (1.0f + expf(-g));
+        s_A[i] = __float2bfloat16(silu_val * u);
+    }
+    __syncthreads();
+
+    if (out_idx >= N) return;
+
+    const __nv_bfloat16* b_col = weight + (size_t)out_idx * K;
+
+    float sum = 0.0f;
+    int k8 = K / 8;
+    const float4* s_v4 = reinterpret_cast<const float4*>(s_A);
+    const float4* b_v4 = reinterpret_cast<const float4*>(b_col);
+
+    for (int i = lane_id; i < k8; i += WARP_SIZE) {
+        float4 a4 = s_v4[i];
+        float4 b4 = b_v4[i];
+        const __nv_bfloat162* a2 = reinterpret_cast<const __nv_bfloat162*>(&a4);
+        const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&b4);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float2 af = __bfloat1622float2(a2[j]);
+            float2 bf = __bfloat1622float2(b2[j]);
+            sum += af.x * bf.x + af.y * bf.y;
+        }
+    }
+
+    int k_tail = k8 * 8;
+    for (int k = k_tail + lane_id; k < K; k += WARP_SIZE) {
+        sum += __bfloat162float(s_A[k]) * __bfloat162float(b_col[k]);
+    }
+
+    #pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, mask);
+    }
+
+    if (lane_id == 0) {
+        output[out_idx] = __float2bfloat16(sum);
+    }
+}
+
+void invoke_dense_gemv_swiglu(
+    const __nv_bfloat16* gate_out,
+    const __nv_bfloat16* up_out,
+    const __nv_bfloat16* weight,
+    __nv_bfloat16* output,
+    int N, int K,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK = 256;
+    constexpr int WARPS = BLOCK / 32;
+    int blocks = (N + WARPS - 1) / WARPS;
+    size_t smem = K * sizeof(__nv_bfloat16);
+    gemv_swiglu_kernel<<<blocks, BLOCK, smem, stream>>>(
+        gate_out, up_out, weight, output, N, K);
+}
+
+// ============================================================================
 // Weighted Expert Reduce: accum[i] = sum_k(weights[k] * outputs[k*hs + i])
 // 将 top_k 个 expert 的加权输出合并为单个向量
 // ============================================================================

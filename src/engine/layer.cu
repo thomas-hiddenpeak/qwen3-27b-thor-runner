@@ -265,31 +265,28 @@ static void run_moe_mlp(
 
     // 8. Shared expert MLP: gate + up + SwiGLU
     if (moe_timing && num_tokens == 1) cudaEventRecord(moe_ev2, stream);
-    if (num_tokens == 1) {
-        ops::invoke_dense_dual_gemv(post_norm_out, moe.shared_gate_w, moe.shared_up_w,
-                                     shared_gate_out, shared_up_out, shared_is, hs, stream);
-    } else {
-        ops::invoke_dense_gemm(post_norm_out, moe.shared_gate_w, shared_gate_out,
-                                num_tokens, shared_is, hs, stream);
-        ops::invoke_dense_gemm(post_norm_out, moe.shared_up_w, shared_up_out,
-                                num_tokens, shared_is, hs, stream);
-    }
-    ops::invoke_swiglu(shared_swiglu_buf, shared_gate_out, shared_up_out,
-                        num_tokens, shared_is, stream);
-
     // 9-10. Shared expert down + gate scalar + gated add + residual
     __nv_bfloat16* shared_down_buf = (num_tokens == 1)
         ? (expert_scratch + top_k * (2 * moe_is + moe_is))
         : (expert_scratch + 2 * moe_is + moe_is);
     if (num_tokens == 1) {
-        // T=1: down GEMV, then fused gate_scalar + sigmoid_gated_add + residual (3→1 launch)
-        ops::invoke_dense_gemv(shared_swiglu_buf, moe.shared_down_w,
-                                shared_down_buf, hs, shared_is, stream);
+        // T=1: dual GEMV for gate+up, then fused SwiGLU+down GEMV (3→2 launches),
+        // then fused gate_scalar + sigmoid_gated_add + residual
+        ops::invoke_dense_dual_gemv(post_norm_out, moe.shared_gate_w, moe.shared_up_w,
+                                     shared_gate_out, shared_up_out, shared_is, hs, stream);
+        ops::invoke_dense_gemv_swiglu(shared_gate_out, shared_up_out, moe.shared_down_w,
+                                       shared_down_buf, hs, shared_is, stream);
         ops::invoke_sigmoid_gated_add_with_dot(
             moe_acc, shared_down_buf, post_norm_out, moe.shared_expert_gate_w,
             hidden_states, hs, hs, stream);
     } else {
-        // T>1: separate gate_scalar GEMM + per-token down GEMV + sigmoid_gated_add
+        // T>1: separate paths
+        ops::invoke_dense_gemm(post_norm_out, moe.shared_gate_w, shared_gate_out,
+                                num_tokens, shared_is, hs, stream);
+        ops::invoke_dense_gemm(post_norm_out, moe.shared_up_w, shared_up_out,
+                                num_tokens, shared_is, hs, stream);
+        ops::invoke_swiglu(shared_swiglu_buf, shared_gate_out, shared_up_out,
+                            num_tokens, shared_is, stream);
         ops::invoke_dense_gemm(post_norm_out, moe.shared_expert_gate_w,
                                 gate_scalar, num_tokens, 1, hs, stream);
         for (int t = 0; t < num_tokens; ++t) {
