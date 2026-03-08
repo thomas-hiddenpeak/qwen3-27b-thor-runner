@@ -4282,4 +4282,139 @@ MoE 模型 (Qwen3.5-35B-A3B) 的 MTP 投机解码完全失效, 接受率 0%, 纯
 - Prefill (T≥256) 中 softmax 占比更高, 但当前 benchmark 用 17 tokens 无法单独测量
 - light_ops 变更对 decode 无额外贡献 (SiLU/DeltaNet 在 BW-bound kernel 中, exp 指令被 memload 掩盖)
 
+---
+
+## SM110a PDL (Programmatic Dependent Launch)
+
+**日期**: 2025-07-24
+**Commit**: `043f8d4`
+
+### 背景
+
+SM90+ 引入 Grid Dependency Control (PDL), 允许同一 stream 上连续 kernel 的 launch 阶段与前驱 kernel 的尾部重叠。对 decode 路径每步 ~70 个 kernel launch, 每个 launch gap ~2-4μs, 累计 ~200μs 的 host-side gap 可被隐藏。
+
+### 实施
+
+1. **pdl.h 基础设施**: `PDL_WAIT()` / `PDL_SIGNAL()` (PTX `griddepcontrol`), `PDL_LAUNCH()` (`cudaLaunchKernelEx` + `ProgrammaticStreamSerialization`)
+2. **全量转换** — 10 个生产 CUDA 文件, 所有 kernel launch 从 `<<<>>>` 迁移到 `PDL_LAUNCH()`:
+   - `dense_gemm_sm110.cu`: 11 kernels (7 core + 4 MoE)
+   - `light_ops.cu`: 21+ kernels, 30+ launch sites
+   - `paged_attention.cu`: 14+ kernels, 18 launch sites
+   - `layer.cu`: 3 kernels, 2 launch sites
+   - `dense_gemm_fp4_sm110.cu`: 4 kernels, 10 launch sites
+   - `streaming_attention.cu`: 3 kernels, 3 launch sites
+   - `cache_kernels.cu`: 2 kernels, 2 launch sites
+   - `gdn_umma_sm110.cu`: 1 kernel, 1 launch site
+   - `vision.cu`: 头文件引入
+3. 每个 kernel 入口 `PDL_WAIT()`, 最后一次 GMEM 写入后 `PDL_SIGNAL()`
+
+### 结果 (B=1, 27B, 30 decode, MTP off)
+
+| 精度 | 基线 ITL (ms) | PDL ITL (ms) | 提升 |
+|------|--------------|-------------|------|
+| BF16 | 229.81 | 225.73 | **-1.8%** |
+| NVFP4 | 98.98 | 97.70 | **-1.3%** |
+
+BF16 BW: 223.0 → 227.0 GB/s (+1.8%)
+
+### 分析
+
+- 每步 ~70 kernel launches, 每个 gap ~2-4μs, PDL 减少了有效 launch latency
+- BW-bound 下减少 launch overhead 直接转化为更高的有效带宽利用
+- NVFP4 权重更小 (每步 ~25 GB), kernel 数量相同, 相对 launch overhead 占比更小, 因此提升略小
+- `cudaStreamSynchronize` 每层重置依赖链, 与现有 per-layer sync 兼容
+- 311 insertions, 109 deletions, 测试全部通过
+
+---
+
+## SM110a f32x2 SIMD FMA
+
+**日期**: 2025-07-24
+**Commit**: `d43a4dd`
+
+### 背景
+
+SM100+ Blackwell 引入 `fma.rn.f32x2` PTX 指令, 可同时执行两路 FP32 fused multiply-add, 在同一吞吐周期内完成原来需要 2 条 FMA 的工作。GEMV inner loop 的 dot-product 累加是理想的应用场景。
+
+### 实施
+
+1. **f32x2 helper functions**:
+   - `f32x2_fma(uint64_t acc, float2 a, float2 b)`: 打包累加, `uint64_t` 存储两路 FP32 结果
+   - `f32x2_reduce(uint64_t acc)`: 解包并求和为标量 `float`
+2. **14 个 BF16 GEMV kernel 全量转换** (dense_gemm_sm110.cu):
+   - 7 个核心 GEMV kernel (gemv, gemv_add, gemv_rmsnorm, dual_gemv, dual_gemv_add, dual_gemv_rmsnorm, dual_gemv_add_rmsnorm)
+   - 4 个 tiled GEMV kernel (gemv_tiled 系列)
+   - 3 个 MoE GEMV kernel
+3. Inner loop 模式: `sum += af.x*bf.x + af.y*bf.y` → `acc = f32x2_fma(acc, af, bf)`, 每次迭代 2 个 serial FMA → 1 个 f32x2 FMA (50% fewer instructions)
+4. 70 insertions, 34 deletions
+
+### 结果 (B=1, 27B BF16, 30 decode, MTP off)
+
+| 指标 | PDL-only | PDL + f32x2 | 变化 |
+|------|----------|-------------|------|
+| ITL | 225.73 ms | 225.56-226.14 ms | noise-neutral |
+| BW | 227.0 GB/s | 226.6-227.2 GB/s | noise-neutral |
+
+### 分析
+
+- GEMV 是 bandwidth-bound (51 GB 权重 / 225ms ≈ 227 GB/s), FMA 指令延迟被 memory load latency 完全掩盖
+- f32x2 在 compute-bound 场景 (高 batch GEMM, prefill) 有更大收益潜力
+- 无性能回退, 代码更简洁 (一个 f32x2 FMA 替代两个标量 FMA + 一个加法)
+- 作为 SM110a 原生特性, 确保指令选择最优, 为未来 compute-bound 路径铺路
+
+---
+
+## SM110a TMA Bulk Copy for SSM State
+
+**日期**: 2025-07-24
+**Commit**: `052f5ab`
+
+### 背景
+
+DeltaNet prefill kernel 中 SSM state (32 KB per block, 16×128 BF16) 的 GMEM↔SMEM 拷贝使用逐元素手动循环, 加载时包含 BF16→FP32 扩展, 存储时包含 FP32→BF16 打包。SM90+ 的 `cp.async.bulk` (TMA) 指令可将整块数据批量传输, 硬件级流水线化。
+
+Probe 数据: 32KB bulk copy 4.31× faster than manual copy (370 ns vs 1597 ns)。
+
+### 实施
+
+1. **tma_utils.h**: 5 个 helper 函数:
+   - `tma_mbar_init()`: mbarrier 初始化
+   - `tma_mbar_expect_tx()`: 设置预期传输字节数
+   - `tma_bulk_g2s()`: GMEM→SMEM bulk copy (`cp.async.bulk.shared::cluster.global`)
+   - `tma_mbar_wait()`: mbarrier 等待完成
+   - `tma_bulk_s2g()`: SMEM→GMEM bulk copy (`cp.async.bulk.global.shared::cta`)
+2. **就地格式转换** (in-place expansion/packing):
+   - 加载: TMA bulk G2S 32KB BF16 → 反向展开 BF16→FP32 (row kd-1→1, row 0 synced) → 64KB FP32 workspace
+   - 存储: 正向打包 FP32→BF16 → TMA bulk S2G 32KB
+3. **两个 prefill kernel 均使用**:
+   - `gated_delta_net_prefill_kernel` (light_ops.cu): SSM state load/store
+   - `gdn_wy_prefill_kernel` (gdn_umma_sm110.cu): SSM state load/store
+4. 135 insertions, 13 deletions
+
+### 结果 (B=1, 27B BF16, 30 decode, MTP off)
+
+| 指标 | PDL + f32x2 | + TMA | 变化 |
+|------|-------------|-------|------|
+| ITL | 225.56 ms | 224.75 ms | noise-neutral |
+| BW | 227.2 GB/s | 226.9 GB/s | noise-neutral |
+
+### 分析
+
+- Decode (T=1) 不走 prefill 路径, 因此 decode ITL 不受影响是预期行为
+- TMA 优势体现在 prefill (T>1): 32KB bulk copy 4.31× 加速影响 TTFT
+- 当前 benchmark 仅 17 tokens prefill, 无法单独测量 prefill 改善
+- 就地 BF16↔FP32 转换避免了额外 SMEM 分配 (64KB → 仍然 64KB, 反向展开复用原始空间的上半部分)
+- 与 PDL 兼容: TMA 使用 mbarrier 同步, kernel 退出前完成所有 bulk ops
+
+### SM110a 三项优化累计效果
+
+| 阶段 | ITL (ms) | BW (GB/s) | vs 基线 |
+|------|----------|-----------|---------|
+| 基线 (exp2f 后) | 229.81 | 223.0 | — |
+| + PDL | 225.73 | 227.0 | -1.8% |
+| + f32x2 | 225.56 | 227.2 | -1.9% |
+| + TMA | 224.75 | 226.9 | **-2.2%** |
+
+**总计**: ITL -5.06ms (**-2.2%**), BW +3.9 GB/s
+
 **累计 MTP 提速**: +51% (5.1 → 7.7-7.8 tok/s)

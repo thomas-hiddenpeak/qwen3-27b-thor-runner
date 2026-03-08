@@ -210,6 +210,10 @@ CLI arguments always override config file values. See [docs/CLI.md](docs/CLI.md)
 │   │   ├── tokenizer.h/cpp      # BPE tokenizer
 │   │   ├── vision.h/cu          # ViT vision encoder
 │   │   ├── safetensors.h/cpp    # Zero-copy safetensors loader
+│   │   ├── pdl.h                # PDL (Programmatic Dependent Launch) macros
+│   │   ├── tma_utils.h          # TMA bulk copy helpers (cp.async.bulk)
+│   │   ├── sm110a_primitives.h  # SM110a hardware feature constants
+│   │   ├── sm110a_probe.cu      # SM110a hardware capability probe
 │   │   └── ...                  # tensor, perf_stats, shm_queue, etc.
 │   ├── serve/
 │   │   └── serve.h/cpp          # Dual-port HTTP server (Ollama + OpenAI)
@@ -252,7 +256,7 @@ Measured on Jetson AGX Thor (MAXN, Qwen3.5-27B BF16, MTP d=3, KV cache 8 GB):
 
 | Metric | Value |
 |--------|-------|
-| Decode throughput (single request) | ~4.3 tok/s (~220 GB/s, 80% peak) |
+| Decode throughput (single request) | ~4.4 tok/s (~227 GB/s, 83% peak) |
 | MTP accept rate | ~70% (d=3, partial accept) |
 | MTP throughput boost | +27.5% over single-token decode |
 | NVFP4 decode boost | +17% over BF16 |
@@ -267,6 +271,8 @@ Key optimizations applied:
 - **Attention**: Split-K paged attention, chunked prefill tiled GEMM, streaming SSD attention
 - **Sampling**: GPU-resident Gumbel-Max + top-k/top-p/min_p/presence penalty
 - **FP4**: V2 GEMV with SMEM LUT + vectorized loads, merged FP4 QKV/GateUp projections
+- **SM110a HW primitives**: PDL (launch overlap, -1.8%), f32x2 SIMD FMA, TMA bulk copy (SSM state 4.31×)
+- **exp2f**: FA4-inspired `exp2f` + LOG2E 预乘全量替换 (-1.1%)
 
 See [docs/OPTIMIZATION_LOG.md](docs/OPTIMIZATION_LOG.md) for the full optimization journal.
 

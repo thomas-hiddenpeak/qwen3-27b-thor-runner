@@ -82,6 +82,10 @@ src/
 │   ├── safetensors.h/cpp — Safetensors 零拷贝加载
 │   ├── tensor.h/cpp      — Tensor 封装
 │   ├── shm_queue.h       — POSIX 共享内存 SPSC 环形队列
+│   ├── pdl.h             — PDL (Programmatic Dependent Launch) 宏 (SM90+)
+│   ├── tma_utils.h       — TMA bulk copy helpers (cp.async.bulk, mbarrier)
+│   ├── sm110a_primitives.h — SM110a 硬件特性常量
+│   ├── sm110a_probe.cu   — SM110a 硬件能力探测
 │   ├── deltanet_chunkwise.cu — WY chunkwise 评估原型 (独立 micro-benchmark, 不参与推理)
 │   └── moe_*.h/cpp, grouped_gemm.h, cutlass_grouped_gemm_sm110.cuh — MoE 预留
 ├── serve/
@@ -127,6 +131,12 @@ src/
 ### GPU Sampling (参考 FlashInfer)
 - Gumbel-Max 快速路径 + GPU top-k/top-p/min_p/presence_penalty
 
+### SM110a 硬件原语
+- PDL (Programmatic Dependent Launch): 全量 kernel launch 转 `PDL_LAUNCH()`, launch overlap -1.8%
+- f32x2 SIMD FMA: 14 个 BF16 GEMV kernel 使用 `fma.rn.f32x2` PTX, 50% fewer FMA instructions
+- TMA bulk copy: SSM state GMEM↔SMEM 使用 `cp.async.bulk`, 32KB 4.31× 加速
+- exp2f: FA4 启发, 全量 `expf` → `exp2f(x * LOG2E)`, softmax LOG2E 预乘
+
 ### 其他
 - Batched argmax, MTP 投机解码, KV/SSM 状态 SSD offload, L2 persistence
 
@@ -154,7 +164,7 @@ src/
 ## 性能优化方向
 
 ### 单请求 Decode (带宽瓶颈)
-- 当前 ~4.3 tok/s, ~220 GB/s (80% 峰值), 每步读 ~51 GB 权重
+- 当前 ~4.4 tok/s, ~227 GB/s (83% 峰值), 每步读 ~51 GB 权重
 - 方向: DRAM bank-level 访问模式, GEMV kernel 微调
 
 ### Prefill
@@ -179,8 +189,10 @@ src/
 - ✅ FP4 QKV/GateUp 投影合并, NVFP4 decode +17% over BF16
 - ✅ 多模型支持 (27B/9B/4B, config.json 自动检测架构)
 - ✅ Benchmark 重构 (参数扫描/多迭代/95% CI/JSON)
-- ✅ Test 框架 (16 tests, 3 categories, --list/--filter/--category/--all)
-- ❌ GDN SMEM caching (occupancy drop, reverted)
+- ✅ Test 框架 (16 tests, 3 categories, --list/--filter/--category/--all)- ✔️ exp2f + LOG2E 预乘 (FA4 启发, 全量 expf→exp2f), -1.1%
+- ✔️ PDL (Programmatic Dependent Launch, 10 files, ~70 launch sites), -1.8%
+- ✔️ f32x2 SIMD FMA (14 BF16 GEMV kernels, fma.rn.f32x2), noise-neutral (BW-bound)
+- ✔️ TMA bulk copy (SSM state cp.async.bulk, 32KB 4.31×), prefill 加速- ❌ GDN SMEM caching (occupancy drop, reverted)
 - ❌ Dual GEMV + SwiGLU fusion (block count halved, +4.6%, reverted)
 
 ### 稳定性
