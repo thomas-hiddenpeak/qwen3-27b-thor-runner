@@ -285,13 +285,13 @@ MTP speculative decoding is enabled by default when the model has MTP weights (`
 | 35B MoE | 31.0 tok/s | 38.2 tok/s | **+23%** |
 
 Key optimizations applied:
-- **GEMV/GEMM**: Scattered GEMV, Dual GEMV, GEMV+Add fusion, CUTLASS SM110 GEMM
+- **GEMV/GEMM**: Scattered GEMV, Dual GEMV, GEMV+Add fusion, Multi-row GEMV (M=2-8, zero SMEM, L2 cache), CUTLASS SM110 GEMM
 - **Weight merging**: QKV merge (32 launches saved), QKVZAB super-merge (144 launches saved)
 - **Fused RMSNorm+GEMV**: norm in SMEM, 64 launches & ~1ms saved
 - **Fused QK_norm+RoPE**: deinterleave + norm + RoPE in single kernel (32 launches saved)
-- **MTP**: GPU-resident draft chain, batched argmax verify, partial accept
+- **MTP**: GPU-resident draft chain, batched argmax verify, partial accept, multi-row GEMV verify (+40-70%)
 - **DeltaNet**: WY chunked prefill (1.71× speedup), SSM state BF16 compression (+42.6% @ B=128)
-- **Attention**: Split-K paged attention, chunked prefill tiled GEMM, streaming SSD attention
+- **Attention**: Split-K paged attention (causal masking for T≤8), chunked prefill tiled GEMM, streaming SSD attention
 - **Sampling**: GPU-resident Gumbel-Max + top-k/top-p/min_p/presence penalty
 - **FP4**: V2 GEMV with SMEM LUT + vectorized loads, merged FP4 QKV/GateUp projections
 - **SM110a HW primitives**: PDL (launch overlap, -1.8%), f32x2 SIMD FMA, TMA bulk copy (SSM state 4.31×)

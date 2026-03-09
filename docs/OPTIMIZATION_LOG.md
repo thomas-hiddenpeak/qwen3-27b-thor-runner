@@ -4417,4 +4417,143 @@ Probe 数据: 32KB bulk copy 4.31× faster than manual copy (370 ns vs 1597 ns)�
 
 **总计**: ITL -5.06ms (**-2.2%**), BW +3.9 GB/s
 
+---
+
+## Multi-row GEMV for MTP Verify (M=2-8)
+
+**日期**: 2025-07-25
+**Commit**: `75fc7fb`
+
+### 背景
+
+MTP verify 阶段 (d=3 → 最多 T=4 tokens) 需要做 M×K × K×N 的矩阵乘法, 其中 M=2-8。此前使用 cuBLAS GEMM, 但 cuBLAS 对 M=2-8 的超小 M 场景优化不足 — launch overhead 大, 无法利用 BW-bound 特性。
+
+Per-stage profiling 发现 MTP verify 每 LinearAttn 层耗时 5.81ms (vs T=1 decode 3.20ms), 其中投影 GEMV 和 MLP GEMM 占大头。cuBLAS GEMM 对 M=4 的场景读取权重效率明显低于 T=1 GEMV。
+
+关键洞察: M=2-8 时, A 矩阵仅 M×K×2 bytes (M=4, K=17408 → 136 KB), 完全可以放入 L2 Cache (32 MB)。B 权重矩阵每列只需读一次, M 行 A 都从 L2 复用, 接近 T=1 GEMV 的带宽效率。
+
+### 实施
+
+1. **`gemv_multirow_kernel_scattered`** (dense_gemm_sm110.cu):
+   - 模板参数 `MAX_M` (编译时展开), 运行时 `M` 参数处理实际行数
+   - 每 warp 计算 1 列输出的 M 个 dot product, 8 warps/block = 8 列并行
+   - B 权重 `float4` 向量化读取 (K/8 次), 每列只读一次
+   - A 行从 L2 cache `float4` 读取, M 行复用同一列 B 数据
+   - `f32x2_fma` SM110a SIMD 累加
+   - **零 SMEM 使用** → 最大化 occupancy (vs SMEM 方案 occupancy 从 6→5 blocks/SM)
+   - Scattered warp mapping 优化 DRAM bank 访问
+2. **Dispatch**: `invoke_dense_gemm` 和 `invoke_dense_gemm_add` 中, M≤8 且 M>1 时分发到 multi-row kernel (MAX_M=4 或 MAX_M=8 模板)
+3. 179 insertions (dense_gemm_sm110.cu)
+
+### 结果
+
+**Per-layer profiling (LinearAttn layer 0, T=4, B=1)**:
+
+| 阶段 | cuBLAS (ms) | Multi-row GEMV (ms) | 变化 |
+|------|-------------|---------------------|------|
+| 投影 (QKV+ZAB) | 1.26 | 0.78 | -38% |
+| out_proj | 0.50 | 0.33 | -34% |
+| MLP (gate_up + down) | 3.86 | 2.37 | -39% |
+| **层总计** | 5.81 | 3.61 | **-38%** |
+| (参考 T=1 decode) | — | 3.20 | (理想下限) |
+
+**MTP 端到端 (27B BF16, d=3, nothink)**:
+
+| 指标 | Before (cuBLAS) | After (multi-row) | 变化 |
+|------|-----------------|---------------------|------|
+| MTP tok/s | 5.2-5.4 | 7.3-9.0 | **+40-70%** |
+
+### 分析
+
+- Multi-row GEMV 的 per-layer 耗时 3.61ms 接近 T=1 decode 的 3.20ms (仅多 13%), 说明 L2 cache 对 A 的复用非常有效
+- MTP verify T=4 的理论下限: 4×(T=1 decode time)/4 = T=1 decode time, 实测 3.61/3.20 = 1.13×, overhead 来源于额外的 M 行读取
+- SMEM 方案 (cooperative A loading into SMEM) 也做了测试, 但因 SMEM 40KB/block 导致 occupancy 从 6→5 blocks/SM, **回退 -24%** (286ms vs 231ms), BW-bound kernel 需要最大 occupancy 做 latency hiding
+- cuBLAS 对 M=2-8 的 GEMM 使用了过于复杂的 tile 策略, launch overhead 和低效 tile 大小导致性能远低于定制 GEMV
+
+### 失败尝试: SMEM Multi-row GEMV
+
+将 A 矩阵 cooperative 加载到 SMEM (确定性 1-2 cycle 访问 vs L2 10-20 cycle), 但结果 **-24% 回退** (286ms vs 231ms)。
+
+**根因**: SMEM 40KB/block (M=4, K=5120, BF16 → 40KB) 导致 occupancy 从 6→5 blocks/SM。BW-bound 场景下, 1 个 block 的 occupancy 损失意味着少了 ~17% 的 warp 做 memory latency hiding, 远大于 L2→SMEM 的延迟收益。
+
+**结论**: BW-bound GEMV 必须 zero-SMEM, 通过最大 occupancy + L2 复用来优化。
+
+---
+
+## FullAttn Small-T Paged Attention + Split-K Causal Masking
+
+**日期**: 2025-07-25
+**Commit**: `d1e25c3`
+
+### 背景
+
+MTP verify 阶段 FullAttn 层 (每 4 层一层, 共 16 层) 的 attention 计算, 此前使用 chunked prefill tiled GEMM attention (`invoke_chunked_prefill_paged_attention`)。
+
+对于 T=4 verify, chunked prefill 的 launch 开销极大:
+- QK^T GEMM: 1 launch
+- tiled causal softmax: 1 launch
+- PV GEMM: 1 launch
+- 乘以 2 tiles (context > tile size) = 6 launches
+- merge kernel: 1 launch
+- 乘以 4 KV groups = **28 kernel launches/层** (实际观测到 ~56)
+- 每层耗时 **0.70ms** (attention 部分)
+
+而 T=1 decode 使用 paged attention split-K, 每层仅 1-2 launches, 耗时 ~0.10ms。
+
+**关键洞察**: T≤8 的 MTP verify 完全可以使用标准 paged attention, 只需为 batch_size=1, num_tokens>1 的情况添加 causal masking 支持。
+
+### 实施
+
+1. **layer.cu**: 新增 dispatch 分支 — `force_paged_attn && num_tokens > 1 && num_tokens <= 8 && batch_size <= 1` 时调用 `invoke_paged_attention` 而非 `invoke_chunked_prefill_paged_attention`
+2. **paged_attention.cu — split-K causal masking**:
+   - `batch_size == 1 && gridDim.x > 1` 时, split-K kernel 对每个 query token 计算独立的 causal context_len: `context_len = total_context - num_tokens + token_idx + 1`
+   - 这样 token 0 只看到前面所有 context, token 1 多看一个, 以此类推 — 自然实现 causal masking
+3. **paged_attention.cu — dispatch 条件**: split-K dispatch 允许 `num_tokens <= 8` (原来仅 `num_tokens == 1`)
+4. **engine.cpp**: verify 循环增加 FA vs LA 计时诊断 (仅首次 verify, 零开销, 使用现有 `cudaStreamSynchronize`)
+5. 47 insertions, 8 deletions
+
+### 结果
+
+**Per-layer profiling (FullAttn layer 3, T=4 verify)**:
+
+| 阶段 | Chunked Prefill (ms) | Paged Split-K (ms) | 变化 |
+|------|----------------------|---------------------|------|
+| attention | 0.70 | 0.10 | **-86%** |
+| FA 层均 | 3.48 | 3.41 | -2% |
+
+**Verify 总时间分解 (T=4, context ~60 tokens)**:
+
+| 组件 | 耗时 (ms) | 占比 |
+|------|-----------|------|
+| FA (16 层) | 54.9 | 23.6% |
+| LA (48 层) | 177.4 | 76.4% |
+| **Verify forward** | **232.3** | 100% |
+
+**MTP pipeline 全时间分解**:
+
+| 组件 | 耗时 (ms) |
+|------|-----------|
+| Verify forward (T=4) | ~222 |
+| LM head × 3 | ~30.7 (10.2 × 3) |
+| MTP draft × 3 | ~42 |
+| **每步总时** | ~275 |
+| (参考 T=1 decode) | ~215 |
+| MTP overhead | ~60 |
+
+**MTP 端到端 (27B BF16, d=3, nothink)**:
+
+| 指标 | Before (chunked) | After (paged split-K) | 变化 |
+|------|-------------------|------------------------|------|
+| MTP tok/s | 9.0 | 9.3 | +3.3% |
+| 长生成 (58% accept) | — | 10.2 | peak |
+
+**T=1 decode 基线**: 204.79ms forward, 238.2 GB/s — **无回退**
+
+### 分析
+
+- attention 部分 -86% 但对 MTP 端到端仅 +3.3%, 因为 attention 仅占 verify forward 的一小部分 (0.70ms × 16 层 = 11.2ms, 占 232ms 的 4.8%)
+- MTP overhead 60ms 中, lm_head 3×10.2ms = 30.7ms 占 51% (BW-bound at 252 GB/s for 248320×5120 BF16), 是下一个优化瓶颈
+- split-K causal masking 实现简洁 (per-token context_len computation), 无额外 memory 开销
+- T=1 decode 路径完全不受影响, 因为 T=1 不进入新分支
+
 **累计 MTP 提速**: +51% (5.1 → 7.7-7.8 tok/s)

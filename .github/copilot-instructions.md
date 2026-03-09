@@ -103,6 +103,7 @@ src/
 
 ### GEMV/GEMM
 - 散列映射 GEMV, Dual GEMV, GEMV+Add 融合
+- Multi-row GEMV: M=2-8 模板, B 权重读一次, A 行从 L2 cache 复用, 零 SMEM, MTP verify 38%/层加速
 - Level 2 投影合并: Init-time 权重合并 + 单 GEMV 替代多次
   - FullAttn QKV: [12288+1024+1024, 5120] → 3 GEMV→1, 16 层 × 2 = 32 launches saved
   - LinearAttn QKVZAB 超级合并: [10240+6144+48+48, 5120] → 4 GEMV→1, 48 层 × 3 = 144 launches saved
@@ -123,8 +124,9 @@ src/
 - MTP checkpoint 用于 reject 回滚
 
 ### Attention
-- Split-K decode paged attention
-- Chunked prefill tiled GEMM attention
+- Split-K decode paged attention (含 causal masking 支持 MTP verify T≤8)
+- FullAttn small-T paged attention: T≤8 用 paged split-K 替代 chunked prefill, attention -86%
+- Chunked prefill tiled GEMM attention (T>8)
 - Fused prefill attention kernel (已实现, 未启用)
 - SSD streaming attention (256K+)
 
@@ -192,7 +194,11 @@ src/
 - ✅ Test 框架 (16 tests, 3 categories, --list/--filter/--category/--all)- ✔️ exp2f + LOG2E 预乘 (FA4 启发, 全量 expf→exp2f), -1.1%
 - ✔️ PDL (Programmatic Dependent Launch, 10 files, ~70 launch sites), -1.8%
 - ✔️ f32x2 SIMD FMA (14 BF16 GEMV kernels, fma.rn.f32x2), noise-neutral (BW-bound)
-- ✔️ TMA bulk copy (SSM state cp.async.bulk, 32KB 4.31×), prefill 加速- ❌ GDN SMEM caching (occupancy drop, reverted)
+- ✔️ TMA bulk copy (SSM state cp.async.bulk, 32KB 4.31×), prefill 加速
+- ✔️ Multi-row GEMV (M=2-8 register-based, L2 cache, zero SMEM), MTP 5.2→7.3-9.0 tok/s
+- ✔️ FullAttn small-T paged attention + split-K causal masking, attention -86%, MTP +3.3%
+- ❌ SMEM multi-row GEMV (occupancy 6→5 blocks/SM, -24%, reverted)
+- ❌ GDN SMEM caching (occupancy drop, reverted)
 - ❌ Dual GEMV + SwiGLU fusion (block count halved, +4.6%, reverted)
 
 ### 稳定性
