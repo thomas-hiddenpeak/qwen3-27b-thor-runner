@@ -74,8 +74,11 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
                 raw_shape_map[name] = std::vector<int64_t>(tensor->shape().begin(), tensor->shape().end());
                 is_nvfp4 = true;
             } else if (dtype == core::DataType::FP32 &&
-                       name.find("_global_scale") != std::string::npos) {
-                // NVFP4 per-projection scalar: read CPU value
+                       (name.find("_global_scale") != std::string::npos ||
+                        name.find("weight_scale_2") != std::string::npos ||
+                        name.find(".input_scale") != std::string::npos)) {
+                // NVFP4 per-projection scalar (llm-compressor: weight_global_scale;
+                //   ModelOpt: weight_scale_2, input_scale)
                 float val = *static_cast<const float*>(tensor->data());
                 scalar_f32_map[name] = val;
             } else if (dtype == core::DataType::BF16) {
@@ -157,10 +160,18 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
 
         if (is_nvfp4) {
             // NVFP4: MLP projections are quantized for all layers
+            // Attn may be FP4 (Sehyo/llm-compressor) or BF16 (txn545/ModelOpt)
+            auto find_bf16 = [&](const std::string& key) -> __nv_bfloat16* {
+                auto it = tensor_map.find(key);
+                return it != tensor_map.end() ? it->second : nullptr;
+            };
             if (config_.is_full_attention(i)) {
-                // Self-attn projections also quantized; only norms are BF16
+                // Pass BF16 attn weights if available (ModelOpt), nullptr if FP4 (llm-compressor)
                 layers_[i].get_full_attn()->set_weights(
-                    nullptr, nullptr, nullptr, nullptr,
+                    find_bf16(p + "self_attn.q_proj.weight"),
+                    find_bf16(p + "self_attn.k_proj.weight"),
+                    find_bf16(p + "self_attn.v_proj.weight"),
+                    find_bf16(p + "self_attn.o_proj.weight"),
                     get_ptr(p + "self_attn.q_norm.weight"),
                     get_ptr(p + "self_attn.k_norm.weight"),
                     nullptr, nullptr, nullptr,
@@ -246,16 +257,30 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
     if (is_nvfp4) {
         auto make_qw = [&](const std::string& prefix) -> QuantizedWeight {
             QuantizedWeight qw;
+            // llm-compressor: weight_packed; ModelOpt: weight (U8)
             std::string pk = prefix + ".weight_packed";
-            std::string sk = prefix + ".weight_scale";
             auto pit = raw_map.find(pk);
+            if (pit == raw_map.end()) { pk = prefix + ".weight"; pit = raw_map.find(pk); }
+            std::string sk = prefix + ".weight_scale";
             auto sit = raw_map.find(sk);
             if (pit == raw_map.end() || sit == raw_map.end()) return qw;
             qw.packed = static_cast<uint8_t*>(pit->second);
             qw.scale = static_cast<uint8_t*>(sit->second);
+            // llm-compressor: weight_global_scale (large, needs 1/x);
+            // ModelOpt: weight_scale_2 (already inv_global_scale, store as 1/x
+            //   so downstream 1.0f/global_scale recovers the correct value)
             auto gsit = scalar_f32_map.find(prefix + ".weight_global_scale");
+            bool is_modelopt = false;
+            if (gsit == scalar_f32_map.end()) {
+                gsit = scalar_f32_map.find(prefix + ".weight_scale_2");
+                is_modelopt = (gsit != scalar_f32_map.end());
+            }
             auto isit = scalar_f32_map.find(prefix + ".input_global_scale");
-            if (gsit != scalar_f32_map.end()) qw.global_scale = gsit->second;
+            if (gsit != scalar_f32_map.end()) {
+                float gs = gsit->second;
+                // ModelOpt weight_scale_2 IS inv_global_scale; invert to get global_scale
+                qw.global_scale = is_modelopt ? (1.0f / gs) : gs;
+            }
             if (isit != scalar_f32_map.end()) qw.input_scale = isit->second;
             auto shit = raw_shape_map.find(pk);
             if (shit != raw_shape_map.end() && shit->second.size() == 2) {
@@ -427,13 +452,15 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
                     layers_[i].get_linear_attn()->set_moe_weights(moe);
                 }
 
-                // Full attention: bind quantized self-attn projections
+                // Full attention: bind quantized self-attn projections (only if FP4)
                 if (config_.is_full_attention(i)) {
                     auto q_qw = make_qw(p + "self_attn.q_proj");
-                    auto k_qw = make_qw(p + "self_attn.k_proj");
-                    auto v_qw = make_qw(p + "self_attn.v_proj");
-                    auto o_qw = make_qw(p + "self_attn.o_proj");
-                    layers_[i].get_full_attn()->set_quantized_attn(q_qw, k_qw, v_qw, o_qw);
+                    if (q_qw.valid()) {
+                        auto k_qw = make_qw(p + "self_attn.k_proj");
+                        auto v_qw = make_qw(p + "self_attn.v_proj");
+                        auto o_qw = make_qw(p + "self_attn.o_proj");
+                        layers_[i].get_full_attn()->set_quantized_attn(q_qw, k_qw, v_qw, o_qw);
+                    }
                 } else {
                     // LinearAttn 投影 FP4
                     auto qkv_qw = make_qw(p + "linear_attn.in_proj_qkv");
@@ -1187,6 +1214,10 @@ void Qwen35Model::forward_decode(
         cudaEventCreate(&ev_end);
     }
 
+    // === 隐藏状态诊断 (QWEN_DEBUG_NORM=1 启用, 打印每层后的 hidden_state 范数) ===
+    static bool debug_norm = !!getenv("QWEN_DEBUG_NORM");
+    static int debug_step = 0;
+
     for (int i = 0; i < config_.num_hidden_layers; ++i) {
         if (timing_enabled) {
             cudaEventRecord(ev_start, stream);
@@ -1217,6 +1248,28 @@ void Qwen35Model::forward_decode(
         // 逐层 stream sync — 防止深排队引发 SM110 统一内存 hard-reset
         cudaStreamSynchronize(stream);
 
+        // Debug: hidden state norm after each layer
+        if (debug_norm && debug_step < 3 && batch_size == 1) {
+            uint16_t h_raw[16];
+            cudaMemcpy(h_raw, hidden_states, 16 * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+            float norm2 = 0;
+            for (int j = 0; j < 16; j++) {
+                uint32_t bits = (uint32_t)h_raw[j] << 16;
+                float v;
+                memcpy(&v, &bits, sizeof(float));
+                norm2 += v * v;
+            }
+            fprintf(stderr, "  [DBG step=%d] Layer %d/%d: norm16=%.4f first4=[", 
+                    debug_step, i, config_.num_hidden_layers, sqrtf(norm2));
+            for (int j = 0; j < 4; j++) {
+                uint32_t bits = (uint32_t)h_raw[j] << 16;
+                float v;
+                memcpy(&v, &bits, sizeof(float));
+                fprintf(stderr, "%.4f%s", v, j < 3 ? "," : "");
+            }
+            fprintf(stderr, "]\n");
+        }
+
         if (timing_enabled) {
             cudaEventRecord(ev_end, stream);
             cudaEventSynchronize(ev_end);
@@ -1227,6 +1280,10 @@ void Qwen35Model::forward_decode(
             else
                 la_total_ms += ms;
         }
+    }
+
+    if (debug_norm && debug_step < 3) {
+        debug_step++;
     }
 
     if (timing_enabled) {

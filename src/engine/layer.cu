@@ -250,7 +250,10 @@ static void run_moe_mlp(
 
         // 6-7. Shared expert MLP + fused final
         if (moe_timing) cudaEventRecord(moe_ev2, stream);
-        __nv_bfloat16* shared_down_buf = expert_scratch + top_k * (2 * moe_is + moe_is);
+        // shared_down_buf: reuse expert_gu_all space (already consumed by fused swiglu+down GEMV)
+        // BUG FIX: previously pointed to expert_down_all (offset top_k*(2*moe_is+moe_is) == top_k*3*moe_is
+        // == top_k*(2*moe_is) + top_k*moe_is == expert_down_all offset), corrupting routed expert 0 output
+        __nv_bfloat16* shared_down_buf = expert_scratch;
         // T=1: dual GEMV for gate+up, then fused SwiGLU+down GEMV,
         // then fused weighted_reduce + gate_scalar + sigmoid_gated_add + residual
         if (fp4 && moe.shared_gate_qw.valid()) {

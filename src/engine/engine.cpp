@@ -1477,6 +1477,35 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 model_->get_lm_head(), logits, vocab_size, hs, compute_stream_);
             profiler_.end("lm_head", compute_stream_);
 
+            // DEBUG: print top-5 logits before sampling
+            {
+                static bool debug_logits = !!getenv("QWEN_DEBUG_LOGITS");
+                static int logit_step = 0;
+                if (debug_logits && logit_step < 30) {
+                    cudaStreamSynchronize(compute_stream_);
+                    std::vector<uint16_t> h_logits(vocab_size);
+                    cudaMemcpy(h_logits.data(), logits, vocab_size * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+                    // Find top-5
+                    std::vector<std::pair<float, int>> vals;
+                    float sum_abs = 0;
+                    for (int vi = 0; vi < vocab_size; vi++) {
+                        uint32_t bits = (uint32_t)h_logits[vi] << 16;
+                        float v; memcpy(&v, &bits, sizeof(float));
+                        vals.push_back({v, vi});
+                        sum_abs += fabsf(v);
+                    }
+                    std::partial_sort(vals.begin(), vals.begin() + 5, vals.end(),
+                        [](auto& a, auto& b) { return a.first > b.first; });
+                    fprintf(stderr, "[DBG logits step=%d pos=%d] mean_abs=%.4f top5:",
+                            logit_step, ctx->cache_state.context_len - 1, sum_abs / vocab_size);
+                    for (int vi = 0; vi < 5; vi++)
+                        fprintf(stderr, " [%d]=%.4f", vals[vi].second, vals[vi].first);
+                    fprintf(stderr, "\n");
+                    fflush(stderr);
+                    logit_step++;
+                }
+            }
+
             profiler_.begin("sample", compute_stream_);
             int next_token = sample_token(logits, vocab_size,
                                           ctx->temperature, ctx->top_p, ctx->top_k,
