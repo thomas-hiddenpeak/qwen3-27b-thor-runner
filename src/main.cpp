@@ -47,7 +47,7 @@ static void crash_handler(int sig) {
     raise(sig);
 }
 
-static const char* VERSION = "0.2.0";
+static const char* VERSION = "2.0.0";
 static const char* BUILD_DATE = __DATE__;
 static const char* AUTHOR = "Thomas";
 
