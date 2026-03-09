@@ -8,7 +8,7 @@ High-performance BF16 / NVFP4 inference engine for **Qwen3.5** model family (4B 
 ## Features
 
 - **Pure C++17 / CUDA** — zero Python dependency, zero-copy weight loading via `safetensors`
-- **Multi-model** — auto-detects model architecture from `config.json` (27B / 9B / 4B)
+- **Multi-model** — auto-detects model architecture from `config.json` (Dense 4B/9B/27B + MoE 35B-A3B/122B-A10B)
 - **BF16 precision** — full BF16 pipeline (weights / activations / KV Cache), FP32 SSM state
 - **NVFP4 (W4A16)** — FP4 E2M1 quantized inference, +17% decode throughput over BF16
 - **Hybrid architecture** — DeltaNet SSM + GQA Full Attention (e.g. 27B: 48+16 = 64 layers)
@@ -54,18 +54,23 @@ make -j$(nproc)
 
 ## Quick Start
 
+> **Note:** `--config` or `--model-dir` is required for all commands (serve/chat/bench).  
+> You can also set `QWEN_MODEL_DIR` environment variable.
+
 ```bash
 # Edit configs/qwen3.5-27b.conf — set model_dir to your model weights path
-# Supports: Qwen3.5-27B / 9B / 4B (BF16 or NVFP4)
 
 # Start HTTP API server (Ollama + OpenAI dual-port)
 ./build/qwen35-thor serve --config configs/qwen3.5-27b.conf
 
+# Or specify model directory directly
+./build/qwen35-thor serve --model-dir /path/to/Qwen3.5-27B --kv-cache-gb 8
+
 # Interactive TUI chat
-./build/qwen35-thor chat --config configs/qwen3.5-27b.conf
+./build/qwen35-thor chat --config configs/qwen3.5-9b.conf
 
 # Benchmarks (parameter sweep with statistics)
-./build/qwen35-thor bench --decode 30 --batch 1,2,4 --prompt-len 64,256 --iterations 3
+./build/qwen35-thor bench --model-dir /path/to/model --decode 30 --batch 1,2,4 --iterations 3
 
 # Unit tests
 ./build/qwen35-thor test              # run unit tests only
@@ -235,6 +240,8 @@ CLI arguments always override config file values. See [docs/CLI.md](docs/CLI.md)
 
 Qwen3.5 uses a hybrid attention architecture with DeltaNet SSM + Full Attention:
 
+### Dense Models
+
 | Parameter | 27B | 9B | 4B |
 |-----------|-----|-----|-----|
 | Layers | 64 (48 SSM + 16 Attn) | 32 (24+8) | 32 (24+8) |
@@ -249,8 +256,22 @@ Qwen3.5 uses a hybrid attention architecture with DeltaNet SSM + Full Attention:
 | tie_word_embeddings | false | false | true |
 | Model size (BF16) | ~51.7 GB | ~18 GB | ~8.7 GB |
 
+### MoE Models
+
+| Parameter | 35B-A3B | 122B-A10B |
+|-----------|---------|----------|
+| Total params | 35B | 122B |
+| Active params | 3B | 10B |
+| Layers | 48 | 48 |
+| Experts | 64 | 256 |
+| Active experts (top-k) | 6 | 8 |
+| Shared experts | 1 | 1 |
+| Precision | BF16 | NVFP4 (W4A16) |
+| Weight size | ~66 GB | ~83 GB |
+
 - **Linear Attention** layers (Gated DeltaNet SSM): `layer_idx % 4 != 3`
 - **Full Attention** layers (GQA + RoPE + Paged KV Cache): `layer_idx % 4 == 3`
+- **MoE** layers replace dense MLP with expert routing (grouped GEMM + shared expert)
 - **NVFP4** variants reduce weight memory by ~60% via FP4 E2M1 quantization
 
 ## Performance
@@ -261,31 +282,34 @@ MTP speculative decoding is enabled by default when the model has MTP weights (`
 
 ### Decode Throughput
 
-| Model | Precision | MTP | tok/s | Accept Rate | Avg tok/step | BW (GB/s) |
-|-------|-----------|-----|-------|-------------|-------------|-----------|
-| Qwen3.5-27B | BF16 | off | 4.4 | — | 1.0 | 227 (83%) |
-| Qwen3.5-27B | BF16 | d=3 | **8.7** | 93% | 3.8 | — |
-| Qwen3.5-27B | NVFP4 | off | 10.1 | — | 1.0 | — |
-| Qwen3.5-27B | NVFP4 | d=3 | **16.9** | 87% | 3.6 | — |
-| Qwen3.5-9B | BF16 | off | 13.9 | — | 1.0 | 221 (81%) |
-| Qwen3.5-9B | BF16 | d=3 | **27.0** | 91% | 3.7 | — |
-| Qwen3.5-4B | BF16 | off | 25.2 | — | 1.0 | 212 (78%) |
-| Qwen3.5-4B | BF16 | d=3 | **37.8** | 67% | 3.0 | — |
-| Qwen3.5-35B-A3B | MoE | off | 31.0 | — | 1.0 | — |
-| Qwen3.5-35B-A3B | MoE | d=1 | **38.2** | 99% | 2.0 | — |
+| Model | Precision | MTP | tok/s | ITL (ms) | BW (GB/s) |
+|-------|-----------|-----|-------|----------|-----------|
+| Qwen3.5-4B | BF16 | off | 26.3 | 38.0 | 221 (81%) |
+| Qwen3.5-4B | BF16 | d=2 | **44.1** | — | — |
+| Qwen3.5-9B | BF16 | off | 14.8 | 67.5 | 235 (86%) |
+| Qwen3.5-9B | BF16 | d=3 | **26.1** | — | — |
+| Qwen3.5-27B | BF16 | off | 4.6 | 217 | 236 (86%) |
+| Qwen3.5-27B | BF16 | d=3 | **10.4** | — | — |
+| Qwen3.5-27B | NVFP4 | off | 10.7 | 93.5 | — |
+| Qwen3.5-27B | NVFP4 | d=2 | **14.2** | — | — |
+| Qwen3.5-35B-A3B | MoE BF16 | off | 32.5 | 30.8 | 191 (70%) |
+| Qwen3.5-35B-A3B | MoE BF16 | d=2 | **40.0** | — | — |
+| Qwen3.5-122B-A10B | MoE NVFP4 | off | 14.9 | 67.1 | 268 (98%) |
+| Qwen3.5-122B-A10B | MoE NVFP4 | d=2 | **19.6** | — | — |
 
-> MTP accept rate varies with content. Values above measured with structured output (counting task, non-thinking mode).
-> MoE model uses d=1 (optimal); dense models use d=3.
+> Baseline measured with `bench --decode 30 --iterations 3`. MTP throughput measured via serve mode.
+> 122B MoE NVFP4 achieves 98% of peak memory bandwidth (268/273 GB/s).
 
 ### MTP Speedup Summary
 
-| Model | MTP off | MTP on | Boost |
-|-------|---------|--------|-------|
-| 27B BF16 | 4.4 tok/s | 8.7 tok/s | **+98%** |
-| 27B NVFP4 | 10.1 tok/s | 16.9 tok/s | **+67%** |
-| 9B BF16 | 13.9 tok/s | 27.0 tok/s | **+94%** |
-| 4B BF16 | 25.2 tok/s | 37.8 tok/s | **+50%** |
-| 35B MoE | 31.0 tok/s | 38.2 tok/s | **+23%** |
+| Model | MTP off | MTP on | Optimal d | Boost |
+|-------|---------|--------|-----------|-------|
+| 4B BF16 | 26.2 tok/s | 44.1 tok/s | d=2 | **+69%** |
+| 9B BF16 | 14.5 tok/s | 26.1 tok/s | d=3 | **+80%** |
+| 27B BF16 | 4.6 tok/s | 10.4 tok/s | d=3 | **+128%** |
+| 27B NVFP4 | 10.2 tok/s | 14.2 tok/s | d=2 | **+39%** |
+| 35B MoE | 30.6 tok/s | 40.0 tok/s | d=2 | **+31%** |
+| 122B MoE NVFP4 | 14.1 tok/s | 19.6 tok/s | d=2 | **+39%** |
 
 Key optimizations applied:
 - **GEMV/GEMM**: Scattered GEMV, Dual GEMV, GEMV+Add fusion, Multi-row GEMV (M=2-8, zero SMEM, L2 cache), CUTLASS SM110 GEMM
