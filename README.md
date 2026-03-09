@@ -36,7 +36,29 @@ High-performance BF16 / NVFP4 inference engine for **Qwen3.5** model family (4B 
 
 This engine targets the specific Jetson AGX Thor unified-memory architecture. It is **not** designed for discrete GPU servers.
 
-## Build
+## Install (Pre-built Binary)
+
+One-line install for Jetson AGX Thor (aarch64, SM110a):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/thomas-hiddenpeak/qwen3-27b-thor-runner/master/install.sh | bash
+```
+
+This downloads the latest release binary to `~/.local/bin/qwen35-thor` and config templates to `~/.local/share/qwen35-thor/configs/`.
+
+After installation:
+
+```bash
+# Set model_dir in config to your weights path, then:
+qwen35-thor serve --config ~/.local/share/qwen35-thor/configs/qwen3.5-27b.conf
+
+# Or specify model directory directly
+qwen35-thor serve --model-dir /path/to/Qwen3.5-27B --kv-cache-gb 8
+```
+
+> If `~/.local/bin` is not in your PATH, add it: `echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc`
+
+## Build from Source
 
 ```bash
 git clone --recursive https://github.com/thomas-hiddenpeak/qwen3-27b-thor-runner.git
