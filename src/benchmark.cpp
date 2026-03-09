@@ -199,7 +199,7 @@ struct BenchConfig {
     bool csv_output     = false;
     bool per_step       = false;
     bool no_graph       = false;
-    std::string model_dir = "/home/rm01/models/dev/llm/Qwen/Qwen3.5-27B";
+    std::string model_dir;
     std::string json_output;        // JSON 输出文件路径 (空则不输出)
 };
 
@@ -243,6 +243,12 @@ BenchConfig parse_args(int argc, char** argv) {
                       << "  bench --decode 30 --no-graph  (single config, backward-compatible)\n";
             exit(0);
         }
+    }
+    if (cfg.model_dir.empty()) {
+        std::cerr << "[Error] --model-dir is required.\n"
+                  << "  Usage: qwen35-thor bench --model-dir <path> [options]\n"
+                  << "     or: export QWEN_MODEL_DIR=<path>\n";
+        exit(1);
     }
     return cfg;
 }

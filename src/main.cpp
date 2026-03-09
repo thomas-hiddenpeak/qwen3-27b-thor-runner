@@ -70,8 +70,10 @@ static void print_usage() {
     printf("    probe       SM110a hardware primitives micro-benchmark\n");
     printf("    version     Print version information\n\n");
     printf("  Engine Options (shared by serve/chat/bench):\n");
-    printf("    --config <file>       Load unified configuration from file (engine + serve)\n");
-    printf("    --model-dir <path>    Model weights directory\n");
+    printf("    --config <file>       Load unified configuration from file (REQUIRED*)\n");
+    printf("    --model-dir <path>    Model weights directory (REQUIRED*)\n");
+    printf("                          * Either --config or --model-dir must be specified,\n");
+    printf("                            or set QWEN_MODEL_DIR environment variable.\n");
     printf("    --kv-cache-gb <N>     GPU KV cache budget in GB (default: 4.0)\n");
     printf("    --cache-enable        Enable SSD prefix caching\n");
     printf("    --cache-dir <path>    SSD cache directory\n");
@@ -107,16 +109,16 @@ static void print_usage() {
     printf("    --no-graph            Disable CUDA Graph for per-phase timing\n");
     printf("    --nsys                Enable NVTX annotations for nsys profiling\n\n");
     printf("  Examples:\n");
-    printf("    # Start API server with 8GB KV cache + SSD caching\n");
-    printf("    qwen35-thor serve --kv-cache-gb 8 --cache-enable\n\n");
-    printf("    # Interactive chat with default settings\n");
-    printf("    qwen35-thor chat --kv-cache-gb 4\n\n");
-    printf("    # Load from unified config file\n");
+    printf("    # Start API server with config file\n");
     printf("    qwen35-thor serve --config configs/qwen3.5-27b.conf\n\n");
-    printf("    # Run benchmarks (single config, backward-compatible)\n");
-    printf("    qwen35-thor bench --decode 50 --no-graph\n\n");
+    printf("    # Start API server with model dir + options\n");
+    printf("    qwen35-thor serve --model-dir /path/to/Qwen3.5-27B --kv-cache-gb 8\n\n");
+    printf("    # Interactive chat\n");
+    printf("    qwen35-thor chat --config configs/qwen3.5-9b.conf\n\n");
+    printf("    # Run benchmarks\n");
+    printf("    qwen35-thor bench --model-dir /path/to/Qwen3.5-27B --decode 50\n\n");
     printf("    # Parameter sweep with JSON output\n");
-    printf("    qwen35-thor bench --batch 1,2,4 --prompt-len 64,256 --iterations 3 --json results.json\n\n");
+    printf("    qwen35-thor bench --model-dir /path/to/model --batch 1,2,4 --iterations 3 --json results.json\n\n");
     printf("    # SM110a hardware primitives probe\n");
     printf("    qwen35-thor probe\n\n");
 }

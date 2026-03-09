@@ -21,7 +21,7 @@ static std::string default_model_dir_from_env() {
     if (env_model_dir && env_model_dir[0] != '\0') {
         return std::string(env_model_dir);
     }
-    return "/home/rm01/models/dev/llm/Qwen/Qwen3.5-27B";
+    return "";
 }
 
 // ============================================================================
@@ -59,6 +59,13 @@ BackendConfig BackendConfig::from_args(int argc, char** argv) {
         } else if (arg == "--config" && i + 1 < argc) {
             cfg = BackendConfig::from_file(argv[++i]);
         }
+    }
+    if (cfg.model_dir.empty()) {
+        fprintf(stderr, "[Error] --model-dir or --config is required.\n");
+        fprintf(stderr, "  Usage: qwen35-thor <command> --config <file>\n");
+        fprintf(stderr, "     or: qwen35-thor <command> --model-dir <path>\n");
+        fprintf(stderr, "     or: export QWEN_MODEL_DIR=<path>\n");
+        exit(1);
     }
     return cfg;
 }

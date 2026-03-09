@@ -81,7 +81,7 @@ struct InferResponse {
 // 后端配置 (聚合 Engine 配置 + Cache 配置)
 // ============================================================================
 struct BackendConfig {
-    std::string model_dir   = "/home/rm01/models/dev/llm/Qwen/Qwen3.5-27B";
+    std::string model_dir;
     double      kv_cache_gb = 4.0;
 
     // SSD 前缀缓存
