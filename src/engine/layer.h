@@ -237,19 +237,6 @@ struct Qwen35Config {
 
 
 // ============================================================================
-// MoE 权重集合: 路由器 + packed experts + 共享专家 + 共享专家门控
-// ============================================================================
-struct MoEWeights {
-    __nv_bfloat16* router_w = nullptr;              // [num_experts, hidden_size]
-    __nv_bfloat16* experts_gate_up_w = nullptr;     // [num_experts, 2*moe_is, hs] packed contiguous
-    __nv_bfloat16* experts_down_w = nullptr;        // [num_experts, hs, moe_is] packed contiguous
-    __nv_bfloat16* shared_gate_w = nullptr;          // [shared_is, hs]
-    __nv_bfloat16* shared_up_w = nullptr;            // [shared_is, hs]
-    __nv_bfloat16* shared_down_w = nullptr;          // [hs, shared_is]
-    __nv_bfloat16* shared_expert_gate_w = nullptr;   // [1, hs]
-    bool valid() const { return router_w != nullptr; }
-};
-
 // ============================================================================
 // NVFP4 量化权重: FP4 E2M1 packed + F8_E4M3 per-group scale + F32 global scale
 // ============================================================================
@@ -260,6 +247,44 @@ struct QuantizedWeight {
     float input_scale = 1.0f;    // per-projection F32 input_global_scale
     int N = 0, K = 0;            // logical weight shape [N, K]
     bool valid() const { return packed != nullptr; }
+};
+
+// MoE 权重集合: 路由器 + packed experts + 共享专家 + 共享专家门控
+// 支持 BF16 和 NVFP4 两种精度 — 推理时根据 is_fp4() 选择路径
+// ============================================================================
+struct MoEWeights {
+    // BF16 权重 (dense model / BF16 MoE)
+    __nv_bfloat16* router_w = nullptr;              // [num_experts, hidden_size]
+    __nv_bfloat16* experts_gate_up_w = nullptr;     // [num_experts, 2*moe_is, hs] packed contiguous
+    __nv_bfloat16* experts_down_w = nullptr;        // [num_experts, hs, moe_is] packed contiguous
+    __nv_bfloat16* shared_gate_w = nullptr;          // [shared_is, hs]
+    __nv_bfloat16* shared_up_w = nullptr;            // [shared_is, hs]
+    __nv_bfloat16* shared_down_w = nullptr;          // [hs, shared_is]
+    __nv_bfloat16* shared_expert_gate_w = nullptr;   // [1, hs]
+
+    // NVFP4 量化权重 (NVFP4 MoE)
+    // Expert weights: packed contiguous across all experts
+    //   gate_up: packed[E * 2*moe_is, K/2], scale[E * 2*moe_is, K/16]
+    //   down:    packed[E * hs, K_down/2], scale[E * hs, K_down/16]
+    //   其中每个 expert 的 N 维度连续排列, stride = N_per_expert * K/2 (packed) or N * K/16 (scale)
+    uint8_t* fp4_experts_gate_up_packed = nullptr;
+    uint8_t* fp4_experts_gate_up_scale = nullptr;
+    float*   fp4_experts_gate_up_inv_gs = nullptr;  // [E] per-expert 1/global_scale
+    int      fp4_experts_gate_up_N = 0;  // = 2 * moe_is (per expert)
+    int      fp4_experts_gate_up_K = 0;  // = hs
+    uint8_t* fp4_experts_down_packed = nullptr;
+    uint8_t* fp4_experts_down_scale = nullptr;
+    float*   fp4_experts_down_inv_gs = nullptr;      // [E] per-expert 1/global_scale
+    int      fp4_experts_down_N = 0;     // = hs (per expert)
+    int      fp4_experts_down_K = 0;     // = moe_is
+
+    // Shared expert FP4
+    QuantizedWeight shared_gate_qw;
+    QuantizedWeight shared_up_qw;
+    QuantizedWeight shared_down_qw;
+
+    bool valid() const { return router_w != nullptr; }
+    bool is_fp4() const { return fp4_experts_gate_up_packed != nullptr; }
 };
 
 // ============================================================================

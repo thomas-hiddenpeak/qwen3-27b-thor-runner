@@ -208,6 +208,8 @@ static void run_moe_mlp(
     const size_t gu_stride = (size_t)2 * moe_is * hs;   // bf16 elements per expert gate_up
     const size_t dn_stride = (size_t)hs * moe_is;       // bf16 elements per expert down
 
+    const bool fp4 = moe.is_fp4();
+
     if (num_tokens == 1) {
         // ============================================================
         // T=1 快速路径: Grouped Expert GEMV (GPU-resident, 无 D2H/sync)
@@ -219,26 +221,50 @@ static void run_moe_mlp(
         __nv_bfloat16* expert_down_all    = expert_swiglu_all + top_k * moe_is;          // [top_k, hs]
 
         // 5a. Grouped gate_up GEMV: all top_k experts, shared input
-        ops::invoke_grouped_expert_gemv(
-            post_norm_out, moe.experts_gate_up_w, expert_gu_all,
-            expert_indices, 2 * moe_is, hs, gu_stride,
-            top_k, /*shared_input=*/true, stream);
+        if (fp4) {
+            ops::invoke_fp4_grouped_expert_gemv(
+                post_norm_out, moe.fp4_experts_gate_up_packed, moe.fp4_experts_gate_up_scale,
+                moe.fp4_experts_gate_up_inv_gs, expert_gu_all,
+                expert_indices, 2 * moe_is, hs,
+                top_k, /*shared_input=*/true, stream);
+        } else {
+            ops::invoke_grouped_expert_gemv(
+                post_norm_out, moe.experts_gate_up_w, expert_gu_all,
+                expert_indices, 2 * moe_is, hs, gu_stride,
+                top_k, /*shared_input=*/true, stream);
+        }
 
         // 5b+5c. Fused SwiGLU + Grouped down GEMV (eliminates SwiGLU launch)
-        ops::invoke_grouped_expert_gemv_swiglu(
-            expert_gu_all, moe.experts_down_w, expert_down_all,
-            expert_indices, hs, moe_is, dn_stride,
-            top_k, stream);
+        if (fp4) {
+            ops::invoke_fp4_grouped_expert_gemv_swiglu(
+                expert_gu_all, moe.fp4_experts_down_packed, moe.fp4_experts_down_scale,
+                moe.fp4_experts_down_inv_gs, expert_down_all,
+                expert_indices, hs, moe_is,
+                top_k, stream);
+        } else {
+            ops::invoke_grouped_expert_gemv_swiglu(
+                expert_gu_all, moe.experts_down_w, expert_down_all,
+                expert_indices, hs, moe_is, dn_stride,
+                top_k, stream);
+        }
 
         // 6-7. Shared expert MLP + fused final
         if (moe_timing) cudaEventRecord(moe_ev2, stream);
         __nv_bfloat16* shared_down_buf = expert_scratch + top_k * (2 * moe_is + moe_is);
         // T=1: dual GEMV for gate+up, then fused SwiGLU+down GEMV,
         // then fused weighted_reduce + gate_scalar + sigmoid_gated_add + residual
-        ops::invoke_dense_dual_gemv(post_norm_out, moe.shared_gate_w, moe.shared_up_w,
-                                     shared_gate_out, shared_up_out, shared_is, hs, stream);
-        ops::invoke_dense_gemv_swiglu(shared_gate_out, shared_up_out, moe.shared_down_w,
-                                       shared_down_buf, hs, shared_is, stream);
+        if (fp4 && moe.shared_gate_qw.valid()) {
+            // FP4 shared expert: dual GEMV → SwiGLU → FP4 down GEMV
+            ops::invoke_fp4_dual_gemv_shared_expert(post_norm_out, moe.shared_gate_qw, moe.shared_up_qw,
+                                                     shared_gate_out, shared_up_out, stream);
+            ops::invoke_swiglu(shared_swiglu_buf, shared_gate_out, shared_up_out, 1, shared_is, stream);
+            ops::invoke_fp4_gemv(shared_swiglu_buf, moe.shared_down_qw, shared_down_buf, stream);
+        } else {
+            ops::invoke_dense_dual_gemv(post_norm_out, moe.shared_gate_w, moe.shared_up_w,
+                                         shared_gate_out, shared_up_out, shared_is, hs, stream);
+            ops::invoke_dense_gemv_swiglu(shared_gate_out, shared_up_out, moe.shared_down_w,
+                                           shared_down_buf, hs, shared_is, stream);
+        }
         ops::invoke_fused_moe_final(
             moe_acc, expert_down_all, expert_weights,
             shared_down_buf, post_norm_out, moe.shared_expert_gate_w,
@@ -252,16 +278,32 @@ static void run_moe_mlp(
         __nv_bfloat16* expert_down_all    = expert_gu_all + (size_t)num_tokens * top_k * 2 * moe_is;  // [T*top_k, hs]
 
         // 5a. Batched grouped gate_up GEMV: all T*top_k assignments
-        ops::invoke_grouped_expert_gemv(
-            post_norm_out, moe.experts_gate_up_w, expert_gu_all,
-            expert_indices, 2 * moe_is, hs, gu_stride,
-            top_k, /*shared_input=*/true, stream, num_tokens);
+        if (fp4) {
+            ops::invoke_fp4_grouped_expert_gemv(
+                post_norm_out, moe.fp4_experts_gate_up_packed, moe.fp4_experts_gate_up_scale,
+                moe.fp4_experts_gate_up_inv_gs, expert_gu_all,
+                expert_indices, 2 * moe_is, hs,
+                top_k, /*shared_input=*/true, stream, num_tokens);
+        } else {
+            ops::invoke_grouped_expert_gemv(
+                post_norm_out, moe.experts_gate_up_w, expert_gu_all,
+                expert_indices, 2 * moe_is, hs, gu_stride,
+                top_k, /*shared_input=*/true, stream, num_tokens);
+        }
 
         // 5b+5c. Fused SwiGLU + Batched grouped down GEMV
-        ops::invoke_grouped_expert_gemv_swiglu(
-            expert_gu_all, moe.experts_down_w, expert_down_all,
-            expert_indices, hs, moe_is, dn_stride,
-            top_k, stream, num_tokens);
+        if (fp4) {
+            ops::invoke_fp4_grouped_expert_gemv_swiglu(
+                expert_gu_all, moe.fp4_experts_down_packed, moe.fp4_experts_down_scale,
+                moe.fp4_experts_down_inv_gs, expert_down_all,
+                expert_indices, hs, moe_is,
+                top_k, stream, num_tokens);
+        } else {
+            ops::invoke_grouped_expert_gemv_swiglu(
+                expert_gu_all, moe.experts_down_w, expert_down_all,
+                expert_indices, hs, moe_is, dn_stride,
+                top_k, stream, num_tokens);
+        }
 
         // 5d. Batched weighted expert reduce: moe_acc[T, hs] = sum_k(w[t,k] * expert_down[t*topk+k, hs])
         ops::invoke_weighted_expert_reduce(
@@ -271,19 +313,31 @@ static void run_moe_mlp(
 
     // Shared expert MLP (T>1 only — T=1 handled above with fused_moe_final)
     if (num_tokens > 1) {
-        ops::invoke_dense_gemm(post_norm_out, moe.shared_gate_w, shared_gate_out,
-                                num_tokens, shared_is, hs, stream);
-        ops::invoke_dense_gemm(post_norm_out, moe.shared_up_w, shared_up_out,
-                                num_tokens, shared_is, hs, stream);
-        ops::invoke_swiglu(shared_swiglu_buf, shared_gate_out, shared_up_out,
-                            num_tokens, shared_is, stream);
-        ops::invoke_dense_gemm(post_norm_out, moe.shared_expert_gate_w,
-                                gate_scalar, num_tokens, 1, hs, stream);
-        // Shared expert down projection: GEMM [T, shared_is] × [shared_is, hs] → [T, hs]
-        // shared_down_buf needs [T, hs] — reuse expert_gu_all area (no longer needed)
-        __nv_bfloat16* shared_down_buf = expert_scratch;  // reuse, large enough
-        ops::invoke_dense_gemm(shared_swiglu_buf, moe.shared_down_w, shared_down_buf,
-                                num_tokens, hs, shared_is, stream);
+        if (fp4 && moe.shared_gate_qw.valid()) {
+            // FP4 shared expert: separate gate + up GEMM, SwiGLU, FP4 down GEMM
+            ops::invoke_fp4_gemm(post_norm_out, moe.shared_gate_qw, shared_gate_out, num_tokens, stream);
+            ops::invoke_fp4_gemm(post_norm_out, moe.shared_up_qw, shared_up_out, num_tokens, stream);
+            ops::invoke_swiglu(shared_swiglu_buf, shared_gate_out, shared_up_out,
+                                num_tokens, shared_is, stream);
+            ops::invoke_dense_gemm(post_norm_out, moe.shared_expert_gate_w,
+                                    gate_scalar, num_tokens, 1, hs, stream);
+            __nv_bfloat16* shared_down_buf = expert_scratch;
+            ops::invoke_fp4_gemm(shared_swiglu_buf, moe.shared_down_qw, shared_down_buf, num_tokens, stream);
+        } else {
+            ops::invoke_dense_gemm(post_norm_out, moe.shared_gate_w, shared_gate_out,
+                                    num_tokens, shared_is, hs, stream);
+            ops::invoke_dense_gemm(post_norm_out, moe.shared_up_w, shared_up_out,
+                                    num_tokens, shared_is, hs, stream);
+            ops::invoke_swiglu(shared_swiglu_buf, shared_gate_out, shared_up_out,
+                                num_tokens, shared_is, stream);
+            ops::invoke_dense_gemm(post_norm_out, moe.shared_expert_gate_w,
+                                    gate_scalar, num_tokens, 1, hs, stream);
+            __nv_bfloat16* shared_down_buf = expert_scratch;
+            ops::invoke_dense_gemm(shared_swiglu_buf, moe.shared_down_w, shared_down_buf,
+                                    num_tokens, hs, shared_is, stream);
+        }
+        // shared_down_buf is at expert_scratch — same location for both paths
+        __nv_bfloat16* shared_down_buf = expert_scratch;
         // Per-token sigmoid-gated add + residual
         for (int t = 0; t < num_tokens; ++t) {
             ops::invoke_sigmoid_gated_add(moe_acc + t * hs, shared_down_buf + t * hs,

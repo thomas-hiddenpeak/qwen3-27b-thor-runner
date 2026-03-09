@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cstdint>
 
 namespace qwen_thor {
 namespace core { struct QuantizedWeight; }
@@ -70,6 +71,55 @@ void invoke_fp4_gemm_add(
 // cuBLASLt FP4 handle 初始化/清理 (在 model 加载后调用一次)
 void init_fp4_cublaslt();
 void cleanup_fp4_cublaslt();
+
+// ============================================================================
+// FP4 Grouped Expert GEMV — MoE expert 路径
+// 权重布局: 所有 expert 的行连续打包
+//   packed: [E * N_per_expert, K/2]   (contiguous, expert e at row offset e*N)
+//   scale:  [E * N_per_expert, K/16]  (contiguous, expert e at row offset e*N)
+// ============================================================================
+
+// FP4 Grouped Expert Gate+Up GEMV:
+// 对 T*top_k 个 assignment, 用 expert_indices 选择 expert
+// shared_input=true: post_norm[T, K] → 每个 token 共享输入
+// 输出: outputs[T*top_k, 2*moe_is]
+void invoke_fp4_grouped_expert_gemv(
+    const __nv_bfloat16* inputs,         // [T, K] (shared) or [T*top_k, K]
+    const uint8_t* packed_weights,       // [E * N, K/2] all experts
+    const uint8_t* packed_scales,        // [E * N, K/16]
+    const float* inv_global_scales,      // [E] per-expert 1/global_scale
+    __nv_bfloat16* outputs,              // [T*top_k, N]
+    const int* expert_indices,           // [T*top_k] on device
+    int N, int K,                        // N = per-expert output dim, K = input dim
+    int top_k, bool shared_input,
+    cudaStream_t stream = nullptr,
+    int num_tokens = 1
+);
+
+// FP4 Grouped Expert SwiGLU + Down GEMV:
+// gate_up[T*top_k, 2*K_down] → SwiGLU → GEMV with down weights → outputs[T*top_k, N]
+void invoke_fp4_grouped_expert_gemv_swiglu(
+    const __nv_bfloat16* gate_up_outputs,  // [T*top_k, 2*K_down]
+    const uint8_t* packed_weights,         // [E * N, K_down/2]
+    const uint8_t* packed_scales,          // [E * N, K_down/16]
+    const float* inv_global_scales,        // [E] per-expert 1/global_scale
+    __nv_bfloat16* outputs,                // [T*top_k, N]
+    const int* expert_indices,             // [T*top_k]
+    int N, int K,                          // N = hs, K = moe_is
+    int top_k,
+    cudaStream_t stream = nullptr,
+    int num_tokens = 1
+);
+
+// FP4 Dual GEMV for shared expert: gate + up, shared input A
+void invoke_fp4_dual_gemv_shared_expert(
+    const __nv_bfloat16* A,              // [1, K]
+    const core::QuantizedWeight& gate_qw,
+    const core::QuantizedWeight& up_qw,
+    __nv_bfloat16* C_gate,               // [1, N]
+    __nv_bfloat16* C_up,                 // [1, N]
+    cudaStream_t stream = nullptr
+);
 
 } // namespace ops
 } // namespace qwen_thor

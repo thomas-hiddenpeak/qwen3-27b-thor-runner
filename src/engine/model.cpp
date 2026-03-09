@@ -265,26 +265,213 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
             return qw;
         };
 
+        // Build ptr→idx map for releasing individual expert weights after packing
+        std::unordered_map<void*, size_t> fp4_ptr_idx;
+        for (size_t j = 0; j < device_weights_.size(); j++) {
+            if (device_weights_[j]) fp4_ptr_idx[device_weights_[j]] = j;
+        }
+        auto release_raw = [&](void* ptr) {
+            if (!ptr) return;
+            auto it = fp4_ptr_idx.find(ptr);
+            if (it != fp4_ptr_idx.end()) {
+                cudaFree(ptr);
+                device_weights_[it->second] = nullptr;
+                fp4_ptr_idx.erase(it);
+            }
+        };
+
         for (int i = 0; i < config_.num_hidden_layers; ++i) {
             std::string p = "model.language_model.layers." + std::to_string(i) + ".";
-            auto gate_qw = make_qw(p + "mlp.gate_proj");
-            auto up_qw   = make_qw(p + "mlp.up_proj");
-            auto down_qw = make_qw(p + "mlp.down_proj");
-            if (config_.is_full_attention(i)) {
-                auto q_qw = make_qw(p + "self_attn.q_proj");
-                auto k_qw = make_qw(p + "self_attn.k_proj");
-                auto v_qw = make_qw(p + "self_attn.v_proj");
-                auto o_qw = make_qw(p + "self_attn.o_proj");
-                layers_[i].get_full_attn()->set_quantized_attn(q_qw, k_qw, v_qw, o_qw);
-                layers_[i].get_full_attn()->set_quantized_mlp(gate_qw, up_qw, down_qw);
+
+            if (config_.is_moe) {
+                // ============================================================
+                // NVFP4 MoE: pack individual expert FP4 weights into contiguous
+                // buffers and bind shared expert FP4 weights
+                // ============================================================
+                const int E      = config_.num_experts;
+                const int moe_is = config_.moe_intermediate_size;
+                const int hs     = config_.hidden_size;
+
+                // -- Expert gate+up: each expert has gate[moe_is, hs] + up[moe_is, hs]
+                // Pack into contiguous: [E * 2*moe_is, hs/2] packed, [E * 2*moe_is, hs/16] scale
+                const int gu_N = 2 * moe_is;       // per-expert output dim
+                const int gu_K = hs;                // input dim
+                const int gu_K_half = gu_K / 2;
+                const int gu_K_groups = gu_K / 16;
+                size_t gu_packed_total = (size_t)E * gu_N * gu_K_half;
+                size_t gu_scale_total  = (size_t)E * gu_N * gu_K_groups;
+
+                uint8_t* gu_packed_buf = nullptr;
+                uint8_t* gu_scale_buf  = nullptr;
+                cudaMalloc(&gu_packed_buf, gu_packed_total);
+                cudaMalloc(&gu_scale_buf,  gu_scale_total);
+                device_weights_.push_back(gu_packed_buf);
+                device_weights_.push_back(gu_scale_buf);
+
+                float gu_global_scale = 1.0f;
+                bool gu_gs_set = false;
+
+                // Per-expert inv_global_scale arrays (device + host staging)
+                std::vector<float> h_gu_inv_gs(E, 1.0f);
+
+                for (int e = 0; e < E; ++e) {
+                    std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
+                    auto gate_qw = make_qw(ep + "gate_proj");
+                    auto up_qw   = make_qw(ep + "up_proj");
+
+                    if (gate_qw.valid()) {
+                        h_gu_inv_gs[e] = 1.0f / gate_qw.global_scale;
+                    }
+
+                    // Destination offset for this expert: rows [e*gu_N .. e*gu_N + gu_N)
+                    size_t row_off = (size_t)e * gu_N;
+                    // gate rows [0..moe_is), up rows [moe_is..2*moe_is)
+                    if (gate_qw.valid()) {
+                        cudaMemcpy(gu_packed_buf + (row_off) * gu_K_half,
+                                   gate_qw.packed, (size_t)moe_is * gu_K_half,
+                                   cudaMemcpyDeviceToDevice);
+                        cudaMemcpy(gu_scale_buf + (row_off) * gu_K_groups,
+                                   gate_qw.scale, (size_t)moe_is * gu_K_groups,
+                                   cudaMemcpyDeviceToDevice);
+                        if (!gu_gs_set) { gu_global_scale = gate_qw.global_scale; gu_gs_set = true; }
+                        release_raw(gate_qw.packed);
+                        release_raw(gate_qw.scale);
+                    }
+                    if (up_qw.valid()) {
+                        cudaMemcpy(gu_packed_buf + (row_off + moe_is) * gu_K_half,
+                                   up_qw.packed, (size_t)moe_is * gu_K_half,
+                                   cudaMemcpyDeviceToDevice);
+                        cudaMemcpy(gu_scale_buf + (row_off + moe_is) * gu_K_groups,
+                                   up_qw.scale, (size_t)moe_is * gu_K_groups,
+                                   cudaMemcpyDeviceToDevice);
+                        release_raw(up_qw.packed);
+                        release_raw(up_qw.scale);
+                    }
+                }
+
+                // Upload per-expert inv_gs to device
+                float* d_gu_inv_gs = nullptr;
+                cudaMalloc(&d_gu_inv_gs, E * sizeof(float));
+                cudaMemcpy(d_gu_inv_gs, h_gu_inv_gs.data(), E * sizeof(float), cudaMemcpyHostToDevice);
+                device_weights_.push_back(d_gu_inv_gs);
+
+                // -- Expert down: each expert has down[hs, moe_is]
+                // Pack into contiguous: [E * hs, moe_is/2] packed, [E * hs, moe_is/16] scale
+                const int dn_N = hs;
+                const int dn_K = moe_is;
+                const int dn_K_half = dn_K / 2;
+                const int dn_K_groups = dn_K / 16;
+                size_t dn_packed_total = (size_t)E * dn_N * dn_K_half;
+                size_t dn_scale_total  = (size_t)E * dn_N * dn_K_groups;
+
+                uint8_t* dn_packed_buf = nullptr;
+                uint8_t* dn_scale_buf  = nullptr;
+                cudaMalloc(&dn_packed_buf, dn_packed_total);
+                cudaMalloc(&dn_scale_buf,  dn_scale_total);
+                device_weights_.push_back(dn_packed_buf);
+                device_weights_.push_back(dn_scale_buf);
+
+                float dn_global_scale = 1.0f;
+                bool dn_gs_set = false;
+
+                std::vector<float> h_dn_inv_gs(E, 1.0f);
+
+                for (int e = 0; e < E; ++e) {
+                    std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
+                    auto down_qw = make_qw(ep + "down_proj");
+                    size_t row_off = (size_t)e * dn_N;
+                    if (down_qw.valid()) {
+                        h_dn_inv_gs[e] = 1.0f / down_qw.global_scale;
+                        cudaMemcpy(dn_packed_buf + row_off * dn_K_half,
+                                   down_qw.packed, (size_t)dn_N * dn_K_half,
+                                   cudaMemcpyDeviceToDevice);
+                        cudaMemcpy(dn_scale_buf + row_off * dn_K_groups,
+                                   down_qw.scale, (size_t)dn_N * dn_K_groups,
+                                   cudaMemcpyDeviceToDevice);
+                        if (!dn_gs_set) { dn_global_scale = down_qw.global_scale; dn_gs_set = true; }
+                        release_raw(down_qw.packed);
+                        release_raw(down_qw.scale);
+                    }
+                }
+
+                float* d_dn_inv_gs = nullptr;
+                cudaMalloc(&d_dn_inv_gs, E * sizeof(float));
+                cudaMemcpy(d_dn_inv_gs, h_dn_inv_gs.data(), E * sizeof(float), cudaMemcpyHostToDevice);
+                device_weights_.push_back(d_dn_inv_gs);
+
+                // -- Build MoEWeights with FP4 fields
+                MoEWeights moe;
+                moe.router_w = get_ptr(p + "mlp.gate.weight");
+                moe.shared_expert_gate_w = get_ptr(p + "mlp.shared_expert_gate.weight");
+
+                // FP4 expert weights
+                moe.fp4_experts_gate_up_packed = gu_packed_buf;
+                moe.fp4_experts_gate_up_scale  = gu_scale_buf;
+                moe.fp4_experts_gate_up_inv_gs = d_gu_inv_gs;
+                moe.fp4_experts_gate_up_N      = gu_N;
+                moe.fp4_experts_gate_up_K      = gu_K;
+                moe.fp4_experts_down_packed    = dn_packed_buf;
+                moe.fp4_experts_down_scale     = dn_scale_buf;
+                moe.fp4_experts_down_inv_gs    = d_dn_inv_gs;
+                moe.fp4_experts_down_N         = dn_N;
+                moe.fp4_experts_down_K         = dn_K;
+
+                // FP4 shared expert weights
+                moe.shared_gate_qw = make_qw(p + "mlp.shared_expert.gate_proj");
+                moe.shared_up_qw   = make_qw(p + "mlp.shared_expert.up_proj");
+                moe.shared_down_qw = make_qw(p + "mlp.shared_expert.down_proj");
+
+                if (config_.is_full_attention(i)) {
+                    layers_[i].get_full_attn()->set_moe_weights(moe);
+                } else {
+                    layers_[i].get_linear_attn()->set_moe_weights(moe);
+                }
+
+                // Full attention: bind quantized self-attn projections
+                if (config_.is_full_attention(i)) {
+                    auto q_qw = make_qw(p + "self_attn.q_proj");
+                    auto k_qw = make_qw(p + "self_attn.k_proj");
+                    auto v_qw = make_qw(p + "self_attn.v_proj");
+                    auto o_qw = make_qw(p + "self_attn.o_proj");
+                    layers_[i].get_full_attn()->set_quantized_attn(q_qw, k_qw, v_qw, o_qw);
+                } else {
+                    // LinearAttn 投影 FP4
+                    auto qkv_qw = make_qw(p + "linear_attn.in_proj_qkv");
+                    auto z_qw   = make_qw(p + "linear_attn.in_proj_z");
+                    auto out_qw = make_qw(p + "linear_attn.out_proj");
+                    if (qkv_qw.valid()) {
+                        layers_[i].get_linear_attn()->set_quantized_attn(qkv_qw, z_qw, out_qw);
+                    }
+                }
+
+                if (i == 0) {
+                    std::cerr << "[Model] NVFP4 MoE layer 0: " << E << " experts packed ("
+                              << "gate_up " << gu_packed_total / 1048576 << "MB + "
+                              << "down " << dn_packed_total / 1048576 << "MB), "
+                              << "shared expert FP4=" << (moe.shared_gate_qw.valid() ? "yes" : "no")
+                              << std::endl;
+                }
             } else {
-                layers_[i].get_linear_attn()->set_quantized_mlp(gate_qw, up_qw, down_qw);
-                // LinearAttn 投影 FP4 (Kbenkhaled 模型有, Sehyo 模型无)
-                auto qkv_qw = make_qw(p + "linear_attn.in_proj_qkv");
-                auto z_qw   = make_qw(p + "linear_attn.in_proj_z");
-                auto out_qw = make_qw(p + "linear_attn.out_proj");
-                if (qkv_qw.valid()) {
-                    layers_[i].get_linear_attn()->set_quantized_attn(qkv_qw, z_qw, out_qw);
+                // Non-MoE NVFP4: bind dense MLP quantized weights
+                auto gate_qw = make_qw(p + "mlp.gate_proj");
+                auto up_qw   = make_qw(p + "mlp.up_proj");
+                auto down_qw = make_qw(p + "mlp.down_proj");
+                if (config_.is_full_attention(i)) {
+                    auto q_qw = make_qw(p + "self_attn.q_proj");
+                    auto k_qw = make_qw(p + "self_attn.k_proj");
+                    auto v_qw = make_qw(p + "self_attn.v_proj");
+                    auto o_qw = make_qw(p + "self_attn.o_proj");
+                    layers_[i].get_full_attn()->set_quantized_attn(q_qw, k_qw, v_qw, o_qw);
+                    layers_[i].get_full_attn()->set_quantized_mlp(gate_qw, up_qw, down_qw);
+                } else {
+                    layers_[i].get_linear_attn()->set_quantized_mlp(gate_qw, up_qw, down_qw);
+                    // LinearAttn 投影 FP4 (Kbenkhaled 模型有, Sehyo 模型无)
+                    auto qkv_qw = make_qw(p + "linear_attn.in_proj_qkv");
+                    auto z_qw   = make_qw(p + "linear_attn.in_proj_z");
+                    auto out_qw = make_qw(p + "linear_attn.out_proj");
+                    if (qkv_qw.valid()) {
+                        layers_[i].get_linear_attn()->set_quantized_attn(qkv_qw, z_qw, out_qw);
+                    }
                 }
             }
         }

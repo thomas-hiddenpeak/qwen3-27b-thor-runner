@@ -15,6 +15,9 @@
 #include <cublasLt.h>
 #include <iostream>
 
+// exp2f-based fast exp: exp(x) = exp2(x * LOG2E)
+static constexpr float LOG2E = 1.4426950408889634f;
+
 namespace qwen_thor {
 namespace ops {
 
@@ -638,6 +641,258 @@ void invoke_fp4_gemm_add(
                  &beta,
                  D, CUDA_R_16BF, N,
                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+// ============================================================================
+// FP4 Grouped Expert GEMV — MoE expert gate_up projection (T=1/T>1)
+//
+// All expert weights packed contiguously: expert e, row n at
+//   packed[(e*N + n) * K/2 ...], scale[(e*N + n) * K/16 ...]
+//
+// Grid:  (ceil(N/8), T*top_k), Block: 256 (8 warps)
+// Each warp computes one output element for one assignment
+// SMEM: LUT (64 bytes) + K bf16 for shared input
+// ============================================================================
+__global__ void fp4_grouped_expert_gemv_kernel(
+    const __nv_bfloat16* __restrict__ inputs,        // [T, K] or [T*top_k, K]
+    const uint8_t* __restrict__ packed_weights,      // [E*N, K/2]
+    const uint8_t* __restrict__ packed_scales,       // [E*N, K/16]
+    const float* __restrict__ inv_global_scales,     // [E] per-expert
+    __nv_bfloat16* __restrict__ outputs,             // [T*top_k, N]
+    const int* __restrict__ expert_indices,          // [T*top_k]
+    int N, int K,
+    bool shared_input, int top_k)
+{
+    constexpr int WARP_SIZE = 32;
+    constexpr int WARPS_PER_BLOCK = 8;
+
+    PDL_WAIT();
+    extern __shared__ char s_mem[];
+    float* s_lut = reinterpret_cast<float*>(s_mem);
+    __nv_bfloat16* s_A = reinterpret_cast<__nv_bfloat16*>(s_mem + 64);
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x & (WARP_SIZE - 1);
+    int out_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    int assign_idx = blockIdx.y;  // 0..T*top_k-1
+
+    // Load FP4 LUT
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = c_fp4_lut[threadIdx.x];
+
+    // Load input into SMEM
+    int input_idx = shared_input ? (assign_idx / top_k) : assign_idx;
+    const __nv_bfloat16* input = inputs + (size_t)input_idx * K;
+    for (int i = threadIdx.x; i < K; i += blockDim.x)
+        s_A[i] = input[i];
+    __syncthreads();
+
+    if (out_idx >= N) { PDL_SIGNAL(); return; }
+
+    int expert_id = expert_indices[assign_idx];
+    float inv_global_scale = inv_global_scales[expert_id];
+    size_t row = (size_t)expert_id * N + out_idx;
+
+    const int K_half = K >> 1;
+    const int K_groups = K >> 4;
+    const uint8_t* w_row = packed_weights + row * K_half;
+    const uint8_t* s_row = packed_scales  + row * K_groups;
+
+    float sum = 0.0f;
+
+    for (int g = lane_id; g < K_groups; g += WARP_SIZE) {
+        float group_scale = e4m3_to_float(s_row[g]) * inv_global_scale;
+
+        uint2 pack = *reinterpret_cast<const uint2*>(w_row + g * 8);
+        uint32_t lo = pack.x, hi = pack.y;
+        int k_base = g << 4;
+
+        float4 a4_lo = *reinterpret_cast<const float4*>(s_A + k_base);
+        float4 a4_hi = *reinterpret_cast<const float4*>(s_A + k_base + 8);
+        const __nv_bfloat162* a_lo = reinterpret_cast<const __nv_bfloat162*>(&a4_lo);
+        const __nv_bfloat162* a_hi = reinterpret_cast<const __nv_bfloat162*>(&a4_hi);
+
+        float group_dot = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint32_t byte_val = (lo >> (j * 8)) & 0xFF;
+            float2 af = __bfloat1622float2(a_lo[j]);
+            group_dot += af.x * s_lut[byte_val & 0xF]
+                       + af.y * s_lut[(byte_val >> 4) & 0xF];
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint32_t byte_val = (hi >> (j * 8)) & 0xFF;
+            float2 af = __bfloat1622float2(a_hi[j]);
+            group_dot += af.x * s_lut[byte_val & 0xF]
+                       + af.y * s_lut[(byte_val >> 4) & 0xF];
+        }
+
+        sum += group_dot * group_scale;
+    }
+
+    #pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1)
+        sum += __shfl_xor_sync(0xffffffff, sum, mask);
+
+    if (lane_id == 0) {
+        outputs[assign_idx * N + out_idx] = __float2bfloat16(sum);
+    }
+    PDL_SIGNAL();
+}
+
+void invoke_fp4_grouped_expert_gemv(
+    const __nv_bfloat16* inputs,
+    const uint8_t* packed_weights,
+    const uint8_t* packed_scales,
+    const float* inv_global_scales,
+    __nv_bfloat16* outputs,
+    const int* expert_indices,
+    int N, int K,
+    int top_k, bool shared_input,
+    cudaStream_t stream,
+    int num_tokens)
+{
+    constexpr int BLOCK = 256;
+    constexpr int WARPS = BLOCK / 32;
+    dim3 grid((N + WARPS - 1) / WARPS, num_tokens * top_k);
+    size_t smem = FP4_LUT_SMEM + K * sizeof(__nv_bfloat16);
+
+    PDL_LAUNCH(fp4_grouped_expert_gemv_kernel, grid, BLOCK, smem, stream,
+        inputs, packed_weights, packed_scales, inv_global_scales,
+        outputs, expert_indices, N, K, shared_input, top_k);
+}
+
+// ============================================================================
+// FP4 Grouped Expert SwiGLU + Down GEMV
+// gate_up[T*top_k, 2*K] → SwiGLU in SMEM → FP4 GEMV with down_proj
+// Grid: (ceil(N/8), T*top_k), Block: 256, SMEM: LUT(64) + 2*K bf16
+// ============================================================================
+__global__ void fp4_grouped_expert_gemv_swiglu_kernel(
+    const __nv_bfloat16* __restrict__ gate_up_outputs,  // [T*top_k, 2*K]
+    const uint8_t* __restrict__ packed_weights,         // [E*N, K/2]
+    const uint8_t* __restrict__ packed_scales,          // [E*N, K/16]
+    const float* __restrict__ inv_global_scales,        // [E] per-expert
+    __nv_bfloat16* __restrict__ outputs,                // [T*top_k, N]
+    const int* __restrict__ expert_indices,
+    int N, int K, int top_k)
+{
+    constexpr int WARP_SIZE = 32;
+    constexpr int WARPS_PER_BLOCK = 8;
+
+    PDL_WAIT();
+    extern __shared__ char s_mem[];
+    float* s_lut = reinterpret_cast<float*>(s_mem);
+    __nv_bfloat16* s_A = reinterpret_cast<__nv_bfloat16*>(s_mem + 64);  // [2*K] then [K] after SwiGLU
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x & (WARP_SIZE - 1);
+    int out_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    int assign_idx = blockIdx.y;
+
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = c_fp4_lut[threadIdx.x];
+
+    // Load gate+up (2*K) into SMEM
+    const __nv_bfloat16* input = gate_up_outputs + (size_t)assign_idx * 2 * K;
+    for (int i = threadIdx.x; i < 2 * K; i += blockDim.x)
+        s_A[i] = input[i];
+    __syncthreads();
+
+    // SwiGLU in-place: s_A[i] = silu(gate[i]) * up[i]
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        float gate = __bfloat162float(s_A[i]);
+        float up = __bfloat162float(s_A[K + i]);
+        float silu_val = gate / (1.0f + exp2f(-gate * LOG2E));
+        s_A[i] = __float2bfloat16(silu_val * up);
+    }
+    __syncthreads();
+
+    if (out_idx >= N) { PDL_SIGNAL(); return; }
+
+    int expert_id = expert_indices[assign_idx];
+    float inv_global_scale = inv_global_scales[expert_id];
+    size_t row = (size_t)expert_id * N + out_idx;
+
+    const int K_half = K >> 1;
+    const int K_groups = K >> 4;
+    const uint8_t* w_row = packed_weights + row * K_half;
+    const uint8_t* s_row = packed_scales  + row * K_groups;
+
+    float sum = 0.0f;
+
+    for (int g = lane_id; g < K_groups; g += WARP_SIZE) {
+        float group_scale = e4m3_to_float(s_row[g]) * inv_global_scale;
+
+        uint2 pack = *reinterpret_cast<const uint2*>(w_row + g * 8);
+        uint32_t lo = pack.x, hi = pack.y;
+        int k_base = g << 4;
+
+        float4 a4_lo = *reinterpret_cast<const float4*>(s_A + k_base);
+        float4 a4_hi = *reinterpret_cast<const float4*>(s_A + k_base + 8);
+        const __nv_bfloat162* a_lo = reinterpret_cast<const __nv_bfloat162*>(&a4_lo);
+        const __nv_bfloat162* a_hi = reinterpret_cast<const __nv_bfloat162*>(&a4_hi);
+
+        float group_dot = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint32_t byte_val = (lo >> (j * 8)) & 0xFF;
+            float2 af = __bfloat1622float2(a_lo[j]);
+            group_dot += af.x * s_lut[byte_val & 0xF]
+                       + af.y * s_lut[(byte_val >> 4) & 0xF];
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint32_t byte_val = (hi >> (j * 8)) & 0xFF;
+            float2 af = __bfloat1622float2(a_hi[j]);
+            group_dot += af.x * s_lut[byte_val & 0xF]
+                       + af.y * s_lut[(byte_val >> 4) & 0xF];
+        }
+
+        sum += group_dot * group_scale;
+    }
+
+    #pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1)
+        sum += __shfl_xor_sync(0xffffffff, sum, mask);
+
+    if (lane_id == 0) {
+        outputs[assign_idx * N + out_idx] = __float2bfloat16(sum);
+    }
+    PDL_SIGNAL();
+}
+
+void invoke_fp4_grouped_expert_gemv_swiglu(
+    const __nv_bfloat16* gate_up_outputs,
+    const uint8_t* packed_weights,
+    const uint8_t* packed_scales,
+    const float* inv_global_scales,
+    __nv_bfloat16* outputs,
+    const int* expert_indices,
+    int N, int K,
+    int top_k,
+    cudaStream_t stream,
+    int num_tokens)
+{
+    constexpr int BLOCK = 256;
+    constexpr int WARPS = BLOCK / 32;
+    dim3 grid((N + WARPS - 1) / WARPS, num_tokens * top_k);
+    size_t smem = FP4_LUT_SMEM + 2 * K * sizeof(__nv_bfloat16);
+
+    PDL_LAUNCH(fp4_grouped_expert_gemv_swiglu_kernel, grid, BLOCK, smem, stream,
+        gate_up_outputs, packed_weights, packed_scales, inv_global_scales,
+        outputs, expert_indices, N, K, top_k);
+}
+
+// FP4 Dual GEMV for shared expert — reuses existing fp4_dual_gemv_kernel
+void invoke_fp4_dual_gemv_shared_expert(
+    const __nv_bfloat16* A,
+    const core::QuantizedWeight& gate_qw,
+    const core::QuantizedWeight& up_qw,
+    __nv_bfloat16* C_gate,
+    __nv_bfloat16* C_up,
+    cudaStream_t stream)
+{
+    // Delegate to existing dual GEMV implementation
+    invoke_fp4_dual_gemv(A, gate_qw, up_qw, C_gate, C_up, stream);
 }
 
 } // namespace ops
