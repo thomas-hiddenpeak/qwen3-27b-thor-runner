@@ -3761,7 +3761,7 @@ Qwen3.5-27B 的 48 层 Linear Attention (GDN) 各持有一个 SSM state 矩阵 `
 
 #### 功能验证
 
-编译通过, `./qwen3-27b-thor test` 全部 PASS, 交互式 chat 正常回答。
+编译通过, `./qwen35-thor test` 全部 PASS, 交互式 chat 正常回答。
 
 #### B=1 性能回归测试
 
@@ -3782,7 +3782,7 @@ Qwen3.5-27B 的 48 层 Linear Attention (GDN) 各持有一个 SSM state 矩阵 `
 
 #### Batched Decode A/B 对比 (背靠背测量)
 
-测试命令: `./qwen3-27b-thor bench --decode 20 --warmup 5 --batch B --kv-cache-gb 8`
+测试命令: `./qwen35-thor bench --decode 20 --warmup 5 --batch B --kv-cache-gb 8`
 
 | Batch | FP32 ITL (ms) | BF16 ITL (ms) | Δ ITL | FP32 tok/s | BF16 tok/s | **Δ tok/s** | FP32 BW (GB/s) | BF16 BW (GB/s) |
 |------:|--------------:|--------------:|------:|-----------:|-----------:|----------:|---------:|---------:|

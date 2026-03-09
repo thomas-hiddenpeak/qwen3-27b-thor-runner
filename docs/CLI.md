@@ -1,9 +1,9 @@
-# CLI Reference — qwen3-27b-thor
+# CLI Reference — qwen35-thor
 
 ## Synopsis
 
 ```
-qwen3-27b-thor <command> [options]
+qwen35-thor <command> [options]
 ```
 
 ## Commands
@@ -128,71 +128,71 @@ qwen3-27b-thor <command> [options]
 
 ```bash
 # 27B BF16 (默认)
-qwen3-27b-thor serve --config configs/qwen3.5-27b.conf
+qwen35-thor serve --config configs/qwen3.5-27b.conf
 
 # 9B BF16
-qwen3-27b-thor serve --config configs/qwen3.5-9b.conf
+qwen35-thor serve --config configs/qwen3.5-9b.conf
 
 # 4B BF16
-qwen3-27b-thor serve --config configs/qwen3.5-4b.conf
+qwen35-thor serve --config configs/qwen3.5-4b.conf
 
 # 27B NVFP4 (量化)
-qwen3-27b-thor serve --config configs/qwen3.5-27b-nvfp4.conf
+qwen35-thor serve --config configs/qwen3.5-27b-nvfp4.conf
 ```
 
 ### SSD 缓存加速
 
 ```bash
 # 启用 SSD 前缀缓存 (4GB GPU + 20GB SSD)
-qwen3-27b-thor serve --config configs/qwen3.5-27b.conf --cache-enable --cache-max-gb 20
+qwen35-thor serve --config configs/qwen3.5-27b.conf --cache-enable --cache-max-gb 20
 
 # 256K 超长上下文 (8GB GPU + SSD offload)
-qwen3-27b-thor serve --kv-cache-gb 8 --cache-enable --cache-dir /mnt/nvme/kv_cache
+qwen35-thor serve --kv-cache-gb 8 --cache-enable --cache-dir /mnt/nvme/kv_cache
 ```
 
 ### 交互式 Chat
 
 ```bash
 # 默认设置
-qwen3-27b-thor chat --config configs/qwen3.5-27b.conf
+qwen35-thor chat --config configs/qwen3.5-27b.conf
 
 # 高温采样
-qwen3-27b-thor chat --temperature 0.8 --top-p 0.95 --max-tokens 4096
+qwen35-thor chat --temperature 0.8 --top-p 0.95 --max-tokens 4096
 ```
 
 ### 性能评估
 
 ```bash
 # 基础 benchmark
-qwen3-27b-thor bench --decode 30
+qwen35-thor bench --decode 30
 
 # 参数扫描 (多 batch × 多 prompt 长度 × 多迭代)
-qwen3-27b-thor bench --batch 1,2,4 --prompt-len 64,256 --iterations 3 --json results.json
+qwen35-thor bench --batch 1,2,4 --prompt-len 64,256 --iterations 3 --json results.json
 
 # 长上下文 benchmark
-qwen3-27b-thor bench --prompt-len 4096 --decode 50
+qwen35-thor bench --prompt-len 4096 --decode 50
 
 # CSV 输出
-qwen3-27b-thor bench --decode 100 --csv > results.csv
+qwen35-thor bench --decode 100 --csv > results.csv
 
 # nsys profiling
-nsys profile --trace=cuda,nvtx -o profile qwen3-27b-thor bench --decode 10 --nsys
+nsys profile --trace=cuda,nvtx -o profile qwen35-thor bench --decode 10 --nsys
 ```
 
 ### 测试
 
 ```bash
 # 快速 unit 测试
-qwen3-27b-thor test
+qwen35-thor test
 
 # 列出全部测试
-qwen3-27b-thor test --all --list
+qwen35-thor test --all --list
 
 # 按名称过滤
-qwen3-27b-thor test --filter gemm
+qwen35-thor test --filter gemm
 
 # 只跑 integration 类别
-qwen3-27b-thor test --category integration
+qwen35-thor test --category integration
 ```
 
 ### API 调用示例

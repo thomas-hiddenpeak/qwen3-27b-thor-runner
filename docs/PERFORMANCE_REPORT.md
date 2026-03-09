@@ -1,4 +1,4 @@
-# Qwen3.5 CUDA Inference Engine — 性能测试报告
+# Qwen3.5-Thor — 性能测试报告
 
 > 测试平台: NVIDIA Jetson AGX Thor (SM110a Blackwell)
 > CPU: 14-core Arm Neoverse V3AE @ 2601 MHz

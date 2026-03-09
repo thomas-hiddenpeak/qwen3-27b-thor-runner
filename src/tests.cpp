@@ -1,11 +1,11 @@
 // tests.cpp — 单元测试集合
 //
 // 测试框架:
-//   qwen3-27b-thor test                    运行所有 unit 测试
-//   qwen3-27b-thor test --list             列出所有可用测试
-//   qwen3-27b-thor test --filter gemm      运行名称含 "gemm" 的测试
-//   qwen3-27b-thor test --category unit    只运行 unit 类别
-//   qwen3-27b-thor test --all              运行所有测试 (含 integration/benchmark)
+//   qwen35-thor test                    运行所有 unit 测试
+//   qwen35-thor test --list             列出所有可用测试
+//   qwen35-thor test --filter gemm      运行名称含 "gemm" 的测试
+//   qwen35-thor test --category unit    只运行 unit 类别
+//   qwen35-thor test --all              运行所有测试 (含 integration/benchmark)
 //
 // 类别:
 //   unit         — 快速, 不需要模型权重, <10s

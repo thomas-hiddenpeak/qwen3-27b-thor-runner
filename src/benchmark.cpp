@@ -1,7 +1,7 @@
 // benchmark.cpp — 专用性能评估程序 (无 IPC 依赖)
 //
 // 用法:
-//   ./qwen3-27b-thor bench [--warmup N] [--decode N] [--prompt-len N] [--nsys] [--csv]
+//   ./qwen35-thor bench [--warmup N] [--decode N] [--prompt-len N] [--nsys] [--csv]
 //
 // 增强:
 //   --batch 1,2,4,8            逗号分隔, 自动扫描所有 batch size
@@ -15,10 +15,10 @@
 //   --csv                      CSV 输出
 //
 // nsys 用法:
-//   nsys profile --trace=cuda,nvtx -o profile ./qwen3-27b-thor bench --decode 30 --nsys
+//   nsys profile --trace=cuda,nvtx -o profile ./qwen35-thor bench --decode 30 --nsys
 //
 // ncu 用法 (单步):
-//   ncu --target-processes all --set full -o ncu_report ./qwen3-27b-thor bench --decode 3 --nsys
+//   ncu --target-processes all --set full -o ncu_report ./qwen35-thor bench --decode 3 --nsys
 
 #include <iostream>
 #include <iomanip>
@@ -224,7 +224,7 @@ BenchConfig parse_args(int argc, char** argv) {
         else if (arg == "--per-step")  cfg.per_step   = true;
         else if (arg == "--no-graph")  cfg.no_graph   = true;
         else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: qwen3-27b-thor bench [options]\n"
+            std::cout << "Usage: qwen35-thor bench [options]\n"
                       << "  --warmup N            Warmup decode steps (default: 5)\n"
                       << "  --decode N            Benchmark decode steps (default: 50)\n"
                       << "  --prompt-len N[,N..]  Prompt token count(s), comma-separated (default: 17)\n"

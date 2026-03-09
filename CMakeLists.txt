@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24 FATAL_ERROR)
-project(qwen_thor LANGUAGES CXX CUDA)
+project(qwen35_thor LANGUAGES CXX CUDA)
 
 # ============================================================================
 # 编译标准
@@ -43,17 +43,17 @@ file(GLOB_RECURSE ENGINE_SOURCES
     "src/engine/*.cu"
 )
 
-add_library(qwen_thor_engine STATIC ${ENGINE_SOURCES})
-target_link_libraries(qwen_thor_engine PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt rt dl)
+add_library(qwen35_thor_engine STATIC ${ENGINE_SOURCES})
+target_link_libraries(qwen35_thor_engine PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt rt dl)
 
 # ============================================================================
-# 主可执行文件: qwen3-27b-thor
+# 主可执行文件: qwen35-thor
 # ============================================================================
-add_executable(qwen3-27b-thor
+add_executable(qwen35-thor
     src/main.cpp
     src/tests.cpp
     src/benchmark.cpp
     src/serve/serve.cpp
     src/tui/tui.cpp
 )
-target_link_libraries(qwen3-27b-thor PRIVATE qwen_thor_engine)
+target_link_libraries(qwen35-thor PRIVATE qwen35_thor_engine)

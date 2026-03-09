@@ -1,8 +1,8 @@
-# Qwen3.5 CUDA Inference Engine — Copilot 项目指令
+# Qwen3.5-Thor — Copilot 项目指令
 
 ## 项目概述
 
-运行在 NVIDIA Jetson AGX Thor (SM110a Blackwell) 上的 Qwen3.5 推理引擎。支持 27B/9B/4B 模型，BF16 + NVFP4 (W4A16) 精度。C++17 / CUDA，目标是极致性能与稳定。
+运行在 NVIDIA Jetson AGX Thor (SM110a Blackwell) 上的 Qwen3.5 推理引擎。支持 4B/9B/27B Dense + 35B-A3B/122B-A10B MoE 模型，BF16 + NVFP4 (W4A16) 精度。C++17 / CUDA，目标是极致性能与稳定。
 
 ## 硬件规格 (Jetson AGX Thor)
 
@@ -217,18 +217,18 @@ src/
 
 ```bash
 mkdir -p build && cd build && cmake .. && make -j$(nproc)
-# 产物: build/qwen3-27b-thor
+# 产物: build/qwen35-thor
 # 运行 (推荐使用统一配置文件 configs/qwen3.5-27b.conf):
-#   ./build/qwen3-27b-thor serve --config configs/qwen3.5-27b.conf
-#   ./build/qwen3-27b-thor chat  --config configs/qwen3.5-27b.conf
-#   ./build/qwen3-27b-thor bench --decode 30 --batch 1,2,4 --iterations 3 --json results.json
-#   ./build/qwen3-27b-thor test --list
-#   ./build/qwen3-27b-thor test --all
+#   ./build/qwen35-thor serve --config configs/qwen3.5-27b.conf
+#   ./build/qwen35-thor chat  --config configs/qwen3.5-27b.conf
+#   ./build/qwen35-thor bench --decode 30 --batch 1,2,4 --iterations 3 --json results.json
+#   ./build/qwen35-thor test --list
+#   ./build/qwen35-thor test --all
 # 多模型 (自动从 config.json 检测架构):
-#   ./build/qwen3-27b-thor serve --config configs/qwen3.5-4b.conf
-#   ./build/qwen3-27b-thor serve --config configs/qwen3.5-27b-nvfp4.conf
+#   ./build/qwen35-thor serve --config configs/qwen3.5-4b.conf
+#   ./build/qwen35-thor serve --config configs/qwen3.5-27b-nvfp4.conf
 # 也可单独覆盖 serve 配置:
-#   ./build/qwen3-27b-thor serve --config configs/qwen3.5-27b.conf --serve-config configs/serve.conf
+#   ./build/qwen35-thor serve --config configs/qwen3.5-27b.conf --serve-config configs/serve.conf
 ```
 
 ## 工作流规范
@@ -259,7 +259,7 @@ bench: B=1 baseline 229.2ms ITL / 218.3ms fwd / 223.6 GB/s
 ## 临时文件
 
 - 调试日志、临时输出一律写到 `tmp/` 目录 (已加入 `.gitignore`)
-- 例如: `./build/qwen3-27b-thor serve ... > tmp/debug.log 2>&1`
+- 例如: `./build/qwen35-thor serve ... > tmp/debug.log 2>&1`
 - 不要使用 `/tmp/` 等系统目录，避免需要额外授权
 
 ## 沟通规范

@@ -70,7 +70,7 @@
 
 #### 实测结果 (2026-03-05, MAXN, Statistical Edition: 20 trials, 5 warmup)
 
-运行命令: `./build/qwen3-27b-thor probe`
+运行命令: `./build/qwen35-thor probe`
 
 ##### TMEM / UMMA / TMA (片上原语, CV=0.0% ★★★)
 
@@ -269,12 +269,12 @@ L3: Op         — GEMV / DeltaNet / Attention / RMSNorm / SiLU 等
 
 ```bash
 # Level 1: 宏观 timeline — 识别热点层
-nsys profile --trace=cuda,nvtx -o baseline ./build/qwen3-27b-thor chat --rounds 3
+nsys profile --trace=cuda,nvtx -o baseline ./build/qwen35-thor chat --rounds 3
 
 # Level 2: 微观 kernel 分析 — 锁定热点后
 ncu --replay-mode application --set full \
     --kernel-name "gated_delta_net_kernel|paged_attention_kernel" \
-    ./build/qwen3-27b-thor chat --rounds 1
+    ./build/qwen35-thor chat --rounds 1
 ```
 
 **状态**: 未开始 — 需插入 NVTX 标记 (~20 处) + CMake 配置

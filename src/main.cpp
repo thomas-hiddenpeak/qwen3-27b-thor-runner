@@ -8,11 +8,11 @@
 //   version   — 打印版本信息
 //
 // 用法:
-//   qwen3-27b-thor serve  [--config engine.conf] [--port 11434] [--host 0.0.0.0]
-//   qwen3-27b-thor chat   [--config engine.conf] [--max-tokens 2048]
-//   qwen3-27b-thor bench  [--warmup 5] [--decode 30] [--prompt-len 64]
-//   qwen3-27b-thor test
-//   qwen3-27b-thor --help
+//   qwen35-thor serve  [--config engine.conf] [--port 11434] [--host 0.0.0.0]
+//   qwen35-thor chat   [--config engine.conf] [--max-tokens 2048]
+//   qwen35-thor bench  [--warmup 5] [--decode 30] [--prompt-len 64]
+//   qwen35-thor test
+//   qwen35-thor --help
 
 #include "engine/backend.h"
 #include "serve/serve.h"
@@ -57,11 +57,11 @@ static const char* AUTHOR = "Thomas";
 
 static void print_usage() {
     printf("\n");
-    printf("  Qwen3.5-27B Thor Inference Engine  v%s  (%s)\n", VERSION, BUILD_DATE);
+    printf("  Qwen3.5-Thor Inference Engine  v%s  (%s)\n", VERSION, BUILD_DATE);
     printf("  Author: %s\n", AUTHOR);
     printf("  NVIDIA Jetson AGX Thor • SM110a Blackwell • 128GB LPDDR5X • BF16\n\n");
     printf("  Usage:\n");
-    printf("    qwen3-27b-thor <command> [options]\n\n");
+    printf("    qwen35-thor <command> [options]\n\n");
     printf("  Commands:\n");
     printf("    serve       Start HTTP API server (Ollama/OpenAI compatible)\n");
     printf("    chat        Start interactive TUI chat\n");
@@ -108,21 +108,21 @@ static void print_usage() {
     printf("    --nsys                Enable NVTX annotations for nsys profiling\n\n");
     printf("  Examples:\n");
     printf("    # Start API server with 8GB KV cache + SSD caching\n");
-    printf("    qwen3-27b-thor serve --kv-cache-gb 8 --cache-enable\n\n");
+    printf("    qwen35-thor serve --kv-cache-gb 8 --cache-enable\n\n");
     printf("    # Interactive chat with default settings\n");
-    printf("    qwen3-27b-thor chat --kv-cache-gb 4\n\n");
+    printf("    qwen35-thor chat --kv-cache-gb 4\n\n");
     printf("    # Load from unified config file\n");
-    printf("    qwen3-27b-thor serve --config configs/config.conf\n\n");
+    printf("    qwen35-thor serve --config configs/qwen3.5-27b.conf\n\n");
     printf("    # Run benchmarks (single config, backward-compatible)\n");
-    printf("    qwen3-27b-thor bench --decode 50 --no-graph\n\n");
+    printf("    qwen35-thor bench --decode 50 --no-graph\n\n");
     printf("    # Parameter sweep with JSON output\n");
-    printf("    qwen3-27b-thor bench --batch 1,2,4 --prompt-len 64,256 --iterations 3 --json results.json\n\n");
+    printf("    qwen35-thor bench --batch 1,2,4 --prompt-len 64,256 --iterations 3 --json results.json\n\n");
     printf("    # SM110a hardware primitives probe\n");
-    printf("    qwen3-27b-thor probe\n\n");
+    printf("    qwen35-thor probe\n\n");
 }
 
 static void print_version() {
-    printf("qwen3-27b-thor v%s (%s)\n", VERSION, BUILD_DATE);
+    printf("qwen35-thor v%s (%s)\n", VERSION, BUILD_DATE);
     printf("  Author:  %s\n", AUTHOR);
     printf("  Device:  NVIDIA Jetson AGX Thor, 128GB LPDDR5X\n");
     printf("  Target:  SM110a Blackwell, 20 SMs, 5th-gen Tensor Cores\n");
@@ -289,7 +289,7 @@ int main(int argc, char** argv) {
     }
     else {
         std::cerr << "Unknown command: " << cmd << "\n";
-        std::cerr << "Run 'qwen3-27b-thor --help' for usage.\n";
+        std::cerr << "Run 'qwen35-thor --help' for usage.\n";
         rc = 1;
     }
 

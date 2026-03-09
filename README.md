@@ -1,6 +1,6 @@
-# Qwen3.5 Thor Inference Engine
+# Qwen3.5-Thor Inference Engine
 
-High-performance BF16 / NVFP4 inference engine for **Qwen3.5** model family (27B / 9B / 4B) on **NVIDIA Jetson AGX Thor** (SM110a Blackwell), written in C++17 / CUDA.
+High-performance BF16 / NVFP4 inference engine for **Qwen3.5** model family (4B / 9B / 27B / 35B-A3B MoE / 122B-A10B MoE) on **NVIDIA Jetson AGX Thor** (SM110a Blackwell), written in C++17 / CUDA.
 
 > **Note:** Model weights are not included. Download from [Hugging Face](https://huggingface.co/Qwen) and set `model_dir` in config.  
 > Supported: [Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B) · [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) · [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) · NVFP4 quantized variants
@@ -59,22 +59,22 @@ make -j$(nproc)
 # Supports: Qwen3.5-27B / 9B / 4B (BF16 or NVFP4)
 
 # Start HTTP API server (Ollama + OpenAI dual-port)
-./build/qwen3-27b-thor serve --config configs/qwen3.5-27b.conf
+./build/qwen35-thor serve --config configs/qwen3.5-27b.conf
 
 # Interactive TUI chat
-./build/qwen3-27b-thor chat --config configs/qwen3.5-27b.conf
+./build/qwen35-thor chat --config configs/qwen3.5-27b.conf
 
 # Benchmarks (parameter sweep with statistics)
-./build/qwen3-27b-thor bench --decode 30 --batch 1,2,4 --prompt-len 64,256 --iterations 3
+./build/qwen35-thor bench --decode 30 --batch 1,2,4 --prompt-len 64,256 --iterations 3
 
 # Unit tests
-./build/qwen3-27b-thor test              # run unit tests only
-./build/qwen3-27b-thor test --list       # list all tests
-./build/qwen3-27b-thor test --all        # run all (unit + integration + benchmark)
-./build/qwen3-27b-thor test --filter kv  # filter by name
+./build/qwen35-thor test              # run unit tests only
+./build/qwen35-thor test --list       # list all tests
+./build/qwen35-thor test --all        # run all (unit + integration + benchmark)
+./build/qwen35-thor test --filter kv  # filter by name
 
 # Version info
-./build/qwen3-27b-thor version
+./build/qwen35-thor version
 ```
 
 ## API
