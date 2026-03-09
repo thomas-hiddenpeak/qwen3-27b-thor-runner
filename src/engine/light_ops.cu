@@ -3,6 +3,7 @@
 #include "pdl.h"
 #include "tma_utils.h"
 #include <cuda_bf16.h>
+#include <curand_kernel.h>
 #include <stdio.h>
 #include <algorithm>
 #include <math.h>
@@ -1990,6 +1991,210 @@ void invoke_fused_moe_final(
     PDL_LAUNCH(fused_moe_final_kernel, 1, 256, 0, stream,
         out, expert_outputs, expert_weights, shared_down,
         hidden, gate_w, residual, n, K, top_k);
+}
+
+// ============================================================================
+// GPU Sampling: Apply Penalties
+// ============================================================================
+// Parallel over num_penalties entries. Each thread handles one penalty token.
+// Modifies BF16 logits in-place (BF16 precision is sufficient for sampling).
+__global__ void apply_penalties_kernel(
+    __nv_bfloat16* __restrict__ logits,
+    const int* __restrict__ token_ids,
+    const int* __restrict__ token_counts,
+    int num_penalties,
+    float repeat_penalty,
+    float freq_penalty,
+    float pres_penalty)
+{
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= num_penalties) return;
+
+    int tok_id = token_ids[idx];
+    int count  = token_counts[idx];
+
+    float logit = __bfloat162float(logits[tok_id]);
+
+    // Repeat penalty (Llama/Qwen style)
+    if (repeat_penalty != 1.0f) {
+        if (logit > 0.0f) logit /= repeat_penalty;
+        else              logit *= repeat_penalty;
+    }
+    // Frequency penalty (OpenAI style)
+    logit -= freq_penalty * count;
+    // Presence penalty (OpenAI style)
+    logit -= pres_penalty;
+
+    logits[tok_id] = __float2bfloat16(logit);
+}
+
+// ============================================================================
+// GPU Sampling: Top-K + Softmax + Top-p + Min-p + Multinomial
+// ============================================================================
+// 1 block of 1024 threads. Iterative argmax to find top-k candidates,
+// masking each winner with -inf. Then thread 0 does softmax + truncation
+// + multinomial sampling via curand Philox.
+//
+// Cost: top_k passes over vocab_size BF16 elements.
+// For k=20, vocab=248320: 20×484KB = 9.4MB reads → ~0.04ms at 220 GB/s.
+//
+// MAX_K=64 (clamped in wrapper). Shared memory: 1024*8 + 64*8 = 8.5KB.
+#define GPU_SAMPLING_MAX_K 64
+
+__global__ void topk_sampling_kernel(
+    __nv_bfloat16* __restrict__ logits,
+    int* __restrict__ result,
+    int vocab_size,
+    int top_k,           // <= GPU_SAMPLING_MAX_K
+    float inv_temp,      // 1.0 / temperature
+    float top_p,
+    float min_p,
+    unsigned long long seed,
+    unsigned long long offset)
+{
+    PDL_WAIT();
+
+    __shared__ float s_vals[1024];
+    __shared__ int   s_idxs[1024];
+    __shared__ float  s_topk_vals[GPU_SAMPLING_MAX_K];
+    __shared__ int    s_topk_idxs[GPU_SAMPLING_MAX_K];
+
+    int tid = threadIdx.x;
+
+    // Phase 1: Iterative argmax to find top-k candidates
+    for (int ki = 0; ki < top_k; ki++) {
+        float local_max = -1e30f;
+        int   local_idx = 0;
+
+        for (int i = tid; i < vocab_size; i += blockDim.x) {
+            float v = __bfloat162float(logits[i]);
+            if (v > local_max) {
+                local_max = v;
+                local_idx = i;
+            }
+        }
+
+        s_vals[tid] = local_max;
+        s_idxs[tid] = local_idx;
+        __syncthreads();
+
+        // Tree reduction to find global max
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                if (s_vals[tid + stride] > s_vals[tid]) {
+                    s_vals[tid] = s_vals[tid + stride];
+                    s_idxs[tid] = s_idxs[tid + stride];
+                }
+            }
+            __syncthreads();
+        }
+
+        // Thread 0: record winner and mask it out
+        if (tid == 0) {
+            s_topk_vals[ki] = s_vals[0];
+            s_topk_idxs[ki] = s_idxs[0];
+            logits[s_idxs[0]] = __float2bfloat16(-1e30f);
+        }
+        __syncthreads();
+    }
+
+    // Phase 2: Thread 0 does softmax + top-p + min-p + sample
+    if (tid == 0) {
+        int k = top_k;
+
+        // Apply temperature and compute softmax
+        float max_val = s_topk_vals[0] * inv_temp;
+        float sum = 0.0f;
+        for (int i = 0; i < k; i++) {
+            float scaled = s_topk_vals[i] * inv_temp;
+            float p = exp2f((scaled - max_val) * LOG2E);  // exp(x) = exp2(x * log2e)
+            s_topk_vals[i] = p;
+            sum += p;
+        }
+        float inv_sum = 1.0f / sum;
+        for (int i = 0; i < k; i++) s_topk_vals[i] *= inv_sum;
+
+        // Top-p (nucleus) truncation
+        int cutoff = k;
+        if (top_p < 1.0f && top_p > 0.0f) {
+            float cumsum = 0.0f;
+            for (int i = 0; i < k; i++) {
+                cumsum += s_topk_vals[i];
+                if (cumsum >= top_p) { cutoff = i + 1; break; }
+            }
+            // Renormalize
+            sum = 0.0f;
+            for (int i = 0; i < cutoff; i++) sum += s_topk_vals[i];
+            inv_sum = 1.0f / sum;
+            for (int i = 0; i < cutoff; i++) s_topk_vals[i] *= inv_sum;
+        }
+
+        // Min-p filtering: remove tokens with prob < min_p * max_prob
+        if (min_p > 0.0f && cutoff > 1) {
+            float max_prob = s_topk_vals[0];  // already sorted descending
+            float threshold = min_p * max_prob;
+            int new_cutoff = cutoff;
+            for (int i = cutoff - 1; i >= 1; i--) {
+                if (s_topk_vals[i] < threshold) new_cutoff = i;
+                else break;
+            }
+            if (new_cutoff < cutoff && new_cutoff >= 1) {
+                cutoff = new_cutoff;
+                sum = 0.0f;
+                for (int i = 0; i < cutoff; i++) sum += s_topk_vals[i];
+                inv_sum = 1.0f / sum;
+                for (int i = 0; i < cutoff; i++) s_topk_vals[i] *= inv_sum;
+            }
+        }
+
+        // Multinomial sampling with curand Philox
+        curandStatePhilox4_32_10_t rng_state;
+        curand_init(seed, offset, 0, &rng_state);
+        float r = curand_uniform(&rng_state);
+
+        int selected = s_topk_idxs[cutoff - 1];  // fallback
+        float cumsum = 0.0f;
+        for (int i = 0; i < cutoff; i++) {
+            cumsum += s_topk_vals[i];
+            if (r < cumsum) { selected = s_topk_idxs[i]; break; }
+        }
+
+        *result = selected;
+    }
+
+    PDL_SIGNAL();
+}
+
+void invoke_gpu_sampling(
+    __nv_bfloat16* logits, int* result_idx, int vocab_size,
+    float temperature, int top_k, float top_p, float min_p,
+    const int* penalty_ids, const int* penalty_counts, int num_penalties,
+    float repeat_penalty, float freq_penalty, float pres_penalty,
+    unsigned long long rng_seed, unsigned long long rng_offset,
+    cudaStream_t stream)
+{
+    // Step 1: Apply penalties if any
+    if (num_penalties > 0) {
+        int block = 256;
+        int grid = (num_penalties + block - 1) / block;
+        PDL_LAUNCH(apply_penalties_kernel, grid, block, 0, stream,
+                   logits, penalty_ids, penalty_counts, num_penalties,
+                   repeat_penalty, freq_penalty, pres_penalty);
+    }
+
+    // Step 2: Greedy after penalty? Just do argmax.
+    if (temperature <= 0.0f || top_k == 1) {
+        PDL_LAUNCH(argmax_bf16_kernel, 1, 1024, 0, stream, logits, result_idx, vocab_size);
+        return;
+    }
+
+    // Step 3: Clamp top_k
+    if (top_k <= 0 || top_k > GPU_SAMPLING_MAX_K) top_k = GPU_SAMPLING_MAX_K;
+
+    float inv_temp = 1.0f / temperature;
+    PDL_LAUNCH(topk_sampling_kernel, 1, 1024, 0, stream,
+               logits, result_idx, vocab_size, top_k,
+               inv_temp, top_p, min_p, rng_seed, rng_offset);
 }
 
 } // namespace ops

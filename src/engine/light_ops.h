@@ -212,5 +212,32 @@ void invoke_fused_moe_final(
     __nv_bfloat16* residual,
     int n, int K, int top_k, cudaStream_t stream = 0);
 
+// ============================================================================
+// GPU Sampling: penalty + top-k + softmax + top-p/min-p + multinomial
+// ============================================================================
+// Replaces CPU sample_token: all computation stays on GPU, only 1 int result.
+// Modifies logits in-place (top-k winners set to -inf). Safe since logits
+// buffer is workspace that gets overwritten on next forward pass.
+//
+// penalty_ids/counts: device arrays of unique tokens + occurrence counts
+// top_k clamped to [1, 64] internally. temperature <= 0 → greedy after penalty.
+void invoke_gpu_sampling(
+    __nv_bfloat16* logits,          // [vocab_size], modified in-place
+    int* result_idx,                 // output: sampled token (managed memory)
+    int vocab_size,
+    float temperature,
+    int top_k,
+    float top_p,
+    float min_p,
+    const int* penalty_ids,          // [num_penalties] on device/managed
+    const int* penalty_counts,       // [num_penalties] on device/managed
+    int num_penalties,
+    float repeat_penalty,
+    float freq_penalty,
+    float pres_penalty,
+    unsigned long long rng_seed,
+    unsigned long long rng_offset,
+    cudaStream_t stream = 0);
+
 } // namespace ops
 } // namespace qwen_thor

@@ -241,11 +241,11 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
         }
     }
 
-    // 10. 初始化采样缓冲区 (CPU 侧)
-    sampling_logits_.resize(config_.vocab_size);
-    sampling_indices_.resize(config_.vocab_size);
-    sampling_logits_bf16_.resize(config_.vocab_size);
-    sampling_rng_.seed(std::random_device{}());
+    // 10. 初始化 GPU 采样缓冲区
+    cudaMallocManaged(&d_penalty_ids_, MAX_PENALTY_TOKENS * sizeof(int));
+    cudaMallocManaged(&d_penalty_counts_, MAX_PENALTY_TOKENS * sizeof(int));
+    gpu_rng_seed_ = std::random_device{}();
+    gpu_rng_offset_ = 0;
 
     // 11. Vision encoder workspace (如果模型有视觉编码器)
     if (model_->has_vision()) {
@@ -276,6 +276,8 @@ InferenceEngine::~InferenceEngine() {
     cudaFree(d_block_tables_);
     cudaFree(d_context_lens_);
     cudaFree(d_argmax_result_);
+    cudaFree(d_penalty_ids_);
+    cudaFree(d_penalty_counts_);
     cudaFree(d_ssm_checkpoints_);
     cudaFree(d_conv_checkpoints_);
     cudaFree(d_mtp_block_tables_);
@@ -1719,13 +1721,13 @@ int InferenceEngine::sample_argmax(__nv_bfloat16* logits, int vocab_size, cudaSt
 }
 
 // ---------------------------------------------------------------------------
-// sample_token: temperature + top_k + top_p 采样
+// sample_token: GPU 全流程采样 (penalty + top-k + softmax + top-p/min-p + sample)
 //   temperature <= 0 → 退化为 argmax (贪心解码)
-//   top_k: 只考虑概率最高的 K 个 token
+//   top_k: 只考虑概率最高的 K 个 token (GPU iterative argmax)
 //   top_p: 在 top_k 结果中，按概率降序累加到 p 后截断
 //
-// CPU 侧实现 (Jetson 统一内存, sync 后 CPU 可直接读 GPU buffer)
-// vocab_size=248320, partial_sort O(n) → ~0.5ms, 相对 decode 200ms 开销 <0.3%
+// GPU 侧实现: 省去 484KB D2H 传输 + CPU partial_sort/softmax
+// 结果通过 managed memory (d_argmax_result_) 返回, 单个 int
 // ---------------------------------------------------------------------------
 int InferenceEngine::sample_token(__nv_bfloat16* logits, int vocab_size,
                                    float temperature, float top_p, int top_k,
@@ -1738,152 +1740,53 @@ int InferenceEngine::sample_token(__nv_bfloat16* logits, int vocab_size,
     bool has_penalty = (repeat_penalty != 1.0f) || (frequency_penalty != 0.0f) || (presence_penalty != 0.0f);
 
     // 贪心: temperature <= 0 或 top_k == 1
-    // BUG FIX: 无 penalty 时走 GPU argmax 快速路径;
-    // 有 penalty 时必须走 CPU 路径以正确应用 penalty 后再 argmax
+    // 无 penalty 时走 GPU argmax 快速路径 (最低延迟)
     bool greedy = (temperature <= 0.0f || top_k == 1);
     if (greedy && !(has_penalty && !generated_tokens.empty())) {
         return sample_argmax(logits, vocab_size, stream);
     }
 
-    // 确定性采样: seed >= 0 时重置 RNG
-    if (!greedy && seed >= 0) {
-        sampling_rng_.seed(static_cast<uint64_t>(seed) + generated_tokens.size());
-    }
-
-    // 1. 等待 GPU 完成, cudaMemcpy logits 到 host staging buffer
-    if (!fast_sync_stream(stream, "sample_token")) {
-        fprintf(stderr, "[Engine] FATAL: GPU hang detected in sample_token, returning EOS\n");
-        fflush(stderr);
-        return Qwen35Config::EOS_TOKEN_IM_END; // EOS token — force stop
-    }
-    cudaMemcpy(sampling_logits_bf16_.data(), logits,
-               vocab_size * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-
-    // 2. BF16 → float (不做 temperature 缩放, penalty 在 raw logits 上操作)
-    for (int i = 0; i < vocab_size; ++i) {
-        sampling_logits_[i] = __bfloat162float(sampling_logits_bf16_[i]);
-    }
-
-    // 2.5 重复惩罚 / 频率惩罚 / 存在性惩罚 — 在 raw logits 上操作
-    // (OpenAI 规范: penalty 在 temperature 缩放之前应用)
+    // 构建 penalty 数据 (CPU 侧写入 managed memory, 对 Jetson 统一内存零拷贝)
+    int num_penalties = 0;
     if (has_penalty && !generated_tokens.empty()) {
-        // 统计已生成 token 的出现次数
         std::unordered_map<int, int> token_counts;
         for (int tok : generated_tokens) {
             if (tok >= 0 && tok < vocab_size) token_counts[tok]++;
         }
         for (auto& [tok_id, count] : token_counts) {
-            float& logit = sampling_logits_[tok_id];
-            // Repeat penalty (Llama/Qwen style): logit /= penalty if >0, *penalty if <0
-            if (repeat_penalty != 1.0f) {
-                if (logit > 0.0f) logit /= repeat_penalty;
-                else              logit *= repeat_penalty;
-            }
-            // Frequency penalty (OpenAI style): logit -= freq_penalty * count
-            logit -= frequency_penalty * count;
-            // Presence penalty (OpenAI style): logit -= pres_penalty * sign(count)
-            logit -= presence_penalty;
-        }
-    }
-
-    // 贪心 + penalty: 在 penalized logits 上做 CPU argmax, 跳过 temperature/sampling
-    if (greedy) {
-        int best = 0;
-        float best_val = sampling_logits_[0];
-        for (int i = 1; i < vocab_size; ++i) {
-            if (sampling_logits_[i] > best_val) {
-                best_val = sampling_logits_[i];
-                best = i;
+            if (num_penalties < MAX_PENALTY_TOKENS) {
+                d_penalty_ids_[num_penalties] = tok_id;
+                d_penalty_counts_[num_penalties] = count;
+                num_penalties++;
             }
         }
-        return best;
     }
 
-    // 3. Temperature 缩放 (在 penalty 之后)
-    float inv_temp = 1.0f / temperature;
-    for (int i = 0; i < vocab_size; ++i) {
-        sampling_logits_[i] *= inv_temp;
+    // 确定 RNG 种子
+    unsigned long long rng_seed, rng_offset;
+    if (seed >= 0) {
+        rng_seed = static_cast<unsigned long long>(seed) + generated_tokens.size();
+        rng_offset = 0;
+    } else {
+        rng_seed = gpu_rng_seed_;
+        rng_offset = gpu_rng_offset_++;
     }
 
-    // 3. Clamp top_k
-    if (top_k <= 0 || top_k > vocab_size) top_k = vocab_size;
+    // GPU 全流程采样: penalty → top-k → softmax → top-p/min-p → sample
+    ops::invoke_gpu_sampling(
+        logits, d_argmax_result_, vocab_size,
+        temperature, top_k, top_p, min_p,
+        d_penalty_ids_, d_penalty_counts_, num_penalties,
+        repeat_penalty, frequency_penalty, presence_penalty,
+        rng_seed, rng_offset, stream);
 
-    // 4. 初始化 indices, partial_sort 取 top_k
-    for (int i = 0; i < vocab_size; ++i) sampling_indices_[i] = i;
-    int k = std::min(top_k, vocab_size);
-    std::partial_sort(sampling_indices_.begin(),
-                      sampling_indices_.begin() + k,
-                      sampling_indices_.end(),
-                      [this](int a, int b) {
-                          return sampling_logits_[a] > sampling_logits_[b];
-                      });
-
-    // 5. 对 top_k 做 softmax
-    float max_logit = sampling_logits_[sampling_indices_[0]];
-    float sum = 0.0f;
-    // 复用 sampling_logits_ 前 k 个位置存 prob (不影响, indices 已排好)
-    float probs[256];  // top_k 通常 ≤ 64, 栈上分配
-    float* prob_buf = (k <= 256) ? probs : new float[k];
-    for (int i = 0; i < k; ++i) {
-        prob_buf[i] = expf(sampling_logits_[sampling_indices_[i]] - max_logit);
-        sum += prob_buf[i];
+    // Sync 并读取结果 (managed memory, 无 memcpy)
+    if (!fast_sync_stream(stream, "gpu_sampling")) {
+        fprintf(stderr, "[Engine] FATAL: GPU hang detected in gpu_sampling, returning EOS\n");
+        fflush(stderr);
+        return Qwen35Config::EOS_TOKEN_IM_END;
     }
-    float inv_sum = 1.0f / sum;
-    for (int i = 0; i < k; ++i) prob_buf[i] *= inv_sum;
-
-    // 6. Top-p (nucleus) 截断
-    int cutoff = k;
-    if (top_p < 1.0f && top_p > 0.0f) {
-        float cumsum = 0.0f;
-        for (int i = 0; i < k; ++i) {
-            cumsum += prob_buf[i];
-            if (cumsum >= top_p) {
-                cutoff = i + 1;
-                break;
-            }
-        }
-        // 重新归一化
-        sum = 0.0f;
-        for (int i = 0; i < cutoff; ++i) sum += prob_buf[i];
-        inv_sum = 1.0f / sum;
-        for (int i = 0; i < cutoff; ++i) prob_buf[i] *= inv_sum;
-    }
-
-    // 6.5 Min-p 过滤: 移除概率 < min_p * max_prob 的 token
-    // 这有效防止高温度采样时选到极低概率的错误 token
-    if (min_p > 0.0f && cutoff > 1) {
-        float max_prob = prob_buf[0];  // 已按概率降序排列
-        float threshold = min_p * max_prob;
-        int new_cutoff = cutoff;
-        for (int i = cutoff - 1; i >= 1; --i) {
-            if (prob_buf[i] < threshold) new_cutoff = i;
-            else break;
-        }
-        if (new_cutoff < cutoff && new_cutoff >= 1) {
-            cutoff = new_cutoff;
-            // 重新归一化
-            sum = 0.0f;
-            for (int i = 0; i < cutoff; ++i) sum += prob_buf[i];
-            inv_sum = 1.0f / sum;
-            for (int i = 0; i < cutoff; ++i) prob_buf[i] *= inv_sum;
-        }
-    }
-
-    // 7. 随机采样
-    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    float r = dist(sampling_rng_);
-    float cumsum = 0.0f;
-    int selected = sampling_indices_[cutoff - 1];  // fallback
-    for (int i = 0; i < cutoff; ++i) {
-        cumsum += prob_buf[i];
-        if (r < cumsum) {
-            selected = sampling_indices_[i];
-            break;
-        }
-    }
-
-    if (prob_buf != probs) delete[] prob_buf;
-    return selected;
+    return *d_argmax_result_;
 }
 
 // ---------------------------------------------------------------------------

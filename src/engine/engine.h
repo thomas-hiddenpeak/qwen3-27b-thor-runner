@@ -176,11 +176,12 @@ private:
     int mtp_total_accepted_ = 0;                 // 累计接受的 draft tokens
     int mtp_total_emitted_ = 0;                  // 累计产出的 tokens (accept + bonus)
 
-    // 采样用预分配缓冲区 (CPU 侧)
-    std::vector<float> sampling_logits_;
-    std::vector<int>   sampling_indices_;
-    std::vector<__nv_bfloat16> sampling_logits_bf16_; // host staging for GPU logits
-    std::mt19937       sampling_rng_;
+    // GPU 采样预分配缓冲区
+    int* d_penalty_ids_ = nullptr;      // managed memory [MAX_PENALTY_TOKENS]
+    int* d_penalty_counts_ = nullptr;   // managed memory [MAX_PENALTY_TOKENS]
+    static constexpr int MAX_PENALTY_TOKENS = 8192;
+    unsigned long long gpu_rng_seed_ = 0;    // non-deterministic RNG seed
+    unsigned long long gpu_rng_offset_ = 0;  // incrementing offset for RNG
 
     // 调试日志: token_id -> 文本
     Tokenizer log_tokenizer_;
