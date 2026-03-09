@@ -55,14 +55,14 @@ make -j$(nproc)
 ## Quick Start
 
 ```bash
-# Edit configs/config.conf — set model_dir to your model weights path
+# Edit configs/qwen3.5-27b.conf — set model_dir to your model weights path
 # Supports: Qwen3.5-27B / 9B / 4B (BF16 or NVFP4)
 
 # Start HTTP API server (Ollama + OpenAI dual-port)
-./build/qwen3-27b-thor serve --config configs/config.conf
+./build/qwen3-27b-thor serve --config configs/qwen3.5-27b.conf
 
 # Interactive TUI chat
-./build/qwen3-27b-thor chat --config configs/config.conf
+./build/qwen3-27b-thor chat --config configs/qwen3.5-27b.conf
 
 # Benchmarks (parameter sweep with statistics)
 ./build/qwen3-27b-thor bench --decode 30 --batch 1,2,4 --prompt-len 64,256 --iterations 3
@@ -143,7 +143,7 @@ curl http://localhost:11434/health
 
 ## Configuration
 
-The unified config file (`configs/config.conf`) covers both engine and serve settings:
+The unified config file (`configs/qwen3.5-27b.conf`) covers both engine and serve settings:
 
 ```ini
 # Model (auto-detects architecture from config.json)
@@ -170,7 +170,7 @@ model_name=qwen3.5-27b
 timeout=300
 ```
 
-Pre-built configs for different models: `configs/4b.conf`, `configs/9b.conf`, `configs/nvfp4.conf`.
+Pre-built configs for different models: `configs/qwen3.5-4b.conf`, `configs/qwen3.5-9b.conf`, `configs/qwen3.5-27b-nvfp4.conf`, `configs/qwen3.5-35b-a3b.conf`, `configs/qwen3.5-122b-a10b-nvfp4.conf`.
 
 CLI arguments always override config file values. See [docs/CLI.md](docs/CLI.md) for the full option reference.
 
@@ -180,9 +180,12 @@ CLI arguments always override config file values. See [docs/CLI.md](docs/CLI.md)
 .
 ├── CMakeLists.txt
 ├── configs/
-│   ├── config.conf              # Unified default config (engine + serve)
-│   ├── 4b.conf / 9b.conf       # Model-specific configs
-│   ├── nvfp4.conf               # NVFP4 quantized model config
+│   ├── qwen3.5-27b.conf         # 27B BF16 config (engine + serve)
+│   ├── qwen3.5-4b.conf          # 4B BF16 config
+│   ├── qwen3.5-9b.conf          # 9B BF16 config
+│   ├── qwen3.5-27b-nvfp4.conf   # 27B NVFP4 config
+│   ├── qwen3.5-35b-a3b.conf     # 35B MoE BF16 config
+│   ├── qwen3.5-122b-a10b-nvfp4.conf  # 122B MoE NVFP4 config
 │   └── serve.conf               # Serve-only overrides
 ├── docs/
 │   ├── API.md                   # Backend API reference

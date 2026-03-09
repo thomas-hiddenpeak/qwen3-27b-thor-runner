@@ -218,17 +218,17 @@ src/
 ```bash
 mkdir -p build && cd build && cmake .. && make -j$(nproc)
 # 产物: build/qwen3-27b-thor
-# 运行 (推荐使用统一配置文件 configs/config.conf):
-#   ./build/qwen3-27b-thor serve --config configs/config.conf
-#   ./build/qwen3-27b-thor chat  --config configs/config.conf
+# 运行 (推荐使用统一配置文件 configs/qwen3.5-27b.conf):
+#   ./build/qwen3-27b-thor serve --config configs/qwen3.5-27b.conf
+#   ./build/qwen3-27b-thor chat  --config configs/qwen3.5-27b.conf
 #   ./build/qwen3-27b-thor bench --decode 30 --batch 1,2,4 --iterations 3 --json results.json
 #   ./build/qwen3-27b-thor test --list
 #   ./build/qwen3-27b-thor test --all
 # 多模型 (自动从 config.json 检测架构):
-#   ./build/qwen3-27b-thor serve --config configs/4b.conf
-#   ./build/qwen3-27b-thor serve --config configs/nvfp4.conf
+#   ./build/qwen3-27b-thor serve --config configs/qwen3.5-4b.conf
+#   ./build/qwen3-27b-thor serve --config configs/qwen3.5-27b-nvfp4.conf
 # 也可单独覆盖 serve 配置:
-#   ./build/qwen3-27b-thor serve --config configs/config.conf --serve-config configs/serve.conf
+#   ./build/qwen3-27b-thor serve --config configs/qwen3.5-27b.conf --serve-config configs/serve.conf
 ```
 
 ## 工作流规范

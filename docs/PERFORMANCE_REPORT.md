@@ -137,12 +137,12 @@
 
 | 模型 | 配置文件 | 最优 d | 基线 (tok/s) | MTP (tok/s) | 提升 | 最大安全 d |
 |------|---------|--------|-------------|-------------|------|-----------|
-| 4B BF16 | configs/4b.conf | **2** | 26.2 | 44.1 | +69% | 5 |
-| 9B BF16 | configs/9b.conf | **3** | 14.5 | 26.1 | +80% | 5 |
-| 27B BF16 | configs/config.conf | **3** | 4.6 | 10.4 | +128% | 4 |
-| 27B NVFP4 | configs/nvfp4.conf | **2** | 10.2 | 14.2 | +39% | 4 |
-| 35B-A3B MoE | configs/moe.conf | **2** | 30.6 | 40.0 | +31% | 5 |
-| 122B-A10B NVFP4 MoE | configs/moe_nvfp4.conf | **2** | 14.1 | 19.6 | +39% | 2 |
+| 4B BF16 | configs/qwen3.5-4b.conf | **2** | 26.2 | 44.1 | +69% | 5 |
+| 9B BF16 | configs/qwen3.5-9b.conf | **3** | 14.5 | 26.1 | +80% | 5 |
+| 27B BF16 | configs/qwen3.5-27b.conf | **3** | 4.6 | 10.4 | +128% | 4 |
+| 27B NVFP4 | configs/qwen3.5-27b-nvfp4.conf | **2** | 10.2 | 14.2 | +39% | 4 |
+| 35B-A3B MoE | configs/qwen3.5-35b-a3b.conf | **2** | 30.6 | 40.0 | +31% | 5 |
+| 122B-A10B NVFP4 MoE | configs/qwen3.5-122b-a10b-nvfp4.conf | **2** | 14.1 | 19.6 | +39% | 2 |
 
 > **最大安全 d**: 该 d 值及以下全部稳定 (PASS)，超过可能出现文本退化
 

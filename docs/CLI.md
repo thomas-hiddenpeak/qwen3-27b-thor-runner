@@ -128,23 +128,23 @@ qwen3-27b-thor <command> [options]
 
 ```bash
 # 27B BF16 (默认)
-qwen3-27b-thor serve --config configs/config.conf
+qwen3-27b-thor serve --config configs/qwen3.5-27b.conf
 
 # 9B BF16
-qwen3-27b-thor serve --config configs/9b.conf
+qwen3-27b-thor serve --config configs/qwen3.5-9b.conf
 
 # 4B BF16
-qwen3-27b-thor serve --config configs/4b.conf
+qwen3-27b-thor serve --config configs/qwen3.5-4b.conf
 
 # 27B NVFP4 (量化)
-qwen3-27b-thor serve --config configs/nvfp4.conf
+qwen3-27b-thor serve --config configs/qwen3.5-27b-nvfp4.conf
 ```
 
 ### SSD 缓存加速
 
 ```bash
 # 启用 SSD 前缀缓存 (4GB GPU + 20GB SSD)
-qwen3-27b-thor serve --config configs/config.conf --cache-enable --cache-max-gb 20
+qwen3-27b-thor serve --config configs/qwen3.5-27b.conf --cache-enable --cache-max-gb 20
 
 # 256K 超长上下文 (8GB GPU + SSD offload)
 qwen3-27b-thor serve --kv-cache-gb 8 --cache-enable --cache-dir /mnt/nvme/kv_cache
@@ -154,7 +154,7 @@ qwen3-27b-thor serve --kv-cache-gb 8 --cache-enable --cache-dir /mnt/nvme/kv_cac
 
 ```bash
 # 默认设置
-qwen3-27b-thor chat --config configs/config.conf
+qwen3-27b-thor chat --config configs/qwen3.5-27b.conf
 
 # 高温采样
 qwen3-27b-thor chat --temperature 0.8 --top-p 0.95 --max-tokens 4096
@@ -240,7 +240,7 @@ for chunk in response:
 
 ## Configuration Files
 
-统一配置文件 (`configs/config.conf`):
+统一配置文件 (`configs/qwen3.5-27b.conf`):
 
 ```properties
 # 模型 (自动检测架构)
@@ -272,6 +272,6 @@ timeout=300
 max_output_tokens=32768
 ```
 
-预置模型配置: `4b.conf` / `9b.conf` / `nvfp4.conf`。
+预置模型配置: `qwen3.5-4b.conf` / `qwen3.5-9b.conf` / `qwen3.5-27b-nvfp4.conf` / `qwen3.5-35b-a3b.conf` / `qwen3.5-122b-a10b-nvfp4.conf`。
 
 配置文件使用 `key=value` 格式, `#` 开头为注释。CLI 参数优先于配置文件。
