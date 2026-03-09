@@ -400,3 +400,122 @@ cuBLAS handle 使用懒初始化 (`get_cublas_handle()`)。
 ### 修改文件
 
 - `src/engine/dense_gemm_sm110.cu`：`can_implement()` 检查 + cuBLAS 回退路径
+
+---
+
+## Bug #6: TMA bulk copy 导致 SSM 状态损坏 — MoE 模型文本退化
+
+**发现时间**: 2026-03-09  
+**严重程度**: CRITICAL  
+**影响范围**: 所有模型的 DeltaNet SSM prefill, MoE 模型尤其明显 (重复循环)
+
+### 现象
+
+Qwen3.5-35B-A3B (MoE) 模型在生成 ~200-350 tokens 后出现严重文本退化：输出进入重复循环，不断生成相同的短语。其他框架 (vLLM, SGLang) 运行同一模型正常。
+
+Dense 模型 (27B) 表面看不出明显症状，但 SSM 状态实际已被静默损坏。
+
+### 排查过程
+
+#### 第一步：怀疑 MoE 代码路径
+
+初步分析了 MoE 路由、expert dispatch、workspace 分配等代码，未发现明显问题。
+
+#### 第二步：HF 参考对比（失败）
+
+尝试用 HuggingFace transformers 在 Jetson Thor 上做 CPU/4-bit 参考推理，分别因 GPU 内存不足和 CPU 过慢而放弃。
+
+#### 第三步：用户提示 — 回溯最近代码变更
+
+用户指出："模型本身不可能有问题，vLLM/SGLang 都是正常的。强烈建议倒回去看看最近的代码改动。"
+
+#### 第四步：Git Bisect 定位
+
+系统性二分搜索最近 14 个 commit (FA4 优化系列):
+
+| Commit | 描述 | 结果 |
+|--------|------|------|
+| `9004234` | batched MoE dispatch | ✅ Good |
+| `ff45d8d` | exp2f conversion | ✅ Good |
+| `d43a4dd` | f32x2 SIMD FMA | ✅ Good |
+| **`052f5ab`** | **TMA bulk copy for SSM state** | **❌ BAD — 首个坏 commit** |
+| `75fc7fb` | multi-row GEMV | ❌ Bad (继承) |
+
+#### 第五步：分析根因
+
+Commit `052f5ab` 引入了 TMA `cp.async.bulk` 用于 SSM state 的 GMEM↔SMEM 加载/存储，替代了原本简单的逐元素拷贝。
+
+**问题核心**：TMA bulk copy 执行原地 BF16↔FP32 格式转换时损坏了 SSM 状态。
+
+具体机制:
+1. **Load (GMEM→SMEM)**: `cp.async.bulk.tensor.2d.global.shared::cta` 将 BF16 SSM state 从 GMEM 批量加载到 SMEM, 然后原地 BF16→FP32 扩展。反向遍历 (`kd-1` 到 `0`) 避免覆盖，但 row 0 需要特殊处理，存在细微的 race condition。
+2. **Store (SMEM→GMEM)**: FP32→BF16 压缩后用 `cp.async.bulk.tensor.2d.shared::cta.global` 写回。同样的原地格式转换问题。
+
+SSM 状态被损坏后：
+- DeltaNet 层的状态传播错误
+- 累积效应导致后续 token 的 attention 计算偏差越来越大
+- 表现为 ~200-350 tokens 后输出退化为重复循环
+
+### 修复方案
+
+回退到原始的逐元素拷贝方式:
+
+**Load:**
+```cpp
+for (int i = 0; i < kd; i++)
+    S_smem[i * vd_pad + j] = __bfloat162float(ssm_state[head * kd * vd + i * vd + j]);
+```
+
+**Store:**
+```cpp
+for (int i = 0; i < kd; i++)
+    ssm_state[head * kd * vd + i * vd + j] = __float2bfloat16(S_smem[i * vd_pad + j]);
+```
+
+同时修复了 greedy+penalty 采样 bug：`temperature<=0` 且有 penalty 参数时，之前会跳过所有 penalty 处理直接 GPU argmax。
+
+### 修改文件
+
+- `src/engine/light_ops.cu`: `gated_delta_net_prefill_kernel` 中 TMA 回退为逐元素拷贝
+- `src/engine/gdn_umma_sm110.cu`: `gdn_wy_prefill_kernel` 中同样回退
+- `src/engine/engine.cpp`: greedy+penalty 采样修复
+
+### 验证
+
+- MoE 35B-A3B: 3 次运行全部 MaxRepeat30 ≤ 2 (之前 2/3 次 > 50)
+- 27B Dense: 回归测试通过 (MaxRepeat30 = 1)
+- 4B/9B: 回归测试通过
+
+**Commit**: `9b69bfd`
+
+### 教训
+
+1. TMA `cp.async.bulk` 用于原地格式转换 (BF16↔FP32) 极易出错，需要精确的同步和无覆盖保证
+2. Git bisect 远比代码审查高效 — 14 个 commit 只需 4 次测试即可定位
+3. SSM 状态损坏是"隐性"的 — dense 模型可能不表现，但 MoE 模型因路由放大效应更敏感
+
+---
+
+## Bug #7: MoE T=1 shared_down_buf 和 expert_down_all 重叠导致路由 expert 0 损坏
+
+**发现时间**: 2026-03-08  
+**严重程度**: HIGH  
+**影响范围**: MoE 模型 T=1 decode 时 expert 0 的输出
+
+### 现象
+
+MoE 模型推理结果异常，当 routed expert 包含 expert 0 时输出不正确。
+
+### 根因
+
+`shared_down_buf` 和 `expert_down_all` 指向同一块 workspace，shared expert 的 down projection 结果覆盖了 expert 0 的输出。
+
+### 修复
+
+为 `shared_down_buf` 分配独立的 workspace 区域，避免与 routed experts 缓冲区重叠。
+
+**Commit**: `93129bb`
+
+### 修改文件
+
+- `src/engine/layer.cu`: shared expert workspace 独立分配
