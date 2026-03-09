@@ -41,7 +41,7 @@ This engine targets the specific Jetson AGX Thor unified-memory architecture. It
 One-line install for Jetson AGX Thor (aarch64, SM110a):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/thomas-hiddenpeak/qwen3-27b-thor-runner/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/thomas-hiddenpeak/qwen35-thor/master/install.sh | bash
 ```
 
 This downloads the latest release binary to `~/.local/bin/qwen35-thor` and config templates to `~/.local/share/qwen35-thor/configs/`.
@@ -61,8 +61,8 @@ qwen35-thor serve --model-dir /path/to/Qwen3.5-27B --kv-cache-gb 8
 ## Build from Source
 
 ```bash
-git clone --recursive https://github.com/thomas-hiddenpeak/qwen3-27b-thor-runner.git
-cd qwen3-27b-thor-runner
+git clone --recursive https://github.com/thomas-hiddenpeak/qwen35-thor.git
+cd qwen35-thor
 mkdir -p build && cd build
 cmake ..
 make -j$(nproc)

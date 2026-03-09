@@ -3,13 +3,13 @@
 # Downloads the pre-built binary for Jetson AGX Thor (aarch64, SM110a)
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/thomas-hiddenpeak/qwen3-27b-thor-runner/master/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/thomas-hiddenpeak/qwen35-thor/master/install.sh | bash
 #   # or
-#   wget -qO- https://raw.githubusercontent.com/thomas-hiddenpeak/qwen3-27b-thor-runner/master/install.sh | bash
+#   wget -qO- https://raw.githubusercontent.com/thomas-hiddenpeak/qwen35-thor/master/install.sh | bash
 
 set -euo pipefail
 
-REPO="thomas-hiddenpeak/qwen3-27b-thor-runner"
+REPO="thomas-hiddenpeak/qwen35-thor"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 BINARY_NAME="qwen35-thor"
 
