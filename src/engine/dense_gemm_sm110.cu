@@ -163,7 +163,7 @@ static cublasHandle_t get_cublas_handle() {
 }
 
 // ============================================================================
-// Multi-row GEMV: C[M,N] = A[M,K] × B[K,N], M=2-8
+// Multi-row GEMV (L2 variant): C[M,N] = A[M,K] × B[K,N], M=2-8
 // B weights read once per column, A rows from L2 cache (≤136KB for M=4,K=17408)
 // No shared memory for A → maximizes occupancy vs SMEM-based approach
 // 8 warps × 32 threads, scattered mapping for DRAM bank optimization
@@ -313,8 +313,9 @@ void invoke_dense_gemm(
     int K,
     cudaStream_t stream
 ) {
-    // Small M: use multi-row GEMV (reads B weights once, A from L2 cache).
+    // Small M: multi-row GEMV (reads B weights once, A from L2 cache).
     // Much faster than cuBLAS for M=2-8: cuBLAS reads B ~1.5-2× for small M.
+    // NOTE: SMEM variant tested but regressed (-24%) due to occupancy drop (5→6 blocks/SM).
     if (M > 1 && M <= 8) {
         constexpr int BLOCK_THREADS = 256;  // 8 warps
         constexpr int WARPS = BLOCK_THREADS / 32;

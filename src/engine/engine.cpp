@@ -1101,7 +1101,13 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             try {
                 profiler_.begin("forward", compute_stream_);
                 int fa_idx = 0, lin_idx = 0;
+                // Temporary per-type timing (first verify only)
+                static bool verify_timed = false;
+                bool do_vt = !verify_timed;
+                double fa_ms = 0, la_ms = 0;
+                auto vt_now = []() { return std::chrono::high_resolution_clock::now(); };
                 for (int li = 0; li < config_.num_hidden_layers; ++li) {
+                    auto t0 = do_vt ? vt_now() : std::chrono::high_resolution_clock::time_point{};
                     if (config_.is_full_attention(li)) {
                         model_->get_layer(li).get_full_attn()->forward(
                             d_hidden_states_, d_pos_ids_, cache_manager_->kv_manager(),
@@ -1128,6 +1134,16 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                         lin_idx++;
                     }
                     cudaStreamSynchronize(compute_stream_);
+                    if (do_vt) {
+                        auto t1 = vt_now();
+                        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                        if (config_.is_full_attention(li)) fa_ms += ms; else la_ms += ms;
+                    }
+                }
+                if (do_vt) {
+                    fprintf(stderr, "[Verify Profile] T=%d, FA %.1fms (%.2fms/layer × 16), LA %.1fms (%.2fms/layer × 48), total %.1fms\n",
+                            T, fa_ms, fa_ms/16, la_ms, la_ms/48, fa_ms+la_ms);
+                    verify_timed = true;
                 }
                 profiler_.end("forward", compute_stream_);
             } catch (const std::exception& e) {

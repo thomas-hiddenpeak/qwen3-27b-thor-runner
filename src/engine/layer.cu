@@ -587,6 +587,19 @@ void Qwen35FullAttnLayer::forward(
             attn_out, q, k, v,
             num_tokens, num_q, num_kv, hd,
             sm_scale, score_workspace, stream);
+    } else if (force_paged_attn && num_tokens > 1 && num_tokens <= 8 && batch_size <= 1) {
+        // MTP verify small T (2-8): use standard paged attention with built-in causal masking
+        // batch_size=1 kernel computes: context_len = total - T + token_idx + 1 (causal)
+        // Eliminates chunked prefill overhead (56 → 1 kernel launch for T=4, ~4× faster)
+        ops::invoke_paged_attention(
+            attn_out, q,
+            kv_manager.get_layer_k_cache(full_attn_idx),
+            kv_manager.get_layer_v_cache(full_attn_idx),
+            block_tables, context_lens,
+            max_num_blocks_per_seq, max_context_len,
+            num_tokens, num_q, num_kv, hd,
+            kv_manager.get_block_size(), sm_scale, stream,
+            batch_size);
     } else if (force_paged_attn && num_tokens > 1 && batch_size <= 1) {
         // Chunked prefill (chunk 1+): tiled GEMM attention with paged KV cache
         // Uses flash-attention-style tiling to avoid O(T_q × context) per-token traversal

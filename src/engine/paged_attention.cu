@@ -194,7 +194,17 @@ __global__ void paged_attention_split_k_kernel(
 
     // 确定序列 & 上下文长度
     const int seq_idx = (batch_size > 1) ? token_idx : 0;
-    const int context_len = context_lens[seq_idx];
+    int context_len;
+    if (batch_size == 1 && gridDim.x > 1) {
+        // Causal masking for MTP verify (multi-token prefill in paged mode)
+        // token i sees KV positions [0, start_pos + i]
+        int total_context = context_lens[0];
+        int num_toks = gridDim.x;
+        int start_pos = total_context - num_toks;
+        context_len = start_pos + token_idx + 1;
+    } else {
+        context_len = context_lens[seq_idx];
+    }
     const int kv_head_idx = head_idx / (num_heads / num_kv_heads);
 
     // 本 partition 的 KV range
@@ -347,13 +357,12 @@ void invoke_paged_attention(
 {
     if (batch_size <= 0) batch_size = 1;
 
-    // Split-K 条件: decode 模式 + 上下文足够长
-    // decode: num_tokens==1 (单序列) 或 batch_size>1 (batched decode)
-    // SM110a 20 SMs: Q heads <= 16 → 非 split-K 仅 16 blocks, 占用率低
-    // 阈值降低到 64 以提高短上下文的 paged attention 性能
+    // Split-K 条件: decode/MTP verify + 上下文足够长
+    // decode: num_tokens==1 || batch_size>1
+    // MTP verify: num_tokens<=8 && batch_size==1 (causal masking in kernel)
     const int SPLIT_K_THRESHOLD = 64;
     bool use_split_k = (max_context_len >= SPLIT_K_THRESHOLD) &&
-                       (num_tokens == 1 || batch_size > 1);
+                       (num_tokens <= 8 || batch_size > 1);
 
     if (use_split_k) {
         // 计算 partition 参数
