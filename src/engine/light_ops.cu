@@ -816,38 +816,13 @@ gated_delta_net_prefill_kernel(
     float* k_hat_s = S_smem + kd * vd_pad;
     float* q_hat_s = k_hat_s + kd;
     float* s_norms = q_hat_s + kd;
-    // Mbarrier for TMA (8-byte aligned, placed after all float arrays)
-    uint64_t* tma_mbar = reinterpret_cast<uint64_t*>(s_norms + 2);
 
     int ss_base = h_v * kd * vd;
     float q_scale = rsqrtf((float)kd);
 
-    // TMA load SSM state: 32KB BF16 contiguous → in-place expand to FP32 padded
-    const int state_bytes = kd * vd * (int)sizeof(__nv_bfloat16);  // 32768
-    if (threadIdx.x == 0) {
-        tma_mbar_init(tma_mbar);
-    }
-    __syncthreads();
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    asm volatile("fence.mbarrier_init.release.cluster;\n" :::);
-#endif
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        tma_mbar_expect_tx(tma_mbar, (uint32_t)state_bytes);
-        tma_bulk_g2s(&ssm_state[ss_base], smem, tma_mbar, (uint32_t)state_bytes);
-    }
-    tma_mbar_wait(tma_mbar, 0);
-    __syncthreads();
-    // In-place BF16→FP32 expansion with padding (backwards to avoid overwrite)
-    // Row 0 handled separately: cross-warp write-read race on same SMEM region
-    {
-        const __nv_bfloat16* raw_bf16 = reinterpret_cast<const __nv_bfloat16*>(smem);
-        for (int i = kd - 1; i >= 1; i--)
-            S_smem[i * vd_pad + j] = __bfloat162float(raw_bf16[i * vd + j]);
-        float row0_val = __bfloat162float(raw_bf16[j]);
-        __syncthreads();
-        S_smem[j] = row0_val;
-    }
+    // Load initial state S[kd, vd] -> S_smem[kd, vd_pad] (BF16 GMEM -> FP32 SMEM)
+    for (int i = 0; i < kd; i++)
+        S_smem[i * vd_pad + j] = __bfloat162float(ssm_state[ss_base + i * vd + j]);
     __syncthreads();
 
     for (int t = 0; t < num_tokens; t++) {
@@ -918,17 +893,9 @@ gated_delta_net_prefill_kernel(
         }
     }
 
-    // TMA store: FP32 padded → pack BF16 contiguous in-place, then bulk copy SMEM→GMEM
-    {
-        __nv_bfloat16* raw_bf16 = reinterpret_cast<__nv_bfloat16*>(smem);
-        for (int i = 0; i < kd; i++)
-            raw_bf16[i * vd + j] = __float2bfloat16(S_smem[i * vd_pad + j]);
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        const int state_bytes_out = kd * vd * (int)sizeof(__nv_bfloat16);
-        tma_bulk_s2g(smem, &ssm_state[ss_base], (uint32_t)state_bytes_out);
-    }
+    // Write final state (FP32 SMEM -> BF16 GMEM)
+    for (int i = 0; i < kd; i++)
+        ssm_state[ss_base + i * vd + j] = __float2bfloat16(S_smem[i * vd_pad + j]);
     PDL_SIGNAL();
 }
 
@@ -1081,8 +1048,8 @@ void invoke_gated_delta_net(const __nv_bfloat16* q, const __nv_bfloat16* k, cons
         int threads = std::min(vd, 128);
         int grid = nkh_x_nvpkh;  // 48 blocks
         const int vd_pad = vd + 1;
-        // SMEM: S[kd,vd_pad] + k_hat[kd] + q_hat[kd] + norms[2] + mbarrier[8B]
-        size_t smem_bytes = (size_t)(kd * vd_pad + 2 * kd + 2) * sizeof(float) + sizeof(uint64_t);
+        // SMEM: S[kd,vd_pad] + k_hat[kd] + q_hat[kd] + norms[2]
+        size_t smem_bytes = (size_t)(kd * vd_pad + 2 * kd + 2) * sizeof(float);
 
         cudaError_t smem_err = cudaFuncSetAttribute(
             gated_delta_net_prefill_kernel,

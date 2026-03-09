@@ -1734,13 +1734,19 @@ int InferenceEngine::sample_token(__nv_bfloat16* logits, int vocab_size,
                                    float presence_penalty, int64_t seed,
                                    const std::vector<int>& generated_tokens,
                                    cudaStream_t stream) {
+    // 检查是否有活跃的 penalty 参数
+    bool has_penalty = (repeat_penalty != 1.0f) || (frequency_penalty != 0.0f) || (presence_penalty != 0.0f);
+
     // 贪心: temperature <= 0 或 top_k == 1
-    if (temperature <= 0.0f || top_k == 1) {
+    // BUG FIX: 无 penalty 时走 GPU argmax 快速路径;
+    // 有 penalty 时必须走 CPU 路径以正确应用 penalty 后再 argmax
+    bool greedy = (temperature <= 0.0f || top_k == 1);
+    if (greedy && !(has_penalty && !generated_tokens.empty())) {
         return sample_argmax(logits, vocab_size, stream);
     }
 
     // 确定性采样: seed >= 0 时重置 RNG
-    if (seed >= 0) {
+    if (!greedy && seed >= 0) {
         sampling_rng_.seed(static_cast<uint64_t>(seed) + generated_tokens.size());
     }
 
@@ -1760,7 +1766,6 @@ int InferenceEngine::sample_token(__nv_bfloat16* logits, int vocab_size,
 
     // 2.5 重复惩罚 / 频率惩罚 / 存在性惩罚 — 在 raw logits 上操作
     // (OpenAI 规范: penalty 在 temperature 缩放之前应用)
-    bool has_penalty = (repeat_penalty != 1.0f) || (frequency_penalty != 0.0f) || (presence_penalty != 0.0f);
     if (has_penalty && !generated_tokens.empty()) {
         // 统计已生成 token 的出现次数
         std::unordered_map<int, int> token_counts;
@@ -1779,6 +1784,19 @@ int InferenceEngine::sample_token(__nv_bfloat16* logits, int vocab_size,
             // Presence penalty (OpenAI style): logit -= pres_penalty * sign(count)
             logit -= presence_penalty;
         }
+    }
+
+    // 贪心 + penalty: 在 penalized logits 上做 CPU argmax, 跳过 temperature/sampling
+    if (greedy) {
+        int best = 0;
+        float best_val = sampling_logits_[0];
+        for (int i = 1; i < vocab_size; ++i) {
+            if (sampling_logits_[i] > best_val) {
+                best_val = sampling_logits_[i];
+                best = i;
+            }
+        }
+        return best;
     }
 
     // 3. Temperature 缩放 (在 penalty 之后)
