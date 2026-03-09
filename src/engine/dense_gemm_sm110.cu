@@ -163,6 +163,143 @@ static cublasHandle_t get_cublas_handle() {
 }
 
 // ============================================================================
+// Multi-row GEMV: C[M,N] = A[M,K] × B[K,N], M=2-8
+// B weights read once per column, A rows from L2 cache (≤136KB for M=4,K=17408)
+// No shared memory for A → maximizes occupancy vs SMEM-based approach
+// 8 warps × 32 threads, scattered mapping for DRAM bank optimization
+// f32x2 SIMD FMA for SM110a
+// ============================================================================
+template<int MAX_M>
+__global__ void gemv_multirow_kernel_scattered(
+    const __nv_bfloat16* __restrict__ A,   // [M, K] row-major
+    const __nv_bfloat16* __restrict__ B,   // [K, N] col-major
+    __nv_bfloat16* __restrict__ C,         // [M, N] row-major
+    int M, int N, int K)
+{
+    PDL_WAIT();
+    constexpr int WARP_SIZE = 32;
+    constexpr int WARPS_PER_BLOCK = 8;
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x & (WARP_SIZE - 1);
+    int num_blocks = (N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    int out_idx = blockIdx.x + warp_id * num_blocks;
+
+    if (out_idx >= N) return;
+
+    const float4* b_col_v4 = reinterpret_cast<const float4*>(B + (size_t)out_idx * K);
+
+    uint64_t sum_pair[MAX_M];
+    #pragma unroll
+    for (int m = 0; m < MAX_M; m++) sum_pair[m] = 0;
+
+    int k8 = K / 8;
+    for (int i = lane_id; i < k8; i += WARP_SIZE) {
+        float4 b4 = b_col_v4[i];
+        const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&b4);
+
+        #pragma unroll
+        for (int m = 0; m < MAX_M; m++) {
+            if (m < M) {
+                float4 a4 = reinterpret_cast<const float4*>(A + (size_t)m * K)[i];
+                const __nv_bfloat162* a2 = reinterpret_cast<const __nv_bfloat162*>(&a4);
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    float2 af = __bfloat1622float2(a2[j]);
+                    float2 bf = __bfloat1622float2(b2[j]);
+                    f32x2_fma(sum_pair[m], af, bf);
+                }
+            }
+        }
+    }
+
+    const __nv_bfloat16* b_col = B + (size_t)out_idx * K;
+    int k_tail_start = k8 * 8;
+
+    #pragma unroll
+    for (int m = 0; m < MAX_M; m++) {
+        if (m >= M) break;
+        float sum = f32x2_reduce(sum_pair[m]);
+        for (int k = k_tail_start + lane_id; k < K; k += WARP_SIZE)
+            sum += __bfloat162float(A[(size_t)m * K + k]) * __bfloat162float(b_col[k]);
+
+        #pragma unroll
+        for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1)
+            sum += __shfl_xor_sync(0xffffffff, sum, mask);
+
+        if (lane_id == 0)
+            C[(size_t)m * N + out_idx] = __float2bfloat16(sum);
+    }
+    PDL_SIGNAL();
+}
+
+// Multi-row GEMV + Residual: D[M,N] = A[M,K] × B[K,N] + residual[M,N]
+template<int MAX_M>
+__global__ void gemv_multirow_kernel_scattered_add(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ D,
+    const __nv_bfloat16* __restrict__ residual,
+    int M, int N, int K)
+{
+    PDL_WAIT();
+    constexpr int WARP_SIZE = 32;
+    constexpr int WARPS_PER_BLOCK = 8;
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x & (WARP_SIZE - 1);
+    int num_blocks = (N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    int out_idx = blockIdx.x + warp_id * num_blocks;
+
+    if (out_idx >= N) return;
+
+    const float4* b_col_v4 = reinterpret_cast<const float4*>(B + (size_t)out_idx * K);
+
+    uint64_t sum_pair[MAX_M];
+    #pragma unroll
+    for (int m = 0; m < MAX_M; m++) sum_pair[m] = 0;
+
+    int k8 = K / 8;
+    for (int i = lane_id; i < k8; i += WARP_SIZE) {
+        float4 b4 = b_col_v4[i];
+        const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&b4);
+
+        #pragma unroll
+        for (int m = 0; m < MAX_M; m++) {
+            if (m < M) {
+                float4 a4 = reinterpret_cast<const float4*>(A + (size_t)m * K)[i];
+                const __nv_bfloat162* a2 = reinterpret_cast<const __nv_bfloat162*>(&a4);
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    float2 af = __bfloat1622float2(a2[j]);
+                    float2 bf = __bfloat1622float2(b2[j]);
+                    f32x2_fma(sum_pair[m], af, bf);
+                }
+            }
+        }
+    }
+
+    const __nv_bfloat16* b_col = B + (size_t)out_idx * K;
+    int k_tail_start = k8 * 8;
+
+    #pragma unroll
+    for (int m = 0; m < MAX_M; m++) {
+        if (m >= M) break;
+        float sum = f32x2_reduce(sum_pair[m]);
+        for (int k = k_tail_start + lane_id; k < K; k += WARP_SIZE)
+            sum += __bfloat162float(A[(size_t)m * K + k]) * __bfloat162float(b_col[k]);
+
+        #pragma unroll
+        for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1)
+            sum += __shfl_xor_sync(0xffffffff, sum, mask);
+
+        if (lane_id == 0)
+            D[(size_t)m * N + out_idx] = __float2bfloat16(sum + __bfloat162float(residual[(size_t)m * N + out_idx]));
+    }
+    PDL_SIGNAL();
+}
+
+// ============================================================================
 // invoke_dense_gemm: CUTLASS SM110 BF16 GEMM + 统一内存 per-GEMM sync
 // C[M,N] = A[M,K] × B[K,N]
 // A: RowMajor, B: ColumnMajor, C: RowMajor
@@ -176,12 +313,23 @@ void invoke_dense_gemm(
     int K,
     cudaStream_t stream
 ) {
-    // Small M: skip CUTLASS entirely, use cuBLAS directly.
-    // CUTLASS SM110 TileShape<128,128,64> + ClusterShape<2,2,1> requires
-    // TMA descriptor boxDim[1] = 128/2 = 64. M_padded must be >= 64 for TMA.
-    // When M < 128, M_padded could be < 64 (e.g. M=39 → M_padded=40) → error 716.
-    // Also: MTP verify T=2 (M=2). cuBLAS handles small GEMM efficiently.
-    if (M > 1 && M < 128) {
+    // Small M: use multi-row GEMV (reads B weights once, A from L2 cache).
+    // Much faster than cuBLAS for M=2-8: cuBLAS reads B ~1.5-2× for small M.
+    if (M > 1 && M <= 8) {
+        constexpr int BLOCK_THREADS = 256;  // 8 warps
+        constexpr int WARPS = BLOCK_THREADS / 32;
+        int blocks = (N + WARPS - 1) / WARPS;
+        if (M <= 4) {
+            PDL_LAUNCH(gemv_multirow_kernel_scattered<4>, blocks, BLOCK_THREADS, 0, stream,
+                A, B, C, M, N, K);
+        } else {
+            PDL_LAUNCH(gemv_multirow_kernel_scattered<8>, blocks, BLOCK_THREADS, 0, stream,
+                A, B, C, M, N, K);
+        }
+        return;
+    }
+    // M=9-127: cuBLAS (CUTLASS TMA requires M_padded ≥ 64)
+    if (M > 8 && M < 128) {
         auto h = get_cublas_handle();
         cublasSetStream(h, stream);
         float alpha = 1.0f, beta_val = 0.0f;
@@ -371,9 +519,22 @@ void invoke_dense_gemm_add(
     int M, int N, int K,
     cudaStream_t stream
 ) {
-    // Small M: skip CUTLASS, use cuBLAS with residual add.
-    // Same TMA descriptor issue as invoke_dense_gemm: M < 128 → use cuBLAS.
-    if (M > 1 && M < 128) {
+    // Small M: multi-row GEMV + residual add (reads B once, A from L2)
+    if (M > 1 && M <= 8) {
+        constexpr int BLOCK_THREADS = 256;
+        constexpr int WARPS = BLOCK_THREADS / 32;
+        int blocks = (N + WARPS - 1) / WARPS;
+        if (M <= 4) {
+            PDL_LAUNCH(gemv_multirow_kernel_scattered_add<4>, blocks, BLOCK_THREADS, 0, stream,
+                A, B, D, residual, M, N, K);
+        } else {
+            PDL_LAUNCH(gemv_multirow_kernel_scattered_add<8>, blocks, BLOCK_THREADS, 0, stream,
+                A, B, D, residual, M, N, K);
+        }
+        return;
+    }
+    // M=9-127: cuBLAS with residual add
+    if (M > 8 && M < 128) {
         auto h = get_cublas_handle();
         cublasSetStream(h, stream);
         if (D != residual) {
