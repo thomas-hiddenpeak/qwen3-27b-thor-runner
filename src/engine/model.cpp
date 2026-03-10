@@ -2,7 +2,9 @@
 #include "safetensors.h"
 #include "light_ops.h"
 #include "dense_gemm.h"
+#include <chrono>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <cmath>
@@ -42,13 +44,21 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
     cudaStream_t conv_stream;
     cudaStreamCreate(&conv_stream);
 
+    auto load_start = std::chrono::steady_clock::now();
+
     // 1. 遍历目录，将所有 safetensors 权重拷贝到 VRAM
     int file_count = 0;
+    size_t total_copy_bytes = 0;
     for (const auto& entry : fs::directory_iterator(model_dir)) {
         if (entry.path().extension() != ".safetensors") continue;
         ++file_count;
+        auto shard_start = std::chrono::steady_clock::now();
         std::cerr << "Loading shard " << file_count << ": "
-                  << entry.path().filename().string() << std::endl;
+                  << entry.path().filename().string()
+                  << " (" << (entry.file_size() >> 20) << " MB)" << std::endl;
+
+        int shard_tensors = 0;
+        size_t shard_bytes = 0;
 
         auto loader = std::make_unique<io::SafetensorsLoader>(entry.path().string());
         for (const auto& name : loader->get_tensor_names()) {
@@ -64,6 +74,9 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
                 throw std::runtime_error("cudaMalloc failed for " + name);
             if (cudaMemcpy(d_ptr, tensor->data(), size_bytes, cudaMemcpyHostToDevice) != cudaSuccess)
                 throw std::runtime_error("cudaMemcpy failed for " + name);
+
+            shard_tensors++;
+            shard_bytes += size_bytes;
 
             device_weights_.push_back(d_ptr);
 
@@ -127,13 +140,27 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
         // 统一内存: 立即释放 mmap, 避免与 cudaMalloc 同时占用双份物理内存
         // (loader 析构 → munmap → OS 回收物理页)
         loader.reset();
+
+        total_copy_bytes += shard_bytes;
+        auto shard_elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - shard_start).count();
+        std::cerr << "  Shard " << file_count << ": " << shard_tensors << " tensors, "
+                  << (shard_bytes >> 20) << " MB copied in "
+                  << std::fixed << std::setprecision(1) << shard_elapsed << "s ("
+                  << std::setprecision(1) << ((shard_bytes / 1048576.0) / shard_elapsed) << " MB/s)"
+                  << std::endl;
     }
     // Wait for all dtype conversions to complete
     cudaStreamSynchronize(conv_stream);
     cudaStreamDestroy(conv_stream);
 
+    auto load_elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - load_start).count();
     std::cerr << "Loaded " << (tensor_map.size() + f32_map.size() + raw_map.size() + scalar_f32_map.size())
-              << " tensors (" << file_count << " shards) into VRAM."
+              << " tensors (" << file_count << " shards, "
+              << (total_copy_bytes >> 20) << " MB) into VRAM in "
+              << std::fixed << std::setprecision(1) << load_elapsed << "s ("
+              << std::setprecision(1) << ((total_copy_bytes / 1048576.0) / load_elapsed) << " MB/s)."
               << (is_nvfp4 ? " [NVFP4 quantized model detected]" : "") << std::endl;
 
     // 2. 绑定权重 — 根据层类型分别绑定
