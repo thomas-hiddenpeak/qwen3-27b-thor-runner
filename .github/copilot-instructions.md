@@ -57,7 +57,7 @@
 src/
 ├── main.cpp              — 统一入口 (serve/chat/bench/test/probe/version 子命令)
 ├── tests.cpp             — 测试框架 (16 tests, 3 categories, --list/--filter/--category/--all)
-├── benchmark.cpp         — Engine-based 性能评估 (通过 InferenceBackend 走完整推理路径)
+├── benchmark.cpp         — 性能评估 (engine bench + --raw-batch 参考基线)
 ├── engine/
 │   ├── engine.h/cpp      — 推理引擎: prefill/decode 循环, 连续批处理, MTP
 │   ├── backend.h/cpp     — 独立后端接口 (线程安全, 与传输层解耦)
@@ -231,6 +231,7 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc)
 #   ./build/qwen35-thor serve --config configs/qwen3.5-27b.conf
 #   ./build/qwen35-thor chat  --config configs/qwen3.5-27b.conf
 #   ./build/qwen35-thor bench --config configs/qwen3.5-27b.conf --decode 30 --iterations 3 --json results.json
+#   ./build/qwen35-thor bench --config configs/qwen3.5-27b.conf --raw-batch 1,32,64,128 --raw-decode 10 --iterations 3
 #   ./build/qwen35-thor test --list
 #   ./build/qwen35-thor test --all
 # 多模型 (自动从 config.json 检测架构):
