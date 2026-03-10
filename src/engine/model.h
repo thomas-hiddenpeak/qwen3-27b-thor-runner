@@ -44,7 +44,28 @@ public:
         bool force_paged_attn = false    // chunked prefill: force paged attn for non-first chunks
     );
 
-    // Batched Decode: batch_size 个请求各 1 token, 无 per-layer sync, CUDA Graph 兼容
+    // Batch Prefill: batch_size 个请求各 tokens_per_seq tokens, per-layer sync
+    //   GEMMs 批量 (M = batch_size * tokens_per_seq), attention/SSM 逐请求串行
+    //   比 N 次 forward_prefill 在权重读取上 N× 加速
+    // ssm_states[lin_idx * batch_size + batch_idx] — SSM 状态指针
+    // conv_states[lin_idx * batch_size + batch_idx] — Conv 状态指针
+    void forward_prefill_batch(
+        __nv_bfloat16* hidden_states,    // [batch_size * tokens_per_seq, hs]
+        const int* pos_ids,              // [batch_size * tokens_per_seq]
+        const ops::KVCacheManager& kv_manager,
+        const int* block_tables,         // [batch_size, max_num_blocks_per_seq]
+        const int* context_lens,         // [batch_size]
+        int max_num_blocks_per_seq,
+        int max_context_len,
+        int batch_size,
+        int tokens_per_seq,
+        __nv_bfloat16** ssm_states,      // [num_lin_layers * batch_size]
+        __nv_bfloat16** conv_states,     // [num_lin_layers * batch_size]
+        __nv_bfloat16* workspace,
+        cudaStream_t stream = 0
+    );
+
+    // Batched Decode: batch_size 个请求各 1 token, 有 per-layer sync
     // ssm_states[lin_idx * batch_size + batch_idx] — SSM 状态指针
     // conv_states[lin_idx * batch_size + batch_idx] — Conv 状态指针
     void forward_decode(

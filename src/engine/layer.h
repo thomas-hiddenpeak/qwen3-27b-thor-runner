@@ -311,6 +311,10 @@ public:
 
     // workspace: >= num_tokens*(hs + q_dim + kv_dim*2 + q_dim + hs*3 + is*3) * sizeof(half)
     // 对 batched decode: block_tables [batch_size, max_blocks_per_seq], context_lens [batch_size]
+    // tokens_per_seq: batch prefill 模式 — batch_size > 1 && tokens_per_seq > 1
+    //   每请求 tokens_per_seq 个 token, 共 batch_size 个请求
+    //   num_tokens = batch_size * tokens_per_seq
+    //   GEMMs 用 B*T 批量处理; attention/KV write 逐请求串行
     void forward(
         __nv_bfloat16* hidden_states,         // [T, hs], in-place
         const int* pos_ids,          // [T]
@@ -325,7 +329,8 @@ public:
         cudaStream_t stream = 0,
         int batch_size = 1,          // >1 for batched decode
         bool force_paged_attn = false, // chunked prefill: force paged attention for non-first chunks
-        ops::StreamingAttnCtx* streaming_ctx = nullptr  // SSD 流式注意力上下文
+        ops::StreamingAttnCtx* streaming_ctx = nullptr,  // SSD 流式注意力上下文
+        int tokens_per_seq = 0       // >1 for batch prefill (batch_size requests × tokens_per_seq tokens)
     );
 
     // 设置合并后的 QKV 权重 (T=1 GEMV 优化: 3 launches → 1)
@@ -455,6 +460,8 @@ public:
     // ssm_state_checkpoint/conv_state_checkpoint: MTP T>1 verify rollback checkpoints
     //   if non-null, save state after processing first num_checkpoints tokens
     //   Layout: [num_checkpoints * state_size_per_layer] contiguous
+    // tokens_per_seq: batch prefill 模式 — batch_size > 1 && tokens_per_seq > 1
+    //   每请求 tokens_per_seq 个 token, GEMMs 批量, conv1d/SSM 逐请求
     void forward(
         __nv_bfloat16* hidden_states,    // [T, hs], in-place
         __nv_bfloat16* ssm_state,       // [nkh, kd, v_per_kh] bf16 (batch_size==1)
@@ -467,7 +474,8 @@ public:
         __nv_bfloat16** conv_state_ptrs = nullptr,  // [batch_size] device ptr array
         __nv_bfloat16* ssm_state_checkpoint = nullptr,
         __nv_bfloat16* conv_state_checkpoint = nullptr,
-        int num_checkpoints = 1
+        int num_checkpoints = 1,
+        int tokens_per_seq = 0       // >1 for batch prefill (batch_size requests × tokens_per_seq tokens)
     );
 
 private:

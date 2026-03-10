@@ -430,7 +430,8 @@ void Qwen35FullAttnLayer::forward(
     cudaStream_t stream,
     int batch_size,
     bool force_paged_attn,
-    ops::StreamingAttnCtx* streaming_ctx)
+    ops::StreamingAttnCtx* streaming_ctx,
+    int tokens_per_seq)
 {
     if (!q_proj_w_ && !quantized_) return;
 
@@ -525,7 +526,10 @@ void Qwen35FullAttnLayer::forward(
 
     // 2b+3+4. Fused: deinterleave Q+Gate, Q/K per-head RMSNorm, partial RoPE
     // 3 kernels → 1: saves 2 launches/layer × 16 FullAttn = 32 launches/step
-    __nv_bfloat16* q = qg_proj;
+    // 重要: q_out 不能和 qg_in 共用同一 buffer, 因为 fused kernel 的输出 stride (6144/tok)
+    //   和输入 stride (12288/tok) 不同, 会导致跨 block 数据竞争 (block (t,h) 的 write
+    //   覆盖 block (t',h') 的 read source). 使用 swiglu_out 作为独立 Q 缓冲区.
+    __nv_bfloat16* q = (num_tokens > 1) ? swiglu_out : qg_proj;
     __nv_bfloat16* attn_gate = gate_buf;
     if (q_norm_w_ && k_norm_w_) {
         ops::invoke_fused_qk_norm_rope(q, attn_gate, qg_proj, k,
@@ -551,7 +555,21 @@ void Qwen35FullAttnLayer::forward(
     __nv_bfloat16* k_cache = const_cast<__nv_bfloat16*>(kv_manager.get_layer_k_cache(full_attn_idx));
     __nv_bfloat16* v_cache = const_cast<__nv_bfloat16*>(kv_manager.get_layer_v_cache(full_attn_idx));
 
-    if (batch_size > 1) {
+    const bool batch_prefill = (tokens_per_seq > 1 && batch_size > 1);
+
+    if (batch_prefill) {
+        // Batch prefill: per-request KV write (B requests × tokens_per_seq tokens each)
+        const int bs = kv_manager.get_block_size();
+        for (int b = 0; b < batch_size; ++b) {
+            ops::invoke_write_kv_cache(k_cache, v_cache,
+                                        k + (size_t)b * tokens_per_seq * kv_dim,
+                                        v + (size_t)b * tokens_per_seq * kv_dim,
+                                        block_tables + b * max_num_blocks_per_seq,
+                                        0 /*unused*/, tokens_per_seq,
+                                        num_kv, hd, bs, max_num_blocks_per_seq,
+                                        stream, 1, nullptr, context_lens + b);
+        }
+    } else if (batch_size > 1) {
         // Batched decode: compute per-sequence write positions from context_lens
         // Place seq_positions int array at end of workspace (after down_out)
         int* seq_positions = reinterpret_cast<int*>(down_out + num_tokens * hs);
@@ -576,7 +594,36 @@ void Qwen35FullAttnLayer::forward(
     // 6. Attention
     float sm_scale = 1.0f / sqrtf((float)hd);
 
-    if (streaming_ctx && streaming_ctx->total_ssd_blocks > 0) {
+    if (batch_prefill) {
+        // Batch prefill: per-request attention (B requests × tokens_per_seq tokens each)
+        // GEMMs 已批量完成, 此处逐请求计算 attention → 自然 block-diagonal masking
+        const int T = tokens_per_seq;
+        const int bs = kv_manager.get_block_size();
+        for (int b = 0; b < batch_size; ++b) {
+            if (T >= 256) {
+                // 长序列: CUTLASS tiled GEMM self-attention (causal)
+                __nv_bfloat16* score_workspace = up_out;
+                ops::invoke_prefill_attention(
+                    attn_out + (size_t)b * T * q_dim,
+                    q + (size_t)b * T * q_dim,
+                    k + (size_t)b * T * kv_dim,
+                    v + (size_t)b * T * kv_dim,
+                    T, num_q, num_kv, hd,
+                    sm_scale, score_workspace, stream);
+            } else {
+                // 短序列: paged attention with causal masking
+                ops::invoke_paged_attention(
+                    attn_out + (size_t)b * T * q_dim,
+                    q + (size_t)b * T * q_dim,
+                    k_cache, v_cache,
+                    block_tables + b * max_num_blocks_per_seq,
+                    context_lens + b,
+                    max_num_blocks_per_seq, max_context_len,
+                    T, num_q, num_kv, hd,
+                    bs, sm_scale, stream, 1);
+            }
+        }
+    } else if (streaming_ctx && streaming_ctx->total_ssd_blocks > 0) {
         // =========================================================
         // Streaming Paged Attention: GPU + SSD 两阶段
         // =========================================================
@@ -769,7 +816,8 @@ void Qwen35LinearAttnLayer::forward(
     __nv_bfloat16** conv_state_ptrs,
     __nv_bfloat16* ssm_state_checkpoint,
     __nv_bfloat16* conv_state_checkpoint,
-    int num_checkpoints)
+    int num_checkpoints,
+    int tokens_per_seq)
 {
     if (!in_proj_qkv_w_ && !in_proj_qkv_qw_.valid()) return;
 
@@ -877,22 +925,52 @@ void Qwen35LinearAttnLayer::forward(
     __nv_bfloat16* k_buf = qkv_out + qk_dim;
     __nv_bfloat16* v_buf = qkv_out + qk_dim * 2;
 
+    const bool batch_prefill = (tokens_per_seq > 1 && batch_size > 1);
+
     // 3. Short Conv1d on Q+K+V (all in_qkv channels) with SiLU activation
     if (conv1d_w_ && (conv_state || conv_state_ptrs)) {
-        ops::invoke_causal_conv1d(qkv_out, conv_state,
-                                   conv1d_w_, num_tokens, in_qkv, conv_k, stream,
-                                   0 /* token_stride */, batch_size, conv_state_ptrs,
-                                   conv_state_checkpoint, num_checkpoints);
+        if (batch_prefill) {
+            // Batch prefill: per-request conv1d (B requests × tokens_per_seq tokens)
+            for (int b = 0; b < batch_size; ++b) {
+                ops::invoke_causal_conv1d(
+                    qkv_out + (size_t)b * tokens_per_seq * in_qkv,
+                    conv_state_ptrs[b],
+                    conv1d_w_, tokens_per_seq, in_qkv, conv_k, stream);
+            }
+        } else {
+            ops::invoke_causal_conv1d(qkv_out, conv_state,
+                                       conv1d_w_, num_tokens, in_qkv, conv_k, stream,
+                                       0 /* token_stride */, batch_size, conv_state_ptrs,
+                                       conv_state_checkpoint, num_checkpoints);
+        }
     }
 
     // 4+5+6. Gated DeltaNet recurrence (alpha/sigmoid-beta computed inline)
-    ops::invoke_gated_delta_net(
-        q_buf, k_buf, v_buf,
-        a_out_f16, dt_bias_, A_log_f32_, beta_out,
-        ssm_state, y_ssm,
-        num_tokens, nkh, kd, nv_per_kh, vd, stream, in_qkv,
-        batch_size, ssm_state_ptrs,
-        ssm_state_checkpoint, num_checkpoints);
+    if (batch_prefill) {
+        // Batch prefill: per-request DeltaNet SSM (B requests × tokens_per_seq tokens)
+        for (int b = 0; b < batch_size; ++b) {
+            size_t tok_off = (size_t)b * tokens_per_seq;
+            ops::invoke_gated_delta_net(
+                qkv_out + tok_off * in_qkv,                    // Q
+                qkv_out + tok_off * in_qkv + qk_dim,           // K
+                qkv_out + tok_off * in_qkv + 2 * qk_dim,       // V
+                a_out_f16 + tok_off * nv,
+                dt_bias_, A_log_f32_,
+                beta_out + tok_off * nv,
+                ssm_state_ptrs[b],
+                y_ssm + tok_off * lin_v,
+                tokens_per_seq, nkh, kd, nv_per_kh, vd,
+                stream, in_qkv);
+        }
+    } else {
+        ops::invoke_gated_delta_net(
+            q_buf, k_buf, v_buf,
+            a_out_f16, dt_bias_, A_log_f32_, beta_out,
+            ssm_state, y_ssm,
+            num_tokens, nkh, kd, nv_per_kh, vd, stream, in_qkv,
+            batch_size, ssm_state_ptrs,
+            ssm_state_checkpoint, num_checkpoints);
+    }
 
     // 7+8. Fused per-head RMSNorm + SiLU gate: y_ssm = rmsnorm(y_ssm) * silu(z_out)
     if (attn_norm_w_) {

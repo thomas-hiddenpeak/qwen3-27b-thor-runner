@@ -127,6 +127,11 @@ private:
     void batch_decode_step(std::vector<RequestContext*>& decode_reqs,
                            std::vector<RequestContext*>& active_requests);
 
+    // Batch prefill: 多个短 prompt 请求一次 forward 完成 prefill
+    // 返回完成的请求数 (0 = 未执行 batch prefill)
+    int batch_prefill_step(std::vector<RequestContext*>& prefill_reqs,
+                           std::vector<RequestContext*>& active_requests);
+
     std::string token_to_log_text(int token_id) const;
 
     Qwen35Config config_;

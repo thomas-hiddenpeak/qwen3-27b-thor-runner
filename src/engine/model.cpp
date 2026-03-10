@@ -1351,6 +1351,64 @@ void Qwen35Model::forward_prefill(
 }
 
 // ============================================================================
+// Batch Prefill 前向传播: batch_size 个请求各 tokens_per_seq tokens
+//
+// 核心优化: GEMMs 批量处理 (M = batch_size * tokens_per_seq), 权重只读一次
+// Attention/SSM/Conv1d: 逐请求串行 (天然 block-diagonal masking)
+// 典型加速: N 次串行 prefill → 1 次 batch prefill
+//   N=32, T=17: 权重读取 32× → 1×, 预估 ramp-up 8000ms → 300ms
+// ============================================================================
+void Qwen35Model::forward_prefill_batch(
+    __nv_bfloat16* hidden_states,
+    const int* pos_ids,
+    const ops::KVCacheManager& kv_manager,
+    const int* block_tables,
+    const int* context_lens,
+    int max_num_blocks_per_seq,
+    int max_context_len,
+    int batch_size,
+    int tokens_per_seq,
+    __nv_bfloat16** ssm_states,
+    __nv_bfloat16** conv_states,
+    __nv_bfloat16* workspace,
+    cudaStream_t stream)
+{
+    int num_tokens = batch_size * tokens_per_seq;
+    int lin_idx = 0;
+    int fa_idx  = 0;
+
+    for (int i = 0; i < config_.num_hidden_layers; ++i) {
+
+        if (config_.is_full_attention(i)) {
+            layers_[i].get_full_attn()->forward(
+                hidden_states, pos_ids, kv_manager,
+                block_tables, context_lens,
+                max_num_blocks_per_seq, max_context_len,
+                num_tokens, fa_idx, workspace, stream,
+                batch_size, false /* force_paged_attn */,
+                nullptr /* streaming_ctx */, tokens_per_seq);
+            ++fa_idx;
+        } else {
+            __nv_bfloat16** lin_ssm = ssm_states + lin_idx * batch_size;
+            __nv_bfloat16** lin_conv = conv_states + lin_idx * batch_size;
+            layers_[i].get_linear_attn()->forward(
+                hidden_states,
+                nullptr /* ssm_state scalar: unused */,
+                nullptr /* conv_state scalar: unused */,
+                num_tokens, workspace, stream,
+                batch_size,
+                lin_ssm, lin_conv,
+                nullptr /* ssm_checkpoint */, nullptr /* conv_checkpoint */, 1,
+                tokens_per_seq);
+            ++lin_idx;
+        }
+
+        // 逐层 stream sync — SM110 统一内存约束
+        cudaStreamSynchronize(stream);
+    }
+}
+
+// ============================================================================
 // Decode 前向传播: batch_size 个请求各 1 token
 //
 // 必须逐层 cudaStreamSynchronize:

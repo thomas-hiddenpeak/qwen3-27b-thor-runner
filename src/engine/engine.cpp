@@ -486,6 +486,126 @@ void InferenceEngine::inference_loop() {
             continue;
         }
 
+        // Burst accumulation: 如果所有已接入请求都是待 prefill (burst 场景),
+        // 循环 yield + redrain 直到队列稳定 (不再增长), 最多 20ms
+        // 典型代价: 5-10ms (submit 1MB×32 ≈ 6ms), 收益: 全部请求一次 batch prefill
+        {
+            bool all_pending = true;
+            for (auto* r : active_requests) {
+                if (!r->generated_tokens.empty() || r->is_finished) {
+                    all_pending = false;
+                    break;
+                }
+            }
+            if (all_pending && (int)active_requests.size() >= 2) {
+                for (int retry = 0; retry < 20; ++retry) {
+                    int prev_count = (int)active_requests.size();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    // Re-drain IPC
+                    while (true) {
+                        bool should_accept = cache_manager_->num_free_gpu_blocks() >= admission_threshold &&
+                                             cache_manager_->num_free_ssm_slots() > 0;
+                        if (!should_accept) break;
+                        ipc::InferenceRequest req;
+                        if (!ipc_queue_->pop(req)) break;
+                        // 快速路径: 跳过多模态/SSD, 仅处理短 prompt 请求
+                        auto ctx = std::make_unique<RequestContext>();
+                        ctx->request_id = req.request_id;
+                        ctx->max_new_tokens = req.max_new_tokens;
+                        ctx->temperature = req.temperature;
+                        ctx->top_p = req.top_p;
+                        ctx->top_k = req.top_k;
+                        ctx->min_p = req.min_p;
+                        ctx->repeat_penalty = req.repeat_penalty;
+                        ctx->frequency_penalty = req.frequency_penalty;
+                        ctx->presence_penalty = req.presence_penalty;
+                        ctx->seed = req.seed;
+                        for (int i = 0; i < req.prompt_len; ++i)
+                            ctx->prompt_tokens.push_back(req.prompt_tokens[i]);
+                        ctx->cache_state.context_len = req.prompt_len;
+                        {
+                            std::lock_guard<std::mutex> lock(pending_images_mutex_);
+                            auto it = pending_images_.find(req.request_id);
+                            if (it != pending_images_.end()) {
+                                ctx->processed_images = std::move(it->second);
+                                pending_images_.erase(it);
+                            }
+                        }
+                        int total_tokens_needed = req.prompt_len + req.max_new_tokens;
+                        if (!cache_manager_->has_ssd_store() && total_tokens_needed > gpu_max_tokens_) {
+                            ipc::InferenceResponse err_resp{};
+                            err_resp.request_id = req.request_id;
+                            err_resp.token_id = 0;
+                            err_resp.is_finished = true;
+                            err_resp.error_code = -1;
+                            ipc_resp_queue_->push(err_resp);
+                            continue;
+                        }
+                        if (req.prompt_len > ipc::MAX_PROMPT_LEN) {
+                            ipc::InferenceResponse err_resp{};
+                            err_resp.request_id = req.request_id;
+                            err_resp.token_id = 0;
+                            err_resp.is_finished = true;
+                            err_resp.error_code = -1;
+                            ipc_resp_queue_->push(err_resp);
+                            continue;
+                        }
+                        int num_blocks_needed = (req.prompt_len + 15) / 16;
+                        while (cache_manager_->num_free_gpu_blocks() < num_blocks_needed && cache_manager_->has_swapper()) {
+                            int freed = try_swap_out_victim(active_requests, num_blocks_needed);
+                            if (freed == 0) break;
+                        }
+                        std::vector<int> blocks;
+                        try {
+                            blocks = cache_manager_->kv_manager().allocate_blocks(num_blocks_needed);
+                        } catch (const std::runtime_error&) {
+                            break;
+                        }
+                        ctx->cache_state.block_table = blocks;
+                        ctx->cache_state.block_tracker.init(blocks);
+                        active_requests.push_back(ctx.get());
+                        if (cache_manager_->num_free_ssm_slots() == 0) {
+                            bool freed_slot = false;
+                            for (size_t i = 1; i < active_requests.size(); ++i) {
+                                auto* r = active_requests[i];
+                                if (!r->cache_state.is_swapped && !r->is_finished && r->cache_state.ssm_slot >= 0) {
+                                    try_swap_out_victim(active_requests, 0);
+                                    freed_slot = cache_manager_->num_free_ssm_slots() > 0;
+                                    if (freed_slot) break;
+                                }
+                            }
+                            if (!freed_slot) {
+                                cache_manager_->kv_manager().free_blocks(ctx->cache_state.block_table);
+                                ctx->cache_state.block_table.clear();
+                                active_requests.pop_back();
+                                ipc::InferenceResponse err_resp{};
+                                err_resp.request_id = req.request_id;
+                                err_resp.token_id = 0;
+                                err_resp.is_finished = true;
+                                err_resp.error_code = -1;
+                                ipc_resp_queue_->push(err_resp);
+                                continue;
+                            }
+                        }
+                        {
+                            int slot = cache_manager_->allocate_ssm_slot();
+                            ctx->cache_state.ssm_slot = slot;
+                            ctx->cache_state.ssm_states.resize(num_linear_layers_);
+                            ctx->cache_state.conv_states.resize(num_linear_layers_);
+                            for (int li = 0; li < num_linear_layers_; ++li) {
+                                ctx->cache_state.ssm_states[li] = cache_manager_->get_ssm_state(slot, li);
+                                ctx->cache_state.conv_states[li] = cache_manager_->get_conv_state(slot, li);
+                                cudaMemsetAsync(ctx->cache_state.ssm_states[li], 0, ssm_size_per_layer_, compute_stream_);
+                                cudaMemsetAsync(ctx->cache_state.conv_states[li], 0, conv_size_per_layer_, compute_stream_);
+                            }
+                        }
+                        all_requests_.push_back(std::move(ctx));
+                    }
+                    if ((int)active_requests.size() == prev_count) break;  // 队列稳定
+                }
+            }
+        }
+
         // 2a. 检查取消请求 — 将已取消的 active request 标记为 finished
         {
             std::lock_guard<std::mutex> lock(cancel_mutex_);
@@ -643,6 +763,29 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
     }
 
     bool did_batch_decode = false;
+    bool did_batch_prefill = false;
+
+    // Batch Prefill 优化: 多个短 prompt 请求一次 forward 完成 prefill
+    //   GEMMs 批量 (权重读一次), attention/SSM 逐请求串行
+    //   N 次串行 prefill (N × 250ms) → 1 次 batch prefill (~300ms)
+    if (has_pending_prefill) {
+        std::vector<RequestContext*> pending_prefills;
+        for (auto* r : active_requests) {
+            if (!r->is_finished && r->generated_tokens.empty() && !r->cache_state.is_swapped) {
+                pending_prefills.push_back(r);
+            }
+        }
+        if ((int)pending_prefills.size() >= 2) {
+            int done = batch_prefill_step(pending_prefills, active_requests);
+            if (done > 0) {
+                did_batch_prefill = true;
+                // batch_prefill 后直接返回, 让下一次 step() 重新收集 batch_decode_reqs
+                // (当前 batch_decode_reqs 在 batch_prefill 之前收集, 不含刚 prefill 的请求)
+                return;
+            }
+        }
+    }
+
     // Ramp-up 优化: 有 pending prefill 时跳过 batch decode
     //   每步只做 1× 权重读取 (prefill) 而非 2× (batch_decode + prefill)
     //   代价: 已 prefilled 的 decode 请求暂停等待, 但 ramp-up 总时间减半
@@ -2158,6 +2301,182 @@ void InferenceEngine::batch_decode_step(
         std::cerr << "[BatchDecode] B=" << B << " requests decoded"
                   << " (max_ctx=" << max_ctx_len << ")" << std::endl;
     }
+}
+
+// ============================================================================
+// Batch Prefill: 多个短 prompt 请求一次 forward 完成 prefill
+//
+// 核心优化: GEMMs 批量处理 (M = B * T), 权重只读一次
+// N 次串行 prefill (N × 250ms) → 1 次 batch prefill (~300ms)
+// 返回完成的请求数 (0 = 未执行)
+// ============================================================================
+int InferenceEngine::batch_prefill_step(
+    std::vector<RequestContext*>& prefill_reqs,
+    std::vector<RequestContext*>& active_requests)
+{
+    const int B = (int)prefill_reqs.size();
+    if (B <= 1) return 0;
+
+    // 检查所有请求是否为短 prompt (单 chunk) 且总 tokens 不超过 max_chunk_size
+    int T = (int)prefill_reqs[0]->prompt_tokens.size();
+    int total_tokens = 0;
+    for (auto* ctx : prefill_reqs) {
+        int plen = (int)ctx->prompt_tokens.size();
+        if (plen != T || plen > max_chunk_size_) return 0;  // 长度不齐或超 chunk — 回退串行
+        total_tokens += plen;
+    }
+    if (total_tokens > max_chunk_size_) {
+        // 超过 workspace 限制 — 取前 max_chunk_size_ / T 个请求
+        int max_B = max_chunk_size_ / T;
+        if (max_B <= 1) return 0;
+        prefill_reqs.resize(max_B);
+        total_tokens = max_B * T;
+    }
+    const int batch_size = (int)prefill_reqs.size();
+    const int hs = config_.hidden_size;
+    const int vocab_size = config_.vocab_size;
+
+    if (verbose_) {
+        fprintf(stderr, "[BatchPrefill] B=%d T=%d total=%d tokens\n",
+                batch_size, T, total_tokens);
+    }
+
+    // 1. Block 分配: 每请求 ceil(T/16) blocks
+    int blocks_per_req = (T + 15) / 16;
+    for (auto* ctx : prefill_reqs) {
+        // 跳过已有 block 的请求 (不应发生)
+        if (!ctx->cache_state.block_table.empty()) continue;
+        while (cache_manager_->num_free_gpu_blocks() < blocks_per_req && cache_manager_->has_swapper()) {
+            int freed = try_swap_out_victim(active_requests, blocks_per_req);
+            if (freed == 0) break;
+        }
+        try {
+            auto blocks = cache_manager_->kv_manager().allocate_blocks(blocks_per_req);
+            ctx->cache_state.block_table = blocks;
+            ctx->cache_state.block_tracker.init(blocks);
+        } catch (const std::runtime_error& e) {
+            fprintf(stderr, "[BatchPrefill] OOM for request %lu\n", ctx->request_id);
+            return 0;  // 回退串行
+        }
+    }
+
+    // 2. Prepare batch inputs
+    // 2a. Embedding: 拼接所有 prompt tokens
+    std::vector<int> h_all_tokens(total_tokens);
+    std::vector<int> h_pos_ids(total_tokens);
+    std::vector<int> h_context_lens(batch_size);
+    int max_blocks_in_batch = 0;
+    for (int b = 0; b < batch_size; ++b) {
+        auto* ctx = prefill_reqs[b];
+        // 拷贝 prompt tokens
+        std::copy(ctx->prompt_tokens.begin(), ctx->prompt_tokens.end(),
+                  h_all_tokens.begin() + b * T);
+        // Position IDs: [0, 1, ..., T-1] per request
+        for (int t = 0; t < T; ++t) h_pos_ids[b * T + t] = t;
+        // Context lens = T
+        h_context_lens[b] = T;
+        max_blocks_in_batch = std::max(max_blocks_in_batch,
+                                        (int)ctx->cache_state.block_table.size());
+    }
+
+    // 2b. Block tables [B, max_blocks]
+    std::vector<int> h_block_tables(batch_size * max_blocks_in_batch, -1);
+    for (int b = 0; b < batch_size; ++b) {
+        auto& bt = prefill_reqs[b]->cache_state.block_table;
+        std::copy(bt.begin(), bt.end(),
+                  h_block_tables.begin() + b * max_blocks_in_batch);
+    }
+
+    // 2c. SSM/Conv 指针数组: [num_lin_layers * batch_size]
+    for (int li = 0; li < num_linear_layers_; ++li) {
+        for (int b = 0; b < batch_size; ++b) {
+            d_batch_ssm_ptrs_[li * batch_size + b] = prefill_reqs[b]->cache_state.ssm_states[li];
+            d_batch_conv_ptrs_[li * batch_size + b] = prefill_reqs[b]->cache_state.conv_states[li];
+        }
+    }
+
+    // 3. GPU 上传 + Embedding
+    profiler_.begin("embedding", compute_stream_);
+    cudaMemcpyAsync(d_pos_ids_, h_all_tokens.data(), total_tokens * sizeof(int),
+                    cudaMemcpyHostToDevice, compute_stream_);
+    ops::invoke_embedding_lookup(d_hidden_states_, d_pos_ids_,
+                                  model_->get_embed_tokens(), total_tokens, hs, compute_stream_);
+    profiler_.end("embedding", compute_stream_);
+
+    // Position IDs (覆盖 d_pos_ids_)
+    cudaMemcpyAsync(d_pos_ids_, h_pos_ids.data(), total_tokens * sizeof(int),
+                    cudaMemcpyHostToDevice, compute_stream_);
+    // Block tables
+    cudaMemcpyAsync(d_batch_block_tables_, h_block_tables.data(),
+                    (size_t)batch_size * max_blocks_in_batch * sizeof(int),
+                    cudaMemcpyHostToDevice, compute_stream_);
+    // Context lens
+    cudaMemcpyAsync(d_context_lens_, h_context_lens.data(),
+                    batch_size * sizeof(int), cudaMemcpyHostToDevice, compute_stream_);
+
+    // 4. Forward: B请求 × T tokens 一次 forward
+    profiler_.begin("forward", compute_stream_);
+    model_->forward_prefill_batch(
+        d_hidden_states_, d_pos_ids_, cache_manager_->kv_manager(),
+        d_batch_block_tables_, d_context_lens_,
+        max_blocks_in_batch, T /* max_context_len */,
+        batch_size, T,
+        d_batch_ssm_ptrs_, d_batch_conv_ptrs_,
+        d_workspace_, compute_stream_);
+    profiler_.end("forward", compute_stream_);
+
+    // 5+6+7. Per-request LM head: 逐请求 fused RMSNorm+GEMV + argmax
+    //   直接从 d_hidden_states_ 读取每请求最后 token，避免 gather + batch GEMM
+    profiler_.begin("lm_head", compute_stream_);
+    __nv_bfloat16* logits_B = d_workspace_;  // [B, vocab]
+    for (int b = 0; b < batch_size; ++b) {
+        ops::invoke_dense_gemv_with_rmsnorm(
+            d_hidden_states_ + (size_t)((b + 1) * T - 1) * hs,
+            model_->get_norm_weight(), config_.rms_norm_eps,
+            model_->get_lm_head(), logits_B + (size_t)b * vocab_size,
+            vocab_size, hs, compute_stream_);
+    }
+    profiler_.end("lm_head", compute_stream_);
+
+    // 7. Batched argmax sampling
+    profiler_.begin("sample", compute_stream_);
+    ops::invoke_batched_argmax(logits_B, d_argmax_result_, vocab_size, batch_size, compute_stream_);
+    if (!fast_sync_stream(compute_stream_, "batch_prefill_argmax")) {
+        fprintf(stderr, "[BatchPrefill] FATAL: sync failed\n");
+        return 0;
+    }
+    profiler_.end("sample", compute_stream_);
+
+    // 8. 结果分发: 设置 generated_tokens, 推送响应
+    for (int b = 0; b < batch_size; ++b) {
+        auto* ctx = prefill_reqs[b];
+        int next_token = d_argmax_result_[b];
+
+        ctx->generated_tokens.push_back(next_token);
+        ctx->cache_state.context_len = T;
+        ctx->cache_state.context_len++;  // 下一步 decode 从 T+1 开始
+
+        bool eos = Qwen35Config::is_eos(next_token);
+
+        ipc::InferenceResponse resp{};
+        resp.request_id  = ctx->request_id;
+        resp.token_id    = next_token;
+        resp.is_finished = eos;
+        resp.error_code  = 0;
+        resp.prefill_time_ms = profiler_.prefill_elapsed_ms();
+        while (!ipc_resp_queue_->push(resp))
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+
+        if (eos) ctx->is_finished = true;
+    }
+    profiler_.request_prefill_done(total_tokens);
+
+    if (verbose_) {
+        fprintf(stderr, "[BatchPrefill] Done: B=%d T=%d total=%d tokens\n",
+                batch_size, T, total_tokens);
+    }
+
+    return batch_size;
 }
 
 std::string InferenceEngine::token_to_log_text(int token_id) const {
