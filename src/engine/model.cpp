@@ -46,6 +46,21 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
 
     auto load_start = std::chrono::steady_clock::now();
 
+    int total_scalars_skipped = 0;
+
+    // Helper: detect FP32 scalar tensors that can be read directly from mmap
+    auto is_scalar_tensor = [](const std::string& name, core::DataType dtype) -> bool {
+        if (dtype != core::DataType::FP32) return false;
+        if (name.find("_global_scale") != std::string::npos) return true;
+        if (name.find("weight_scale_2") != std::string::npos) return true;
+        if (name.find(".input_scale") != std::string::npos) return true;
+        // ModelOpt k_scale / v_scale
+        size_t len = name.size();
+        if (len >= 8 && name.compare(len - 8, 8, ".k_scale") == 0) return true;
+        if (len >= 8 && name.compare(len - 8, 8, ".v_scale") == 0) return true;
+        return false;
+    };
+
     // 1. 遍历目录，将所有 safetensors 权重拷贝到 VRAM
     int file_count = 0;
     size_t total_copy_bytes = 0;
@@ -65,41 +80,38 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
             auto tensor = loader->get_tensor(name);
             if (!tensor) continue;
 
+            auto dtype = tensor->dtype();
             size_t num_elements = 1;
             for (auto dim : tensor->shape()) num_elements *= dim;
-            size_t size_bytes = num_elements * core::get_dtype_size(tensor->dtype());
+            size_t size_bytes = num_elements * core::get_dtype_size(dtype);
+
+            // --- Scalar bypass: read FP32 scalar directly from mmap, skip GPU alloc ---
+            if (is_scalar_tensor(name, dtype)) {
+                float val = *static_cast<const float*>(tensor->data());
+                scalar_f32_map[name] = val;
+                total_scalars_skipped++;
+                continue;
+            }
 
             void* d_ptr = nullptr;
             if (cudaMalloc(&d_ptr, size_bytes) != cudaSuccess)
                 throw std::runtime_error("cudaMalloc failed for " + name);
+            device_weights_.push_back(d_ptr);
+
             if (cudaMemcpy(d_ptr, tensor->data(), size_bytes, cudaMemcpyHostToDevice) != cudaSuccess)
                 throw std::runtime_error("cudaMemcpy failed for " + name);
 
             shard_tensors++;
             shard_bytes += size_bytes;
 
-            device_weights_.push_back(d_ptr);
-
-            auto dtype = tensor->dtype();
             if (dtype == core::DataType::U8 || dtype == core::DataType::FP8_E4M3) {
-                // NVFP4 quantization tensor (weight_packed or weight_scale)
                 raw_map[name] = d_ptr;
                 raw_shape_map[name] = std::vector<int64_t>(tensor->shape().begin(), tensor->shape().end());
                 is_nvfp4 = true;
-            } else if (dtype == core::DataType::FP32 &&
-                       (name.find("_global_scale") != std::string::npos ||
-                        name.find("weight_scale_2") != std::string::npos ||
-                        name.find(".input_scale") != std::string::npos)) {
-                // NVFP4 per-projection scalar (llm-compressor: weight_global_scale;
-                //   ModelOpt: weight_scale_2, input_scale)
-                float val = *static_cast<const float*>(tensor->data());
-                scalar_f32_map[name] = val;
             } else if (dtype == core::DataType::BF16) {
-                // Check for A_log stored as BF16 (NVFP4 model variant)
                 bool is_a_log = (name.size() >= 5 &&
                                  name.substr(name.size() - 5) == "A_log");
                 if (is_a_log) {
-                    // BF16 → FP32 conversion on CPU (only 48 elements)
                     float* d_f32 = nullptr;
                     size_t f32_bytes = num_elements * sizeof(float);
                     if (cudaMalloc(reinterpret_cast<void**>(&d_f32), f32_bytes) != cudaSuccess)
@@ -117,13 +129,11 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
                     tensor_map[name] = static_cast<__nv_bfloat16*>(d_ptr);
                 }
             } else if (dtype == core::DataType::FP32) {
-                // Check if this is an A_log tensor (keep as FP32)
                 bool is_a_log = (name.size() >= 5 &&
                                  name.substr(name.size() - 5) == "A_log");
                 if (is_a_log) {
                     f32_map[name] = static_cast<float*>(d_ptr);
                 } else {
-                    // Convert FP32 → FP16 into a new half buffer
                     __nv_bfloat16* d_fp16 = nullptr;
                     size_t fp16_bytes = num_elements * sizeof(__nv_bfloat16);
                     if (cudaMalloc(reinterpret_cast<void**>(&d_fp16), fp16_bytes) != cudaSuccess)
@@ -133,12 +143,10 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
                     tensor_map[name] = d_fp16;
                 }
             } else {
-                // FP16 or INT8 – keep as-is
                 tensor_map[name] = static_cast<__nv_bfloat16*>(d_ptr);
             }
         }
         // 统一内存: 立即释放 mmap, 避免与 cudaMalloc 同时占用双份物理内存
-        // (loader 析构 → munmap → OS 回收物理页)
         loader.reset();
 
         total_copy_bytes += shard_bytes;
@@ -161,7 +169,10 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
               << (total_copy_bytes >> 20) << " MB) into VRAM in "
               << std::fixed << std::setprecision(1) << load_elapsed << "s ("
               << std::setprecision(1) << ((total_copy_bytes / 1048576.0) / load_elapsed) << " MB/s)."
-              << (is_nvfp4 ? " [NVFP4 quantized model detected]" : "") << std::endl;
+              << (is_nvfp4 ? " [NVFP4 quantized model detected]" : "");
+    if (total_scalars_skipped > 0)
+        std::cerr << " [scalar bypass: " << total_scalars_skipped << "]";
+    std::cerr << std::endl;
 
     // 2. 绑定权重 — 根据层类型分别绑定
     auto get_ptr = [&](const std::string& key) -> __nv_bfloat16* {
