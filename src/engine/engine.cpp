@@ -977,6 +977,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             ctx->cache_state.context_len++;
             
             // 推送响应 token 给 Python 前端
+            profiler_.request_prefill_done(num_tokens);
             {
                 bool eos = Qwen35Config::is_eos(next_token);
                 ipc::InferenceResponse resp{};
@@ -984,12 +985,12 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 resp.token_id    = next_token;
                 resp.is_finished = eos;
                 resp.error_code  = 0;
+                resp.prefill_time_ms = profiler_.prefill_elapsed_ms();
                 while (!ipc_resp_queue_->push(resp))
                     std::this_thread::sleep_for(std::chrono::microseconds(100));
                 if (eos) ctx->is_finished = true;
             }
             
-            profiler_.request_prefill_done(num_tokens);
             if (verbose_) {
                 std::cerr << "Prefill tok=" << next_token
                           << " txt=\"" << token_to_log_text(next_token) << "\""

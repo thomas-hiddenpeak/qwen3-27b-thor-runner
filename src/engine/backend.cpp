@@ -462,6 +462,7 @@ bool InferenceBackend::poll(InferResponse& response) {
     response.token_id    = ipc_resp.token_id;
     response.is_finished = ipc_resp.is_finished;
     response.error_code  = ipc_resp.error_code;
+    response.prefill_time_ms = ipc_resp.prefill_time_ms;
     return true;
 }
 

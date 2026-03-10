@@ -40,6 +40,8 @@ struct InferenceResponse {
     bool is_finished; 
     // 错误码，0 表示成功
     int32_t error_code; 
+    // Prefill 耗时 (ms), 仅首 token 有效 (>0), 后续 token 为 0
+    float prefill_time_ms = 0;
 };
 
 // -----------------------------------------------------------------------------

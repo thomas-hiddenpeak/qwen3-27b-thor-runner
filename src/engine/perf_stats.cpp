@@ -259,6 +259,11 @@ void PerfProfiler::request_done() {
     // 在 print_request_summary 中使用
 }
 
+float PerfProfiler::prefill_elapsed_ms() const {
+    double s = std::chrono::duration<double>(prefill_done_ - req_start_).count();
+    return static_cast<float>(s * 1000.0);
+}
+
 SystemSnapshot PerfProfiler::snapshot() {
     return monitor_.sample();
 }

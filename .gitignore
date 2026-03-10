@@ -62,3 +62,4 @@ docs/references/*.pdf
 # third_party/
 tmp/
 IMG_3375.png
+*.bak

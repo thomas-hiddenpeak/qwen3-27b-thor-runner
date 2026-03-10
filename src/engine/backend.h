@@ -75,6 +75,7 @@ struct InferResponse {
     int32_t     token_id;
     bool        is_finished;
     int32_t     error_code;     // 0 = 成功
+    float       prefill_time_ms = 0;  // Prefill 耗时 (ms), 仅首 token 有效
 };
 
 // ============================================================================

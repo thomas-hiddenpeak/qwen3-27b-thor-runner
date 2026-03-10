@@ -274,6 +274,8 @@ struct RequestResult {
     float total_ms;       // 提交到完成的总时间
     float gen_tps;        // generation throughput: (total_tokens-1) / generation_ms * 1000
     float overall_tps;    // total_tokens / total_ms * 1000
+    float prefill_ms;     // Engine 内部 prefill 耗时 (CUDA event 计时)
+    float prefill_tps;    // prefill throughput: prompt_len / prefill_ms * 1000
 };
 
 // ============================================================================
@@ -329,6 +331,7 @@ static RequestResult run_single_request(
     }
 
     int token_count = 0;
+    float prefill_ms_from_engine = 0;
     auto t_first = t_submit;  // 将在首 token 时更新
 
     while (true) {
@@ -338,6 +341,7 @@ static RequestResult run_single_request(
             token_count++;
             if (token_count == 1) {
                 t_first = Clock::now();
+                prefill_ms_from_engine = resp.prefill_time_ms;
             }
             if (resp.is_finished || resp.error_code != 0) break;
         } else {
@@ -351,8 +355,19 @@ static RequestResult run_single_request(
     float gen_ms   = std::chrono::duration<float, std::milli>(t_end - t_first).count();
     float gen_tps  = (token_count > 1 && gen_ms > 0) ? (token_count - 1) * 1000.0f / gen_ms : 0;
     float all_tps  = (total_ms > 0) ? token_count * 1000.0f / total_ms : 0;
+    float pf_tps   = (prefill_ms_from_engine > 0) ? prompt_len * 1000.0f / prefill_ms_from_engine : 0;
 
-    return {prompt_len, token_count, ttft_ms, gen_ms, total_ms, gen_tps, all_tps};
+    RequestResult result;
+    result.prompt_len = prompt_len;
+    result.total_tokens = token_count;
+    result.ttft_ms = ttft_ms;
+    result.generation_ms = gen_ms;
+    result.total_ms = total_ms;
+    result.gen_tps = gen_tps;
+    result.overall_tps = all_tps;
+    result.prefill_ms = prefill_ms_from_engine;
+    result.prefill_tps = pf_tps;
+    return result;
 }
 
 // ============================================================================
@@ -366,6 +381,8 @@ struct AggResult {
     Stats gen_tps;
     Stats total_tokens;
     Stats total_ms;
+    Stats prefill_ms;
+    Stats prefill_tps;
 };
 
 // ============================================================================
@@ -412,6 +429,8 @@ static void write_json(const std::string& path,
         ofs << "      \"ttft_median_ms\": " << std::setprecision(1) << r.ttft.median() << ",\n";
         ofs << "      \"ttft_ci95_ms\": " << std::setprecision(2) << r.ttft.ci95() << ",\n";
         ofs << "      \"ttft_cv_pct\": " << std::setprecision(1) << r.ttft.cv_pct() << ",\n";
+        ofs << "      \"prefill_median_ms\": " << std::setprecision(1) << r.prefill_ms.median() << ",\n";
+        ofs << "      \"prefill_tps_median\": " << std::setprecision(0) << r.prefill_tps.median() << ",\n";
         ofs << "      \"gen_tps_median\": " << std::setprecision(2) << r.gen_tps.median() << ",\n";
         ofs << "      \"gen_tps_ci95\": " << std::setprecision(2) << r.gen_tps.ci95() << ",\n";
         ofs << "      \"total_tokens_median\": " << std::setprecision(0) << r.total_tokens.median() << ",\n";
@@ -498,10 +517,13 @@ int run_benchmark(int argc, char** argv) {
             agg.gen_tps.add(r.gen_tps);
             agg.total_tokens.add((float)r.total_tokens);
             agg.total_ms.add(r.total_ms);
+            agg.prefill_ms.add(r.prefill_ms);
+            agg.prefill_tps.add(r.prefill_tps);
 
-            printf("    [prompt=%d iter=%d] TTFT=%.1fms  gen=%.1f tok/s  "
+            printf("    [prompt=%d iter=%d] TTFT=%.1fms  prefill=%.1fms (%.0f tok/s)  gen=%.1f tok/s  "
                    "tokens=%d  total=%.0fms\n",
-                   pl, iter + 1, r.ttft_ms, r.gen_tps, r.total_tokens, r.total_ms);
+                   pl, iter + 1, r.ttft_ms, r.prefill_ms, r.prefill_tps,
+                   r.gen_tps, r.total_tokens, r.total_ms);
         }
 
         agg_results.push_back(std::move(agg));
@@ -516,22 +538,23 @@ int run_benchmark(int argc, char** argv) {
     printf("║  MTP: %-6s  chunk: %-5d  temp: %.1f  seed: %-6lld  max_tokens: %-4d     ║\n",
            bcfg.mtp_mode.c_str(), bcfg.max_chunk_size, cfg.temperature,
            (long long)cfg.seed, cfg.max_tokens);
-    printf("╠═══════╦════════════════════╦══════════════════╦════════╦════════╦═══════════╣\n");
-    printf("║Prompt ║  TTFT (ms)         ║  Gen tok/s       ║ Tokens ║Time ms║ Iters     ║\n");
-    printf("║       ║  med    ±ci95  cv%%  ║  med    ±ci95    ║  med   ║  med  ║           ║\n");
-    printf("╠═══════╬════════════════════╬══════════════════╬════════╬════════╬═══════════╣\n");
+    printf("╠═══════╦════════════════════╦═══════════════════════╦══════════════════╦════════╦════════╦═════╣\n");
+    printf("║Prompt ║  TTFT (ms)         ║  Prefill              ║  Gen tok/s       ║ Tokens ║Time ms║Iters║\n");
+    printf("║       ║  med    ±ci95  cv%%  ║  ms     tok/s         ║  med    ±ci95    ║  med   ║  med  ║     ║\n");
+    printf("╠═══════╬════════════════════╬═══════════════════════╬══════════════════╬════════╬════════╬═════╣\n");
 
     for (const auto& r : agg_results) {
-        printf("║ %5d ║ %6.1f ±%5.1f %4.1f%% ║ %6.1f ±%5.2f    ║ %5.0f  ║%6.0f ║ %4d      ║\n",
+        printf("║ %5d ║ %6.1f ±%5.1f %4.1f%% ║ %6.1f  %6.0f tok/s  ║ %6.1f ±%5.2f    ║ %5.0f  ║%6.0f ║ %3d ║\n",
                r.prompt_len,
                r.ttft.median(), r.ttft.ci95(), r.ttft.cv_pct(),
+               r.prefill_ms.median(), r.prefill_tps.median(),
                r.gen_tps.median(), r.gen_tps.ci95(),
                r.total_tokens.median(),
                r.total_ms.median(),
                r.iterations);
     }
 
-    printf("╚═══════╩════════════════════╩══════════════════╩════════╩════════╩═══════════╝\n");
+    printf("╚═══════╩════════════════════╩═══════════════════════╩══════════════════╩════════╩════════╩═════╝\n");
 
     // 单配置时打印详细信息
     if (agg_results.size() == 1 && agg_results[0].ttft.count() >= 1) {
@@ -549,6 +572,15 @@ int run_benchmark(int argc, char** argv) {
             printf("║      P95:     %8.1f ms                                      ║\n", r.ttft.p95());
             printf("║      Min:     %8.1f ms  Max: %.1f ms                        ║\n",
                    r.ttft.min_val(), r.ttft.max_val());
+        }
+        printf("║                                                                ║\n");
+        printf("║  ▸ Prefill (CUDA event timing from engine)                     ║\n");
+        printf("║      Median:  %8.1f ms  → %6.0f tok/s  (N=%d, CV=%.1f%%)      ║\n",
+               r.prefill_ms.median(), r.prefill_tps.median(),
+               r.prefill_ms.count(), r.prefill_ms.cv_pct());
+        if (r.prefill_ms.count() > 1) {
+            printf("║      Min:     %8.1f ms  Max: %.1f ms                        ║\n",
+                   r.prefill_ms.min_val(), r.prefill_ms.max_val());
         }
         printf("║                                                                ║\n");
         printf("║  ▸ Generation Throughput (first → last token)                  ║\n");

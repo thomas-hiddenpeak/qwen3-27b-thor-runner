@@ -149,6 +149,9 @@ public:
     void request_decode_step();
     void request_done();
 
+    // 获取 prefill 耗时 (ms), request_prefill_done() 后可调用
+    float prefill_elapsed_ms() const;
+
     // ---- 系统快照 ----
     // 调用 SystemMonitor::sample(), 通常在每 N 个 step 调用一次
     SystemSnapshot snapshot();
