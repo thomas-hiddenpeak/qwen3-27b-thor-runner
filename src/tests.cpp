@@ -36,6 +36,7 @@
 #include "engine/cache_key.h"
 #include "engine/disk_backend.h"
 #include "engine/kv_swapper.h"
+#include "engine/backend.h"
 #include <cmath>
 #include <unistd.h>
 #include <iomanip>
@@ -2588,6 +2589,352 @@ void bench_chunked_prefill() {
 }
 
 // ============================================================================
+// test_kv_ref_counting — KVCacheManager 引用计数正确性
+//   验证 Phase 3 CoW (Copy-on-Write) KV block 共享逻辑:
+//   - allocate 后 ref_count = 1
+//   - share_blocks 后 ref_count++
+//   - free_blocks 后 ref_count--, 仅 ref_count=0 时回收
+// ============================================================================
+void test_kv_ref_counting() {
+    std::cout << "\n--- Testing KV Ref Counting (CoW Block Sharing) ---\n";
+    auto allocator = std::make_shared<core::UnifiedAllocator>();
+
+    int num_blocks = 64;
+    int block_size = 16;
+    int num_heads = 4;
+    int head_dim = 128;
+    int num_layers = 2;
+
+    ops::KVCacheManager kv_mgr(num_blocks, block_size, num_heads, head_dim,
+                                core::DataType::BF16, allocator, num_layers);
+
+    int initial_free = kv_mgr.num_free_blocks();
+    std::cout << "  [1/5] Initial free blocks: " << initial_free << std::endl;
+
+    // 1. allocate → ref_count = 1
+    auto blocks_a = kv_mgr.allocate_blocks(4);
+    if (blocks_a.size() != 4) {
+        std::cerr << "  FAIL: allocate_blocks(4) returned " << blocks_a.size() << std::endl;
+        return;
+    }
+    for (int b : blocks_a) {
+        if (kv_mgr.get_ref_count(b) != 1) {
+            std::cerr << "  FAIL: block " << b << " ref_count != 1 after allocate" << std::endl;
+            return;
+        }
+    }
+    std::cout << "  [2/5] PASS: allocate sets ref_count=1" << std::endl;
+
+    // 2. share_blocks → ref_count = 2
+    kv_mgr.share_blocks(blocks_a);
+    for (int b : blocks_a) {
+        if (kv_mgr.get_ref_count(b) != 2) {
+            std::cerr << "  FAIL: block " << b << " ref_count != 2 after share" << std::endl;
+            return;
+        }
+    }
+    std::cout << "  [3/5] PASS: share_blocks increments ref_count to 2" << std::endl;
+
+    // 3. free_blocks with ref_count=2 → ref_count=1, blocks NOT recycled
+    int free_before = kv_mgr.num_free_blocks();
+    kv_mgr.free_blocks(blocks_a);
+    int free_after = kv_mgr.num_free_blocks();
+    if (free_after != free_before) {
+        std::cerr << "  FAIL: free with ref_count=2 should not recycle. free_before="
+                  << free_before << " free_after=" << free_after << std::endl;
+        return;
+    }
+    for (int b : blocks_a) {
+        if (kv_mgr.get_ref_count(b) != 1) {
+            std::cerr << "  FAIL: block " << b << " ref_count != 1 after first free" << std::endl;
+            return;
+        }
+    }
+    std::cout << "  [4/5] PASS: first free decrements to 1, no recycle" << std::endl;
+
+    // 4. free_blocks again with ref_count=1 → ref_count=0, blocks recycled
+    kv_mgr.free_blocks(blocks_a);
+    int free_final = kv_mgr.num_free_blocks();
+    if (free_final != free_before + 4) {
+        std::cerr << "  FAIL: second free should recycle 4 blocks. free_before="
+                  << free_before << " free_final=" << free_final << std::endl;
+        return;
+    }
+    std::cout << "  [5/5] PASS: second free recycles blocks (ref_count → 0)" << std::endl;
+
+    std::cout << "KV Ref Counting test passed.\n" << std::endl;
+}
+
+// ============================================================================
+// test_concurrent_backend — 多请求并发推理 (通过 InferenceBackend)
+//   验证 Phase 2 batch decode + Phase 4 调度:
+//   - 同时提交 4 个请求
+//   - 所有请求均正常完成
+//   - 测量聚合吞吐量 vs 单请求基线
+// ============================================================================
+void test_concurrent_backend() {
+    std::cout << "\n╔══════════════════════════════════════════════════════════════╗" << std::endl;
+    std::cout << "║      Concurrent Backend Test (Multi-Request Inference)      ║" << std::endl;
+    std::cout << "╚══════════════════════════════════════════════════════════════╝\n" << std::endl;
+
+    const int NUM_REQUESTS = 4;
+    const int MAX_TOKENS = 10;
+    const int PROMPT_LEN = 17;
+
+    // 构建 BackendConfig
+    BackendConfig bcfg;
+    bcfg.model_dir = g_test_model_dir;
+    bcfg.kv_cache_gb = 4.0;
+    bcfg.verbose = false;
+    bcfg.cache_enabled = false;
+
+    try {
+        std::cout << "  [1/4] Initializing backend..." << std::endl;
+        InferenceBackend backend(bcfg);
+        backend.start();
+
+        // 先发单请求做基线
+        std::cout << "  [2/4] Single request baseline..." << std::endl;
+        {
+            InferRequest req;
+            req.request_id = 9000;
+            int tokens[] = {248045, 846, 198, 3710, 369, 220, 17, 10, 17, 30,
+                            248046, 198, 248045, 74455, 198, 248068, 198};
+            req.prompt_tokens.assign(tokens, tokens + 17);
+            req.max_new_tokens = MAX_TOKENS;
+            req.temperature = 0.0f;
+            req.seed = 42;
+            req.stream = true;
+            backend.submit(req);
+
+            int count = 0;
+            while (true) {
+                InferResponse resp;
+                if (backend.poll(resp) && resp.request_id == 9000) {
+                    count++;
+                    if (resp.is_finished) break;
+                } else {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+            }
+            std::cout << "    Baseline: " << count << " tokens generated" << std::endl;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // 同时提交 N 个请求
+        std::cout << "  [3/4] Submitting " << NUM_REQUESTS << " concurrent requests..." << std::endl;
+        int base_tokens[] = {248045, 846, 198, 3710, 369, 220, 17, 10, 17, 30,
+                             248046, 198, 248045, 74455, 198, 248068, 198};
+        auto t_start = std::chrono::high_resolution_clock::now();
+
+        for (int i = 0; i < NUM_REQUESTS; ++i) {
+            InferRequest req;
+            req.request_id = 9100 + i;
+            req.prompt_tokens.assign(base_tokens, base_tokens + PROMPT_LEN);
+            // 添加不同后缀让各请求生成不同内容
+            req.prompt_tokens.back() = 198 + i;
+            req.max_new_tokens = MAX_TOKENS;
+            req.temperature = 0.0f;
+            req.seed = 42 + i;
+            req.stream = true;
+            if (!backend.submit(req)) {
+                std::cerr << "  FAIL: could not submit request " << i << std::endl;
+                backend.stop();
+                return;
+            }
+        }
+
+        // 收集所有响应
+        std::unordered_map<uint64_t, int> tokens_per_req;
+        std::unordered_map<uint64_t, bool> finished_map;
+        int finished = 0;
+        auto timeout = std::chrono::seconds(300);
+
+        while (finished < NUM_REQUESTS) {
+            InferResponse resp;
+            if (backend.poll(resp)) {
+                tokens_per_req[resp.request_id]++;
+                if (resp.is_finished && !finished_map[resp.request_id]) {
+                    finished_map[resp.request_id] = true;
+                    finished++;
+                }
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+
+            auto elapsed = std::chrono::high_resolution_clock::now() - t_start;
+            if (elapsed > timeout) {
+                std::cerr << "  FAIL: TIMEOUT after 300s, only " << finished
+                          << "/" << NUM_REQUESTS << " finished" << std::endl;
+                backend.stop();
+                return;
+            }
+        }
+
+        auto t_end = std::chrono::high_resolution_clock::now();
+        double wall_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        int total_tokens = 0;
+        for (auto& [id, cnt] : tokens_per_req) total_tokens += cnt;
+
+        // 输出结果
+        std::cout << "\n  [4/4] Results:" << std::endl;
+        std::cout << "    Completed:  " << finished << "/" << NUM_REQUESTS << std::endl;
+        std::cout << "    Total tokens: " << total_tokens << std::endl;
+        std::cout << "    Wall time:    " << std::fixed << std::setprecision(1) << wall_ms << " ms" << std::endl;
+        if (wall_ms > 0) {
+            std::cout << "    Aggregate:    " << std::setprecision(1)
+                      << (total_tokens * 1000.0 / wall_ms) << " tok/s" << std::endl;
+        }
+        for (auto& [id, cnt] : tokens_per_req) {
+            std::cout << "    Request " << id << ": " << cnt << " tokens" << std::endl;
+        }
+
+        backend.stop();
+
+        if (finished == NUM_REQUESTS) {
+            std::cout << "\n    PASS: All " << NUM_REQUESTS
+                      << " concurrent requests completed via Backend API" << std::endl;
+        } else {
+            std::cerr << "\n    FAIL: Only " << finished << "/" << NUM_REQUESTS
+                      << " completed" << std::endl;
+        }
+
+    } catch (const std::exception& e) {
+        std::cerr << "  ERROR: " << e.what() << std::endl;
+    }
+
+    std::cout << "\nConcurrent backend test finished.\n" << std::endl;
+}
+
+// ============================================================================
+// test_shared_prefix — 共享前缀请求 (验证 CoW + GPU 前缀共享)
+//   验证 Phase 3: 多个请求使用相同 system prompt, 通过 SSD prefix cache
+//   触发 GPU 前缀共享路径
+// ============================================================================
+void test_shared_prefix() {
+    std::cout << "\n╔══════════════════════════════════════════════════════════════╗" << std::endl;
+    std::cout << "║      Shared Prefix Test (CoW KV Block Sharing)             ║" << std::endl;
+    std::cout << "╚══════════════════════════════════════════════════════════════╝\n" << std::endl;
+
+    const int NUM_REQUESTS = 4;
+    const int PROMPT_LEN = 256;  // 256 token 共享前缀 (16 blocks)
+    const int MAX_TOKENS = 5;
+
+    // 构建 BackendConfig (启用 SSD cache 以触发 prefix sharing)
+    BackendConfig bcfg;
+    bcfg.model_dir = g_test_model_dir;
+    bcfg.kv_cache_gb = 4.0;
+    bcfg.verbose = false;
+    bcfg.cache_enabled = true;
+    bcfg.cache_dir = "/tmp/qwen_test_shared_prefix_" + std::to_string(getpid());
+    bcfg.cache_max_gb = 1.0;
+    bcfg.cache_chunk_size = 256;
+    bcfg.cache_ssm_state = true;
+
+    try {
+        std::cout << "  [1/3] Initializing backend with SSD prefix cache..." << std::endl;
+        InferenceBackend backend(bcfg);
+        backend.start();
+
+        // 构建共享前缀 prompt
+        int chat_header[] = {248045, 846, 198, 3710, 369, 220, 17, 10, 17, 30,
+                             248046, 198, 248045, 74455, 198, 248068, 198};
+        int padding[] = {279, 448, 350, 264, 311, 389, 369, 279, 498, 323,
+                         304, 448, 311, 389, 350, 264, 279, 323, 498, 304};
+
+        auto build_prompt = [&](int req_idx) -> std::vector<int> {
+            std::vector<int> tokens(PROMPT_LEN);
+            for (int i = 0; i < PROMPT_LEN; ++i) {
+                if (i < 17)
+                    tokens[i] = chat_header[i];
+                else if (i < PROMPT_LEN - 5)
+                    tokens[i] = padding[(i - 17) % 20];  // 共享前缀部分
+                else
+                    tokens[i] = 1000 + req_idx * 100 + (i - (PROMPT_LEN - 5));  // 不同后缀
+            }
+            return tokens;
+        };
+
+        // 依次提交请求 (第 1 个 miss, 后续应匹配 prefix)
+        std::cout << "  [2/3] Submitting " << NUM_REQUESTS << " requests with shared "
+                  << PROMPT_LEN << "-token prefix..." << std::endl;
+
+        int finished = 0;
+        auto t_start = std::chrono::high_resolution_clock::now();
+
+        for (int i = 0; i < NUM_REQUESTS; ++i) {
+            InferRequest req;
+            req.request_id = 9200 + i;
+            req.prompt_tokens = build_prompt(i);
+            req.max_new_tokens = MAX_TOKENS;
+            req.temperature = 0.0f;
+            req.seed = 42 + i;
+            req.stream = true;
+            backend.submit(req);
+        }
+
+        // 收集响应
+        std::unordered_map<uint64_t, int> tokens_per_req;
+        std::unordered_map<uint64_t, bool> finished_map;
+        auto timeout = std::chrono::seconds(600);
+
+        while (finished < NUM_REQUESTS) {
+            InferResponse resp;
+            if (backend.poll(resp)) {
+                tokens_per_req[resp.request_id]++;
+                if (resp.is_finished && !finished_map[resp.request_id]) {
+                    finished_map[resp.request_id] = true;
+                    finished++;
+                    auto now = std::chrono::high_resolution_clock::now();
+                    double elapsed_s = std::chrono::duration<double>(now - t_start).count();
+                    printf("    Request %lu finished (%d/%d) — %d tokens, %.1fs\n",
+                           (unsigned long)resp.request_id, finished, NUM_REQUESTS,
+                           tokens_per_req[resp.request_id], elapsed_s);
+                }
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+
+            auto elapsed = std::chrono::high_resolution_clock::now() - t_start;
+            if (elapsed > timeout) {
+                std::cerr << "  FAIL: TIMEOUT" << std::endl;
+                break;
+            }
+        }
+
+        auto t_end = std::chrono::high_resolution_clock::now();
+        double wall_s = std::chrono::duration<double>(t_end - t_start).count();
+
+        // 输出
+        std::cout << "\n  [3/3] Results:" << std::endl;
+        std::cout << "    Completed:   " << finished << "/" << NUM_REQUESTS << std::endl;
+        std::cout << "    Wall time:   " << std::fixed << std::setprecision(1) << wall_s << "s" << std::endl;
+        int total = 0;
+        for (auto& [id, cnt] : tokens_per_req) total += cnt;
+        std::cout << "    Total tokens: " << total << std::endl;
+
+        backend.stop();
+
+        // 清理
+        (void)system(("rm -rf " + bcfg.cache_dir).c_str());
+
+        if (finished == NUM_REQUESTS) {
+            std::cout << "\n    PASS: All " << NUM_REQUESTS
+                      << " shared-prefix requests completed" << std::endl;
+        } else {
+            std::cerr << "\n    FAIL: " << finished << "/" << NUM_REQUESTS
+                      << " completed" << std::endl;
+        }
+
+    } catch (const std::exception& e) {
+        std::cerr << "  ERROR: " << e.what() << std::endl;
+    }
+
+    std::cout << "\nShared prefix test finished.\n" << std::endl;
+}
+
+// ============================================================================
 // 测试入口 — 由 main.cpp 中的 cmd_test 调用
 // ============================================================================
 int run_tests(int argc, char** argv) {
@@ -2612,6 +2959,9 @@ int run_tests(int argc, char** argv) {
     register_test("inference_engine",   TestCategory::INTEGRATION, test_inference_engine);
     register_test("swap_256k_bench",    TestCategory::BENCHMARK,   test_swap_256k_benchmark);
     register_test("chunked_prefill_bench", TestCategory::BENCHMARK, bench_chunked_prefill);
+    register_test("kv_ref_counting",   TestCategory::UNIT,        test_kv_ref_counting);
+    register_test("concurrent_backend", TestCategory::INTEGRATION, test_concurrent_backend);
+    register_test("shared_prefix",     TestCategory::INTEGRATION,  test_shared_prefix);
 
     // --- 解析 CLI 参数 ---
     std::string filter;

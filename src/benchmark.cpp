@@ -161,6 +161,10 @@ struct BenchConfig {
     int warmup_requests = 1;
     std::string json_output;
 
+    // 并发参数
+    int concurrent          = 1;     // 并发请求数 (1=顺序, >1=同时提交)
+    bool shared_prefix      = false; // 并发请求使用相同 prefix
+
     // 采样参数
     float temperature       = 0.0f;  // 0 = greedy
     float top_p             = 0.95f;
@@ -195,6 +199,8 @@ static BenchConfig parse_bench_args(int argc, char** argv) {
         else if (arg == "--mtp-disable")   cfg.mtp_mode = "off";
         else if (arg == "--mtp-enable")    cfg.mtp_mode = "on";
         else if (arg == "--max-chunk-size" && i + 1 < argc) cfg.max_chunk_size = std::atoi(argv[++i]);
+        else if (arg == "--concurrent" && i + 1 < argc) cfg.concurrent = std::max(1, std::atoi(argv[++i]));
+        else if (arg == "--shared-prefix") cfg.shared_prefix = true;
         else if (arg == "--verbose")       cfg.verbose = true;
         else if (arg == "--help" || arg == "-h") {
             printf("Usage: qwen35-thor bench [options]\n\n"
@@ -218,10 +224,15 @@ static BenchConfig parse_bench_args(int argc, char** argv) {
                    "  --top-p F               Top-p threshold (default: 0.95)\n"
                    "  --top-k N               Top-k (default: 20)\n"
                    "  --seed N                Random seed (default: 42)\n"
+                   "\nConcurrency options:\n"
+                   "  --concurrent N          Submit N requests simultaneously (default: 1)\n"
+                   "  --shared-prefix         All concurrent requests share same prefix tokens\n"
                    "\nExamples:\n"
                    "  bench --config configs/qwen3.5-27b.conf --decode 50\n"
                    "  bench --config configs/qwen3.5-27b.conf --prompt-len 17,64,256 --iterations 3 --json results.json\n"
-                   "  bench --config configs/qwen3.5-27b.conf --mtp-disable --decode 30\n");
+                   "  bench --config configs/qwen3.5-27b.conf --mtp-disable --decode 30\n"
+                   "  bench --config configs/qwen3.5-27b.conf --concurrent 4 --decode 20\n"
+                   "  bench --config configs/qwen3.5-27b.conf --concurrent 4 --shared-prefix --prompt-len 256 --decode 20\n");
             exit(0);
         }
     }
@@ -445,10 +456,273 @@ static void write_json(const std::string& path,
 }
 
 // ============================================================================
+// 并发 Benchmark: 同时提交 N 个请求, 测量聚合吞吐量
+// ============================================================================
+struct ConcurrentResult {
+    int concurrent;
+    int prompt_len;
+    int iterations;
+    float wall_time_ms;          // 从首个请求提交到最后一个完成的壁钟时间
+    float aggregate_tps;         // 总生成 token / wall_time
+    int   total_tokens;          // 所有请求生成的 token 总数
+    Stats per_req_ttft;          // 各请求的 TTFT 分布
+    Stats per_req_tps;           // 各请求的吞吐量分布
+    Stats per_req_tokens;        // 各请求的 token 数分布
+    float batch_efficiency;      // aggregate_tps / (concurrent × single_req_tps)
+};
+
+static int run_concurrent_benchmark(int argc, char** argv) {
+    BenchConfig cfg = parse_bench_args(argc, argv);
+
+    printf("╔══════════════════════════════════════════════════════════════════╗\n");
+    printf("║  Qwen3.5 Concurrent Engine Benchmark                           ║\n");
+    printf("╠══════════════════════════════════════════════════════════════════╣\n");
+    printf("║  Concurrent reqs : %-4d                                        ║\n", cfg.concurrent);
+    printf("║  Shared prefix   : %-4s                                        ║\n", cfg.shared_prefix ? "yes" : "no");
+    printf("║  Prompt len      : %d                                          ║\n", cfg.prompt_lens[0]);
+    printf("║  Max tokens      : %-4d                                        ║\n", cfg.max_tokens);
+    printf("║  Iterations      : %-4d                                        ║\n", cfg.iterations);
+    printf("║  Temperature     : %.2f%s                                      ║\n",
+           cfg.temperature, cfg.temperature == 0 ? " (greedy)" : "");
+    printf("╚══════════════════════════════════════════════════════════════════╝\n\n");
+
+    // 初始化 Backend (启用 ssd cache 若 shared_prefix, 否则关闭)
+    printf("[1/4] Initializing engine...\n");
+    BackendConfig bcfg = build_backend_config(cfg);
+    if (cfg.shared_prefix) {
+        bcfg.cache_enabled = true;
+        bcfg.cache_dir = "/tmp/qwen_bench_concurrent_" + std::to_string(getpid());
+    }
+    InferenceBackend backend(bcfg);
+    backend.start();
+    printf("      Engine ready.\n\n");
+
+    // 构建 prompt tokens (所有请求共享或各自不同)
+    int prompt_len = cfg.prompt_lens[0];
+    static const int chat_header[] = {
+        248045, 846, 198, 3710, 369, 220, 17, 10, 17, 30,
+        248046, 198, 248045, 74455, 198, 248068, 198
+    };
+    // 填充用自然语言 token
+    static const int padding_tokens[] = {
+        279, 448, 350, 264, 311, 389, 369, 279, 498, 323,
+        304, 448, 311, 389, 350, 264, 279, 323, 498, 304,
+        279, 448, 279, 350, 389, 311, 264, 498, 304, 323
+    };
+    // 不同的 suffix tokens (使各请求生成不同内容, 避免 shared prefix 后完全相同)
+    static const int suffix_variants[][10] = {
+        {579, 748, 350, 264, 311, 389, 369, 279, 498, 323},
+        {604, 848, 450, 364, 411, 489, 469, 379, 598, 423},
+        {704, 948, 550, 464, 511, 589, 569, 479, 698, 523},
+        {804, 1048, 650, 564, 611, 689, 669, 579, 798, 623},
+        {904, 1148, 750, 664, 711, 789, 769, 679, 898, 723},
+        {1004, 1248, 850, 764, 811, 889, 869, 779, 998, 823},
+        {1104, 1348, 950, 864, 911, 989, 969, 879, 1098, 923},
+        {1204, 1448, 1050, 964, 1011, 1089, 1069, 979, 1198, 1023},
+    };
+
+    auto build_prompt = [&](int req_idx) -> std::vector<int> {
+        std::vector<int> tokens(prompt_len);
+        for (int i = 0; i < prompt_len; ++i) {
+            if (i < 17) {
+                tokens[i] = chat_header[i];
+            } else if (cfg.shared_prefix && i >= prompt_len - 10 && prompt_len > 27) {
+                // 最后 10 个 token 使用不同 suffix (让各请求生成不同结果)
+                int si = i - (prompt_len - 10);
+                tokens[i] = suffix_variants[req_idx % 8][si];
+            } else {
+                tokens[i] = padding_tokens[(i - 17) % 30];
+            }
+        }
+        return tokens;
+    };
+
+    // Warmup: 单请求预热
+    printf("[2/4] Warmup...\n");
+    {
+        auto warmup_result = run_single_request(backend, cfg, prompt_len, 1, false);
+        printf("      Warmup: TTFT=%.1fms, %d tokens, %.1f tok/s\n\n",
+               warmup_result.ttft_ms, warmup_result.total_tokens, warmup_result.gen_tps);
+    }
+
+    // 先测量单请求基线 (用于计算 batch_efficiency)
+    float baseline_tps = 0;
+    {
+        printf("[3/4] Baseline (single request)...\n");
+        auto r = run_single_request(backend, cfg, prompt_len, 100, true);
+        baseline_tps = r.gen_tps;
+        printf("      Baseline: TTFT=%.1fms, %.1f tok/s, %d tokens\n\n",
+               r.ttft_ms, r.gen_tps, r.total_tokens);
+    }
+
+    // 并发测量
+    printf("[4/4] Concurrent measurement (N=%d, %d iterations)...\n\n",
+           cfg.concurrent, cfg.iterations);
+
+    std::vector<ConcurrentResult> all_results;
+    uint64_t next_id = 200;
+
+    for (int iter = 0; iter < cfg.iterations; ++iter) {
+        // 等待引擎 idle
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        ConcurrentResult cr;
+        cr.concurrent = cfg.concurrent;
+        cr.prompt_len = prompt_len;
+        cr.iterations = 1;
+
+        // 同时提交 N 个请求
+        auto t_start = Clock::now();
+        for (int i = 0; i < cfg.concurrent; ++i) {
+            InferRequest req;
+            req.request_id = next_id++;
+            req.prompt_tokens = build_prompt(i);
+            req.max_new_tokens = cfg.max_tokens;
+            req.temperature = cfg.temperature;
+            req.top_p = cfg.top_p;
+            req.top_k = cfg.top_k;
+            req.min_p = cfg.min_p;
+            req.presence_penalty = cfg.presence_penalty;
+            req.seed = (cfg.seed >= 0) ? cfg.seed + i : -1;
+            req.stream = true;
+            if (!backend.submit(req)) {
+                fprintf(stderr, "  [Error] Failed to submit request %d\n", i);
+            }
+        }
+
+        // 收集所有响应
+        struct PerReqState {
+            int token_count = 0;
+            Clock::time_point t_first;
+            bool got_first = false;
+            bool finished = false;
+        };
+        std::unordered_map<uint64_t, PerReqState> states;
+        int finished = 0;
+
+        while (finished < cfg.concurrent) {
+            InferResponse resp;
+            if (backend.poll(resp)) {
+                auto& st = states[resp.request_id];
+                st.token_count++;
+                if (!st.got_first) {
+                    st.t_first = Clock::now();
+                    st.got_first = true;
+                }
+                if (resp.is_finished || resp.error_code != 0) {
+                    if (!st.finished) {
+                        st.finished = true;
+                        finished++;
+                    }
+                }
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+        }
+        auto t_end = Clock::now();
+
+        // 汇总本轮结果
+        float wall_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
+        int total_tokens = 0;
+        for (auto& [id, st] : states) {
+            total_tokens += st.token_count;
+            float ttft = std::chrono::duration<float, std::milli>(st.t_first - t_start).count();
+            float req_ms = std::chrono::duration<float, std::milli>(t_end - st.t_first).count();
+            float req_tps = (st.token_count > 1 && req_ms > 0)
+                            ? (st.token_count - 1) * 1000.0f / req_ms : 0;
+            cr.per_req_ttft.add(ttft);
+            cr.per_req_tps.add(req_tps);
+            cr.per_req_tokens.add((float)st.token_count);
+        }
+        cr.wall_time_ms = wall_ms;
+        cr.total_tokens = total_tokens;
+        cr.aggregate_tps = (wall_ms > 0) ? total_tokens * 1000.0f / wall_ms : 0;
+        cr.batch_efficiency = (baseline_tps > 0)
+                              ? cr.aggregate_tps / (cfg.concurrent * baseline_tps) : 0;
+
+        printf("  [iter=%d] wall=%.0fms  tokens=%d  agg_tps=%.1f  "
+               "per_req_tps=%.1f±%.1f  ttft=%.1f±%.1fms  efficiency=%.1f%%\n",
+               iter + 1, wall_ms, total_tokens,
+               cr.aggregate_tps,
+               cr.per_req_tps.mean(), cr.per_req_tps.stddev(),
+               cr.per_req_ttft.mean(), cr.per_req_ttft.stddev(),
+               cr.batch_efficiency * 100);
+
+        all_results.push_back(std::move(cr));
+    }
+
+    // 汇总
+    Stats agg_tps_stats, agg_wall_stats, agg_eff_stats;
+    for (auto& r : all_results) {
+        agg_tps_stats.add(r.aggregate_tps);
+        agg_wall_stats.add(r.wall_time_ms);
+        agg_eff_stats.add(r.batch_efficiency * 100);
+    }
+
+    printf("\n╔══════════════════════════════════════════════════════════════════════════╗\n");
+    printf("║  Concurrent Benchmark Summary                                          ║\n");
+    printf("╠══════════════════════════════════════════════════════════════════════════╣\n");
+    printf("║  Concurrent requests : %-4d    Shared prefix: %-3s                      ║\n",
+           cfg.concurrent, cfg.shared_prefix ? "yes" : "no");
+    printf("║  Prompt length       : %-6d  Max tokens   : %-4d                      ║\n",
+           prompt_len, cfg.max_tokens);
+    printf("║  Baseline (1 req)    : %6.1f tok/s                                     ║\n",
+           baseline_tps);
+    printf("╠══════════════════════════════════════════════════════════════════════════╣\n");
+    printf("║  Aggregate throughput: %6.1f tok/s ±%.1f (median: %.1f)                ║\n",
+           agg_tps_stats.mean(), agg_tps_stats.ci95(), agg_tps_stats.median());
+    printf("║  Wall time           : %6.0f ms ±%.0f                                  ║\n",
+           agg_wall_stats.mean(), agg_wall_stats.ci95());
+    printf("║  Batch efficiency    : %5.1f%%                                          ║\n",
+           agg_eff_stats.mean());
+    printf("║  Scaling factor      : %.2fx over single request                       ║\n",
+           (baseline_tps > 0) ? agg_tps_stats.mean() / baseline_tps : 0.0f);
+    printf("╚══════════════════════════════════════════════════════════════════════════╝\n");
+
+    // JSON 输出
+    if (!cfg.json_output.empty()) {
+        std::ofstream ofs(cfg.json_output);
+        if (ofs.is_open()) {
+            ofs << std::fixed;
+            ofs << "{\n";
+            ofs << "  \"benchmark\": \"concurrent-throughput\",\n";
+            ofs << "  \"model_dir\": \"" << json_escape(bcfg.model_dir) << "\",\n";
+            ofs << "  \"concurrent\": " << cfg.concurrent << ",\n";
+            ofs << "  \"shared_prefix\": " << (cfg.shared_prefix ? "true" : "false") << ",\n";
+            ofs << "  \"prompt_len\": " << prompt_len << ",\n";
+            ofs << "  \"max_tokens\": " << cfg.max_tokens << ",\n";
+            ofs << "  \"baseline_tps\": " << std::setprecision(2) << baseline_tps << ",\n";
+            ofs << "  \"aggregate_tps_mean\": " << std::setprecision(2) << agg_tps_stats.mean() << ",\n";
+            ofs << "  \"aggregate_tps_median\": " << std::setprecision(2) << agg_tps_stats.median() << ",\n";
+            ofs << "  \"wall_time_mean_ms\": " << std::setprecision(1) << agg_wall_stats.mean() << ",\n";
+            ofs << "  \"batch_efficiency_pct\": " << std::setprecision(1) << agg_eff_stats.mean() << ",\n";
+            ofs << "  \"scaling_factor\": " << std::setprecision(2) << (baseline_tps > 0 ? agg_tps_stats.mean() / baseline_tps : 0) << ",\n";
+            ofs << "  \"iterations\": " << cfg.iterations << "\n";
+            ofs << "}\n";
+            ofs.close();
+            printf("  JSON results written to: %s\n", cfg.json_output.c_str());
+        }
+    }
+
+    // 清理
+    backend.stop();
+    if (cfg.shared_prefix) {
+        (void)system(("rm -rf /tmp/qwen_bench_concurrent_" + std::to_string(getpid())).c_str());
+    }
+
+    return 0;
+}
+
+// ============================================================================
 // 主程序
 // ============================================================================
 int run_benchmark(int argc, char** argv) {
     BenchConfig cfg = parse_bench_args(argc, argv);
+
+    // 并发模式: 路由到专用函数
+    if (cfg.concurrent > 1) {
+        return run_concurrent_benchmark(argc, argv);
+    }
 
     int total_configs = (int)cfg.prompt_lens.size() * cfg.iterations;
     int total_requests = cfg.warmup_requests + total_configs;
