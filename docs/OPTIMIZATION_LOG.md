@@ -4556,4 +4556,130 @@ MTP verify 阶段 FullAttn 层 (每 4 层一层, 共 16 层) 的 attention 计�
 - split-K causal masking 实现简洁 (per-token context_len computation), 无额外 memory 开销
 - T=1 decode 路径完全不受影响, 因为 T=1 不进入新分支
 
+---
+
+## 权重加载优化系列 (2026-03)
+
+### 背景
+
+权重加载是每次启动/测试的固定成本。对于 122B MoE NVFP4 模型 (78 GB, 149,765 tensors), 原始加载路径存在多个瓶颈:
+- ~73K 个 FP32 scalar (global_scale) 逐一 cudaMalloc → 海量小分配
+- ~73K 个 expert 张量逐一 cudaMalloc → 海量 GPU 分配
+- Phase 2c expert packing: 73K 次 D2D copy + 73K 次 cudaFree
+- mmap 策略固定, 未针对 shard 大小自适应
+
+### 优化 #1: Adaptive mmap Strategy
+
+**日期**: 2026-03-09
+**Commit**: `ca46cd5`
+
+**问题**: 所有 shard 统一使用 `MAP_POPULATE` mmap 策略。对于 122B 的两个巨大 shard (47 GB + 31 GB), `MAP_POPULATE` 会预分配全部物理页面, 与 cudaMalloc 竞争统一内存, 造成内存压力。
+
+**改动**:
+- 小 shard (< MemAvailable 的 25%): 继续使用 `MAP_POPULATE` (预取到物理内存, 减少 page fault)
+- 大 shard: 使用 `MADV_SEQUENTIAL` + `MADV_WILLNEED` (OS 级预读, 不锁定物理页)
+- 基于 `/proc/meminfo` MemAvailable 动态决策
+
+**结果**:
+
+| 模型 | 加载时间 | 吞吐 |
+|------|---------|------|
+| 27B BF16 (11 shards, 52 GB) | 44.1s | 1201 MB/s |
+| 122B NVFP4 (2 shards, 78 GB) | 151.8s | 520 MB/s |
+
+**文件**: `src/engine/allocator.cpp`, `src/engine/model.cpp`
+
+### 优化 #2: FP32 Scalar Bypass
+
+**日期**: 2026-03-09
+**Commit**: `a777319`
+
+**问题**: 122B MoE 有 74,040 个 FP32 标量张量 (global_scale / weight_scale_2), 每个 4 bytes, 逐一执行 cudaMalloc(4B) + cudaMemcpy(4B)。cudaMalloc 粒度为 512 bytes, 实际浪费 99.2%, 且 74K 次 cudaMalloc 极慢。
+
+**改动**:
+- 检测 1-element FP32 tensor (dtype FP32, size_bytes == 4 或 numel == 1)
+- 直接从 mmap 读取 FP32 值存入 `scalar_f32_map` (CPU 端 unordered_map)
+- 跳过 cudaMalloc + cudaMemcpy, Phase 2c 从 map 查询 inv_global_scale
+
+**结果**: 消除 74,040 次 cudaMalloc + cudaMemcpy, 加载过程中减少 ~37 MB GPU 内存浪费
+
+### 优化 #2b: ShardPool (已回退)
+
+**日期**: 2026-03-09
+**Commit**: `a777319` (回退)
+
+**问题**: 尝试用单次 cudaMalloc 为每个 shard 的所有 expert raw tensor 分配连续内存, 减少 74K→2 次分配。
+
+**失败原因**: ShardPool 阻止了 Phase 2c 中 `release_raw()` 逐一释放 expert tensor:
+- Pool pointer 检测 → 跳过 cudaFree
+- 全部原始 expert 数据 (~78 GB) 与全部新 packed buffer (~78 GB) **共存**
+- 峰值 ~156 GB >> 128 GB 物理内存 → GPU hard-reset → 系统挂起
+
+**教训**: MoE expert packing 要求逐 tensor 释放旧数据来控制峰值内存。任何阻止 `release_raw()` 工作的优化都会 OOM。
+
+### 优化 #3: Direct-to-Packed Expert Loading
+
+**日期**: 2026-03-10
+**Commit**: `eaa6626`
+
+**核心思想**: 不再分两步 (Phase 1: H2D→个别 buffer; Phase 2c: D2D→packed buffer), 而是 Phase 1 加载时直接 H2D copy 到预分配的 packed buffer 的正确偏移位置。
+
+**实现**:
+1. **`ExpertFP4Info` + `parse_expert_fp4()`**: 解析张量名 `model.language_model.layers.{L}.mlp.experts.{E}.{gate|up|down}_proj.weight{_packed|_scale}`, 提取 layer_idx, expert_idx, projection 类型, 是否 scale
+2. **`DirectPackedBuffers`**: 每层 4 个连续缓冲区 (gate_up_packed, gate_up_scale, down_packed, down_scale)
+3. **Phase 1 内循环**: 首次遇到某层 expert tensor 时, 一次性 cudaMalloc 4 个 packed buffer (~1.27 GB/层); 后续 expert tensor 计算目标偏移, 直接 `cudaMemcpy(H2D)` 从 mmap 到 packed buffer
+4. **Phase 2c**: 检测 `direct_packed.find(layer)`, 命中则跳过 buffer 分配 + D2D copy loop, 使用预填充的 buffer; 从 `scalar_f32_map` 构建 `inv_global_scale` 数组
+
+**内存安全分析**:
+- 峰值 = packed buffers (~61 GB) + non-expert allocs (~5 GB) + mmap pages (按需) ≈ 66 GB + mmap
+- 对比原方案: 78 GB individual buffers + 78 GB packed - gradual release ≈ 80 GB 峰值
+- Direct-to-packed 峰值更低, 因为不存在中间 individual buffer
+
+**消除的操作**:
+- ~73,728 次 cudaMalloc (expert individual buffers)
+- ~73,728 次 cudaMemcpy D2D (individual → packed)
+- ~73,728 次 cudaFree (release individual buffers)
+
+**Packed buffer 布局** (每层):
+```
+gate_up_packed: [E × 2×moe_is, hs/2]    = [256×2048, 1536] = 768 MB
+gate_up_scale:  [E × 2×moe_is, hs/16]   = [256×2048, 192]  = 96 MB
+down_packed:    [E × hs, moe_is/2]       = [256×3072, 512]  = 384 MB
+down_scale:     [E × hs, moe_is/16]      = [256×3072, 64]   = 48 MB
+每层合计: ~1.27 GB, 48 层: ~61 GB
+```
+
+**偏移计算** (以 gate_proj expert e 为例):
+```
+row_off = e × gu_N (= e × 2×moe_is)
+gate rows = [row_off, row_off + moe_is)
+up rows   = [row_off + moe_is, row_off + 2×moe_is)
+packed offset = row_off × (hs/2) bytes
+scale offset  = row_off × (hs/16) bytes
+```
+
+**结果** (清缓存后测量):
+
+| 模型 | 张量数 | 大小 | 加载时间 | 吞吐 | 变化 |
+|------|--------|------|---------|------|------|
+| 4B BF16 | 738 | 8.7 GB | 6.2s | 1435 MB/s | — |
+| 9B BF16 | 775 | 18.0 GB | 11.7s | 1576 MB/s | — |
+| 27B BF16 | 1,199 | 51.7 GB | 36.9s | 1437 MB/s | — |
+| 27B NVFP4 | 2,399 | 19.2 GB | 12.5s | 1569 MB/s | — |
+| 35B-A3B MoE | 1,811 | 67.0 GB | 59.0s | 1163 MB/s | — |
+| **122B NVFP4 MoE** | **76,037** | **77.1 GB** | **120.2s** | **657 MB/s** | **-20.5%** |
+
+122B 加载优化前后对比:
+
+| 指标 | 优化前 | 优化后 | 变化 |
+|------|--------|--------|------|
+| 加载时间 | 151.2s | 120.2s | **-20.5%** |
+| 吞吐 | 522 MB/s | 657 MB/s | **+25.9%** |
+| cudaMalloc 调用 | ~75,000 | ~2,200 | **-97%** |
+| 峰值内存 | ~80 GB | ~66 GB | **-17.5%** |
+| Decode tok/s | 14.29 | 14.56 | 不变 |
+| BW | 257 GB/s | 262 GB/s | 不变 |
+
+**文件**: `src/engine/model.cpp` (+238 -99), `src/engine/allocator.cpp`
+
 **累计 MTP 提速**: +51% (5.1 → 7.7-7.8 tok/s)

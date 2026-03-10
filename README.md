@@ -333,6 +333,21 @@ MTP speculative decoding is enabled by default when the model has MTP weights (`
 | 35B MoE | 30.6 tok/s | 40.0 tok/s | d=2 | **+31%** |
 | 122B MoE NVFP4 | 14.1 tok/s | 19.6 tok/s | d=2 | **+39%** |
 
+### Weight Loading Performance
+
+Measured with cold page cache (`echo 3 > /proc/sys/vm/drop_caches`).
+
+| Model | Precision | Size | Tensors | Load Time | Throughput |
+|-------|-----------|------|---------|-----------|------------|
+| Qwen3.5-4B | BF16 | 8.7 GB | 738 | 6.2s | 1435 MB/s |
+| Qwen3.5-9B | BF16 | 18.0 GB | 775 | 11.7s | 1576 MB/s |
+| Qwen3.5-27B | BF16 | 51.7 GB | 1,199 | 36.9s | 1437 MB/s |
+| Qwen3.5-27B | NVFP4 | 19.2 GB | 2,399 | 12.5s | 1569 MB/s |
+| Qwen3.5-35B-A3B | MoE BF16 | 67.0 GB | 1,811 | 59.0s | 1163 MB/s |
+| Qwen3.5-122B-A10B | MoE NVFP4 | 77.1 GB | 76,037 | 120.2s | 657 MB/s |
+
+> Loading uses adaptive mmap strategy, scalar bypass (74K FP32 scalars from mmap), and direct-to-packed expert loading (73K expert tensors H2D to pre-allocated packed buffers, eliminating 97% cudaMalloc calls).
+
 Key optimizations applied:
 - **GEMV/GEMM**: Scattered GEMV, Dual GEMV, GEMV+Add fusion, Multi-row GEMV (M=2-8, zero SMEM, L2 cache), CUTLASS SM110 GEMM
 - **Weight merging**: QKV merge (32 launches saved), QKVZAB super-merge (144 launches saved)
@@ -345,6 +360,7 @@ Key optimizations applied:
 - **FP4**: V2 GEMV with SMEM LUT + vectorized loads, merged FP4 QKV/GateUp projections
 - **SM110a HW primitives**: PDL (launch overlap, -1.8%), f32x2 SIMD FMA, TMA bulk copy (SSM state 4.31×)
 - **exp2f**: FA4-inspired `exp2f` + LOG2E 预乘全量替换 (-1.1%)
+- **Weight loading**: Adaptive mmap, scalar bypass, direct-to-packed expert loading (122B: -20.5% load time)
 
 See [docs/OPTIMIZATION_LOG.md](docs/OPTIMIZATION_LOG.md) for the full optimization journal.
 

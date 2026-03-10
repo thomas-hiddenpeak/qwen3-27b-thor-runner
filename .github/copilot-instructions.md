@@ -197,6 +197,10 @@ src/
 - ✔️ TMA bulk copy (SSM state cp.async.bulk, 32KB 4.31×), prefill 加速
 - ✔️ Multi-row GEMV (M=2-8 register-based, L2 cache, zero SMEM), MTP 5.2→7.3-9.0 tok/s
 - ✔️ FullAttn small-T paged attention + split-K causal masking, attention -86%, MTP +3.3%
+- ✅ 权重加载: adaptive mmap + scalar bypass + direct-to-packed expert loading
+  - 122B: 151.2→120.2s (-20.5%), 657 MB/s (+25.9%), cudaMalloc -97%
+  - 27B: 36.9s/1437 MB/s, 9B: 11.7s/1576 MB/s, 4B: 6.2s/1435 MB/s
+- ❌ ShardPool (阻止 release_raw → 2× peak memory OOM, reverted)
 - ❌ SMEM multi-row GEMV (occupancy 6→5 blocks/SM, -24%, reverted)
 - ❌ GDN SMEM caching (occupancy drop, reverted)
 - ❌ Dual GEMV + SwiGLU fusion (block count halved, +4.6%, reverted)
