@@ -120,7 +120,7 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
     }
 
     // 5. 初始化 IPC 队列
-    ipc_queue_      = std::make_unique<ipc::ShmRingBuffer<ipc::InferenceRequest,  8>>("/qwen_thor_ipc",  true);
+    ipc_queue_      = std::make_unique<ipc::ShmRingBuffer<ipc::InferenceRequest, 128>>("/qwen_thor_ipc",  true);
     ipc_resp_queue_ = std::make_unique<ipc::ShmRingBuffer<ipc::InferenceResponse, 512>>("/qwen_thor_resp", true);
 
     // 5b. 预分配显存
@@ -612,8 +612,8 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
     //
     // 收集所有标准 decode 请求 (非 SSD, 非 swapped, 已完成 prefill):
     //   - ≥2 个: batch_decode_step() 一次 forward 服务所有请求
-    //   - =1 + MTP drafts: 走 MTP verify (existing single-request path)
-    //   - =1 无 MTP: 走标准 T=1 decode (existing, 可 bootstrap MTP)
+    //   - =1 + 有 pending prefill: 走 batch decode (不走 MTP, 让步给 prefill ramp-up)
+    //   - =1 + 无 pending: 走 MTP verify (最大化单请求吞吐)
     //   - =0: 只处理 prefill/streaming/swap-in
     //
     // Batch decode 后, 继续处理一个 prefill 或 streaming 请求 (如有)
@@ -626,8 +626,22 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
         }
     }
 
+    // 检查是否有待 prefill 的请求 (用于 B=1 路由决策)
+    bool has_pending_prefill = false;
+    for (auto* r : active_requests) {
+        if (!r->is_finished && r->generated_tokens.empty() && !r->cache_state.is_swapped) {
+            has_pending_prefill = true;
+            break;
+        }
+    }
+
     bool did_batch_decode = false;
-    if ((int)batch_decode_reqs.size() >= 2) {
+    // B≥2: 常规 batch decode
+    // B=1 + 有 pending prefill: 也走 batch decode (牺牲 MTP, 让 pending 请求尽快 prefill)
+    //   这样下一步 B 就变成 2+, 避免请求串行处理
+    // B=1 + 无 pending prefill: 走 MTP 路径 (最大化单请求吞吐)
+    if ((int)batch_decode_reqs.size() >= 2 ||
+        ((int)batch_decode_reqs.size() == 1 && has_pending_prefill)) {
         batch_decode_step(batch_decode_reqs, active_requests);
         for (auto* r : batch_decode_reqs) r->last_active_step = step_counter_;
         did_batch_decode = true;
@@ -1832,7 +1846,8 @@ void InferenceEngine::generate_mtp_drafts(RequestContext* ctx,
 //   - 每请求独立 block_table, context_len, SSM/Conv state
 //   - MTP 在 batch 模式下禁用 (batch 权重复用收益 >> MTP)
 //
-// 调用条件: decode_reqs.size() >= 2, 所有请求无 SSD blocks, 未 swapped
+// 调用条件: B≥1, 所有请求无 SSD blocks, 未 swapped
+//   B=1 时: 有 pending prefill 时走此路径 (让步给 ramp-up), 否则走 MTP
 // ---------------------------------------------------------------------------
 void InferenceEngine::batch_decode_step(
     std::vector<RequestContext*>& decode_reqs,

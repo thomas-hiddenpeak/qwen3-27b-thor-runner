@@ -585,8 +585,14 @@ static int run_concurrent_benchmark(int argc, char** argv) {
             req.presence_penalty = cfg.presence_penalty;
             req.seed = (cfg.seed >= 0) ? cfg.seed + i : -1;
             req.stream = true;
-            if (!backend.submit(req)) {
-                fprintf(stderr, "  [Error] Failed to submit request %d\n", i);
+            // 重试提交 (队列可能暂时满, 等引擎消费)
+            int retries = 0;
+            while (!backend.submit(req)) {
+                if (++retries > 200) {  // 20s 超时
+                    fprintf(stderr, "  [Error] Failed to submit request %d after %d retries\n", i, retries);
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         }
 

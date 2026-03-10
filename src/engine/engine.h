@@ -139,7 +139,7 @@ private:
     std::unique_ptr<cache::CacheManager> cache_manager_;
 
     std::unique_ptr<Qwen35Model> model_;
-    std::unique_ptr<ipc::ShmRingBuffer<ipc::InferenceRequest,  8>> ipc_queue_;
+    std::unique_ptr<ipc::ShmRingBuffer<ipc::InferenceRequest, 128>> ipc_queue_;
     std::unique_ptr<ipc::ShmRingBuffer<ipc::InferenceResponse, 512>> ipc_resp_queue_;
     
     std::vector<std::unique_ptr<RequestContext>> all_requests_;
