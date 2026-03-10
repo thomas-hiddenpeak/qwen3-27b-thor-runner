@@ -176,6 +176,9 @@ src/
 - batched decode GEMV→GEMM, 权重只读一次服务多 token
 - Head-Group Batch Attention: 同 KV head 的 6 Q head 合并读取
 - SSM State BF16 化: ✅ 已完成, 72MB/request, B=128 吞吐 +42.6%
+- Batch MTP: 在 batch decode 模式下启用 MTP (T=4×B GEMM), 预估 2-3× 提升
+- Batch Prefill: 不同请求的 prefill 合并为单次 forward (block-diagonal attention)
+  - 可将 N 次串行 prefill (N×270ms) 压缩为 ~1-2 次 forward, ramp-up 时间降 10-30×
 
 ### 已完成优化清单
 - ✅ Level 1: SSM State BF16化 (GMEM BF16, kernel FP32), B=128 +42.6%
@@ -208,7 +211,14 @@ src/
   - CLI: --max-chunk-size, 配置: max_chunk_size=2048, 上限 4096
 - ✅ CUTLASS 接管 M=9+ (M=9-16 CUTLASS 替代 GEMV<16>, B=16 吞吐 +87%)
 - ✅ Batch decode routing fix (B=1 让步 prefill ramp-up, IPC 队列 8→128)
-- ✅ 并发 scaling: B=4 1.28×, B=8 1.62×, B=16 2.41×, B=32 3.64×, B=64 6.09× (69.2 tok/s)
+- ✅ Engine pipeline 优化:
+  - Batched argmax: batch_decode_step greedy 采样 B×sync→1 sync
+  - Prefill-first ramp-up: 有 pending prefill 时跳过 batch decode, 1× 权重读取
+  - Bulk IPC admission: 一次 pop 所有请求, 消除队列延迟
+  - Cleanup fast sync: 替代 polling+sleep, 利用 step 已 sync 特性
+  - B=32/d=100: 90.6 tok/s (raw ceiling 109.2, 83%), 19.5× scaling
+  - B=64/d=100: 123.2 tok/s (raw ceiling 233.2, 53%), 26.5× scaling
+  - Steady-state per-step 效率 ~90%, 差距主要来自串行 prefill ramp-up
 
 ### 稳定性
 - 统一内存 SMMU 资源有限, 大规模并发访问可致 GPU hard-reset
