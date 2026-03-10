@@ -43,7 +43,17 @@
 #include <cstdlib>
 #include <thread>
 
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
 #include "engine/backend.h"
+#include "engine/model.h"
+#include "engine/layer.h"
+#include "engine/allocator.h"
+#include "engine/light_ops.h"
+#include "engine/dense_gemm.h"
+#include "engine/paged_attention.h"
+#include "engine/cache_config.h"
 
 using namespace qwen_thor;
 using Clock = std::chrono::steady_clock;
@@ -165,6 +175,12 @@ struct BenchConfig {
     int concurrent          = 1;     // 并发请求数 (1=顺序, >1=同时提交)
     bool shared_prefix      = false; // 并发请求使用相同 prefix
 
+    // Raw batch decode 参数 (直接 model->forward_decode, 无 engine/serve 开销, 作为性能天花板参考)
+    std::vector<int> raw_batch_sizes;  // 非空则走 raw batch decode 模式
+    int raw_warmup_steps    = 5;
+    int raw_decode_steps    = 10;
+    bool no_graph           = false;
+
     // 采样参数
     float temperature       = 0.0f;  // 0 = greedy
     float top_p             = 0.95f;
@@ -201,6 +217,10 @@ static BenchConfig parse_bench_args(int argc, char** argv) {
         else if (arg == "--max-chunk-size" && i + 1 < argc) cfg.max_chunk_size = std::atoi(argv[++i]);
         else if (arg == "--concurrent" && i + 1 < argc) cfg.concurrent = std::max(1, std::atoi(argv[++i]));
         else if (arg == "--shared-prefix") cfg.shared_prefix = true;
+        else if (arg == "--raw-batch" && i + 1 < argc) cfg.raw_batch_sizes = parse_int_list(argv[++i]);
+        else if (arg == "--raw-warmup" && i + 1 < argc) cfg.raw_warmup_steps = std::max(1, std::atoi(argv[++i]));
+        else if (arg == "--raw-decode" && i + 1 < argc) cfg.raw_decode_steps = std::max(1, std::atoi(argv[++i]));
+        else if (arg == "--no-graph") cfg.no_graph = true;
         else if (arg == "--verbose")       cfg.verbose = true;
         else if (arg == "--help" || arg == "-h") {
             printf("Usage: qwen35-thor bench [options]\n\n"
@@ -224,6 +244,11 @@ static BenchConfig parse_bench_args(int argc, char** argv) {
                    "  --top-p F               Top-p threshold (default: 0.95)\n"
                    "  --top-k N               Top-k (default: 20)\n"
                    "  --seed N                Random seed (default: 42)\n"
+                   "\nRaw batch decode options (direct model forward, reference baseline):\n"
+                   "  --raw-batch N[,N..]     Batch sizes for raw decode (bypasses engine/serve)\n"
+                   "  --raw-warmup N          Raw decode warmup steps (default: 5)\n"
+                   "  --raw-decode N          Raw decode measured steps (default: 10)\n"
+                   "  --no-graph              Disable CUDA Graph\n"
                    "\nConcurrency options:\n"
                    "  --concurrent N          Submit N requests simultaneously (default: 1)\n"
                    "  --shared-prefix         All concurrent requests share same prefix tokens\n"
@@ -232,7 +257,8 @@ static BenchConfig parse_bench_args(int argc, char** argv) {
                    "  bench --config configs/qwen3.5-27b.conf --prompt-len 17,64,256 --iterations 3 --json results.json\n"
                    "  bench --config configs/qwen3.5-27b.conf --mtp-disable --decode 30\n"
                    "  bench --config configs/qwen3.5-27b.conf --concurrent 4 --decode 20\n"
-                   "  bench --config configs/qwen3.5-27b.conf --concurrent 4 --shared-prefix --prompt-len 256 --decode 20\n");
+                   "  bench --config configs/qwen3.5-27b.conf --concurrent 4 --shared-prefix --prompt-len 256 --decode 20\n"
+                   "  bench --config configs/qwen3.5-27b.conf --raw-batch 1,32,64,128 --raw-decode 10 --iterations 3\n");
             exit(0);
         }
     }
@@ -453,6 +479,430 @@ static void write_json(const std::string& path,
     ofs << "}\n";
     ofs.close();
     printf("  JSON results written to: %s\n", path.c_str());
+}
+
+// ============================================================================
+// Raw Batch Decode Benchmark (Phase 8 style)
+//
+// 直接调 model->forward_decode(), 不走 InferenceBackend/Engine 路径
+// 测量纯 GPU kernel 性能, 复现 Phase 8/9 数据
+// ============================================================================
+struct RawBatchCtx {
+    std::vector<int> block_table;
+    int context_len;
+    std::vector<__nv_bfloat16*> ssm_states;
+    std::vector<__nv_bfloat16*> conv_states;
+    int last_token;
+};
+
+struct EventTimer {
+    cudaEvent_t start, stop;
+    EventTimer() { cudaEventCreate(&start); cudaEventCreate(&stop); }
+    ~EventTimer() { cudaEventDestroy(start); cudaEventDestroy(stop); }
+    void record_start(cudaStream_t s) { cudaEventRecord(start, s); }
+    void record_stop(cudaStream_t s)  { cudaEventRecord(stop, s); }
+    float elapsed_ms() {
+        cudaEventSynchronize(stop);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, start, stop);
+        return ms;
+    }
+};
+
+static int run_raw_batch_benchmark(int argc, char** argv) {
+    BenchConfig cfg = parse_bench_args(argc, argv);
+
+    printf("========================================\n");
+    printf("  Raw Model Decode Benchmark\n");
+    printf("  (reference baseline, no engine overhead)\n");
+    printf("========================================\n");
+    printf("  Batch sizes   : ");
+    for (size_t i = 0; i < cfg.raw_batch_sizes.size(); ++i)
+        printf("%s%d", i ? "," : "", cfg.raw_batch_sizes[i]);
+    printf("\n");
+    printf("  Prompt len    : %d\n", cfg.prompt_lens[0]);
+    printf("  Warmup steps  : %d\n", cfg.raw_warmup_steps);
+    printf("  Decode steps  : %d\n", cfg.raw_decode_steps);
+    printf("  CUDA Graph    : %s\n", cfg.no_graph ? "OFF" : "ON");
+    printf("  Iterations    : %d\n", cfg.iterations);
+    printf("========================================\n\n");
+
+    // 加载模型
+    std::string model_dir = cfg.model_dir;
+    if (model_dir.empty() && !cfg.config_file.empty()) {
+        auto bcfg = BackendConfig::from_file(cfg.config_file);
+        model_dir = bcfg.model_dir;
+    }
+    if (model_dir.empty()) {
+        const char* env = std::getenv("QWEN_MODEL_DIR");
+        if (env && env[0]) model_dir = env;
+    }
+    if (model_dir.empty()) {
+        fprintf(stderr, "[Error] --model-dir, --config, or QWEN_MODEL_DIR required.\n");
+        return 1;
+    }
+
+    core::Qwen35Config config;
+    config.model_dir = model_dir;
+    config.load_from_model_dir(model_dir);
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+
+    printf("[1/3] Loading model weights...\n");
+    auto model = std::make_unique<core::Qwen35Model>(config);
+    model->load_weights(model_dir);
+    printf("      Model loaded. (hidden=%d layers=%d vocab=%d)\n",
+           config.hidden_size, config.num_hidden_layers, config.vocab_size);
+
+    // L2 persistence
+    {
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, 0);
+        if (prop.persistingL2CacheMaxSize > 0) {
+            size_t persist_size = std::min((size_t)4 * 1024 * 1024, (size_t)prop.persistingL2CacheMaxSize);
+            cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist_size);
+        }
+    }
+
+    // Weight size
+    const int hs = config.hidden_size;
+    const int is_dim = config.intermediate_size;
+    const int qp_dim = config.q_proj_dim();
+    const int kv_dim = config.kv_dim();
+    const int qk = config.lin_qk_dim();
+    const int lin_v = config.lin_v_dim();
+    const int nkh = config.linear_num_key_heads;
+    const int nv = config.linear_num_value_heads;
+    const int in_qkv = 2 * qk + lin_v;
+    int num_full_attn = config.num_full_attn_layers();
+    int num_lin = config.num_hidden_layers - num_full_attn;
+
+    size_t la_params = (size_t)in_qkv * hs + (lin_v + 2*nv) * hs + hs * lin_v
+                       + (size_t)is_dim * hs + is_dim * hs + hs * is_dim;
+    size_t fa_params = (size_t)(qp_dim + 2*kv_dim) * hs + hs * config.q_dim()
+                       + (size_t)is_dim * hs + is_dim * hs + hs * is_dim;
+    size_t total_weight_bytes = (num_lin * la_params + num_full_attn * fa_params
+                                 + (size_t)config.vocab_size * hs) * 2;
+    printf("      Weight size: %.1f MB (BF16)\n\n", (float)total_weight_bytes / 1e6);
+
+    int prompt_len = cfg.prompt_lens[0];
+
+    // 结果收集
+    struct RawResult {
+        int batch_size;
+        float step_ms;
+        float tok_s;
+        float bw_GBs;
+    };
+    std::vector<RawResult> all_results;
+
+    for (int bs : cfg.raw_batch_sizes) {
+        for (int iter = 0; iter < cfg.iterations; ++iter) {
+            printf("[2/3] B=%d, prompt=%d, iter=%d/%d\n", bs, prompt_len, iter+1, cfg.iterations);
+
+            // KV cache
+            double kv_gb = cfg.kv_cache_gb > 0 ? cfg.kv_cache_gb : 8.0;
+            auto allocator = std::make_shared<core::DeviceAllocator>();
+            cache::ModelCacheParams mcp;
+            mcp.num_full_attn_layers   = num_full_attn;
+            mcp.num_kv_heads           = config.num_key_value_heads;
+            mcp.head_dim               = config.head_dim;
+            mcp.block_size             = 16;
+            mcp.num_linear_attn_layers = num_lin;
+            mcp.nkh                    = nkh;
+            mcp.kd                     = config.linear_key_head_dim;
+            mcp.v_per_kh               = config.lin_v_per_kh();
+            mcp.in_qkv                 = in_qkv;
+            mcp.conv_k_minus_1         = config.linear_conv_kernel_dim - 1;
+
+            cache::CacheConfig cache_cfg;
+            cache_cfg.kv_cache_budget_gb = kv_gb;
+            auto capacity = cache::CapacityPlanner::plan(cache_cfg, mcp);
+
+            auto kv_manager = std::make_unique<ops::KVCacheManager>(
+                capacity.gpu_kv_blocks, 16, config.num_key_value_heads, config.head_dim,
+                core::DataType::FP16, allocator, num_full_attn);
+            printf("KVCacheManager: %d layers x %d blocks, %.0f MB\n",
+                   num_full_attn, capacity.gpu_kv_blocks, kv_gb * 1024);
+
+            // Buffers
+            int max_tokens = std::max(prompt_len + 64, bs);
+            int max_kv_blks = ((prompt_len + cfg.raw_decode_steps + cfg.raw_warmup_steps + 15) / 16) + 4;
+
+            __nv_bfloat16* d_hidden = nullptr;
+            int* d_pos = nullptr;
+            int* d_btables = nullptr;
+            int* d_ctx_lens = nullptr;
+            int* d_argmax = nullptr;
+            __nv_bfloat16* d_ws = nullptr;
+
+            cudaMalloc(&d_hidden, (size_t)max_tokens * hs * sizeof(__nv_bfloat16));
+            cudaMalloc(&d_pos, (size_t)max_tokens * sizeof(int));
+            cudaMalloc(&d_btables, (size_t)bs * max_kv_blks * sizeof(int));
+            cudaMalloc(&d_ctx_lens, (size_t)bs * sizeof(int));
+            cudaMallocManaged(&d_argmax, (size_t)bs * sizeof(int));
+
+            size_t ws_full = (size_t)(4*hs + qp_dim + config.q_dim() + 2*kv_dim + 3*is_dim);
+            size_t ws_linear = (size_t)(hs + in_qkv + lin_v + nv + qk + lin_v + hs + hs + 3*is_dim + hs + nkh*2);
+            size_t ws_per_tok = std::max(ws_full, ws_linear);
+            size_t ws_total = ws_per_tok * max_tokens + (size_t)bs * config.vocab_size + (size_t)bs * hs;
+            cudaMalloc(&d_ws, ws_total * sizeof(__nv_bfloat16));
+
+            // SSM/Conv states
+            size_t ssm_sz = (size_t)nkh * config.linear_key_head_dim * config.lin_v_per_kh() * sizeof(__nv_bfloat16);
+            size_t conv_sz = (size_t)in_qkv * (config.linear_conv_kernel_dim - 1) * sizeof(__nv_bfloat16);
+
+            std::vector<RawBatchCtx> reqs(bs);
+            for (int b = 0; b < bs; ++b) {
+                reqs[b].ssm_states.resize(num_lin);
+                reqs[b].conv_states.resize(num_lin);
+                for (int li = 0; li < num_lin; ++li) {
+                    cudaMalloc(&reqs[b].ssm_states[li], ssm_sz);
+                    cudaMemset(reqs[b].ssm_states[li], 0, ssm_sz);
+                    cudaMalloc(&reqs[b].conv_states[li], conv_sz);
+                    cudaMemset(reqs[b].conv_states[li], 0, conv_sz);
+                }
+            }
+
+            // SSM/Conv pointer arrays
+            __nv_bfloat16** d_ssm_ptrs = nullptr;
+            __nv_bfloat16** d_conv_ptrs = nullptr;
+            cudaMallocManaged(&d_ssm_ptrs, (size_t)num_lin * bs * sizeof(__nv_bfloat16*));
+            cudaMallocManaged(&d_conv_ptrs, (size_t)num_lin * bs * sizeof(__nv_bfloat16*));
+            for (int li = 0; li < num_lin; ++li)
+                for (int bi = 0; bi < bs; ++bi) {
+                    d_ssm_ptrs[li * bs + bi] = reqs[bi].ssm_states[li];
+                    d_conv_ptrs[li * bs + bi] = reqs[bi].conv_states[li];
+                }
+
+            // Prefill each request
+            {
+                int default_tokens[] = {248045, 846, 198, 3710, 369, 220, 17, 10, 17, 30,
+                                        248046, 198, 248045, 74455, 198, 248068, 198};
+                std::vector<int> prompt_toks(prompt_len);
+                for (int i = 0; i < prompt_len; ++i)
+                    prompt_toks[i] = (i < 17) ? default_tokens[i] : 1;
+
+                for (int b = 0; b < bs; ++b) {
+                    for (int li = 0; li < num_lin; ++li) {
+                        cudaMemset(reqs[b].ssm_states[li], 0, ssm_sz);
+                        cudaMemset(reqs[b].conv_states[li], 0, conv_sz);
+                    }
+                    int nblk = (prompt_len + 15) / 16;
+                    auto btable = kv_manager->allocate_blocks(nblk);
+                    reqs[b].block_table = btable;
+                    reqs[b].context_len = prompt_len;
+
+                    cudaMemcpyAsync(d_pos, prompt_toks.data(), prompt_len * sizeof(int),
+                                    cudaMemcpyHostToDevice, stream);
+                    ops::invoke_embedding_lookup(d_hidden, d_pos, model->get_embed_tokens(),
+                                                 prompt_len, hs, stream);
+                    std::vector<int> pos(prompt_len);
+                    for (int i = 0; i < prompt_len; ++i) pos[i] = i;
+                    cudaMemcpyAsync(d_pos, pos.data(), prompt_len * sizeof(int),
+                                    cudaMemcpyHostToDevice, stream);
+                    cudaMemcpyAsync(d_btables, btable.data(), btable.size() * sizeof(int),
+                                    cudaMemcpyHostToDevice, stream);
+                    int cl = prompt_len;
+                    cudaMemcpyAsync(d_ctx_lens, &cl, sizeof(int), cudaMemcpyHostToDevice, stream);
+
+                    std::vector<__nv_bfloat16*> s_ssm(num_lin), s_conv(num_lin);
+                    for (int li = 0; li < num_lin; ++li) {
+                        s_ssm[li] = reqs[b].ssm_states[li];
+                        s_conv[li] = reqs[b].conv_states[li];
+                    }
+
+                    model->forward_prefill(d_hidden, d_pos, *kv_manager,
+                                   d_btables, d_ctx_lens,
+                                   (int)btable.size(), cl, prompt_len,
+                                   s_ssm.data(), s_conv.data(),
+                                   d_ws, stream);
+                    cudaStreamSynchronize(stream);
+
+                    // LM head + argmax to get first decode token
+                    __nv_bfloat16* norm_out = d_ws;
+                    __nv_bfloat16* logits = norm_out + hs;
+                    ops::invoke_rmsnorm(norm_out, d_hidden + (prompt_len - 1) * hs,
+                                        model->get_norm_weight(), config.rms_norm_eps, 1, hs, stream);
+                    ops::invoke_dense_gemv(norm_out, model->get_lm_head(), logits,
+                                           config.vocab_size, hs, stream);
+                    ops::invoke_argmax(logits, d_argmax, config.vocab_size, stream);
+                    cudaStreamSynchronize(stream);
+
+                    reqs[b].last_token = d_argmax[0];
+                    reqs[b].context_len++;
+                }
+                printf("    Prefill done (%d requests × %d tokens)\n", bs, prompt_len);
+            }
+
+            // Decode loop
+            int total_steps = cfg.raw_warmup_steps + cfg.raw_decode_steps;
+            __nv_bfloat16* norm_out_g = d_ws + ws_per_tok * max_tokens;
+            __nv_bfloat16* logits_g = norm_out_g + (size_t)bs * hs;
+
+            cudaGraph_t decode_graph = nullptr;
+            cudaGraphExec_t decode_graph_exec = nullptr;
+            bool graph_captured = false;
+
+            std::vector<int> h_tids(bs), h_pids(bs), h_clens(bs);
+            std::vector<int> h_bt_flat(bs * max_kv_blks, 0);
+
+            EventTimer t_total;
+            Stats decode_stats;
+
+            for (int step = 0; step < total_steps; ++step) {
+                bool warmup = (step < cfg.raw_warmup_steps);
+
+                int max_ctx = 0;
+                for (int b = 0; b < bs; ++b) {
+                    h_tids[b] = reqs[b].last_token;
+                    h_pids[b] = reqs[b].context_len - 1;
+                    h_clens[b] = reqs[b].context_len;
+                    max_ctx = std::max(max_ctx, reqs[b].context_len);
+                }
+                std::fill(h_bt_flat.begin(), h_bt_flat.end(), 0);
+                for (int b = 0; b < bs; ++b)
+                    for (int j = 0; j < (int)reqs[b].block_table.size(); ++j)
+                        h_bt_flat[b * max_kv_blks + j] = reqs[b].block_table[j];
+
+                t_total.record_start(stream);
+
+                // Embedding + upload
+                cudaMemcpyAsync(d_pos, h_tids.data(), bs * sizeof(int), cudaMemcpyHostToDevice, stream);
+                ops::invoke_embedding_lookup(d_hidden, d_pos, model->get_embed_tokens(), bs, hs, stream);
+                cudaMemcpyAsync(d_pos, h_pids.data(), bs * sizeof(int), cudaMemcpyHostToDevice, stream);
+                cudaMemcpyAsync(d_btables, h_bt_flat.data(), bs * max_kv_blks * sizeof(int),
+                                cudaMemcpyHostToDevice, stream);
+                cudaMemcpyAsync(d_ctx_lens, h_clens.data(), bs * sizeof(int), cudaMemcpyHostToDevice, stream);
+
+                if (graph_captured) {
+                    cudaGraphLaunch(decode_graph_exec, stream);
+                } else {
+                    model->forward_decode(d_hidden, d_pos, *kv_manager,
+                                   d_btables, d_ctx_lens,
+                                   max_kv_blks, max_ctx, bs,
+                                   d_ssm_ptrs, d_conv_ptrs,
+                                   d_ws, stream);
+                    ops::invoke_rmsnorm(norm_out_g, d_hidden, model->get_norm_weight(),
+                                        config.rms_norm_eps, bs, hs, stream);
+                    if (bs == 1)
+                        ops::invoke_dense_gemv(norm_out_g, model->get_lm_head(), logits_g,
+                                               config.vocab_size, hs, stream);
+                    else
+                        ops::invoke_dense_gemm(norm_out_g, model->get_lm_head(), logits_g,
+                                               bs, config.vocab_size, hs, stream);
+                    ops::invoke_batched_argmax(logits_g, d_argmax, config.vocab_size, bs, stream);
+
+                    // Capture graph after last warmup
+                    if (warmup && step == cfg.raw_warmup_steps - 1 && !cfg.no_graph) {
+                        cudaStreamSynchronize(stream);
+                        cudaStream_t cap_stream;
+                        cudaStreamCreate(&cap_stream);
+                        cudaStreamBeginCapture(cap_stream, cudaStreamCaptureModeGlobal);
+
+                        model->forward_decode(d_hidden, d_pos, *kv_manager,
+                                       d_btables, d_ctx_lens,
+                                       max_kv_blks, max_ctx, bs,
+                                       d_ssm_ptrs, d_conv_ptrs,
+                                       d_ws, cap_stream);
+                        ops::invoke_rmsnorm(norm_out_g, d_hidden, model->get_norm_weight(),
+                                            config.rms_norm_eps, bs, hs, cap_stream);
+                        if (bs == 1)
+                            ops::invoke_dense_gemv(norm_out_g, model->get_lm_head(), logits_g,
+                                                   config.vocab_size, hs, cap_stream);
+                        else
+                            ops::invoke_dense_gemm(norm_out_g, model->get_lm_head(), logits_g,
+                                                   bs, config.vocab_size, hs, cap_stream);
+                        ops::invoke_batched_argmax(logits_g, d_argmax, config.vocab_size, bs, cap_stream);
+
+                        cudaStreamEndCapture(cap_stream, &decode_graph);
+                        auto err = cudaGraphInstantiate(&decode_graph_exec, decode_graph, 0);
+                        cudaStreamDestroy(cap_stream);
+                        if (err == cudaSuccess) {
+                            graph_captured = true;
+                            printf("    [graph] CUDA Graph captured (%d kernels)\n", bs);
+                        } else {
+                            printf("    [graph] capture failed: %s — using non-graph path\n",
+                                   cudaGetErrorString(err));
+                        }
+                    }
+                }
+
+                t_total.record_stop(stream);
+                float ms = t_total.elapsed_ms();
+
+                // Update state
+                for (int b = 0; b < bs; ++b) {
+                    reqs[b].last_token = d_argmax[b];
+                    reqs[b].context_len++;
+                    if (reqs[b].context_len > (int)reqs[b].block_table.size() * 16) {
+                        auto new_blks = kv_manager->allocate_blocks(1);
+                        if (!new_blks.empty()) reqs[b].block_table.push_back(new_blks[0]);
+                    }
+                }
+
+                if (warmup) {
+                    printf("    [warmup %3d] step=%.2f ms  tok=%d\n", step, ms, reqs[0].last_token);
+                } else {
+                    decode_stats.add(ms);
+                }
+            }
+
+            // Results
+            float step_ms = decode_stats.median();
+            float tok_s = (step_ms > 0) ? bs * 1000.0f / step_ms : 0;
+            float bw = (step_ms > 0) ? total_weight_bytes / (step_ms / 1000.0f) / 1e9f : 0;
+
+            printf("    ┌────────────────────────────────────────────────────┐\n");
+            printf("    │ B=%-3d  Step: %.1f ms  tok/s: %.1f  BW: %.1f GB/s │\n",
+                   bs, step_ms, tok_s, bw);
+            printf("    │ CV=%.1f%%  p95=%.2f  p99=%.2f                     │\n",
+                   decode_stats.cv_pct(), decode_stats.p95(), decode_stats.p99());
+            printf("    └────────────────────────────────────────────────────┘\n\n");
+
+            all_results.push_back({bs, step_ms, tok_s, bw});
+
+            // Cleanup
+            if (decode_graph_exec) cudaGraphExecDestroy(decode_graph_exec);
+            if (decode_graph) cudaGraphDestroy(decode_graph);
+            for (auto& r : reqs) {
+                for (auto* p : r.ssm_states) cudaFree(p);
+                for (auto* p : r.conv_states) cudaFree(p);
+            }
+            cudaFree(d_ssm_ptrs); cudaFree(d_conv_ptrs);
+            cudaFree(d_hidden); cudaFree(d_pos); cudaFree(d_ws);
+            cudaFree(d_btables); cudaFree(d_ctx_lens); cudaFree(d_argmax);
+        }
+    }
+
+    // Summary table
+    printf("\n[3/3] Raw Batch Decode Summary\n\n");
+    printf("╔═══════╦══════════╦════════╦═══════════╗\n");
+    printf("║ Batch ║ Step(ms) ║ tok/s  ║ BW(GB/s)  ║\n");
+    printf("╠═══════╬══════════╬════════╬═══════════╣\n");
+    for (auto& r : all_results) {
+        printf("║ %5d ║ %8.1f ║%7.1f ║ %8.1f  ║\n", r.batch_size, r.step_ms, r.tok_s, r.bw_GBs);
+    }
+    printf("╚═══════╩══════════╩════════╩═══════════╝\n");
+
+    if (!cfg.json_output.empty()) {
+        std::ofstream ofs(cfg.json_output);
+        ofs << "{\n  \"benchmark\": \"raw-batch-decode\",\n  \"results\": [\n";
+        for (size_t i = 0; i < all_results.size(); ++i) {
+            auto& r = all_results[i];
+            ofs << "    {\"batch\": " << r.batch_size << ", \"step_ms\": " << std::fixed << std::setprecision(1) << r.step_ms
+                << ", \"tok_s\": " << std::setprecision(1) << r.tok_s
+                << ", \"bw_GBs\": " << std::setprecision(1) << r.bw_GBs << "}"
+                << (i+1 < all_results.size() ? ",\n" : "\n");
+        }
+        ofs << "  ]\n}\n";
+        printf("  JSON written to: %s\n", cfg.json_output.c_str());
+    }
+
+    cudaStreamDestroy(stream);
+    return 0;
 }
 
 // ============================================================================
@@ -724,6 +1174,11 @@ static int run_concurrent_benchmark(int argc, char** argv) {
 // ============================================================================
 int run_benchmark(int argc, char** argv) {
     BenchConfig cfg = parse_bench_args(argc, argv);
+
+    // Raw batch decode 模式: 直接调 model->forward_decode(), 作为性能天花板参考
+    if (!cfg.raw_batch_sizes.empty()) {
+        return run_raw_batch_benchmark(argc, argv);
+    }
 
     // 并发模式: 路由到专用函数
     if (cfg.concurrent > 1) {
