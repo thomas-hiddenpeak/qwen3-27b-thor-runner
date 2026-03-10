@@ -314,27 +314,25 @@ void invoke_dense_gemm(
     cudaStream_t stream
 ) {
     // Small M: multi-row GEMV (reads B weights once, A from L2 cache).
-    // Much faster than cuBLAS for M=2-16: cuBLAS reads B ~1.5-2× for small M.
-    // A[M,K] fits in 32MB L2 cache for M≤16, K≤17408 (A = 560KB max).
-    // MAX_M>16 tested but regressed: instruction pressure turns kernel compute-bound.
+    // Much faster than cuBLAS for M=2-8: cuBLAS reads B ~1.5-2× for small M.
+    // A[M,K] fits in 32MB L2 cache for M≤8, K≤17408 (A = 280KB max).
+    // M=9-16: CUTLASS GEMM with tensor cores is faster than GEMV<16>
+    //   (GEMV<16> has severe register pressure → 4.5× slowdown per step).
     // NOTE: SMEM variant tested but regressed (-24%) due to occupancy drop (5→6 blocks/SM).
-    if (M > 1 && M <= 16) {
+    if (M > 1 && M <= 8) {
         constexpr int BLOCK_THREADS = 256;  // 8 warps
         constexpr int WARPS = BLOCK_THREADS / 32;
         int blocks = (N + WARPS - 1) / WARPS;
         if (M <= 4) {
             PDL_LAUNCH(gemv_multirow_kernel_scattered<4>, blocks, BLOCK_THREADS, 0, stream,
                 A, B, C, M, N, K);
-        } else if (M <= 8) {
-            PDL_LAUNCH(gemv_multirow_kernel_scattered<8>, blocks, BLOCK_THREADS, 0, stream,
-                A, B, C, M, N, K);
         } else {
-            PDL_LAUNCH(gemv_multirow_kernel_scattered<16>, blocks, BLOCK_THREADS, 0, stream,
+            PDL_LAUNCH(gemv_multirow_kernel_scattered<8>, blocks, BLOCK_THREADS, 0, stream,
                 A, B, C, M, N, K);
         }
         return;
     }
-    // M≥17: 尝试 CUTLASS (can_implement 失败自动回退 cuBLAS)
+    // M≥9: CUTLASS GEMM (M=9-16 使用 tensor cores 替代 register-heavy GEMV<16>)
     // M=17-31 需要 8-aligned padding (17→24, 24→24, 31→32)
 
     // M padding to 8-aligned (required by CUTLASS tensor core)
