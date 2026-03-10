@@ -283,18 +283,35 @@ static RequestResult run_single_request(
     InferenceBackend& backend,
     const BenchConfig& cfg,
     int prompt_len,
-    uint64_t request_id)
+    uint64_t request_id,
+    bool wait_engine_idle = true)
 {
-    // 合成 prompt (与旧 bench 相同的 token 序列)
+    // 等待 Engine 的请求间 idle sleep (200ms) 完成, 避免计入 TTFT
+    if (wait_engine_idle) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    }
+
+    // 合成 prompt: chat 模板头 + 自然语言填充 (避免 EOS 提前终止)
+    // <|im_start|>user\nWrite a quicksort...<|im_end|>\n<|im_start|>assistant\n<|think|>\n
     static const int default_tokens[] = {
         248045, 846, 198, 3710, 369, 220, 17, 10, 17, 30,
         248046, 198, 248045, 74455, 198, 248068, 198
     };
+    // 填充用常见自然语言 token (非特殊 token, 减少 EOS 触发)
+    static const int padding_tokens[] = {
+        279, 448, 350, 264, 311, 389, 369, 279, 498, 323,
+        304, 448, 311, 389, 350, 264, 279, 323, 498, 304,
+        279, 448, 279, 350, 389, 311, 264, 498, 304, 323
+    };
     InferRequest req;
     req.request_id = request_id;
     req.prompt_tokens.resize(prompt_len);
-    for (int i = 0; i < prompt_len; ++i)
-        req.prompt_tokens[i] = (i < 17) ? default_tokens[i] : 1;
+    for (int i = 0; i < prompt_len; ++i) {
+        if (i < 17)
+            req.prompt_tokens[i] = default_tokens[i];
+        else
+            req.prompt_tokens[i] = padding_tokens[(i - 17) % 30];
+    }
     req.max_new_tokens    = cfg.max_tokens;
     req.temperature       = cfg.temperature;
     req.top_p             = cfg.top_p;
@@ -452,7 +469,8 @@ int run_benchmark(int argc, char** argv) {
                cfg.warmup_requests, cfg.warmup_requests > 1 ? "s" : "");
         for (int w = 0; w < cfg.warmup_requests; ++w) {
             int wpl = cfg.prompt_lens[0];
-            auto r = run_single_request(backend, cfg, wpl, next_id++);
+            auto r = run_single_request(backend, cfg, wpl, next_id++,
+                                          w > 0 /* first warmup no wait */);
             printf("      Warmup %d: TTFT=%.1fms, %d tokens, %.1f tok/s\n",
                    w + 1, r.ttft_ms, r.total_tokens, r.gen_tps);
         }
@@ -473,7 +491,8 @@ int run_benchmark(int argc, char** argv) {
         agg.max_tokens = cfg.max_tokens;
 
         for (int iter = 0; iter < cfg.iterations; ++iter) {
-            auto r = run_single_request(backend, cfg, pl, next_id++);
+            auto r = run_single_request(backend, cfg, pl, next_id++,
+                                          true /* wait engine idle */);
 
             agg.ttft.add(r.ttft_ms);
             agg.gen_tps.add(r.gen_tps);
