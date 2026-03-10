@@ -38,6 +38,9 @@ public:
     // 检查是否包含某个 Tensor
     bool has_tensor(const std::string& name) const;
 
+    // 访问已解析的元数据 (用于预扫描, 无需构造 Tensor 对象)
+    const std::unordered_map<std::string, TensorMetadata>& get_metadata() const { return metadata_map_; }
+
 private:
     void parse_header();
     core::DataType parse_dtype(const std::string& dtype_str) const;

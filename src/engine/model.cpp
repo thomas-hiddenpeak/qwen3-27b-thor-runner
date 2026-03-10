@@ -13,6 +13,65 @@
 
 namespace fs = std::filesystem;
 
+namespace {
+// Parse expert FP4 tensor name: model.language_model.layers.{L}.mlp.experts.{E}.{gate|up|down}_proj.weight{_packed|_scale|}
+// Returns true if this is an expert packed/scale tensor eligible for direct-to-packed loading.
+struct ExpertFP4Info {
+    int layer_idx;
+    int expert_idx;
+    int proj;         // 0=gate, 1=up, 2=down
+    bool is_scale;    // true=weight_scale (FP8), false=weight_packed/weight (U8)
+};
+
+bool parse_expert_fp4(const std::string& name, ExpertFP4Info& info) {
+    // Must be model.language_model.layers (not mtp.layers)
+    auto lp = name.find("model.language_model.layers.");
+    if (lp == std::string::npos) return false;
+    auto ep = name.find(".mlp.experts.");
+    if (ep == std::string::npos) return false;
+
+    // Extract layer index
+    size_t li = lp + 27;
+    size_t ld = name.find('.', li);
+    if (ld == std::string::npos) return false;
+    info.layer_idx = 0;
+    for (size_t i = li; i < ld; i++) {
+        if (name[i] < '0' || name[i] > '9') return false;
+        info.layer_idx = info.layer_idx * 10 + (name[i] - '0');
+    }
+
+    // Extract expert index
+    size_t xi = ep + 13;
+    size_t xd = name.find('.', xi);
+    if (xd == std::string::npos) return false;
+    info.expert_idx = 0;
+    for (size_t i = xi; i < xd; i++) {
+        if (name[i] < '0' || name[i] > '9') return false;
+        info.expert_idx = info.expert_idx * 10 + (name[i] - '0');
+    }
+
+    // Determine projection type
+    size_t pp = xd + 1;
+    if (name.compare(pp, 9, "gate_proj") == 0) info.proj = 0;
+    else if (name.compare(pp, 7, "up_proj") == 0) info.proj = 1;
+    else if (name.compare(pp, 9, "down_proj") == 0) info.proj = 2;
+    else return false;
+
+    // Determine if scale or packed (weight_global_scale/weight_scale_2 are FP32, already scalar-bypassed)
+    size_t suf = name.size();
+    info.is_scale = (suf >= 13 && name.compare(suf - 13, 13, ".weight_scale") == 0);
+    return true;
+}
+
+// Pre-allocated packed buffers for one layer's expert FP4 weights
+struct DirectPackedBuffers {
+    uint8_t* gu_packed = nullptr;   // [E * 2*moe_is, hs/2]
+    uint8_t* gu_scale = nullptr;    // [E * 2*moe_is, hs/16]
+    uint8_t* dn_packed = nullptr;   // [E * hs, moe_is/2]
+    uint8_t* dn_scale = nullptr;    // [E * hs, moe_is/16]
+};
+} // anonymous namespace
+
 namespace qwen_thor {
 namespace core {
 
@@ -61,6 +120,22 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
         return false;
     };
 
+    // Direct-to-packed: for MoE NVFP4 expert raw tensors, pre-allocate packed buffers
+    // and H2D copy directly to the final offset (skipping individual cudaMalloc + D2D copy).
+    // Reduces ~73K cudaMalloc to ~192 (4 buffers × 48 layers).
+    std::unordered_map<int, DirectPackedBuffers> direct_packed;
+    int total_direct_packed = 0;
+    const bool moe_direct_pack = config_.is_moe;  // enabled for MoE models
+    const int dp_E = config_.num_experts;
+    const int dp_moe_is = config_.moe_intermediate_size;
+    const int dp_hs = config_.hidden_size;
+    const int dp_gu_N = 2 * dp_moe_is;
+    const int dp_gu_K_half = dp_hs / 2;
+    const int dp_gu_K_groups = dp_hs / 16;
+    const int dp_dn_N = dp_hs;
+    const int dp_dn_K_half = dp_moe_is / 2;
+    const int dp_dn_K_groups = dp_moe_is / 16;
+
     // 1. 遍历目录，将所有 safetensors 权重拷贝到 VRAM
     int file_count = 0;
     size_t total_copy_bytes = 0;
@@ -91,6 +166,55 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
                 scalar_f32_map[name] = val;
                 total_scalars_skipped++;
                 continue;
+            }
+
+            // --- Direct-to-packed: expert FP4 tensors H2D to pre-allocated packed buffer ---
+            if (moe_direct_pack &&
+                (dtype == core::DataType::U8 || dtype == core::DataType::FP8_E4M3)) {
+                ExpertFP4Info einfo;
+                if (parse_expert_fp4(name, einfo)) {
+                    // Allocate packed buffers for this layer on first encounter
+                    auto dpit = direct_packed.find(einfo.layer_idx);
+                    if (dpit == direct_packed.end()) {
+                        DirectPackedBuffers dp;
+                        cudaMalloc(&dp.gu_packed, (size_t)dp_E * dp_gu_N * dp_gu_K_half);
+                        cudaMalloc(&dp.gu_scale,  (size_t)dp_E * dp_gu_N * dp_gu_K_groups);
+                        cudaMalloc(&dp.dn_packed, (size_t)dp_E * dp_dn_N * dp_dn_K_half);
+                        cudaMalloc(&dp.dn_scale,  (size_t)dp_E * dp_dn_N * dp_dn_K_groups);
+                        device_weights_.push_back(dp.gu_packed);
+                        device_weights_.push_back(dp.gu_scale);
+                        device_weights_.push_back(dp.dn_packed);
+                        device_weights_.push_back(dp.dn_scale);
+                        direct_packed[einfo.layer_idx] = dp;
+                        dpit = direct_packed.find(einfo.layer_idx);
+                    }
+                    auto& dp = dpit->second;
+
+                    // Compute destination offset and H2D copy
+                    uint8_t* dst = nullptr;
+                    if (einfo.proj == 0) {  // gate_proj
+                        size_t row_off = (size_t)einfo.expert_idx * dp_gu_N;
+                        dst = einfo.is_scale ?
+                            dp.gu_scale + row_off * dp_gu_K_groups :
+                            dp.gu_packed + row_off * dp_gu_K_half;
+                    } else if (einfo.proj == 1) {  // up_proj
+                        size_t row_off = (size_t)einfo.expert_idx * dp_gu_N + dp_moe_is;
+                        dst = einfo.is_scale ?
+                            dp.gu_scale + row_off * dp_gu_K_groups :
+                            dp.gu_packed + row_off * dp_gu_K_half;
+                    } else {  // down_proj
+                        size_t row_off = (size_t)einfo.expert_idx * dp_dn_N;
+                        dst = einfo.is_scale ?
+                            dp.dn_scale + row_off * dp_dn_K_groups :
+                            dp.dn_packed + row_off * dp_dn_K_half;
+                    }
+                    cudaMemcpy(dst, tensor->data(), size_bytes, cudaMemcpyHostToDevice);
+                    is_nvfp4 = true;
+                    total_direct_packed++;
+                    shard_tensors++;
+                    shard_bytes += size_bytes;
+                    continue;
+                }
             }
 
             void* d_ptr = nullptr;
@@ -170,8 +294,9 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
               << std::fixed << std::setprecision(1) << load_elapsed << "s ("
               << std::setprecision(1) << ((total_copy_bytes / 1048576.0) / load_elapsed) << " MB/s)."
               << (is_nvfp4 ? " [NVFP4 quantized model detected]" : "");
-    if (total_scalars_skipped > 0)
-        std::cerr << " [scalar bypass: " << total_scalars_skipped << "]";
+    if (total_scalars_skipped > 0 || total_direct_packed > 0)
+        std::cerr << " [scalar bypass: " << total_scalars_skipped
+                  << ", direct packed: " << total_direct_packed << "]";
     std::cerr << std::endl;
 
     // 2. 绑定权重 — 根据层类型分别绑定
@@ -348,121 +473,129 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
 
             if (config_.is_moe) {
                 // ============================================================
-                // NVFP4 MoE: pack individual expert FP4 weights into contiguous
-                // buffers and bind shared expert FP4 weights
+                // NVFP4 MoE expert weight binding
                 // ============================================================
                 const int E      = config_.num_experts;
                 const int moe_is = config_.moe_intermediate_size;
                 const int hs     = config_.hidden_size;
+                const int gu_N = 2 * moe_is;
+                const int gu_K = hs;
+                const int dn_N = hs;
+                const int dn_K = moe_is;
 
-                // -- Expert gate+up: each expert has gate[moe_is, hs] + up[moe_is, hs]
-                // Pack into contiguous: [E * 2*moe_is, hs/2] packed, [E * 2*moe_is, hs/16] scale
-                const int gu_N = 2 * moe_is;       // per-expert output dim
-                const int gu_K = hs;                // input dim
-                const int gu_K_half = gu_K / 2;
-                const int gu_K_groups = gu_K / 16;
-                size_t gu_packed_total = (size_t)E * gu_N * gu_K_half;
-                size_t gu_scale_total  = (size_t)E * gu_N * gu_K_groups;
+                // Helper: get inv_global_scale for one expert projection from scalar_f32_map
+                auto get_expert_inv_gs = [&](const std::string& prefix) -> float {
+                    auto gsit = scalar_f32_map.find(prefix + ".weight_global_scale");
+                    bool is_modelopt = false;
+                    if (gsit == scalar_f32_map.end()) {
+                        gsit = scalar_f32_map.find(prefix + ".weight_scale_2");
+                        is_modelopt = (gsit != scalar_f32_map.end());
+                    }
+                    if (gsit == scalar_f32_map.end()) return 1.0f;
+                    float gs = gsit->second;
+                    float global_scale = is_modelopt ? (1.0f / gs) : gs;
+                    return 1.0f / global_scale;
+                };
 
-                uint8_t* gu_packed_buf = nullptr;
-                uint8_t* gu_scale_buf  = nullptr;
-                cudaMalloc(&gu_packed_buf, gu_packed_total);
-                cudaMalloc(&gu_scale_buf,  gu_scale_total);
-                device_weights_.push_back(gu_packed_buf);
-                device_weights_.push_back(gu_scale_buf);
+                uint8_t* gu_packed_buf;
+                uint8_t* gu_scale_buf;
+                uint8_t* dn_packed_buf;
+                uint8_t* dn_scale_buf;
 
-                float gu_global_scale = 1.0f;
-                bool gu_gs_set = false;
+                auto dpit = direct_packed.find(i);
+                if (dpit != direct_packed.end()) {
+                    // ---- Direct-to-packed path: buffers already populated during Phase 1 ----
+                    auto& dp = dpit->second;
+                    gu_packed_buf = dp.gu_packed;
+                    gu_scale_buf  = dp.gu_scale;
+                    dn_packed_buf = dp.dn_packed;
+                    dn_scale_buf  = dp.dn_scale;
+                } else {
+                    // ---- Fallback: original D2D copy path ----
+                    const int gu_K_half = gu_K / 2;
+                    const int gu_K_groups = gu_K / 16;
+                    size_t gu_packed_total = (size_t)E * gu_N * gu_K_half;
+                    size_t gu_scale_total  = (size_t)E * gu_N * gu_K_groups;
+                    gu_packed_buf = nullptr;
+                    gu_scale_buf  = nullptr;
+                    cudaMalloc(&gu_packed_buf, gu_packed_total);
+                    cudaMalloc(&gu_scale_buf,  gu_scale_total);
+                    device_weights_.push_back(gu_packed_buf);
+                    device_weights_.push_back(gu_scale_buf);
 
-                // Per-expert inv_global_scale arrays (device + host staging)
-                std::vector<float> h_gu_inv_gs(E, 1.0f);
-
-                for (int e = 0; e < E; ++e) {
-                    std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
-                    auto gate_qw = make_qw(ep + "gate_proj");
-                    auto up_qw   = make_qw(ep + "up_proj");
-
-                    if (gate_qw.valid()) {
-                        h_gu_inv_gs[e] = 1.0f / gate_qw.global_scale;
+                    for (int e = 0; e < E; ++e) {
+                        std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
+                        auto gate_qw = make_qw(ep + "gate_proj");
+                        auto up_qw   = make_qw(ep + "up_proj");
+                        size_t row_off = (size_t)e * gu_N;
+                        if (gate_qw.valid()) {
+                            cudaMemcpy(gu_packed_buf + (row_off) * gu_K_half,
+                                       gate_qw.packed, (size_t)moe_is * gu_K_half,
+                                       cudaMemcpyDeviceToDevice);
+                            cudaMemcpy(gu_scale_buf + (row_off) * gu_K_groups,
+                                       gate_qw.scale, (size_t)moe_is * gu_K_groups,
+                                       cudaMemcpyDeviceToDevice);
+                            release_raw(gate_qw.packed);
+                            release_raw(gate_qw.scale);
+                        }
+                        if (up_qw.valid()) {
+                            cudaMemcpy(gu_packed_buf + (row_off + moe_is) * gu_K_half,
+                                       up_qw.packed, (size_t)moe_is * gu_K_half,
+                                       cudaMemcpyDeviceToDevice);
+                            cudaMemcpy(gu_scale_buf + (row_off + moe_is) * gu_K_groups,
+                                       up_qw.scale, (size_t)moe_is * gu_K_groups,
+                                       cudaMemcpyDeviceToDevice);
+                            release_raw(up_qw.packed);
+                            release_raw(up_qw.scale);
+                        }
                     }
 
-                    // Destination offset for this expert: rows [e*gu_N .. e*gu_N + gu_N)
-                    size_t row_off = (size_t)e * gu_N;
-                    // gate rows [0..moe_is), up rows [moe_is..2*moe_is)
-                    if (gate_qw.valid()) {
-                        cudaMemcpy(gu_packed_buf + (row_off) * gu_K_half,
-                                   gate_qw.packed, (size_t)moe_is * gu_K_half,
-                                   cudaMemcpyDeviceToDevice);
-                        cudaMemcpy(gu_scale_buf + (row_off) * gu_K_groups,
-                                   gate_qw.scale, (size_t)moe_is * gu_K_groups,
-                                   cudaMemcpyDeviceToDevice);
-                        if (!gu_gs_set) { gu_global_scale = gate_qw.global_scale; gu_gs_set = true; }
-                        release_raw(gate_qw.packed);
-                        release_raw(gate_qw.scale);
-                    }
-                    if (up_qw.valid()) {
-                        cudaMemcpy(gu_packed_buf + (row_off + moe_is) * gu_K_half,
-                                   up_qw.packed, (size_t)moe_is * gu_K_half,
-                                   cudaMemcpyDeviceToDevice);
-                        cudaMemcpy(gu_scale_buf + (row_off + moe_is) * gu_K_groups,
-                                   up_qw.scale, (size_t)moe_is * gu_K_groups,
-                                   cudaMemcpyDeviceToDevice);
-                        release_raw(up_qw.packed);
-                        release_raw(up_qw.scale);
+                    const int dn_K_half = dn_K / 2;
+                    const int dn_K_groups = dn_K / 16;
+                    size_t dn_packed_total = (size_t)E * dn_N * dn_K_half;
+                    size_t dn_scale_total  = (size_t)E * dn_N * dn_K_groups;
+                    dn_packed_buf = nullptr;
+                    dn_scale_buf  = nullptr;
+                    cudaMalloc(&dn_packed_buf, dn_packed_total);
+                    cudaMalloc(&dn_scale_buf,  dn_scale_total);
+                    device_weights_.push_back(dn_packed_buf);
+                    device_weights_.push_back(dn_scale_buf);
+
+                    for (int e = 0; e < E; ++e) {
+                        std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
+                        auto down_qw = make_qw(ep + "down_proj");
+                        size_t row_off = (size_t)e * dn_N;
+                        if (down_qw.valid()) {
+                            cudaMemcpy(dn_packed_buf + row_off * dn_K_half,
+                                       down_qw.packed, (size_t)dn_N * dn_K_half,
+                                       cudaMemcpyDeviceToDevice);
+                            cudaMemcpy(dn_scale_buf + row_off * dn_K_groups,
+                                       down_qw.scale, (size_t)dn_N * dn_K_groups,
+                                       cudaMemcpyDeviceToDevice);
+                            release_raw(down_qw.packed);
+                            release_raw(down_qw.scale);
+                        }
                     }
                 }
 
-                // Upload per-expert inv_gs to device
+                // Build per-expert inv_global_scale arrays (both paths)
+                std::vector<float> h_gu_inv_gs(E, 1.0f);
+                std::vector<float> h_dn_inv_gs(E, 1.0f);
+                for (int e = 0; e < E; ++e) {
+                    std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
+                    h_gu_inv_gs[e] = get_expert_inv_gs(ep + "gate_proj");
+                    h_dn_inv_gs[e] = get_expert_inv_gs(ep + "down_proj");
+                }
                 float* d_gu_inv_gs = nullptr;
                 cudaMalloc(&d_gu_inv_gs, E * sizeof(float));
                 cudaMemcpy(d_gu_inv_gs, h_gu_inv_gs.data(), E * sizeof(float), cudaMemcpyHostToDevice);
                 device_weights_.push_back(d_gu_inv_gs);
-
-                // -- Expert down: each expert has down[hs, moe_is]
-                // Pack into contiguous: [E * hs, moe_is/2] packed, [E * hs, moe_is/16] scale
-                const int dn_N = hs;
-                const int dn_K = moe_is;
-                const int dn_K_half = dn_K / 2;
-                const int dn_K_groups = dn_K / 16;
-                size_t dn_packed_total = (size_t)E * dn_N * dn_K_half;
-                size_t dn_scale_total  = (size_t)E * dn_N * dn_K_groups;
-
-                uint8_t* dn_packed_buf = nullptr;
-                uint8_t* dn_scale_buf  = nullptr;
-                cudaMalloc(&dn_packed_buf, dn_packed_total);
-                cudaMalloc(&dn_scale_buf,  dn_scale_total);
-                device_weights_.push_back(dn_packed_buf);
-                device_weights_.push_back(dn_scale_buf);
-
-                float dn_global_scale = 1.0f;
-                bool dn_gs_set = false;
-
-                std::vector<float> h_dn_inv_gs(E, 1.0f);
-
-                for (int e = 0; e < E; ++e) {
-                    std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
-                    auto down_qw = make_qw(ep + "down_proj");
-                    size_t row_off = (size_t)e * dn_N;
-                    if (down_qw.valid()) {
-                        h_dn_inv_gs[e] = 1.0f / down_qw.global_scale;
-                        cudaMemcpy(dn_packed_buf + row_off * dn_K_half,
-                                   down_qw.packed, (size_t)dn_N * dn_K_half,
-                                   cudaMemcpyDeviceToDevice);
-                        cudaMemcpy(dn_scale_buf + row_off * dn_K_groups,
-                                   down_qw.scale, (size_t)dn_N * dn_K_groups,
-                                   cudaMemcpyDeviceToDevice);
-                        if (!dn_gs_set) { dn_global_scale = down_qw.global_scale; dn_gs_set = true; }
-                        release_raw(down_qw.packed);
-                        release_raw(down_qw.scale);
-                    }
-                }
-
                 float* d_dn_inv_gs = nullptr;
                 cudaMalloc(&d_dn_inv_gs, E * sizeof(float));
                 cudaMemcpy(d_dn_inv_gs, h_dn_inv_gs.data(), E * sizeof(float), cudaMemcpyHostToDevice);
                 device_weights_.push_back(d_dn_inv_gs);
 
-                // -- Build MoEWeights with FP4 fields
+                // Build MoEWeights with FP4 fields
                 MoEWeights moe;
                 moe.router_w = get_ptr(p + "mlp.gate.weight");
                 moe.shared_expert_gate_w = get_ptr(p + "mlp.shared_expert_gate.weight");
@@ -510,10 +643,13 @@ void Qwen35Model::load_weights(const std::string& model_dir) {
                 }
 
                 if (i == 0) {
+                    size_t gu_mb = (size_t)E * gu_N * (gu_K / 2) / 1048576;
+                    size_t dn_mb = (size_t)E * dn_N * (dn_K / 2) / 1048576;
                     std::cerr << "[Model] NVFP4 MoE layer 0: " << E << " experts packed ("
-                              << "gate_up " << gu_packed_total / 1048576 << "MB + "
-                              << "down " << dn_packed_total / 1048576 << "MB), "
+                              << "gate_up " << gu_mb << "MB + "
+                              << "down " << dn_mb << "MB), "
                               << "shared expert FP4=" << (moe.shared_gate_qw.valid() ? "yes" : "no")
+                              << (dpit != direct_packed.end() ? " [direct-packed]" : "")
                               << std::endl;
                 }
             } else {
