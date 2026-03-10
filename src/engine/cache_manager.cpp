@@ -34,6 +34,7 @@ CacheManager::CacheManager(const core::Qwen35Config& model_config,
     block_size_ = 16;
     total_gpu_blocks_ = capacity.gpu_kv_blocks;
     gpu_max_tokens_ = capacity.gpu_max_tokens;
+    max_chunk_size_ = std::max(64, std::min(4096, cache_config.max_chunk_size));
 
     // 统计 linear attention 层数
     num_linear_layers_ = 0;

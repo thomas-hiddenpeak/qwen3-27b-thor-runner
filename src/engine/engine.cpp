@@ -101,6 +101,10 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
     auto capacity = cache::CapacityPlanner::plan(cache_config, mcp);
     cache::CapacityPlanner::print_report(capacity, cache_config);
 
+    // 3.5 Prefill 分块大小 (从配置读取, 上限 4096 防止 CUTLASS TMA 崩溃)
+    max_chunk_size_ = std::max(64, std::min(4096, cache_config.max_chunk_size));
+    fprintf(stderr, "[Engine] Prefill max_chunk_size: %d tokens\n", max_chunk_size_);
+
     // 4. 统一缓存管理器 (包含 KV pool, SSM/Conv pool, prefix cache, KV swapper, SSD store + streaming buffers)
     cache_manager_ = std::make_unique<cache::CacheManager>(config_, cache_config, mcp, capacity, compute_stream_, verbose_);
     gpu_max_tokens_ = cache_manager_->gpu_max_tokens();

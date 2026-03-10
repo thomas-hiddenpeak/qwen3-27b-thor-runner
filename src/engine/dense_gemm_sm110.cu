@@ -314,23 +314,28 @@ void invoke_dense_gemm(
     cudaStream_t stream
 ) {
     // Small M: multi-row GEMV (reads B weights once, A from L2 cache).
-    // Much faster than cuBLAS for M=2-8: cuBLAS reads B ~1.5-2× for small M.
+    // Much faster than cuBLAS for M=2-16: cuBLAS reads B ~1.5-2× for small M.
+    // A[M,K] fits in 32MB L2 cache for M≤16, K≤17408 (A = 560KB max).
+    // MAX_M>16 tested but regressed: instruction pressure turns kernel compute-bound.
     // NOTE: SMEM variant tested but regressed (-24%) due to occupancy drop (5→6 blocks/SM).
-    if (M > 1 && M <= 8) {
+    if (M > 1 && M <= 16) {
         constexpr int BLOCK_THREADS = 256;  // 8 warps
         constexpr int WARPS = BLOCK_THREADS / 32;
         int blocks = (N + WARPS - 1) / WARPS;
         if (M <= 4) {
             PDL_LAUNCH(gemv_multirow_kernel_scattered<4>, blocks, BLOCK_THREADS, 0, stream,
                 A, B, C, M, N, K);
-        } else {
+        } else if (M <= 8) {
             PDL_LAUNCH(gemv_multirow_kernel_scattered<8>, blocks, BLOCK_THREADS, 0, stream,
+                A, B, C, M, N, K);
+        } else {
+            PDL_LAUNCH(gemv_multirow_kernel_scattered<16>, blocks, BLOCK_THREADS, 0, stream,
                 A, B, C, M, N, K);
         }
         return;
     }
-    // M=9-127: cuBLAS (CUTLASS TMA requires M_padded ≥ 64)
-    if (M > 8 && M < 128) {
+    // M=17-127: cuBLAS (CUTLASS TMA requires M_padded ≥ 64)
+    if (M > 16 && M < 128) {
         auto h = get_cublas_handle();
         cublasSetStream(h, stream);
         float alpha = 1.0f, beta_val = 0.0f;
@@ -521,21 +526,24 @@ void invoke_dense_gemm_add(
     cudaStream_t stream
 ) {
     // Small M: multi-row GEMV + residual add (reads B once, A from L2)
-    if (M > 1 && M <= 8) {
+    if (M > 1 && M <= 16) {
         constexpr int BLOCK_THREADS = 256;
         constexpr int WARPS = BLOCK_THREADS / 32;
         int blocks = (N + WARPS - 1) / WARPS;
         if (M <= 4) {
             PDL_LAUNCH(gemv_multirow_kernel_scattered_add<4>, blocks, BLOCK_THREADS, 0, stream,
                 A, B, D, residual, M, N, K);
-        } else {
+        } else if (M <= 8) {
             PDL_LAUNCH(gemv_multirow_kernel_scattered_add<8>, blocks, BLOCK_THREADS, 0, stream,
+                A, B, D, residual, M, N, K);
+        } else {
+            PDL_LAUNCH(gemv_multirow_kernel_scattered_add<16>, blocks, BLOCK_THREADS, 0, stream,
                 A, B, D, residual, M, N, K);
         }
         return;
     }
-    // M=9-127: cuBLAS with residual add
-    if (M > 8 && M < 128) {
+    // M=17-127: cuBLAS with residual add
+    if (M > 16 && M < 128) {
         auto h = get_cublas_handle();
         cublasSetStream(h, stream);
         if (D != residual) {

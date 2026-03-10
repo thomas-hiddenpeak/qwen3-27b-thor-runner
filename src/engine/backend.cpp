@@ -48,6 +48,8 @@ BackendConfig BackendConfig::from_args(int argc, char** argv) {
             cfg.cache_chunk_size = std::stoi(argv[++i]);
         } else if (arg == "--cache-no-ssm") {
             cfg.cache_ssm_state = false;
+        } else if (arg == "--max-chunk-size" && i + 1 < argc) {
+            cfg.max_chunk_size = std::max(64, std::min(4096, std::stoi(argv[++i])));
         } else if (arg == "--mtp-enable") {
             cfg.mtp_mode = "on";
         } else if (arg == "--mtp-disable") {
@@ -98,6 +100,7 @@ BackendConfig BackendConfig::from_file(const std::string& path) {
         else if (key == "chunk_size" || key == "cache_chunk_size")  cfg.cache_chunk_size = std::stoi(val);
         else if (key == "cache_ssm_state")    cfg.cache_ssm_state = (val == "true" || val == "1");
         else if (key == "eviction_policy")    cfg.eviction_policy = val;
+        else if (key == "max_chunk_size")     cfg.max_chunk_size = std::max(64, std::min(4096, std::stoi(val)));
         else if (key == "mtp_mode")           cfg.mtp_mode = val;
         else if (key == "mtp_kv_blocks")      cfg.mtp_kv_blocks = std::stoi(val);
         else if (key == "mtp_num_drafts" || key == "mtp_drafts")
@@ -116,6 +119,7 @@ cache::CacheConfig BackendConfig::to_cache_config() const {
     cc.chunk_size         = cache_chunk_size;
     cc.cache_ssm_state    = cache_ssm_state;
     cc.eviction_policy    = eviction_policy;
+    cc.max_chunk_size     = max_chunk_size;
     cc.mtp_mode           = mtp_mode;
     cc.mtp_kv_blocks      = mtp_kv_blocks;
     cc.mtp_num_drafts     = mtp_num_drafts;
@@ -137,6 +141,7 @@ void BackendConfig::print() const {
         fprintf(stderr, "│  Chunk Size:    %-6d tokens               │\n", cache_chunk_size);
         fprintf(stderr, "│  SSM Caching:   %-3s                        │\n", cache_ssm_state ? "ON" : "OFF");
     }
+    fprintf(stderr, "│  Max Chunk:     %-6d tokens               │\n", max_chunk_size);
     fprintf(stderr, "│  MTP Mode:      %-8s                    │\n", mtp_mode.c_str());
     fprintf(stderr, "│  MTP Drafts:    %-6d                      │\n", mtp_num_drafts);
     fprintf(stderr, "└─────────────────────────────────────────────┘\n\n");

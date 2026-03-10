@@ -80,6 +80,7 @@ static void print_usage() {
     printf("    --cache-max-gb <N>    Max SSD cache size in GB\n");
     printf("    --cache-chunk-size <N> Prefix cache chunk size (tokens)\n");
     printf("    --cache-no-ssm        Disable SSM/Conv state caching\n");
+    printf("    --max-chunk-size <N>  Prefill chunk size (64-4096, default: 2048)\n");
     printf("    --mtp-enable          Force enable MTP speculative decoding\n");
     printf("    --mtp-disable         Force disable MTP speculative decoding\n");
     printf("    --mtp-drafts <N>      Draft tokens per step (1-8, default: 1)\n\n");

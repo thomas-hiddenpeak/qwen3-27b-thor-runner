@@ -4682,4 +4682,47 @@ scale offset  = row_off × (hs/16) bytes
 
 **文件**: `src/engine/model.cpp` (+238 -99), `src/engine/allocator.cpp`
 
+---
+
+## Phase 21: Prefill max_chunk_size 256→2048
+
+**日期**: 2025-07-08
+**状态**: ✅ 完成
+
+### 问题
+
+Engine 的 chunked prefill 以 `max_chunk_size=256` 分块处理长 prompt。每个 chunk 需要完整读取 ~51 GB 权重一次。对于 T=1024 的 prompt，需要 4 个 chunk，权重被读取 4 次 = 204 GB 带宽浪费。
+
+原始约束 "max_chunk_size=256 是 SMMU 硬约束" 经验证过于保守。实际 per-layer `cudaStreamSynchronize` 已防止 SMMU 过载，chunk 大小可安全提升至 4096。
+
+### 方法
+
+1. 通过 benchmark 验证 `forward_prefill()` 在 T=512/1024/2048/4096 下稳定运行（均无 GPU crash）
+2. T=8192 时 CUTLASS TMA 描述符创建失败（错误码 700 → SIGSEGV），确定上限 4096
+3. 交叉分析：单 chunk 在 T≤2048 时优于多 chunk（权重读取减少），T≥4096 时 O(T²) attention 开始主导
+4. 默认值设为 2048，上限 4096，通过 CLI `--max-chunk-size` 和配置文件 `max_chunk_size=` 可调
+
+### 实现
+
+- `CacheConfig` 添加 `max_chunk_size` 字段（默认 2048）
+- `BackendConfig` 添加字段 + CLI/config 解析
+- `InferenceEngine` 和 `CacheManager` 构造时从配置读取
+- 范围强制 `[64, 4096]`
+
+### 结果 (27B BF16, Engine TTFT, 无 prefix cache, 精确 A/B)
+
+| Prompt Tokens | chunk=256 (ms) | chunk=2048 (ms) | 变化 |
+|:-:|:-:|:-:|:-:|
+| ~128 | 369.7 | 369.4 | 0% (已是单块) |
+| ~256 | 694.4 | 437.5 | **-37.0%** |
+| ~512 | 980.4 | 734.3 | **-25.1%** |
+| ~1024 | 1720.2 | 1432.0 | **-16.8%** |
+
+机理分析：
+- chunk=256 时 ~260 token prompt 需 2 chunk = 2 次权重读取 (102 GB)，TTFT 翻倍
+- chunk=2048 时同样 prompt 仅需 1 chunk (51 GB)，TTFT 接近理论下限
+- 效果在 T=256 临界点最显著（-37%），随 T 增大由 compute 稀释
+
+**文件**: `src/engine/cache_config.h`, `src/engine/backend.h/cpp`, `src/engine/engine.h/cpp`, `src/engine/cache_manager.h/cpp`, `configs/qwen3.5-27b.conf`
+
 **累计 MTP 提速**: +51% (5.1 → 7.7-7.8 tok/s)

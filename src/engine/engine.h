@@ -153,7 +153,8 @@ private:
     std::unordered_map<uint64_t, std::vector<core::ProcessedImage>> pending_images_;
 
     // Chunked prefill: 当 prompt 超过此值时自动分块处理
-    int max_chunk_size_ = 256;  // Jetson SMMU 硬约束: >256 的 chunk 在长上下文时 →  GPU illegal memory access
+    // 默认 2048, 上限 4096 (CUTLASS TMA 描述符限制), 从 CacheConfig 读取
+    int max_chunk_size_ = 2048;
 
     // 容量上限: 单请求最大 token 数 (= gpu_kv_blocks × block_size)
     int gpu_max_tokens_ = 0;

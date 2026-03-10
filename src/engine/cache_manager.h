@@ -284,7 +284,7 @@ private:
     int block_size_ = 16;
     int total_gpu_blocks_ = 0;
     int gpu_max_tokens_ = 0;
-    int max_chunk_size_ = 256;       // SMMU 硬约束
+    int max_chunk_size_ = 2048;      // Prefill 分块大小 (从 CacheConfig 读取)
     size_t ssm_size_per_layer_ = 0;
     size_t conv_size_per_layer_ = 0;
 

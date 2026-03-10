@@ -27,9 +27,8 @@
 ### 统一内存的关键约束
 
 权重 (~51 GB) + merged 权重 (~5 GB) + KV Cache + SSM 状态 + Workspace 全在 128 GB 物理内存中:
-- 大 prefill chunk (>256 tokens) 的 MLP GEMM 同时访问 >300 MB 权重, 超过 SMMU 资源 → GPU hard-reset
 - 必须 `loaders_.clear()` 释放 mmap 防止双份权重 (~54 GB)
-- `max_chunk_size_ = 256` 是稳定性硬约束
+- `max_chunk_size_ = 2048` 默认值, 上限 4096 (>4096 触发 CUTLASS TMA 描述符错误 → SIGSEGV)
 - 每层 forward 需 `cudaStreamSynchronize` 防止统一内存并发访问超载
 
 ## 模型架构 (Qwen3.5-27B)
@@ -152,7 +151,7 @@ src/
 - Conv1d 操作全部 10240 通道 (Q+K+V), 不只是 Q
 - CUTLASS output RowMajor, `can_implement()` 失败必须 cuBLAS 回退
 - Chunked prefill chunk 1+ 用 tiled GEMM attention
-- `max_chunk_size_ = 256` 不可放宽 (GPU hard-reset)
+- `max_chunk_size_ = 2048` 默认值, 可配置 64-4096, 不可超 4096 (CUTLASS TMA → SIGSEGV)
 - `loaders_.clear()` 不可移除 (双份权重 → OOM)
 - per-layer `cudaStreamSynchronize` 不可移除 (forward_decode/forward_prefill)
 
@@ -204,6 +203,9 @@ src/
 - ❌ SMEM multi-row GEMV (occupancy 6→5 blocks/SM, -24%, reverted)
 - ❌ GDN SMEM caching (occupancy drop, reverted)
 - ❌ Dual GEMV + SwiGLU fusion (block count halved, +4.6%, reverted)
+- ✅ Prefill max_chunk_size 256→2048 (减少权重重复读取, TTFT -17%~-37%)
+  - T~256: 694→438ms (-37%), T~512: 980→734ms (-25%), T~1024: 1720→1432ms (-17%)
+  - CLI: --max-chunk-size, 配置: max_chunk_size=2048, 上限 4096
 
 ### 稳定性
 - 统一内存 SMMU 资源有限, 大规模并发访问可致 GPU hard-reset

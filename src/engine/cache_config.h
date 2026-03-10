@@ -52,6 +52,11 @@ struct CacheConfig {
     // ---- 驱逐策略 ----
     std::string eviction_policy = "lru";
 
+    // ---- Prefill 分块大小 ----
+    // 长 prompt 超过此值时自动分块 prefill
+    // 默认 2048; 上限 4096 (CUTLASS TMA 限制)
+    int max_chunk_size = 2048;
+
     // ---- MTP 投机解码 ----
     // 使用模型自带的 Multi-Token Prediction 模块实现投机解码
     // mtp_mode: "auto" (模型有 MTP 权重则启用), "on" (强制开), "off" (强制关)

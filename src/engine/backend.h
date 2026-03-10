@@ -92,6 +92,9 @@ struct BackendConfig {
     bool        cache_ssm_state  = true;
     std::string eviction_policy  = "lru";
 
+    // Prefill 分块大小 (默认 2048, 上限 4096)
+    int         max_chunk_size   = 2048;
+
     // MTP 投机解码
     std::string mtp_mode         = "auto";
     int         mtp_kv_blocks    = 256;
