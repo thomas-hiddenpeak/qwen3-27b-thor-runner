@@ -323,8 +323,14 @@ void InferenceEngine::inference_loop() {
 
     while (running_) {
         // 1. 尝试从 IPC 队列获取新请求
+        // 内存压力时暂停接入: 至少保留一个 chunk 的 blocks
+        int admission_threshold = max_chunk_size_ / 16;  // 128 blocks for chunk_size=2048
+        bool should_accept = active_requests.empty() ||
+            (cache_manager_->num_free_gpu_blocks() >= admission_threshold &&
+             cache_manager_->num_free_ssm_slots() > 0);
+
         ipc::InferenceRequest req;
-        if (ipc_queue_->pop(req)) {
+        if (should_accept && ipc_queue_->pop(req)) {
             auto ctx = std::make_unique<RequestContext>();
             ctx->request_id = req.request_id;
             ctx->max_new_tokens = req.max_new_tokens;
@@ -599,6 +605,8 @@ void InferenceEngine::step() {
 void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
     if (active_requests.empty()) return;
 
+    ++step_counter_;
+
     // ========================================================================
     // Phase 2: Batch decode 路由
     //
@@ -621,11 +629,14 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
     bool did_batch_decode = false;
     if ((int)batch_decode_reqs.size() >= 2) {
         batch_decode_step(batch_decode_reqs, active_requests);
+        for (auto* r : batch_decode_reqs) r->last_active_step = step_counter_;
         did_batch_decode = true;
     }
 
-    // 找到下一个需要处理的请求 (跳过已 batch-decoded 的)
+    // 找到下一个需要处理的请求
+    // 优先级: decode/streaming/swap-in > 进行中的 prefill (chunk 抢占)
     RequestContext* ctx = nullptr;
+    RequestContext* pending_prefill = nullptr;
     for (auto* r : active_requests) {
         if (r->is_finished) continue;
         // 跳过已 batch decoded 的标准 decode 请求
@@ -633,10 +644,18 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             !r->generated_tokens.empty() && !r->cache_state.has_ssd_blocks()) {
             continue;
         }
-        ctx = r;
-        break;
+        // Decode/streaming/swap-in 优先于 prefill
+        if (!r->generated_tokens.empty() || r->cache_state.is_swapped) {
+            ctx = r;
+            break;
+        }
+        // 记住第一个待处理的 prefill 请求
+        if (!pending_prefill) pending_prefill = r;
     }
+    if (!ctx) ctx = pending_prefill;
     if (!ctx) return;  // 所有请求都被 batch-decoded 或已完成
+
+    ctx->last_active_step = step_counter_;
 
     // ---- 如果该请求被换出过, 先换入 ----
     if (ctx->cache_state.is_swapped && cache_manager_->has_swapper()) {
@@ -672,61 +691,64 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
     
     if (ctx->generated_tokens.empty()) {
         // --------------------------------------------------------------------
-        // Prefill 阶段
+        // Prefill 阶段 (支持 chunk-level 抢占: 有 decode 请求时逐 chunk 让步)
         // --------------------------------------------------------------------
-        profiler_.request_start();
         int num_tokens = ctx->prompt_tokens.size();
 
-        // ---- KV Cache Prefix Lookup ----
-        int cached_tokens = 0;
+        // ---- 首次进入: cache lookup + 初始化 prefill 进度 ----
+        if (ctx->prefill_chunk_idx < 0) {
+            profiler_.request_start();
+            int cached_tokens = 0;
 
-        // 1) 优先尝试 GPU 前缀共享 (直接复用已驻留 GPU 的 KV blocks, 零 SSD I/O)
-        if (cache_manager_->is_prefix_cache_enabled()) {
-            // 计算 chunk-aligned prefix 长度用于哈希
-            int chunk_sz = cache_manager_->prefix_cache()->config().chunk_size;
-            int prefix_aligned = (num_tokens / chunk_sz) * chunk_sz;
-            if (prefix_aligned > 0) {
-                uint64_t ph = cache_manager_->compute_prefix_hash(
-                    ctx->prompt_tokens.data(), prefix_aligned);
-                int shared = cache_manager_->try_share_gpu_prefix(ph, ctx->cache_state);
-                if (shared > 0) {
-                    // KV blocks 已共享, 还需从 SSD 恢复 SSM/Conv 状态
-                    int ssm_restored = cache_manager_->restore_ssm_only(
-                        ctx->prompt_tokens.data(), shared, ctx->cache_state);
-                    if (ssm_restored <= 0) {
-                        // SSM 恢复失败 — 回滚 KV sharing, 走正常 prefill
-                        cache_manager_->release_gpu_prefix(ph);
-                        cache_manager_->kv_manager().free_blocks(ctx->cache_state.block_table);
-                        ctx->cache_state.block_table.clear();
-                        ctx->cache_state.block_tracker = cache::BlockTracker();
-                        ctx->cache_state.context_len = 0;
-                    } else {
-                        cached_tokens = shared;
-                        ctx->cache_state.shared_prefix_hash = ph;
-                        std::cerr << "[Cache] Shared " << shared << "/" << num_tokens
-                                  << " tokens from GPU (CoW), SSM restored from SSD" << std::endl;
+            // 1) 优先尝试 GPU 前缀共享
+            if (cache_manager_->is_prefix_cache_enabled()) {
+                int chunk_sz = cache_manager_->prefix_cache()->config().chunk_size;
+                int prefix_aligned = (num_tokens / chunk_sz) * chunk_sz;
+                if (prefix_aligned > 0) {
+                    uint64_t ph = cache_manager_->compute_prefix_hash(
+                        ctx->prompt_tokens.data(), prefix_aligned);
+                    int shared = cache_manager_->try_share_gpu_prefix(ph, ctx->cache_state);
+                    if (shared > 0) {
+                        int ssm_restored = cache_manager_->restore_ssm_only(
+                            ctx->prompt_tokens.data(), shared, ctx->cache_state);
+                        if (ssm_restored <= 0) {
+                            cache_manager_->release_gpu_prefix(ph);
+                            cache_manager_->kv_manager().free_blocks(ctx->cache_state.block_table);
+                            ctx->cache_state.block_table.clear();
+                            ctx->cache_state.block_tracker = cache::BlockTracker();
+                            ctx->cache_state.context_len = 0;
+                        } else {
+                            cached_tokens = shared;
+                            ctx->cache_state.shared_prefix_hash = ph;
+                            std::cerr << "[Cache] Shared " << shared << "/" << num_tokens
+                                      << " tokens from GPU (CoW), SSM restored from SSD" << std::endl;
+                        }
                     }
                 }
             }
-        }
 
-        // 2) 回退到 SSD prefix cache
-        if (cached_tokens == 0 && cache_manager_->is_prefix_cache_enabled()) {
-            int matched = cache_manager_->lookup_prefix(ctx->prompt_tokens.data(), num_tokens);
-            if (matched > 0) {
-                cached_tokens = cache_manager_->restore_prefix(
-                    ctx->prompt_tokens.data(), num_tokens,
-                    ctx, d_workspace_, d_block_tables_);
-                if (cached_tokens > 0) {
-                    std::cerr << "[Cache] Restored " << cached_tokens << "/" << num_tokens
-                              << " tokens from SSD" << std::endl;
+            // 2) 回退到 SSD prefix cache
+            if (cached_tokens == 0 && cache_manager_->is_prefix_cache_enabled()) {
+                int matched = cache_manager_->lookup_prefix(ctx->prompt_tokens.data(), num_tokens);
+                if (matched > 0) {
+                    cached_tokens = cache_manager_->restore_prefix(
+                        ctx->prompt_tokens.data(), num_tokens,
+                        ctx, d_workspace_, d_block_tables_);
+                    if (cached_tokens > 0) {
+                        std::cerr << "[Cache] Restored " << cached_tokens << "/" << num_tokens
+                                  << " tokens from SSD" << std::endl;
+                    }
                 }
             }
+
+            ctx->prefill_cached_tokens = cached_tokens;
+            ctx->prefill_chunk_idx = 0;
+            ctx->prefill_ssd_cursor = 0;
         }
 
-        // 如果部分恢复, 只 prefill 剩余 token; 如果全部命中, 跳过 forward
-        int prefill_start = cached_tokens;
-        int prefill_tokens = num_tokens - cached_tokens;
+        // ---- 恢复已保存的进度 ----
+        int prefill_start = ctx->prefill_cached_tokens;
+        int prefill_tokens = num_tokens - prefill_start;
         
         if (prefill_tokens > 0) {
             // ================================================================
@@ -750,15 +772,20 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             int chunk_size = max_chunk_size_;
             int num_chunks = (prefill_tokens + chunk_size - 1) / chunk_size;
 
-            if (num_chunks > 1 && verbose_) {
+            if (ctx->prefill_chunk_idx == 0 && num_chunks > 1 && verbose_) {
                 std::cerr << "[ChunkedPrefill] " << prefill_tokens << " tokens → "
                           << num_chunks << " chunks of ≤" << chunk_size << std::endl;
             }
 
-            // SSD 模式追踪: evict 起始位置 (FIFO: 从头开始 evict)
-            int ssd_evict_cursor = 0;  // 下一个要 evict 的 logical block index
+            // Chunk-level 抢占: 有 decode 请求等待时, 每次 step 只处理 1 个 chunk
+            bool yield_for_decode = !batch_decode_reqs.empty() && num_chunks > 1;
+            int start_chunk = ctx->prefill_chunk_idx;
+            int end_chunk = yield_for_decode ? std::min(start_chunk + 1, num_chunks) : num_chunks;
 
-            for (int chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+            // SSD 模式追踪: evict 起始位置
+            int ssd_evict_cursor = ctx->prefill_ssd_cursor;
+
+            for (int chunk_idx = start_chunk; chunk_idx < end_chunk; ++chunk_idx) {
                 int chunk_start = prefill_start + chunk_idx * chunk_size;
                 int chunk_end   = std::min(chunk_start + chunk_size, num_tokens);
                 int chunk_len   = chunk_end - chunk_start;
@@ -1025,7 +1052,21 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                               << std::endl;
                 }
             }
+
+            // 保存 SSD eviction 游标
+            ctx->prefill_ssd_cursor = ssd_evict_cursor;
+            ctx->prefill_chunk_idx = end_chunk;
+
+            // Chunk-level 抢占: 还有未完成的 chunk → 让步给 decode
+            if (end_chunk < num_chunks) {
+                if (verbose_) {
+                    fprintf(stderr, "[ChunkedPrefill] Yielding after chunk %d/%d for decode (%d reqs)\n",
+                            end_chunk, num_chunks, (int)batch_decode_reqs.size());
+                }
+                return;  // 下一个 step() 从 prefill_chunk_idx 继续
+            }
         
+            // ---- 所有 chunk 完成 — 后处理 ----
             // ---- Cache Store: prefill 完成后缓存 KV + SSM/Conv 到 SSD ----
             cache_manager_->store_prefix(ctx->prompt_tokens.data(), num_tokens, ctx, d_workspace_, d_block_tables_);
 
@@ -1104,7 +1145,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             }
 
             // ---- LMCache Monitor: 记录请求级指标 ----
-            cache_manager_->record_prefix_stats(num_tokens, cached_tokens, prefill_tokens);
+            cache_manager_->record_prefix_stats(num_tokens, ctx->prefill_cached_tokens, prefill_tokens);
         } else {
             // 完全缓存命中 (prefill_tokens == 0):
             // KV + SSM/Conv 已从 SSD 恢复, 跳过 forward
@@ -2122,7 +2163,7 @@ int InferenceEngine::sample_token(__nv_bfloat16* logits, int vocab_size,
 }
 
 // ---------------------------------------------------------------------------
-// try_swap_out_victim: 当 KV blocks 不够时, 换出占用最多 block 的非当前请求
+// try_swap_out_victim: 当 KV blocks 不够时, 换出最久未活跃的非当前请求 (LRU)
 // 返回释放的 block 数
 // ---------------------------------------------------------------------------
 int InferenceEngine::try_swap_out_victim(
@@ -2131,31 +2172,35 @@ int InferenceEngine::try_swap_out_victim(
 
     if (!cache_manager_->has_swapper()) return 0;
 
-    // 选择 victim: 占用 blocks 最多且不是当前正在处理的请求 (active_requests[0])
+    // LRU: 选择 last_active_step 最小 (最久未活跃) 的非当前请求
     RequestContext* victim = nullptr;
-    int max_blocks = 0;
+    uint64_t min_step = UINT64_MAX;
+    int victim_blocks = 0;
     for (size_t i = 1; i < active_requests.size(); ++i) {
         auto* r = active_requests[i];
         if (r->cache_state.is_swapped || r->is_finished) continue;
-        if ((int)r->cache_state.block_table.size() > max_blocks) {
-            max_blocks = (int)r->cache_state.block_table.size();
+        if (r->cache_state.block_table.empty()) continue;
+        if (r->last_active_step < min_step) {
+            min_step = r->last_active_step;
             victim = r;
+            victim_blocks = (int)r->cache_state.block_table.size();
         }
     }
 
-    if (!victim || max_blocks == 0) {
+    if (!victim || victim_blocks == 0) {
         return 0;  // 没有可换出的请求
     }
 
     if (verbose_) std::cerr << "[Engine] Swapping out request " << victim->request_id
-              << " (" << max_blocks << " blocks, ctx=" << victim->cache_state.context_len << ")" << std::endl;
+              << " (LRU step=" << min_step << ", " << victim_blocks
+              << " blocks, ctx=" << victim->cache_state.context_len << ")" << std::endl;
 
     cache_manager_->swap_out_request(victim->request_id, victim);
 
     if (verbose_) std::cerr << "[Engine] Swap-out: returned SSM slot (free slots: "
               << cache_manager_->num_free_ssm_slots() << ")" << std::endl;
 
-    return max_blocks;
+    return victim_blocks;
 }
 
 } // namespace core

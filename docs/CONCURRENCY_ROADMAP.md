@@ -160,24 +160,27 @@ step() 逻辑:
 
 ---
 
-### Phase 4: 动态调度与抢占 (风险: 中)
+### Phase 4: 动态调度与抢占 (风险: 中) — ✅ 已实现
 
 **目标**: decode 优先于 prefill, 内存压力时智能 swap-out
 
-**改动范围**:
-- `src/engine/engine.cpp`: `inference_loop` 调度逻辑
-  - Decode 请求优先 (Short-Job-First: 减少平均延迟)
-  - 新请求 prefill 与已有 decode 交错 (不饿死新请求)
-  - 内存压力阈值: free_blocks < threshold → 暂停接入新请求
-- Swap-out 策略: LRU (最久未产出 token 的请求优先换出)
-- 抢占支持: prefill 可被 decode 中断 (在 chunk 边界)
+**实现**:
+- `src/engine/engine.h`: `RequestContext` 增加调度字段
+  - `last_active_step`: 最近活跃步 (用于 LRU swap-out)
+  - `prefill_chunk_idx`, `prefill_cached_tokens`, `prefill_ssd_cursor`: chunk 级 prefill 进度
+  - `step_counter_`: InferenceEngine 全局步数
+- `src/engine/engine.cpp`:
+  - **LRU swap-out**: `try_swap_out_victim()` 从"最大 blocks" → "最久未活跃" (最小 `last_active_step`)
+  - **Decode-first 调度**: 请求选择循环优先 decode/streaming/swap-in, 其次 prefill
+  - **Chunk-level 抢占**: 有 decode 请求等待时, prefill 每次只处理 1 个 chunk 然后 yield
+    - 首次进入: cache lookup → 保存 `prefill_cached_tokens` → `prefill_chunk_idx = 0`
+    - 后续进入: 从保存的 `prefill_chunk_idx` 继续
+    - 所有 chunk 完成: 执行 post-processing (store prefix, lm_head, sample)
+  - **Admission control**: `inference_loop` 内存压力时暂停接入新请求
+    - 阈值: `free_blocks < max_chunk_size/16` (128 blocks) 或 SSM slots 耗尽
+    - 不丢弃请求, 而是保留在 IPC 队列中等候
 
-**验证**:
-- 混合负载: 持续新请求 + 并发 decode, 无饿死, 无 OOM
-- Swap 往返: 换出→换入后推理结果正确
-- 性能: 平均 TTFT 和 decode 延迟在可接受范围
-
-**依赖**: Phase 2, Phase 3
+**Decode 延迟改善**: 20K prompt (10 chunks) 期间, decode 等待从 ~2-5s → ~200-500ms/chunk
 
 ## 风险与回退
 

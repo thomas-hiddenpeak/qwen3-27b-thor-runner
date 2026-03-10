@@ -50,6 +50,14 @@ struct RequestContext {
     // 多模态: 预处理后的图像数据
     std::vector<core::ProcessedImage> processed_images;
 
+    // 调度: 最近活跃步 (用于 LRU swap-out 策略)
+    uint64_t last_active_step = 0;
+
+    // Prefill chunk-level preemption: 保存分块 prefill 进度
+    int prefill_chunk_idx = -1;      // -1 = 未开始 prefill, 0..N-1 = 当前 chunk
+    int prefill_cached_tokens = 0;   // cache lookup/restore 恢复的 token 数
+    int prefill_ssd_cursor = 0;      // SSD eviction FIFO 游标
+
     bool is_finished = false;
 };
 
@@ -125,6 +133,7 @@ private:
     int num_linear_layers_ = 0;    // 线性注意力层数 (48)
     size_t ssm_size_per_layer_ = 0;
     size_t conv_size_per_layer_ = 0;
+    uint64_t step_counter_ = 0;   // 全局步数计数器 (用于 LRU 调度)
 
     // ======== 统一缓存管理器 (替代原先 5 个独立组件) ========
     std::unique_ptr<cache::CacheManager> cache_manager_;
