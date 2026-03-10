@@ -115,6 +115,10 @@ private:
     void generate_mtp_drafts(RequestContext* ctx, __nv_bfloat16* main_hidden,
                              int first_token, int start_pos, int N, int vocab_size);
 
+    // Batch decode: 多请求并行 decode (Phase 2)
+    void batch_decode_step(std::vector<RequestContext*>& decode_reqs,
+                           std::vector<RequestContext*>& active_requests);
+
     std::string token_to_log_text(int token_id) const;
 
     Qwen35Config config_;
@@ -136,8 +140,15 @@ private:
     __nv_bfloat16* d_hidden_states_ = nullptr;
     int* d_pos_ids_ = nullptr;
     int* d_block_tables_ = nullptr;
-    int* d_context_lens_ = nullptr;
-    int* d_argmax_result_ = nullptr;  // GPU argmax 结果 (managed memory, 16 ints for batched)
+    int* d_context_lens_ = nullptr;      // [max_batch_size] for batched decode
+    int* d_argmax_result_ = nullptr;     // GPU argmax 结果 (managed memory)
+
+    // Batch decode buffers (Phase 2)
+    int* d_batch_block_tables_ = nullptr;     // [max_batch, max_blocks_per_seq] packed 2D
+    __nv_bfloat16** d_batch_ssm_ptrs_ = nullptr;   // [num_lin_layers * max_batch] managed
+    __nv_bfloat16** d_batch_conv_ptrs_ = nullptr;  // [num_lin_layers * max_batch] managed
+    int max_batch_size_ = 64;                      // from CacheConfig::max_ssm_slots
+    int batch_max_blocks_per_seq_ = 0;             // for 2D block table packing
     
     std::thread worker_thread_;
     std::atomic<bool> running_{false};

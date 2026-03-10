@@ -127,14 +127,23 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
     // max_tokens = 最大单 chunk 序列长度 (chunked prefill 时每块不超过此值)
     int max_tokens   = 8192;
 
+    // Batch decode 参数
+    max_batch_size_ = cache_config.max_ssm_slots;  // 最大并发数 = SSM slot 数
+    batch_max_blocks_per_seq_ = (gpu_max_tokens_ + 15) / 16;  // 单请求最大 block 数
+
     // d_hidden_states: max_tokens * hidden_size
     cudaMalloc(&d_hidden_states_, (size_t)max_tokens * config_.hidden_size * sizeof(__nv_bfloat16));
     cudaMalloc(&d_pos_ids_,       (size_t)max_tokens * sizeof(int));
     // d_block_tables: 支持全长度 prompt 的 block table (chunked prefill 需要)
     int max_kv_blks = (ipc::MAX_PROMPT_LEN + 15) / 16 + 1024;  // prompt + decode headroom
     cudaMalloc(&d_block_tables_,  (size_t)max_kv_blks * sizeof(int));
-    cudaMalloc(&d_context_lens_,  sizeof(int));
-    cudaMallocManaged(&d_argmax_result_, 16 * sizeof(int));  // GPU argmax 结果 (batched verify 用)
+    cudaMalloc(&d_context_lens_,  (size_t)max_batch_size_ * sizeof(int));  // batch decode 需要 [B] 维
+    cudaMallocManaged(&d_argmax_result_, (size_t)std::max(16, max_batch_size_) * sizeof(int));
+
+    // Batch decode 专用: 2D 打包 block table + SSM/Conv 指针数组
+    cudaMalloc(&d_batch_block_tables_, (size_t)max_batch_size_ * batch_max_blocks_per_seq_ * sizeof(int));
+    cudaMallocManaged(&d_batch_ssm_ptrs_, (size_t)config_.num_hidden_layers * max_batch_size_ * sizeof(__nv_bfloat16*));
+    cudaMallocManaged(&d_batch_conv_ptrs_, (size_t)config_.num_hidden_layers * max_batch_size_ * sizeof(__nv_bfloat16*));
 
     // Workspace: 单层最大激活量 (linear_attn 更大)
     const int hs     = config_.hidden_size;            // 5120
@@ -280,6 +289,9 @@ InferenceEngine::~InferenceEngine() {
     cudaFree(d_block_tables_);
     cudaFree(d_context_lens_);
     cudaFree(d_argmax_result_);
+    cudaFree(d_batch_block_tables_);
+    cudaFree(d_batch_ssm_ptrs_);
+    cudaFree(d_batch_conv_ptrs_);
     cudaFree(d_penalty_ids_);
     cudaFree(d_penalty_counts_);
     cudaFree(d_ssm_checkpoints_);
@@ -582,8 +594,44 @@ void InferenceEngine::step() {
 void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
     if (active_requests.empty()) return;
 
-    // 简化版：只处理第一个请求
-    auto* ctx = active_requests[0];
+    // ========================================================================
+    // Phase 2: Batch decode 路由
+    //
+    // 收集所有标准 decode 请求 (非 SSD, 非 swapped, 已完成 prefill):
+    //   - ≥2 个: batch_decode_step() 一次 forward 服务所有请求
+    //   - =1 + MTP drafts: 走 MTP verify (existing single-request path)
+    //   - =1 无 MTP: 走标准 T=1 decode (existing, 可 bootstrap MTP)
+    //   - =0: 只处理 prefill/streaming/swap-in
+    //
+    // Batch decode 后, 继续处理一个 prefill 或 streaming 请求 (如有)
+    // ========================================================================
+    std::vector<RequestContext*> batch_decode_reqs;
+    for (auto* r : active_requests) {
+        if (!r->is_finished && !r->cache_state.is_swapped &&
+            !r->generated_tokens.empty() && !r->cache_state.has_ssd_blocks()) {
+            batch_decode_reqs.push_back(r);
+        }
+    }
+
+    bool did_batch_decode = false;
+    if ((int)batch_decode_reqs.size() >= 2) {
+        batch_decode_step(batch_decode_reqs, active_requests);
+        did_batch_decode = true;
+    }
+
+    // 找到下一个需要处理的请求 (跳过已 batch-decoded 的)
+    RequestContext* ctx = nullptr;
+    for (auto* r : active_requests) {
+        if (r->is_finished) continue;
+        // 跳过已 batch decoded 的标准 decode 请求
+        if (did_batch_decode && !r->cache_state.is_swapped &&
+            !r->generated_tokens.empty() && !r->cache_state.has_ssd_blocks()) {
+            continue;
+        }
+        ctx = r;
+        break;
+    }
+    if (!ctx) return;  // 所有请求都被 batch-decoded 或已完成
 
     // ---- 如果该请求被换出过, 先换入 ----
     if (ctx->cache_state.is_swapped && cache_manager_->has_swapper()) {
@@ -1678,6 +1726,228 @@ void InferenceEngine::generate_mtp_drafts(RequestContext* ctx,
         ctx->draft_tokens.push_back(d_argmax_result_[di]);
     }
     ctx->mtp_context_len += N;
+}
+
+// ---------------------------------------------------------------------------
+// batch_decode_step: 多请求并行 decode (Phase 2)
+//
+// 将 B 个 decode-ready 请求 batch 成一次 forward_decode(batch_size=B):
+//   - 权重只读一次, B 个 token 同时计算
+//   - 每请求独立 block_table, context_len, SSM/Conv state
+//   - MTP 在 batch 模式下禁用 (batch 权重复用收益 >> MTP)
+//
+// 调用条件: decode_reqs.size() >= 2, 所有请求无 SSD blocks, 未 swapped
+// ---------------------------------------------------------------------------
+void InferenceEngine::batch_decode_step(
+    std::vector<RequestContext*>& decode_reqs,
+    std::vector<RequestContext*>& active_requests)
+{
+    const int hs = config_.hidden_size;
+    const int vocab_size = config_.vocab_size;
+
+    // 0. 过滤: 检查 max_new_tokens, 移除已完成
+    for (auto* ctx : decode_reqs) {
+        if ((int)ctx->generated_tokens.size() >= ctx->max_new_tokens) {
+            ipc::InferenceResponse fin{};
+            fin.request_id  = ctx->request_id;
+            fin.token_id    = -1;
+            fin.is_finished = true;
+            fin.error_code  = 0;
+            while (!ipc_resp_queue_->push(fin))
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            ctx->is_finished = true;
+            profiler_.request_done();
+        }
+    }
+    decode_reqs.erase(
+        std::remove_if(decode_reqs.begin(), decode_reqs.end(),
+                        [](RequestContext* r) { return r->is_finished; }),
+        decode_reqs.end());
+
+    int B = (int)decode_reqs.size();
+    if (B == 0) return;
+
+    // 1. Block 分配: 确保每请求有足够的 blocks 容纳 context_len
+    for (int i = 0; i < B; i++) {
+        auto* ctx = decode_reqs[i];
+        if (ctx->cache_state.context_len > (int)(ctx->cache_state.block_table.size() * 16)) {
+            if (cache_manager_->num_free_gpu_blocks() < 1 && cache_manager_->has_swapper()) {
+                try_swap_out_victim(active_requests, 1);
+            }
+            try {
+                auto nb = cache_manager_->kv_manager().allocate_blocks(1);
+                ctx->cache_state.block_table.push_back(nb[0]);
+                ctx->cache_state.block_tracker.push_block(nb[0]);
+            } catch (const std::runtime_error&) {
+                std::cerr << "[BatchDecode] OOM for request " << ctx->request_id << std::endl;
+                ctx->is_finished = true;
+            }
+        }
+    }
+    decode_reqs.erase(
+        std::remove_if(decode_reqs.begin(), decode_reqs.end(),
+                        [](RequestContext* r) { return r->is_finished; }),
+        decode_reqs.end());
+    B = (int)decode_reqs.size();
+    if (B == 0) return;
+
+    // 2. 收集 batch 输入
+    int max_blocks_in_batch = 0;
+    int max_ctx_len = 0;
+    for (int i = 0; i < B; i++) {
+        max_blocks_in_batch = std::max(max_blocks_in_batch,
+                                        (int)decode_reqs[i]->cache_state.block_table.size());
+        max_ctx_len = std::max(max_ctx_len, decode_reqs[i]->cache_state.context_len);
+    }
+
+    // Host staging arrays (栈上分配, B <= max_batch_size_)
+    std::vector<int> h_tokens(B), h_positions(B), h_context_lens(B);
+    std::vector<int> h_block_tables(B * max_blocks_in_batch, -1);  // pad with -1
+
+    for (int i = 0; i < B; i++) {
+        auto* ctx = decode_reqs[i];
+        int last_tok = ctx->generated_tokens.back();
+        if (last_tok == -1) last_tok = ctx->prompt_tokens.back();  // full cache hit 占位
+        h_tokens[i] = last_tok;
+        h_positions[i] = ctx->cache_state.context_len - 1;
+        h_context_lens[i] = ctx->cache_state.context_len;
+
+        // 打包 block table (2D row-major)
+        auto& bt = ctx->cache_state.block_table;
+        std::copy(bt.begin(), bt.end(),
+                  h_block_tables.begin() + i * max_blocks_in_batch);
+    }
+
+    // 3. SSM/Conv 指针数组: [num_lin_layers * B], 布局 = ssm[lin_idx * B + batch_idx]
+    for (int li = 0; li < num_linear_layers_; li++) {
+        for (int bi = 0; bi < B; bi++) {
+            d_batch_ssm_ptrs_[li * B + bi] = decode_reqs[bi]->cache_state.ssm_states[li];
+            d_batch_conv_ptrs_[li * B + bi] = decode_reqs[bi]->cache_state.conv_states[li];
+        }
+    }
+
+    // 4. GPU 上传
+    // Embedding: tokens → d_pos_ids_ → embedding lookup → d_hidden_states_ [B, hs]
+    profiler_.begin("embedding", compute_stream_);
+    cudaMemcpyAsync(d_pos_ids_, h_tokens.data(), B * sizeof(int),
+                    cudaMemcpyHostToDevice, compute_stream_);
+    ops::invoke_embedding_lookup(d_hidden_states_, d_pos_ids_,
+                                  model_->get_embed_tokens(), B, hs, compute_stream_);
+    profiler_.end("embedding", compute_stream_);
+
+    // Position IDs (实际位置)
+    cudaMemcpyAsync(d_pos_ids_, h_positions.data(), B * sizeof(int),
+                    cudaMemcpyHostToDevice, compute_stream_);
+
+    // Block tables [B, max_blocks_in_batch] → d_batch_block_tables_
+    cudaMemcpyAsync(d_batch_block_tables_, h_block_tables.data(),
+                    (size_t)B * max_blocks_in_batch * sizeof(int),
+                    cudaMemcpyHostToDevice, compute_stream_);
+
+    // Context lens [B] → d_context_lens_
+    cudaMemcpyAsync(d_context_lens_, h_context_lens.data(),
+                    B * sizeof(int), cudaMemcpyHostToDevice, compute_stream_);
+
+    // 5. Forward decode (batch_size = B)
+    try {
+        profiler_.begin("forward", compute_stream_);
+        model_->forward_decode(
+            d_hidden_states_, d_pos_ids_, cache_manager_->kv_manager(),
+            d_batch_block_tables_, d_context_lens_,
+            max_blocks_in_batch, max_ctx_len, B,
+            d_batch_ssm_ptrs_, d_batch_conv_ptrs_,
+            d_workspace_, compute_stream_);
+        profiler_.end("forward", compute_stream_);
+    } catch (const std::exception& e) {
+        std::cerr << "[BatchDecode] forward_decode failed: " << e.what() << std::endl;
+        for (auto* ctx : decode_reqs) ctx->is_finished = true;
+        return;
+    }
+
+    // GPU 异步错误检查
+    {
+        cudaError_t gpu_err = cudaGetLastError();
+        if (gpu_err != cudaSuccess) {
+            fprintf(stderr, "[BatchDecode] CUDA error after forward: %s\n",
+                    cudaGetErrorString(gpu_err));
+            for (auto* ctx : decode_reqs) ctx->is_finished = true;
+            return;
+        }
+    }
+
+    // 6. Final Norm + LM Head (B tokens)
+    // 不能用 fused RMSNorm+GEMV (仅 M=1), 改用分离的 RMSNorm + GEMM
+    profiler_.begin("lm_head", compute_stream_);
+    __nv_bfloat16* norm_out = d_workspace_;
+    ops::invoke_rmsnorm(norm_out, d_hidden_states_, model_->get_norm_weight(),
+                        config_.rms_norm_eps, B, hs, compute_stream_);
+
+    __nv_bfloat16* logits_B = norm_out + (size_t)B * hs;
+    ops::invoke_dense_gemm(norm_out, model_->get_lm_head(), logits_B,
+                           B, vocab_size, hs, compute_stream_);
+    profiler_.end("lm_head", compute_stream_);
+
+    // 7. 逐请求采样 + 结果分发
+    profiler_.begin("sample", compute_stream_);
+    for (int i = 0; i < B; i++) {
+        auto* ctx = decode_reqs[i];
+        __nv_bfloat16* req_logits = logits_B + (size_t)i * vocab_size;
+
+        int next_token = sample_token(req_logits, vocab_size,
+                                      ctx->temperature, ctx->top_p, ctx->top_k,
+                                      ctx->min_p,
+                                      ctx->repeat_penalty, ctx->frequency_penalty,
+                                      ctx->presence_penalty, ctx->seed,
+                                      ctx->generated_tokens, compute_stream_);
+
+        ctx->generated_tokens.push_back(next_token);
+        ctx->cache_state.context_len++;
+
+        bool eos = Qwen35Config::is_eos(next_token);
+        bool done = (int)ctx->generated_tokens.size() >= ctx->max_new_tokens || eos;
+
+        // N-gram 重复检测 (4-gram × 8 次)
+        if (!done && (int)ctx->generated_tokens.size() >= 32) {
+            const auto& gen = ctx->generated_tokens;
+            int sz = (int)gen.size();
+            bool is_repeating = true;
+            for (int ri = 1; ri < 8 && is_repeating; ri++) {
+                for (int gi = 0; gi < 4; gi++) {
+                    if (gen[sz - 1 - gi] != gen[sz - 1 - gi - 4 * ri]) {
+                        is_repeating = false;
+                        break;
+                    }
+                }
+            }
+            if (is_repeating) {
+                done = true;
+                eos = true;
+                std::cerr << "[BatchDecode] Repetition detected for request "
+                          << ctx->request_id << std::endl;
+            }
+        }
+
+        {
+            ipc::InferenceResponse resp{};
+            resp.request_id  = ctx->request_id;
+            resp.token_id    = next_token;
+            resp.is_finished = done;
+            resp.error_code  = 0;
+            while (!ipc_resp_queue_->push(resp))
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        if (done) {
+            ctx->is_finished = true;
+            profiler_.request_done();
+        }
+        profiler_.request_decode_step();
+    }
+    profiler_.end("sample", compute_stream_);
+
+    if (verbose_) {
+        std::cerr << "[BatchDecode] B=" << B << " requests decoded"
+                  << " (max_ctx=" << max_ctx_len << ")" << std::endl;
+    }
 }
 
 std::string InferenceEngine::token_to_log_text(int token_id) const {
