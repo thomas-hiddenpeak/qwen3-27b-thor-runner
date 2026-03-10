@@ -57,6 +57,11 @@ struct CacheConfig {
     // 默认 2048; 上限 4096 (CUTLASS TMA 限制)
     int max_chunk_size = 2048;
 
+    // ---- SSM/Conv 并发槽位 ----
+    // 每个活跃请求占一个独立 SSM/Conv slot, 决定最大并发数
+    // 每 slot ~75 MB (SSM 72 MB + Conv 2.88 MB), 64 slots ≈ 4.8 GB
+    int max_ssm_slots = 64;
+
     // ---- MTP 投机解码 ----
     // 使用模型自带的 Multi-Token Prediction 模块实现投机解码
     // mtp_mode: "auto" (模型有 MTP 权重则启用), "on" (强制开), "off" (强制关)
@@ -75,6 +80,7 @@ struct CacheConfig {
     //   --cache-chunk-size N    chunk 大小 (tokens)
     //   --cache-no-ssm          不缓存 SSM/Conv 状态
     //   --cache-config FILE     从配置文件加载
+    //   --max-ssm-slots N        SSM/Conv 并发槽位数 (默认 64)
     //   --mtp-enable            强制启用 MTP 投机解码
     //   --mtp-disable           强制禁用 MTP 投机解码
     //   --mtp-kv-blocks N       MTP KV Cache blocks (默认 256)
@@ -99,6 +105,8 @@ struct CacheConfig {
                 cfg.cache_ssm_state = false;
             } else if (arg == "--cache-config" && i + 1 < argc) {
                 cfg = CacheConfig::from_file(argv[++i]);
+            } else if (arg == "--max-ssm-slots" && i + 1 < argc) {
+                cfg.max_ssm_slots = std::max(1, std::stoi(argv[++i]));
             } else if (arg == "--mtp-enable") {
                 cfg.mtp_mode = "on";
             } else if (arg == "--mtp-disable") {
@@ -162,6 +170,7 @@ struct CacheConfig {
             else if (key == "chunk_size")      cfg.chunk_size = std::stoi(val);
             else if (key == "cache_ssm_state") cfg.cache_ssm_state = (val == "true" || val == "1");
             else if (key == "eviction_policy") cfg.eviction_policy = val;
+            else if (key == "max_ssm_slots")   cfg.max_ssm_slots = std::max(1, std::stoi(val));
             else if (key == "mtp_mode")        cfg.mtp_mode = val;
             else if (key == "mtp_kv_blocks")   cfg.mtp_kv_blocks = std::stoi(val);
             else if (key == "mtp_num_drafts" || key == "mtp_drafts")
@@ -180,6 +189,7 @@ struct CacheConfig {
         std::cerr << "  Chunk Size:      " << chunk_size << " tokens" << std::endl;
         std::cerr << "  SSM Caching:     " << (cache_ssm_state ? "ON" : "OFF") << std::endl;
         std::cerr << "  Eviction:        " << eviction_policy << std::endl;
+        std::cerr << "  SSM Slots:       " << max_ssm_slots << std::endl;
         std::cerr << "  MTP Spec Decode: " << mtp_mode << std::endl;
         std::cerr << "  MTP KV Blocks:   " << mtp_kv_blocks << std::endl;
     }
@@ -308,13 +318,14 @@ public:
         r.conv_per_request_mb  = params.conv_bytes_total() / (1024.0*1024);
         r.total_per_request_mb = r.ssm_per_request_mb + r.conv_per_request_mb;
 
-        // -- 最大并发估算 --
+        // -- 最大并发估算 (受 max_ssm_slots 和内存双重限制) --
         r.available_for_ssm_gb = total_memory_gb - model_weights_gb
                                  - r.gpu_kv_memory_gb - system_reserved_gb;
         if (r.available_for_ssm_gb < 0) r.available_for_ssm_gb = 0;
         double ssm_per_req_gb = r.total_per_request_mb / 1024.0;
-        r.estimated_max_batch = (ssm_per_req_gb > 0)
+        int mem_limit = (ssm_per_req_gb > 0)
             ? (int)(r.available_for_ssm_gb / ssm_per_req_gb) : 0;
+        r.estimated_max_batch = std::min(mem_limit, config.max_ssm_slots);
 
         return r;
     }

@@ -57,18 +57,19 @@ CacheManager::CacheManager(const core::Qwen35Config& model_config,
     fprintf(stderr, "[CacheManager] GPU KV pool: %d blocks, %d max tokens (%.1f GB)\n",
            total_gpu_blocks_, gpu_max_tokens_, cache_config.kv_cache_budget_gb);
 
-    // 2. SSM/Conv Pool
+    // 2. SSM/Conv Pool (槽位数从配置读取)
+    max_ssm_slots_ = std::max(1, cache_config.max_ssm_slots);
     {
-        size_t total_ssm = (size_t)MAX_CACHE_SSM_SLOTS * num_linear_layers_ * ssm_size_per_layer_;
-        size_t total_conv = (size_t)MAX_CACHE_SSM_SLOTS * num_linear_layers_ * conv_size_per_layer_;
+        size_t total_ssm = (size_t)max_ssm_slots_ * num_linear_layers_ * ssm_size_per_layer_;
+        size_t total_conv = (size_t)max_ssm_slots_ * num_linear_layers_ * conv_size_per_layer_;
         cudaMalloc(&ssm_pool_base_, total_ssm);
         cudaMalloc(&conv_pool_base_, total_conv);
 
-        pooled_ssm_states_.resize(MAX_CACHE_SSM_SLOTS);
-        pooled_conv_states_.resize(MAX_CACHE_SSM_SLOTS);
+        pooled_ssm_states_.resize(max_ssm_slots_);
+        pooled_conv_states_.resize(max_ssm_slots_);
         size_t ssm_slot_stride = (size_t)num_linear_layers_ * ssm_size_per_layer_;
         size_t conv_slot_stride = (size_t)num_linear_layers_ * conv_size_per_layer_;
-        for (int s = 0; s < MAX_CACHE_SSM_SLOTS; ++s) {
+        for (int s = 0; s < max_ssm_slots_; ++s) {
             pooled_ssm_states_[s].resize(num_linear_layers_);
             pooled_conv_states_[s].resize(num_linear_layers_);
             for (int li = 0; li < num_linear_layers_; ++li) {
@@ -81,13 +82,13 @@ CacheManager::CacheManager(const core::Qwen35Config& model_config,
         cudaMemset(ssm_pool_base_, 0, total_ssm);
         cudaMemset(conv_pool_base_, 0, total_conv);
 
-        free_ssm_slots_.reserve(MAX_CACHE_SSM_SLOTS);
-        for (int s = MAX_CACHE_SSM_SLOTS - 1; s >= 0; --s)
+        free_ssm_slots_.reserve(max_ssm_slots_);
+        for (int s = max_ssm_slots_ - 1; s >= 0; --s)
             free_ssm_slots_.push_back(s);
 
         fprintf(stderr, "[CacheManager] SSM/Conv pool: %d slots × %d layers, "
                "SSM=%.1f KB/layer, Conv=%.1f KB/layer, total=%.1f MB\n",
-               MAX_CACHE_SSM_SLOTS, num_linear_layers_,
+               max_ssm_slots_, num_linear_layers_,
                ssm_size_per_layer_ / 1024.0, conv_size_per_layer_ / 1024.0,
                (total_ssm + total_conv) / 1048576.0);
     }

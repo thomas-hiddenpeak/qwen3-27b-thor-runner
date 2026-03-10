@@ -30,8 +30,7 @@ namespace core {
 }  // forward declarations
 namespace cache {
 
-// SSM/Conv 状态池最大槽位数
-static constexpr int MAX_CACHE_SSM_SLOTS = 8;
+// SSM/Conv 状态池: 槽位数由 CacheConfig::max_ssm_slots 配置
 
 // -----------------------------------------------------------------------
 // RequestCacheState: 单请求的缓存状态 (替代 RequestContext 中散布的多个字段)
@@ -287,6 +286,7 @@ private:
     int max_chunk_size_ = 2048;      // Prefill 分块大小 (从 CacheConfig 读取)
     size_t ssm_size_per_layer_ = 0;
     size_t conv_size_per_layer_ = 0;
+    int max_ssm_slots_ = 64;        // 从 CacheConfig::max_ssm_slots 读取
 
     // ---- CUDA ----
     cudaStream_t stream_;

@@ -19,8 +19,7 @@
 namespace qwen_thor {
 namespace core {
 
-// SSM/Conv 状态池最大槽位数 (每个活跃请求占一个独立 slot, 互不干扰)
-static constexpr int MAX_SSM_SLOTS = 8;
+// SSM/Conv 状态池: 槽位数由 CacheConfig::max_ssm_slots 配置 (默认 64)
 
 // 表示一个正在处理的推理请求
 struct RequestContext {
