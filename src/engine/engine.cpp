@@ -322,15 +322,18 @@ void InferenceEngine::inference_loop() {
     std::vector<RequestContext*> active_requests;
 
     while (running_) {
-        // 1. 尝试从 IPC 队列获取新请求
+        // 1. 批量从 IPC 队列获取新请求 (每次循环接入多个, 加速 ramp-up)
         // 内存压力时暂停接入: 至少保留一个 chunk 的 blocks
         int admission_threshold = max_chunk_size_ / 16;  // 128 blocks for chunk_size=2048
-        bool should_accept = active_requests.empty() ||
-            (cache_manager_->num_free_gpu_blocks() >= admission_threshold &&
-             cache_manager_->num_free_ssm_slots() > 0);
 
-        ipc::InferenceRequest req;
-        if (should_accept && ipc_queue_->pop(req)) {
+        while (true) {
+            bool should_accept = active_requests.empty() ||
+                (cache_manager_->num_free_gpu_blocks() >= admission_threshold &&
+                 cache_manager_->num_free_ssm_slots() > 0);
+            if (!should_accept) break;
+
+            ipc::InferenceRequest req;
+            if (!ipc_queue_->pop(req)) break;
             auto ctx = std::make_unique<RequestContext>();
             ctx->request_id = req.request_id;
             ctx->max_new_tokens = req.max_new_tokens;
@@ -517,12 +520,16 @@ void InferenceEngine::inference_loop() {
         // CRITICAL: 必须先等 compute_stream_ 上所有 kernel 完成,
         // 否则 SSM/Conv pool 的清零 (下一请求的 cudaMemsetAsync) 可能
         // 与正在运行的 kernel 竞态 → GPU hang.
+        //
+        // 注: step() 内部所有路径 (batch_decode_step, prefill, MTP) 在采样时
+        // 已调用 fast_sync_stream(), 所以此处 stream 通常已空闲. 使用
+        // fast_sync_stream 替代 sync_stream_with_timeout 避免 10ms polling 开销.
         {
             bool has_finished = false;
             for (auto* ctx : active_requests)
                 if (ctx->is_finished) { has_finished = true; break; }
             if (has_finished) {
-                if (!sync_stream_with_timeout(compute_stream_, 90, "cleanup_pre_sync")) {
+                if (!fast_sync_stream(compute_stream_, "cleanup_pre_sync")) {
                     fprintf(stderr, "[Engine] FATAL: GPU hang detected during cleanup sync! "
                             "Marking all requests finished to prevent further damage.\\n");
                     fflush(stderr);
@@ -636,19 +643,25 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
     }
 
     bool did_batch_decode = false;
-    // B≥2: 常规 batch decode
-    // B=1 + 有 pending prefill: 也走 batch decode (牺牲 MTP, 让 pending 请求尽快 prefill)
-    //   这样下一步 B 就变成 2+, 避免请求串行处理
-    // B=1 + 无 pending prefill: 走 MTP 路径 (最大化单请求吞吐)
-    if ((int)batch_decode_reqs.size() >= 2 ||
-        ((int)batch_decode_reqs.size() == 1 && has_pending_prefill)) {
+    // Ramp-up 优化: 有 pending prefill 时跳过 batch decode
+    //   每步只做 1× 权重读取 (prefill) 而非 2× (batch_decode + prefill)
+    //   代价: 已 prefilled 的 decode 请求暂停等待, 但 ramp-up 总时间减半
+    //   当所有请求都已 prefilled 后, 恢复正常 batch decode 路径
+    //
+    // 稳态 (无 pending prefill):
+    //   B≥2: batch decode
+    //   B=1 + 无 pending: MTP 路径 (最大化单请求吞吐)
+    if (!has_pending_prefill && (int)batch_decode_reqs.size() >= 2) {
         batch_decode_step(batch_decode_reqs, active_requests);
         for (auto* r : batch_decode_reqs) r->last_active_step = step_counter_;
         did_batch_decode = true;
     }
 
     // 找到下一个需要处理的请求
-    // 优先级: decode/streaming/swap-in > 进行中的 prefill (chunk 抢占)
+    // 优先级:
+    //   - 已 batch decoded: 跳过
+    //   - Ramp-up (有 pending prefill, !did_batch_decode): 优先 prefill, 跳过 decode
+    //   - 稳态: decode/streaming/swap-in > prefill (chunk 抢占)
     RequestContext* ctx = nullptr;
     RequestContext* pending_prefill = nullptr;
     for (auto* r : active_requests) {
@@ -656,6 +669,11 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
         // 跳过已 batch decoded 的标准 decode 请求
         if (did_batch_decode && !r->cache_state.is_swapped &&
             !r->generated_tokens.empty() && !r->cache_state.has_ssd_blocks()) {
+            continue;
+        }
+        // Ramp-up: 跳过 decode 请求 (它们等待, 下次 batch decode 处理)
+        if (has_pending_prefill && !did_batch_decode &&
+            !r->generated_tokens.empty() && !r->cache_state.is_swapped) {
             continue;
         }
         // Decode/streaming/swap-in 优先于 prefill
@@ -1998,60 +2016,141 @@ void InferenceEngine::batch_decode_step(
                            B, vocab_size, hs, compute_stream_);
     profiler_.end("lm_head", compute_stream_);
 
-    // 7. 逐请求采样 + 结果分发
+    // 7. 采样 + 结果分发
+    //
+    // Greedy 批量快速路径 (temperature≤0, 无 penalty):
+    //   单次 invoke_batched_argmax + 单次 sync → B 个 token
+    //   替代 B 次 sample_token (B 次 kernel launch + B 次 sync)
+    //
+    // 非 greedy 或有 penalty: 逐请求 sample_token (保留完整功能)
     profiler_.begin("sample", compute_stream_);
+
+    // 检查是否所有请求都可走 greedy 快速路径
+    bool all_greedy = true;
     for (int i = 0; i < B; i++) {
         auto* ctx = decode_reqs[i];
-        __nv_bfloat16* req_logits = logits_B + (size_t)i * vocab_size;
+        bool greedy = (ctx->temperature <= 0.0f || ctx->top_k == 1);
+        bool has_penalty = (ctx->repeat_penalty != 1.0f) ||
+                           (ctx->frequency_penalty != 0.0f) ||
+                           (ctx->presence_penalty != 0.0f);
+        bool penalty_active = has_penalty && !ctx->generated_tokens.empty();
+        if (!greedy || penalty_active) {
+            all_greedy = false;
+            break;
+        }
+    }
 
-        int next_token = sample_token(req_logits, vocab_size,
-                                      ctx->temperature, ctx->top_p, ctx->top_k,
-                                      ctx->min_p,
-                                      ctx->repeat_penalty, ctx->frequency_penalty,
-                                      ctx->presence_penalty, ctx->seed,
-                                      ctx->generated_tokens, compute_stream_);
+    if (all_greedy) {
+        // 批量 argmax: 单次 GPU kernel + 单次 sync (省 B-1 次 sync)
+        ops::invoke_batched_argmax(logits_B, d_argmax_result_, vocab_size, B, compute_stream_);
+        if (!fast_sync_stream(compute_stream_, "batch_argmax")) {
+            fprintf(stderr, "[BatchDecode] FATAL: GPU hang in batch argmax\n");
+            for (auto* ctx : decode_reqs) ctx->is_finished = true;
+            profiler_.end("sample", compute_stream_);
+            return;
+        }
 
-        ctx->generated_tokens.push_back(next_token);
-        ctx->cache_state.context_len++;
+        for (int i = 0; i < B; i++) {
+            auto* ctx = decode_reqs[i];
+            int next_token = d_argmax_result_[i];
 
-        bool eos = Qwen35Config::is_eos(next_token);
-        bool done = (int)ctx->generated_tokens.size() >= ctx->max_new_tokens || eos;
+            ctx->generated_tokens.push_back(next_token);
+            ctx->cache_state.context_len++;
 
-        // N-gram 重复检测 (4-gram × 8 次)
-        if (!done && (int)ctx->generated_tokens.size() >= 32) {
-            const auto& gen = ctx->generated_tokens;
-            int sz = (int)gen.size();
-            bool is_repeating = true;
-            for (int ri = 1; ri < 8 && is_repeating; ri++) {
-                for (int gi = 0; gi < 4; gi++) {
-                    if (gen[sz - 1 - gi] != gen[sz - 1 - gi - 4 * ri]) {
-                        is_repeating = false;
-                        break;
+            bool eos = Qwen35Config::is_eos(next_token);
+            bool done = (int)ctx->generated_tokens.size() >= ctx->max_new_tokens || eos;
+
+            // N-gram 重复检测 (4-gram × 8 次)
+            if (!done && (int)ctx->generated_tokens.size() >= 32) {
+                const auto& gen = ctx->generated_tokens;
+                int sz = (int)gen.size();
+                bool is_repeating = true;
+                for (int ri = 1; ri < 8 && is_repeating; ri++) {
+                    for (int gi = 0; gi < 4; gi++) {
+                        if (gen[sz - 1 - gi] != gen[sz - 1 - gi - 4 * ri]) {
+                            is_repeating = false;
+                            break;
+                        }
                     }
                 }
+                if (is_repeating) {
+                    done = true;
+                    eos = true;
+                    std::cerr << "[BatchDecode] Repetition detected for request "
+                              << ctx->request_id << std::endl;
+                }
             }
-            if (is_repeating) {
-                done = true;
-                eos = true;
-                std::cerr << "[BatchDecode] Repetition detected for request "
-                          << ctx->request_id << std::endl;
-            }
-        }
 
-        {
-            ipc::InferenceResponse resp{};
-            resp.request_id  = ctx->request_id;
-            resp.token_id    = next_token;
-            resp.is_finished = done;
-            resp.error_code  = 0;
-            while (!ipc_resp_queue_->push(resp))
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            {
+                ipc::InferenceResponse resp{};
+                resp.request_id  = ctx->request_id;
+                resp.token_id    = next_token;
+                resp.is_finished = done;
+                resp.error_code  = 0;
+                while (!ipc_resp_queue_->push(resp))
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+            if (done) {
+                ctx->is_finished = true;
+                profiler_.request_done();
+            }
+            profiler_.request_decode_step();
         }
-        if (done) {
-            ctx->is_finished = true;
-            profiler_.request_done();
+    } else {
+        // 非 greedy 路径: 逐请求采样 (保留完整 penalty/sampling 功能)
+        for (int i = 0; i < B; i++) {
+            auto* ctx = decode_reqs[i];
+            __nv_bfloat16* req_logits = logits_B + (size_t)i * vocab_size;
+
+            int next_token = sample_token(req_logits, vocab_size,
+                                          ctx->temperature, ctx->top_p, ctx->top_k,
+                                          ctx->min_p,
+                                          ctx->repeat_penalty, ctx->frequency_penalty,
+                                          ctx->presence_penalty, ctx->seed,
+                                          ctx->generated_tokens, compute_stream_);
+
+            ctx->generated_tokens.push_back(next_token);
+            ctx->cache_state.context_len++;
+
+            bool eos = Qwen35Config::is_eos(next_token);
+            bool done = (int)ctx->generated_tokens.size() >= ctx->max_new_tokens || eos;
+
+            // N-gram 重复检测 (4-gram × 8 次)
+            if (!done && (int)ctx->generated_tokens.size() >= 32) {
+                const auto& gen = ctx->generated_tokens;
+                int sz = (int)gen.size();
+                bool is_repeating = true;
+                for (int ri = 1; ri < 8 && is_repeating; ri++) {
+                    for (int gi = 0; gi < 4; gi++) {
+                        if (gen[sz - 1 - gi] != gen[sz - 1 - gi - 4 * ri]) {
+                            is_repeating = false;
+                            break;
+                        }
+                    }
+                }
+                if (is_repeating) {
+                    done = true;
+                    eos = true;
+                    std::cerr << "[BatchDecode] Repetition detected for request "
+                              << ctx->request_id << std::endl;
+                }
+            }
+
+            {
+                ipc::InferenceResponse resp{};
+                resp.request_id  = ctx->request_id;
+                resp.token_id    = next_token;
+                resp.is_finished = done;
+                resp.error_code  = 0;
+                while (!ipc_resp_queue_->push(resp))
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+            if (done) {
+                ctx->is_finished = true;
+                profiler_.request_done();
+            }
+            profiler_.request_decode_step();
         }
-        profiler_.request_decode_step();
     }
     profiler_.end("sample", compute_stream_);
 
