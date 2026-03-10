@@ -42,6 +42,9 @@ KVCacheManager::KVCacheManager(
     // Block IDs are per-layer; the layer offset is added when computing cache addresses
     free_blocks_.resize(num_blocks_);
     std::iota(free_blocks_.begin(), free_blocks_.end(), 0);
+
+    // 引用计数: 所有 block 初始为 0 (空闲)
+    ref_count_.resize(num_blocks_, 0);
 }
 
 KVCacheManager::~KVCacheManager() {}
@@ -78,8 +81,10 @@ std::vector<int> KVCacheManager::allocate_blocks(int num_blocks_needed) {
     allocated.reserve(num_blocks_needed);
     
     for (int i = 0; i < num_blocks_needed; ++i) {
-        allocated.push_back(free_blocks_.back());
+        int block = free_blocks_.back();
         free_blocks_.pop_back();
+        ref_count_[block] = 1;
+        allocated.push_back(block);
     }
     
     return allocated;
@@ -88,12 +93,34 @@ std::vector<int> KVCacheManager::allocate_blocks(int num_blocks_needed) {
 void KVCacheManager::free_blocks(const std::vector<int>& block_indices) {
     std::lock_guard<std::mutex> lock(mutex_);
     
-    // 将释放的 blocks 放回空闲列表
+    // ref_count--, 仅 ref_count 降至 0 时回收到空闲列表
     for (int idx : block_indices) {
         if (idx >= 0 && idx < num_blocks_) {
-            free_blocks_.push_back(idx);
+            if (ref_count_[idx] > 0) {
+                --ref_count_[idx];
+                if (ref_count_[idx] == 0) {
+                    free_blocks_.push_back(idx);
+                }
+            }
         }
     }
+}
+
+void KVCacheManager::share_blocks(const std::vector<int>& block_indices) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (int idx : block_indices) {
+        if (idx >= 0 && idx < num_blocks_ && ref_count_[idx] > 0) {
+            ++ref_count_[idx];
+        }
+    }
+}
+
+int KVCacheManager::get_ref_count(int block_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (block_id >= 0 && block_id < num_blocks_) {
+        return ref_count_[block_id];
+    }
+    return 0;
 }
 
 } // namespace ops

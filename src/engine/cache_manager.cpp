@@ -24,7 +24,7 @@ CacheManager::CacheManager(const core::Qwen35Config& model_config,
                            const CapacityReport& capacity,
                            cudaStream_t stream,
                            bool verbose)
-    : stream_(stream), verbose_(verbose)
+    : stream_(stream), verbose_(verbose), prefix_hasher_(cache_config.chunk_size)
 {
     // 保存模型参数
     int num_full_attn = model_config.num_full_attn_layers();
@@ -622,6 +622,93 @@ ops::StreamingAttnCtx CacheManager::build_streaming_ctx(
     int gpu_ctx_len)
 {
     return build_streaming_ctx(req_id, ctx->cache_state, gpu_ctx_len);
+}
+
+// ===========================================================================
+// GPU Prefix Sharing (CoW)
+// ===========================================================================
+
+uint64_t CacheManager::compute_prefix_hash(const int* tokens, int num_tokens) const {
+    auto key = prefix_hasher_.compute_prefix_key(tokens, num_tokens);
+    return key.hash;
+}
+
+void CacheManager::register_gpu_prefix(uint64_t prefix_hash,
+                                       const std::vector<int>& block_ids,
+                                       int num_tokens) {
+    auto it = gpu_prefix_registry_.find(prefix_hash);
+    if (it != gpu_prefix_registry_.end()) {
+        // 已有 entry — 增加引用计数
+        it->second.active_users++;
+    } else {
+        // 新 entry
+        SharedGPUPrefix entry;
+        entry.block_ids = block_ids;
+        entry.num_tokens = num_tokens;
+        entry.active_users = 1;
+        gpu_prefix_registry_[prefix_hash] = std::move(entry);
+
+        // KV blocks ref_count 已经是 1 (allocate 时设的), 不需要额外操作
+    }
+    if (verbose_) {
+        auto& e = gpu_prefix_registry_[prefix_hash];
+        fprintf(stderr, "[CacheManager] register_gpu_prefix: hash=%016lx, %d blocks, %d tokens, users=%d\n",
+                prefix_hash, (int)e.block_ids.size(), e.num_tokens, e.active_users);
+    }
+}
+
+int CacheManager::try_share_gpu_prefix(uint64_t prefix_hash,
+                                       RequestCacheState& state) {
+    auto it = gpu_prefix_registry_.find(prefix_hash);
+    if (it == gpu_prefix_registry_.end()) return 0;
+
+    auto& entry = it->second;
+
+    // KV blocks ref_count++
+    kv_manager_->share_blocks(entry.block_ids);
+
+    // 共享 block_ids 到新请求的 state
+    state.block_tracker.init(entry.block_ids);
+    state.block_table = entry.block_ids;
+    state.context_len = entry.num_tokens;
+
+    entry.active_users++;
+
+    if (verbose_) {
+        fprintf(stderr, "[CacheManager] try_share_gpu_prefix: hash=%016lx, shared %d blocks (%d tokens), users=%d\n",
+                prefix_hash, (int)entry.block_ids.size(), entry.num_tokens, entry.active_users);
+    }
+    return entry.num_tokens;
+}
+
+void CacheManager::release_gpu_prefix(uint64_t prefix_hash) {
+    auto it = gpu_prefix_registry_.find(prefix_hash);
+    if (it == gpu_prefix_registry_.end()) return;
+
+    auto& entry = it->second;
+    entry.active_users--;
+
+    if (verbose_) {
+        fprintf(stderr, "[CacheManager] release_gpu_prefix: hash=%016lx, users=%d\n",
+                prefix_hash, entry.active_users);
+    }
+
+    if (entry.active_users <= 0) {
+        // 最后一个用户 — 移除 registry entry
+        // KV blocks 的实际回收由各请求的 free_blocks(block_table) 处理
+        // (ref_count-- → 0 时自动回收到空闲列表)
+        gpu_prefix_registry_.erase(it);
+    }
+}
+
+int CacheManager::restore_ssm_only(const int* tokens, int num_tokens,
+                                   RequestCacheState& state) {
+    if (!cache_engine_ || !cache_engine_->is_enabled()) return 0;
+    return cache_engine_->restore_ssm_only(
+        tokens, num_tokens,
+        state.ssm_states.empty() ? nullptr : state.ssm_states.data(),
+        state.conv_states.empty() ? nullptr : state.conv_states.data(),
+        stream_);
 }
 
 } // namespace cache

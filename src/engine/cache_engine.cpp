@@ -323,7 +323,34 @@ int CacheEngine::retrieve_prefix(
 }
 
 // ---------------------------------------------------------------------------
-// SSM/Conv 状态拷贝
+// SSM/Conv 状態の SSD-only リストア (GPU prefix sharing 用, KV I/O をスキップ)
+// ---------------------------------------------------------------------------
+int CacheEngine::restore_ssm_only(
+    const int* tokens, int num_tokens,
+    __nv_bfloat16** ssm_states,
+    __nv_bfloat16** conv_states,
+    cudaStream_t stream)
+{
+    if (!config_.enabled || !backend_ || !config_.cache_ssm_state) return 0;
+    if (!ssm_states || !conv_states) return 0;
+
+    auto keys = hasher_.compute_keys(tokens, num_tokens);
+    int matched = backend_->prefix_match(keys);
+    if (matched <= 0) return 0;
+
+    // 最後のチャンクのエントリを取得し SSM 状態を復元
+    auto entry = backend_->get(keys[matched - 1]);
+    if (!entry || !entry->has_ssm_state()) return 0;
+
+    copy_state_from_host(*entry, ssm_states, conv_states, stream);
+    cudaStreamSynchronize(stream);
+
+    int restore_tokens = matched * config_.chunk_size;
+    return restore_tokens;
+}
+
+// ---------------------------------------------------------------------------
+// SSM/Conv 状態拷贝
 // ---------------------------------------------------------------------------
 void CacheEngine::copy_state_to_host(CacheEntry& entry,
                                      __nv_bfloat16** ssm_states,

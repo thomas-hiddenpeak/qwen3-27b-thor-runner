@@ -14,6 +14,7 @@
 #include "paged_attention.h"
 #include "cache_config.h"
 #include "cache_engine.h"
+#include "cache_key.h"
 #include "kv_swapper.h"
 #include "block_tracker.h"
 #include "streaming_attention.h"
@@ -33,6 +34,15 @@ namespace cache {
 // SSM/Conv 状态池: 槽位数由 CacheConfig::max_ssm_slots 配置
 
 // -----------------------------------------------------------------------
+// SharedGPUPrefix: GPU 上已驻留的共享前缀 KV blocks
+// -----------------------------------------------------------------------
+struct SharedGPUPrefix {
+    std::vector<int> block_ids;  // GPU block IDs (前缀 KV 数据)
+    int num_tokens;              // 前缀 token 数
+    int active_users;            // 当前引用此前缀的活跃请求数
+};
+
+// -----------------------------------------------------------------------
 // RequestCacheState: 单请求的缓存状态 (替代 RequestContext 中散布的多个字段)
 // -----------------------------------------------------------------------
 struct RequestCacheState {
@@ -47,6 +57,9 @@ struct RequestCacheState {
     int context_len = 0;             // 总 token 数 (GPU + SSD)
     int ssm_slot = -1;               // SSM/Conv pool slot (-1 = 未分配)
     bool is_swapped = false;         // 整请求换出到 SSD
+
+    // GPU 前缀共享: 非零表示该请求共享了某个 GPU prefix
+    uint64_t shared_prefix_hash = 0;
 
     // SSM/Conv 状态指针 (指向池化 buffer, 非 owned)
     std::vector<__nv_bfloat16*> ssm_states;   // [num_linear_layers]
@@ -140,6 +153,29 @@ public:
 
     // 记录统计
     void record_prefix_stats(int prompt_tokens, int restored, int computed);
+
+    // =============== GPU Prefix Sharing (CoW) ===============
+
+    // 计算前缀哈希 (用于 registry key)
+    uint64_t compute_prefix_hash(const int* tokens, int num_tokens) const;
+
+    // 注册 GPU 上已建立的前缀 blocks 为可共享 (首次 prefill/restore 后调用)
+    void register_gpu_prefix(uint64_t prefix_hash,
+                             const std::vector<int>& block_ids,
+                             int num_tokens);
+
+    // 尝试共享已驻留 GPU 的前缀 (新请求到来时调用)
+    // 成功: ref_count++, block_ids 复制到 state, 返回共享 token 数
+    // 失败: 返回 0
+    int try_share_gpu_prefix(uint64_t prefix_hash,
+                             RequestCacheState& state);
+
+    // 释放共享前缀引用 (请求结束时调用)
+    void release_gpu_prefix(uint64_t prefix_hash);
+
+    // 仅恢复 SSM/Conv 状态 (GPU prefix sharing 时 KV 已共享, 只需 SSM)
+    int restore_ssm_only(const int* tokens, int num_tokens,
+                         RequestCacheState& state);
 
     // =============== Streaming Attention 支持 ===============
 
@@ -291,6 +327,10 @@ private:
     // ---- CUDA ----
     cudaStream_t stream_;
     bool verbose_ = true;
+
+    // ---- GPU Prefix Sharing Registry ----
+    std::unordered_map<uint64_t, SharedGPUPrefix> gpu_prefix_registry_;
+    TokenHasher prefix_hasher_;
 };
 
 } // namespace cache

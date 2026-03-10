@@ -46,12 +46,18 @@ public:
     KVCacheManager(int num_blocks, int block_size, int num_heads, int head_dim, core::DataType dtype, std::shared_ptr<core::Allocator> allocator, int num_layers = 1);
     ~KVCacheManager();
 
-    // 为一个新的请求分配初始的 Blocks
+    // 为一个新的请求分配初始的 Blocks (ref_count 初始化为 1)
     // 返回分配的 Block 索引列表
     std::vector<int> allocate_blocks(int num_blocks_needed);
 
-    // 释放一个请求占用的所有 Blocks
+    // 释放一个请求占用的所有 Blocks (ref_count--, 仅 ref_count=0 时回收)
     void free_blocks(const std::vector<int>& block_indices);
+
+    // CoW: 共享 blocks (ref_count++ for each, 用于前缀共享)
+    void share_blocks(const std::vector<int>& block_indices);
+
+    // 查询 block 引用计数
+    int get_ref_count(int block_id) const;
 
     // 获取底层的物理 Tensor (用于传递给 CUDA Kernel)
     // 形状通常为: [num_layers * num_blocks, block_size, num_heads, head_dim]
@@ -87,6 +93,8 @@ private:
 
     // 空闲 Block 列表
     std::vector<int> free_blocks_;
+    // 每 block 引用计数 (0=空闲, 1=独占, >1=共享)
+    std::vector<int> ref_count_;
     mutable std::mutex mutex_;
 };
 

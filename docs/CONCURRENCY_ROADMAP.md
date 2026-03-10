@@ -126,39 +126,37 @@ step() 逻辑:
 
 ---
 
-### Phase 3: CoW KV 共享 (风险: 高)
+### Phase 3: CoW KV 共享 (风险: 高) — ✅ 已实现
 
 **目标**: 相同 system prompt 的多个请求共享 prefix KV blocks, 写时复制
 
-**改动范围**:
-- `src/engine/paged_attention.h`: `KVCacheManager` 增加 `ref_count_[]` (per-block 原子引用计数)
+**实现**:
+- `src/engine/paged_attention.h/cpp`: `KVCacheManager` ref counting
+  - `ref_count_[]` per-block 引用计数 (0=空闲, 1=独占, >1=共享)
   - `allocate_blocks()` → ref_count = 1
-  - `share_blocks(block_ids)` → ref_count++
-  - `release_block(block_id)` → ref_count--, 为 0 时回收到 free list
-  - `copy_on_write(block_id)` → 如果 ref_count > 1: allocate 新 block, 拷贝数据, 旧 block ref_count--
-- `src/engine/cache_manager.h/cpp`: 
-  - 识别相同 prefix (通过 TokenHasher 已有能力)
-  - 首次: SSD → GPU inject 完整 prefix blocks
-  - 后续: 直接 share_blocks() 引用已有 GPU blocks
+  - `share_blocks(block_ids)` → ref_count++ (用于前缀共享)
+  - `free_blocks()` → ref_count--, 仅 ref_count 降至 0 时回收
+  - `get_ref_count(block_id)` → 查询
+- `src/engine/cache_manager.h/cpp`:
+  - `SharedGPUPrefix` struct: block_ids + num_tokens + active_users
+  - `gpu_prefix_registry_` (hash → SharedGPUPrefix): GPU 上已驻留的共享前缀
+  - `register_gpu_prefix()` 注册 / `try_share_gpu_prefix()` 共享 / `release_gpu_prefix()` 释放
+  - `restore_ssm_only()`: GPU prefix sharing 时仅从 SSD 恢复 SSM/Conv (跳过 KV I/O)
+  - `compute_prefix_hash()`: 使用 TokenHasher 计算 chunk-aligned 前缀哈希
+- `src/engine/cache_engine.h/cpp`: `restore_ssm_only()` — SSD 读取 SSM/Conv 状態のみ
 - `src/engine/engine.cpp`:
-  - decode 时 `write_kv_cache` 前: 检查当前 block 是否 shared → CoW
-  - 新请求匹配已有 prefix → 跳过 prefill, 共享 + 恢复 SSM
+  - prefill 前: 先尝试 GPU prefix sharing (零 SSD KV I/O), 回退到 SSD restore
+  - prefill 后: register_gpu_prefix 注册前缀 blocks 为可共享
+  - cleanup: release_gpu_prefix 释放引用
+  - SSM 恢复失败时自动回滚 KV sharing
 
 **隔离保证 ("不能窜")**:
-- 共享 prefix blocks 是**只读**的 (所有请求的前 20K tokens 相同, KV 值相同)
-- decode 新 token 写入的 block 一定是 ref_count=1 的独占 block
-- CoW 触发条件: `write_kv_cache` 的目标 block ref_count > 1
-- SSM/Conv slot: 每请求始终独立, 从 prefix cache 恢复各自终态
+- 共享 prefix blocks 是**只读**的 (所有请求的前 N tokens 相同, KV 值相同)
+- decode 新 token 写入的 block 一定是 ref_count=1 的独占 block (新分配)
+- prefix 边界始终对齐 block_size (chunk_size=256, block_size=16 → 16 blocks/chunk)
+- SSM/Conv slot: 每请求始终独立, 从 SSD prefix cache 恢复各自终态
 
 **内存收益**: N×20K prefix 从 N×1.25 GB → 1×1.25 GB + N×(decode_only)
-
-**验证**:
-- 正确性: 两个请求共享 prefix, decode 不同 token, 输出完全独立
-- 引用计数: 请求结束后 ref_count 正确递减, 无泄漏
-- CoW: 写入时正确触发拷贝, 原 block 不被修改
-- 压力: 64 请求同时共享 + 并发结束, 无 race condition
-
-**依赖**: Phase 2 (共享才有意义需要先能并发 decode)
 
 ---
 

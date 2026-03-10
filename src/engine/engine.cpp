@@ -527,6 +527,11 @@ void InferenceEngine::inference_loop() {
         for (auto* ctx : active_requests) {
             if (ctx->is_finished) {
                 if (verbose_) fprintf(stderr, "[Engine] Cleanup: req=%lu freeing resources...\n", ctx->request_id);
+                // 释放 GPU 前缀共享引用
+                if (ctx->cache_state.shared_prefix_hash != 0) {
+                    cache_manager_->release_gpu_prefix(ctx->cache_state.shared_prefix_hash);
+                    ctx->cache_state.shared_prefix_hash = 0;
+                }
                 // 释放 KV blocks + SSD 文件 + swap 文件 + SSM/Conv slot
                 cache_manager_->free_request(ctx->request_id, ctx);
                 // 释放 processed_images (ViT 后不再需要 bf16 pixel 数据)
@@ -674,7 +679,39 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
 
         // ---- KV Cache Prefix Lookup ----
         int cached_tokens = 0;
+
+        // 1) 优先尝试 GPU 前缀共享 (直接复用已驻留 GPU 的 KV blocks, 零 SSD I/O)
         if (cache_manager_->is_prefix_cache_enabled()) {
+            // 计算 chunk-aligned prefix 长度用于哈希
+            int chunk_sz = cache_manager_->prefix_cache()->config().chunk_size;
+            int prefix_aligned = (num_tokens / chunk_sz) * chunk_sz;
+            if (prefix_aligned > 0) {
+                uint64_t ph = cache_manager_->compute_prefix_hash(
+                    ctx->prompt_tokens.data(), prefix_aligned);
+                int shared = cache_manager_->try_share_gpu_prefix(ph, ctx->cache_state);
+                if (shared > 0) {
+                    // KV blocks 已共享, 还需从 SSD 恢复 SSM/Conv 状态
+                    int ssm_restored = cache_manager_->restore_ssm_only(
+                        ctx->prompt_tokens.data(), shared, ctx->cache_state);
+                    if (ssm_restored <= 0) {
+                        // SSM 恢复失败 — 回滚 KV sharing, 走正常 prefill
+                        cache_manager_->release_gpu_prefix(ph);
+                        cache_manager_->kv_manager().free_blocks(ctx->cache_state.block_table);
+                        ctx->cache_state.block_table.clear();
+                        ctx->cache_state.block_tracker = cache::BlockTracker();
+                        ctx->cache_state.context_len = 0;
+                    } else {
+                        cached_tokens = shared;
+                        ctx->cache_state.shared_prefix_hash = ph;
+                        std::cerr << "[Cache] Shared " << shared << "/" << num_tokens
+                                  << " tokens from GPU (CoW), SSM restored from SSD" << std::endl;
+                    }
+                }
+            }
+        }
+
+        // 2) 回退到 SSD prefix cache
+        if (cached_tokens == 0 && cache_manager_->is_prefix_cache_enabled()) {
             int matched = cache_manager_->lookup_prefix(ctx->prompt_tokens.data(), num_tokens);
             if (matched > 0) {
                 cached_tokens = cache_manager_->restore_prefix(
@@ -991,6 +1028,24 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
         
             // ---- Cache Store: prefill 完成后缓存 KV + SSM/Conv 到 SSD ----
             cache_manager_->store_prefix(ctx->prompt_tokens.data(), num_tokens, ctx, d_workspace_, d_block_tables_);
+
+            // ---- GPU Prefix Register: 注册前缀 blocks 为可共享 (CoW) ----
+            if (ctx->cache_state.shared_prefix_hash == 0 && cache_manager_->is_prefix_cache_enabled()) {
+                int chunk_sz = cache_manager_->prefix_cache()->config().chunk_size;
+                int prefix_aligned = (num_tokens / chunk_sz) * chunk_sz;
+                if (prefix_aligned > 0) {
+                    uint64_t ph = cache_manager_->compute_prefix_hash(
+                        ctx->prompt_tokens.data(), prefix_aligned);
+                    int prefix_blocks = prefix_aligned / cache_manager_->block_size();
+                    if (prefix_blocks > 0 && prefix_blocks <= (int)ctx->cache_state.block_table.size()) {
+                        std::vector<int> prefix_block_ids(
+                            ctx->cache_state.block_table.begin(),
+                            ctx->cache_state.block_table.begin() + prefix_blocks);
+                        cache_manager_->register_gpu_prefix(ph, prefix_block_ids, prefix_aligned);
+                        ctx->cache_state.shared_prefix_hash = ph;
+                    }
+                }
+            }
 
             // 标记 prefill forward 结束 (不含 lm_head/sample, 纯 forward 计时)
             profiler_.request_prefill_done(prefill_tokens);

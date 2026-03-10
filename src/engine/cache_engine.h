@@ -88,6 +88,14 @@ public:
         int* d_block_table_buf,
         cudaStream_t stream);
 
+    // ---- 仅恢复 SSM/Conv 状态 (用于 GPU prefix sharing 场景, 跳过 KV I/O) ----
+    // 返回恢复的 token 数 (0 = miss/无 SSM)
+    int restore_ssm_only(
+        const int* tokens, int num_tokens,
+        __nv_bfloat16** ssm_states,
+        __nv_bfloat16** conv_states,
+        cudaStream_t stream);
+
     // ---- 统计 (旧接口, 保持兼容) ----
     CacheStats get_stats() const;
     void print_stats() const;
