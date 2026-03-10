@@ -943,6 +943,9 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
         
             // ---- Cache Store: prefill 完成后缓存 KV + SSM/Conv 到 SSD ----
             cache_manager_->store_prefix(ctx->prompt_tokens.data(), num_tokens, ctx, d_workspace_, d_block_tables_);
+
+            // 标记 prefill forward 结束 (不含 lm_head/sample, 纯 forward 计时)
+            profiler_.request_prefill_done(prefill_tokens);
         } // end if (prefill_tokens > 0)
 
         if (prefill_tokens > 0) {
@@ -977,7 +980,6 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             ctx->cache_state.context_len++;
             
             // 推送响应 token 给 Python 前端
-            profiler_.request_prefill_done(num_tokens);
             {
                 bool eos = Qwen35Config::is_eos(next_token);
                 ipc::InferenceResponse resp{};
@@ -1005,7 +1007,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
             // KV + SSM/Conv 已从 SSD 恢复, 跳过 forward
             // 用占位符标记 prefill 完成, 下一次 step() 会进入 decode 生成第一个 token
             ctx->generated_tokens.push_back(-1);  // 占位, decode 会使用 last prompt token
-            profiler_.request_prefill_done(num_tokens);
+            profiler_.request_prefill_done(0);  // cache hit: 0 forward tokens
             if (verbose_) std::cerr << "[Cache] Full hit! Skipped prefill (" << num_tokens << " tokens)" << std::endl;
 
             // ---- LMCache Monitor: 完全命中 ----
