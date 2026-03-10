@@ -192,3 +192,56 @@ step() 逻辑:
 | 4 | 中 | 调度导致饿死或延迟不稳 | 回退到 FIFO |
 
 每个 Phase 独立可交付, 有独立 commit, 可单独回退。
+
+---
+
+## 性能验证结果 (2026-03-10)
+
+### 发现并修复的 Bug
+
+1. **B=1 阻塞 prefill**: `step()` 路由中, B=1 走 MTP 路径时不做 pending prefill,
+   导致所有请求串行处理。修复: B=1 且有 pending prefill 时走 batch decode (牺牲 MTP 换取快速 ramp-up)。
+2. **IPC 队列容量不足**: 请求队列容量 8 (可用 7), B=8 时第 8 个请求失败。修复: 容量 8→128。
+
+### GEMV→CUTLASS 阈值优化
+
+发现 `gemv_multirow_kernel_scattered<16>` 有严重寄存器压力 (每线程 16 FMA 累加器,
+低占用率), 导致 B=16 反而比 B=8 慢。将 CUTLASS GEMM 接管阈值从 M≥17 降到 M≥9,
+B=16 吞吐 +87%。
+
+### Scaling 曲线
+
+| Batch Size | tok/s | Scaling | GEMM 路径 | per_req_tps | TTFT (avg) |
+|-----------|-------|---------|----------|-------------|------------|
+| 1 (MTP)   | 12.1  | 1.0×    | GEMV<4>  | 12.1        | 233ms      |
+| 4         | 15.5  | 1.28×   | GEMV<4>  | 4.1         | 903ms      |
+| 8         | 19.6  | 1.62×   | GEMV<8>  | 2.7         | 1836ms     |
+| 16        | 29.2  | 2.41×   | CUTLASS  | 2.1         | 4029ms     |
+| 32        | 44.3  | 3.64×   | CUTLASS  | 2.0         | ~10s       |
+| 64        | 69.2  | 6.09×   | CUTLASS  | 1.8         | ~16s       |
+
+### 效率分析
+
+理论极限: 51.2 GB 权重 / 220 GB/s 实测带宽 = 233ms/step
+- B=64 理论: 64 tok / 233ms = 275 tok/s
+- B=64 实测: 69.2 tok/s (25% of theoretical)
+- 差距主因: 64 ×串行 prefill ramp-up (~32s of 46s wall time)
+
+### 下一步优化方向
+
+| 优先级 | 方向 | 预期收益 | 复杂度 |
+|--------|------|----------|--------|
+| P0 | 并行/批量 Prefill | 消除 ramp-up, B=64 可达 100+ tok/s | 中 |
+| P1 | Head-Group Batch Attention | 6 Q heads per KV group 合并, 减少 FA 时间 | 中 |
+| P2 | Batch MTP (B=4-8 开启投机) | 小 batch +50-80% | 高 |
+| P3 | SSM State 压缩 | 减少每 slot 75 MB, 支持更多并发 | 中 |
+
+### Batch MTP 可行性分析
+
+**结论: 暂不实现, 标记为 future work**
+
+难点:
+- SSM 检查点内存: B × N × 48 层, B=8 需 1.7 GB, B=64 需 13.8 GB
+- 异步验证: 各请求 accept count 不同, 无法 batch rollback
+- forward 重构: B 请求各 T 个 token, 需拆分为 per-request block/position 映射
+- 对目标场景 (B=32-64) 收益有限 (已接近带宽极限)

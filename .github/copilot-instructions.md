@@ -206,7 +206,9 @@ src/
 - ✅ Prefill max_chunk_size 256→2048 (减少权重重复读取, TTFT -17%~-37%)
   - T~256: 694→438ms (-37%), T~512: 980→734ms (-25%), T~1024: 1720→1432ms (-17%)
   - CLI: --max-chunk-size, 配置: max_chunk_size=2048, 上限 4096
-- ✅ CUTLASS 接管 M=17-31 (消除 cuBLAS shortcut, TTFT T=17: -33%, T=24: -32%)
+- ✅ CUTLASS 接管 M=9+ (M=9-16 CUTLASS 替代 GEMV<16>, B=16 吞吐 +87%)
+- ✅ Batch decode routing fix (B=1 让步 prefill ramp-up, IPC 队列 8→128)
+- ✅ 并发 scaling: B=4 1.28×, B=8 1.62×, B=16 2.41×, B=32 3.64×, B=64 6.09× (69.2 tok/s)
 
 ### 稳定性
 - 统一内存 SMMU 资源有限, 大规模并发访问可致 GPU hard-reset
