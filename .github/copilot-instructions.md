@@ -57,7 +57,7 @@
 src/
 ├── main.cpp              — 统一入口 (serve/chat/bench/test/probe/version 子命令)
 ├── tests.cpp             — 测试框架 (16 tests, 3 categories, --list/--filter/--category/--all)
-├── benchmark.cpp         — 性能评估 (参数扫描/多迭代/统计/JSON输出)
+├── benchmark.cpp         — Engine-based 性能评估 (通过 InferenceBackend 走完整推理路径)
 ├── engine/
 │   ├── engine.h/cpp      — 推理引擎: prefill/decode 循环, 连续批处理, MTP
 │   ├── backend.h/cpp     — 独立后端接口 (线程安全, 与传输层解耦)
@@ -189,7 +189,7 @@ src/
 - ✅ NVFP4 (W4A16) 推理支持 (FP4 E2M1 GEMV V2, SMEM LUT, 向量化读取)
 - ✅ FP4 QKV/GateUp 投影合并, NVFP4 decode +17% over BF16
 - ✅ 多模型支持 (27B/9B/4B, config.json 自动检测架构)
-- ✅ Benchmark 重构 (参数扫描/多迭代/95% CI/JSON)
+- ✅ Benchmark 重构 (Engine-based, 通过 InferenceBackend 走完整推理路径, TTFT/吞吐量/统计/JSON)
 - ✅ Test 框架 (16 tests, 3 categories, --list/--filter/--category/--all)- ✔️ exp2f + LOG2E 预乘 (FA4 启发, 全量 expf→exp2f), -1.1%
 - ✔️ PDL (Programmatic Dependent Launch, 10 files, ~70 launch sites), -1.8%
 - ✔️ f32x2 SIMD FMA (14 BF16 GEMV kernels, fma.rn.f32x2), noise-neutral (BW-bound)
@@ -228,7 +228,7 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc)
 # 运行 (推荐使用统一配置文件 configs/qwen3.5-27b.conf):
 #   ./build/qwen35-thor serve --config configs/qwen3.5-27b.conf
 #   ./build/qwen35-thor chat  --config configs/qwen3.5-27b.conf
-#   ./build/qwen35-thor bench --decode 30 --batch 1,2,4 --iterations 3 --json results.json
+#   ./build/qwen35-thor bench --config configs/qwen3.5-27b.conf --decode 30 --iterations 3 --json results.json
 #   ./build/qwen35-thor test --list
 #   ./build/qwen35-thor test --all
 # 多模型 (自动从 config.json 检测架构):
@@ -253,14 +253,15 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc)
 ```
 perf: fused RMSNorm+GEMV saves 64 launches, ITL 230→229ms (-0.5%)
 revert: dual GEMV+SwiGLU fusion — block count halved, +4.6% regression
-bench: B=1 baseline 229.2ms ITL / 218.3ms fwd / 223.6 GB/s
+bench: prompt=17 TTFT=467ms gen=10.4 tok/s (engine-based, MTP enabled)
 ```
 
 ### Benchmark 基本要求
 
-- 最少 `--decode 30 --warmup 5`, N≥30 才有统计意义
+- Benchmark 通过 InferenceBackend 走完整推理路径 (含 MTP, chunked prefill, GPU 采样)
+- 最少 `--decode 30 --iterations 3`, N≥3 才有统计意义
 - 每次测量前 `pkill` 之前的进程, 确保 GPU 空闲
-- 对比必须控制相同参数 (kv-cache-gb, batch, decode steps)
+- 对比必须控制相同参数 (config, kv-cache-gb, decode steps, mtp-disable/enable)
 - `docs/OPTIMIZATION_LOG.md` 记录每次优化的 A/B 结果
 
 ## 临时文件

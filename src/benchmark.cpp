@@ -1,24 +1,32 @@
-// benchmark.cpp — 专用性能评估程序 (无 IPC 依赖)
+// benchmark.cpp — Engine-based 性能基准测试
+//
+// 通过 InferenceBackend 走完整推理路径, 测量真实 TTFT/吞吐量:
+//   - Chunked prefill (max_chunk_size)
+//   - MTP 投机解码
+//   - GPU 采样 (top-k/top-p/min-p/penalties)
+//   - KV Cache 管理
 //
 // 用法:
-//   ./qwen35-thor bench [--warmup N] [--decode N] [--prompt-len N] [--nsys] [--csv]
+//   ./qwen35-thor bench --config configs/qwen3.5-27b.conf --decode 50
+//   ./qwen35-thor bench --config configs/qwen3.5-27b.conf --prompt-len 17,64,256 --iterations 3
+//   ./qwen35-thor bench --model-dir <path> --decode 30 --json results.json
 //
-// 增强:
-//   --batch 1,2,4,8            逗号分隔, 自动扫描所有 batch size
-//   --prompt-len 32,128,256    逗号分隔, 扫描多个 prompt 长度
-//   --iterations N             多轮迭代, 每轮独立测量 (跨次方差 + 95% CI)
-//   --prefill-repeat N         Prefill 每个配置重复 N 次 (默认 3)
-//   --json results.json        结构化 JSON 输出到文件
-//   --no-graph                 禁用 CUDA Graph (用于精确每阶段计时)
-//   --per-step                 打印每步详情
-//   --nsys                     NVTX 标记
-//   --csv                      CSV 输出
-//
-// nsys 用法:
-//   nsys profile --trace=cuda,nvtx -o profile ./qwen35-thor bench --decode 30 --nsys
-//
-// ncu 用法 (单步):
-//   ncu --target-processes all --set full -o ncu_report ./qwen35-thor bench --decode 3 --nsys
+// 参数:
+//   --decode N / --max-tokens N   每请求生成 token 数 (默认 50)
+//   --prompt-len N[,N..]          逗号分隔 prompt 长度列表 (默认 17)
+//   --iterations N                每配置独立迭代次数 (默认 1)
+//   --warmup N                    预热请求数 (默认 1, 不计入统计)
+//   --json FILE                   JSON 结构化输出
+//   --temperature F               采样温度 (0=greedy, 默认 0)
+//   --top-p F                     Top-p 采样阈值 (默认 0.95)
+//   --top-k N                     Top-k 采样 (默认 20)
+//   --seed N                      随机种子 (默认 42, 确定性)
+//   --verbose                     显示 Engine 内部日志
+//   --config FILE                 同 serve/chat 的配置文件
+//   --model-dir DIR               模型目录 (可由 config 或 QWEN_MODEL_DIR 环境变量提供)
+//   --kv-cache-gb F               KV Cache 预算 (GB)
+//   --mtp-disable                 禁用 MTP 投机解码
+//   --max-chunk-size N            Prefill 分块大小 (默认 2048)
 
 #include <iostream>
 #include <iomanip>
@@ -33,56 +41,12 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <thread>
 
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
-#include <nvtx3/nvToolsExt.h>
-
-#include "engine/model.h"
-#include "engine/engine.h"
-#include "engine/layer.h"
-#include "engine/allocator.h"
-#include "engine/light_ops.h"
-#include "engine/dense_gemm.h"
-#include "engine/paged_attention.h"
-#include "engine/cache_config.h"
+#include "engine/backend.h"
 
 using namespace qwen_thor;
-
-// ============================================================================
-// NVTX helpers
-// ============================================================================
-static bool g_nvtx_enabled = false;
-
-static void nvtx_push(const char* name) {
-    if (g_nvtx_enabled) nvtxRangePushA(name);
-}
-static void nvtx_pop() {
-    if (g_nvtx_enabled) nvtxRangePop();
-}
-
-// ============================================================================
-// CUDA Event Timer pair
-// ============================================================================
-struct EventTimer {
-    cudaEvent_t start, stop;
-    EventTimer() {
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-    }
-    ~EventTimer() {
-        cudaEventDestroy(start);
-        cudaEventDestroy(stop);
-    }
-    void record_start(cudaStream_t s) { cudaEventRecord(start, s); }
-    void record_stop(cudaStream_t s)  { cudaEventRecord(stop, s); }
-    float elapsed_ms() {
-        cudaEventSynchronize(stop);
-        float ms = 0;
-        cudaEventElapsedTime(&ms, start, stop);
-        return ms;
-    }
-};
+using Clock = std::chrono::steady_clock;
 
 // ============================================================================
 // 统计工具 — 增加 CI, CV%, trimmed mean
@@ -127,26 +91,22 @@ struct Stats {
         return sqrtf(acc / (count() - 1));
     }
 
-    // Coefficient of Variation (%) — 越小越稳定
     float cv_pct() const {
         float m = mean();
         return (m > 0 && count() >= 2) ? (stddev() / m * 100.0f) : 0;
     }
 
-    // 95% Confidence Interval half-width (t-distribution approx for N>30: ~1.96)
     float ci95() const {
         if (count() < 2) return 0;
-        // For small N, use t-value approximations
-        float t_val = 1.96f; // N>=30
+        float t_val = 1.96f;
         if (count() < 30) {
-            // Simple lookup for common small N
             static const float t_table[] = {
-                0, 12.71f, 4.30f, 3.18f, 2.78f, 2.57f,  // N=1..5
-                2.45f, 2.36f, 2.31f, 2.26f, 2.23f,       // N=6..10
-                2.20f, 2.18f, 2.16f, 2.14f, 2.13f,       // N=11..15
-                2.12f, 2.11f, 2.10f, 2.09f, 2.09f,       // N=16..20
-                2.08f, 2.07f, 2.07f, 2.06f, 2.06f,       // N=21..25
-                2.06f, 2.05f, 2.05f, 2.05f                // N=26..29
+                0, 12.71f, 4.30f, 3.18f, 2.78f, 2.57f,
+                2.45f, 2.36f, 2.31f, 2.26f, 2.23f,
+                2.20f, 2.18f, 2.16f, 2.14f, 2.13f,
+                2.12f, 2.11f, 2.10f, 2.09f, 2.09f,
+                2.08f, 2.07f, 2.07f, 2.06f, 2.06f,
+                2.06f, 2.05f, 2.05f, 2.05f
             };
             int idx = std::min(count(), 29);
             t_val = t_table[idx];
@@ -154,7 +114,6 @@ struct Stats {
         return t_val * stddev() / sqrtf((float)count());
     }
 
-    // Trimmed mean (去掉最高/最低各 trim_pct%)
     float trimmed_mean(float trim_pct = 0.10f) const {
         if (count() < 4) return mean();
         auto s = samples;
@@ -185,120 +144,215 @@ static std::vector<int> parse_int_list(const char* str) {
 }
 
 // ============================================================================
-// 命令行参数
+// Benchmark 配置
 // ============================================================================
 struct BenchConfig {
-    int warmup_steps    = 5;
-    int decode_steps    = 50;
-    std::vector<int> prompt_lens = {17};
-    std::vector<int> batch_sizes = {1};
-    int iterations      = 1;       // 跨次迭代 (每轮独立测量)
-    int prefill_repeat  = 3;       // Prefill 重复次数
-    double kv_cache_gb  = 4.0;
-    bool nsys_mode      = false;
-    bool csv_output     = false;
-    bool per_step       = false;
-    bool no_graph       = false;
+    // Engine 配置来源
+    std::string config_file;
     std::string model_dir;
-    std::string json_output;        // JSON 输出文件路径 (空则不输出)
+    double kv_cache_gb = 0;  // 0 = 不覆盖 config 文件
+    std::string mtp_mode;    // empty = 不覆盖 config 文件的值
+    int max_chunk_size = 0;  // 0 = 不覆盖
+
+    // 测量参数
+    std::vector<int> prompt_lens = {17};
+    int max_tokens      = 50;
+    int iterations      = 1;
+    int warmup_requests = 1;
+    std::string json_output;
+
+    // 采样参数
+    float temperature       = 0.0f;  // 0 = greedy
+    float top_p             = 0.95f;
+    int   top_k             = 20;
+    float min_p             = 0.0f;
+    float presence_penalty  = 0.0f;
+    int64_t seed            = 42;
+
+    // 日志
+    bool verbose = false;
 };
 
-BenchConfig parse_args(int argc, char** argv) {
+static BenchConfig parse_bench_args(int argc, char** argv) {
     BenchConfig cfg;
-    if (const char* env_model_dir = std::getenv("QWEN_MODEL_DIR"); env_model_dir && env_model_dir[0] != '\0') {
-        cfg.model_dir = env_model_dir;
-    }
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--warmup"        && i + 1 < argc) cfg.warmup_steps = std::atoi(argv[++i]);
-        else if (arg == "--decode"        && i + 1 < argc) cfg.decode_steps  = std::atoi(argv[++i]);
-        else if (arg == "--prompt-len"    && i + 1 < argc) cfg.prompt_lens   = parse_int_list(argv[++i]);
-        else if (arg == "--batch"         && i + 1 < argc) cfg.batch_sizes   = parse_int_list(argv[++i]);
-        else if (arg == "--iterations"    && i + 1 < argc) cfg.iterations    = std::max(1, std::atoi(argv[++i]));
-        else if (arg == "--prefill-repeat" && i + 1 < argc) cfg.prefill_repeat = std::max(1, std::atoi(argv[++i]));
-        else if (arg == "--model-dir"     && i + 1 < argc) cfg.model_dir     = argv[++i];
-        else if (arg == "--kv-cache-gb"   && i + 1 < argc) cfg.kv_cache_gb   = std::atof(argv[++i]);
-        else if (arg == "--json"          && i + 1 < argc) cfg.json_output   = argv[++i];
-        else if (arg == "--nsys")      cfg.nsys_mode  = true;
-        else if (arg == "--csv")       cfg.csv_output = true;
-        else if (arg == "--per-step")  cfg.per_step   = true;
-        else if (arg == "--no-graph")  cfg.no_graph   = true;
+        if      (arg == "--config"     && i + 1 < argc) cfg.config_file  = argv[++i];
+        else if (arg == "--model-dir"  && i + 1 < argc) cfg.model_dir    = argv[++i];
+        else if (arg == "--kv-cache-gb" && i + 1 < argc) cfg.kv_cache_gb = std::atof(argv[++i]);
+        else if (arg == "--decode"     && i + 1 < argc) cfg.max_tokens   = std::max(1, std::atoi(argv[++i]));
+        else if (arg == "--max-tokens" && i + 1 < argc) cfg.max_tokens   = std::max(1, std::atoi(argv[++i]));
+        else if (arg == "--prompt-len" && i + 1 < argc) cfg.prompt_lens  = parse_int_list(argv[++i]);
+        else if (arg == "--iterations" && i + 1 < argc) cfg.iterations   = std::max(1, std::atoi(argv[++i]));
+        else if (arg == "--warmup"     && i + 1 < argc) cfg.warmup_requests = std::max(0, std::atoi(argv[++i]));
+        else if (arg == "--json"       && i + 1 < argc) cfg.json_output  = argv[++i];
+        else if (arg == "--temperature" && i + 1 < argc) cfg.temperature = std::atof(argv[++i]);
+        else if (arg == "--top-p"      && i + 1 < argc) cfg.top_p       = std::atof(argv[++i]);
+        else if (arg == "--top-k"      && i + 1 < argc) cfg.top_k       = std::atoi(argv[++i]);
+        else if (arg == "--min-p"      && i + 1 < argc) cfg.min_p       = std::atof(argv[++i]);
+        else if (arg == "--seed"       && i + 1 < argc) cfg.seed        = std::atoll(argv[++i]);
+        else if (arg == "--presence-penalty" && i + 1 < argc) cfg.presence_penalty = std::atof(argv[++i]);
+        else if (arg == "--mtp-disable")   cfg.mtp_mode = "off";
+        else if (arg == "--mtp-enable")    cfg.mtp_mode = "on";
+        else if (arg == "--max-chunk-size" && i + 1 < argc) cfg.max_chunk_size = std::atoi(argv[++i]);
+        else if (arg == "--verbose")       cfg.verbose = true;
         else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: qwen35-thor bench [options]\n"
-                      << "  --warmup N            Warmup decode steps (default: 5)\n"
-                      << "  --decode N            Benchmark decode steps (default: 50)\n"
-                      << "  --prompt-len N[,N..]  Prompt token count(s), comma-separated (default: 17)\n"
-                      << "  --batch N[,N..]       Batch size(s), comma-separated (default: 1)\n"
-                      << "  --iterations N        Independent iterations per config (default: 1)\n"
-                      << "  --prefill-repeat N    Prefill repeats per iteration (default: 3)\n"
-                      << "  --kv-cache-gb N       GPU KV Cache budget in GB (default: 4.0)\n"
-                      << "  --model-dir DIR       Model weights directory\n"
-                      << "  --json FILE           Output structured JSON results to file\n"
-                      << "  --nsys                Enable NVTX markers for nsys/ncu\n"
-                      << "  --csv                 Output CSV format\n"
-                      << "  --per-step            Print per-step timing details\n"
-                      << "  --no-graph            Disable CUDA Graph for accurate per-phase timing\n"
-                      << "\nExamples:\n"
-                      << "  bench --decode 50 --batch 1,2,4 --prompt-len 64,256 --iterations 3 --json results.json\n"
-                      << "  bench --decode 30 --no-graph  (single config, backward-compatible)\n";
+            printf("Usage: qwen35-thor bench [options]\n\n"
+                   "Engine options:\n"
+                   "  --config FILE           Engine config file (same as serve/chat)\n"
+                   "  --model-dir DIR         Model weights directory\n"
+                   "  --kv-cache-gb F         KV Cache budget in GB\n"
+                   "  --max-chunk-size N      Prefill chunk size\n"
+                   "  --mtp-disable           Disable MTP speculative decoding\n"
+                   "  --mtp-enable            Enable MTP speculative decoding\n"
+                   "\nBenchmark options:\n"
+                   "  --decode N              Tokens to generate per request (default: 50)\n"
+                   "  --max-tokens N          Same as --decode\n"
+                   "  --prompt-len N[,N..]    Prompt lengths, comma-separated (default: 17)\n"
+                   "  --iterations N          Iterations per prompt length (default: 1)\n"
+                   "  --warmup N              Warmup requests (default: 1)\n"
+                   "  --json FILE             JSON output file\n"
+                   "  --verbose               Show engine internal logs\n"
+                   "\nSampling options:\n"
+                   "  --temperature F         Sampling temperature (0=greedy, default: 0)\n"
+                   "  --top-p F               Top-p threshold (default: 0.95)\n"
+                   "  --top-k N               Top-k (default: 20)\n"
+                   "  --seed N                Random seed (default: 42)\n"
+                   "\nExamples:\n"
+                   "  bench --config configs/qwen3.5-27b.conf --decode 50\n"
+                   "  bench --config configs/qwen3.5-27b.conf --prompt-len 17,64,256 --iterations 3 --json results.json\n"
+                   "  bench --config configs/qwen3.5-27b.conf --mtp-disable --decode 30\n");
             exit(0);
         }
-    }
-    if (cfg.model_dir.empty()) {
-        std::cerr << "[Error] --model-dir is required.\n"
-                  << "  Usage: qwen35-thor bench --model-dir <path> [options]\n"
-                  << "     or: export QWEN_MODEL_DIR=<path>\n";
-        exit(1);
     }
     return cfg;
 }
 
 // ============================================================================
-// 单次 benchmark 结果
+// 构建 BackendConfig
 // ============================================================================
-struct BenchResult {
-    int batch_size;
+static BackendConfig build_backend_config(const BenchConfig& cfg) {
+    BackendConfig bcfg;
+
+    // 1. 从 config 文件加载基础配置
+    if (!cfg.config_file.empty()) {
+        bcfg = BackendConfig::from_file(cfg.config_file);
+    }
+
+    // 2. CLI 覆盖
+    if (!cfg.model_dir.empty())  bcfg.model_dir = cfg.model_dir;
+    if (cfg.kv_cache_gb > 0)     bcfg.kv_cache_gb = cfg.kv_cache_gb;
+    if (!cfg.mtp_mode.empty())   bcfg.mtp_mode = cfg.mtp_mode;
+    if (cfg.max_chunk_size > 0)  bcfg.max_chunk_size = std::max(64, std::min(4096, cfg.max_chunk_size));
+
+    // 3. Benchmark 模式: 关闭 SSD prefix cache (避免缓存干扰), 控制日志
+    bcfg.cache_enabled = false;
+    bcfg.verbose = cfg.verbose;
+
+    // 4. 环境变量 fallback
+    if (bcfg.model_dir.empty()) {
+        const char* env = std::getenv("QWEN_MODEL_DIR");
+        if (env && env[0]) bcfg.model_dir = env;
+    }
+
+    if (bcfg.model_dir.empty()) {
+        fprintf(stderr, "[Error] --model-dir, --config, or QWEN_MODEL_DIR is required.\n");
+        exit(1);
+    }
+
+    return bcfg;
+}
+
+// ============================================================================
+// 单请求结果
+// ============================================================================
+struct RequestResult {
     int prompt_len;
-    int iteration;
-    int decode_steps;
-    int warmup_steps;
-    bool cuda_graph;
-    bool cuda_graph_requested = false;
-    bool cuda_graph_active = false;
-    bool decode_phase_aggregated = false;
-    bool prefill_serialized = true;
-    bool bandwidth_valid = true;
-    std::string cuda_graph_status;
-
-    // Prefill
-    Stats prefill_ttft;
-    Stats prefill_forward;
-    Stats prefill_embed;
-    Stats prefill_lmhead;
-
-    // Decode
-    Stats decode_total;
-    Stats decode_forward;
-    Stats decode_embed;
-    Stats decode_norm;
-    Stats decode_lmhead;
-    Stats decode_sample;
-
-    // Derived (computed after measurement)
-    float weight_bytes = 0;
+    int total_tokens;     // 生成的 token 总数
+    float ttft_ms;        // Time to First Token
+    float generation_ms;  // 首 token 到末 token 的时间
+    float total_ms;       // 提交到完成的总时间
+    float gen_tps;        // generation throughput: (total_tokens-1) / generation_ms * 1000
+    float overall_tps;    // total_tokens / total_ms * 1000
 };
 
-static const char* decode_phase_mode_label(const BenchResult& r) {
-    return r.decode_phase_aggregated ? "graph_aggregated" : "separate";
-}
+// ============================================================================
+// 运行单个请求并测量
+// ============================================================================
+static RequestResult run_single_request(
+    InferenceBackend& backend,
+    const BenchConfig& cfg,
+    int prompt_len,
+    uint64_t request_id)
+{
+    // 合成 prompt (与旧 bench 相同的 token 序列)
+    static const int default_tokens[] = {
+        248045, 846, 198, 3710, 369, 220, 17, 10, 17, 30,
+        248046, 198, 248045, 74455, 198, 248068, 198
+    };
+    InferRequest req;
+    req.request_id = request_id;
+    req.prompt_tokens.resize(prompt_len);
+    for (int i = 0; i < prompt_len; ++i)
+        req.prompt_tokens[i] = (i < 17) ? default_tokens[i] : 1;
+    req.max_new_tokens    = cfg.max_tokens;
+    req.temperature       = cfg.temperature;
+    req.top_p             = cfg.top_p;
+    req.top_k             = cfg.top_k;
+    req.min_p             = cfg.min_p;
+    req.presence_penalty  = cfg.presence_penalty;
+    req.seed              = cfg.seed;
+    req.stream            = true;
 
-static std::string cuda_graph_status_for(const BenchConfig& cfg) {
-    if (cfg.no_graph) return "disabled_by_flag";
-    return "disabled_not_graph_safe";
+    // 提交并计时
+    auto t_submit = Clock::now();
+    if (!backend.submit(req)) {
+        fprintf(stderr, "[Bench] Failed to submit request %lu\n", (unsigned long)request_id);
+        return {prompt_len, 0, 0, 0, 0, 0, 0};
+    }
+
+    int token_count = 0;
+    auto t_first = t_submit;  // 将在首 token 时更新
+
+    while (true) {
+        InferResponse resp;
+        if (backend.poll(resp)) {
+            if (resp.request_id != request_id) continue;
+            token_count++;
+            if (token_count == 1) {
+                t_first = Clock::now();
+            }
+            if (resp.is_finished || resp.error_code != 0) break;
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
+
+    auto t_end = Clock::now();
+    float ttft_ms  = std::chrono::duration<float, std::milli>(t_first - t_submit).count();
+    float total_ms = std::chrono::duration<float, std::milli>(t_end - t_submit).count();
+    float gen_ms   = std::chrono::duration<float, std::milli>(t_end - t_first).count();
+    float gen_tps  = (token_count > 1 && gen_ms > 0) ? (token_count - 1) * 1000.0f / gen_ms : 0;
+    float all_tps  = (total_ms > 0) ? token_count * 1000.0f / total_ms : 0;
+
+    return {prompt_len, token_count, ttft_ms, gen_ms, total_ms, gen_tps, all_tps};
 }
 
 // ============================================================================
-// 辅助: JSON 字符串转义
+// 汇总结果 (按 prompt_len 聚合)
+// ============================================================================
+struct AggResult {
+    int prompt_len;
+    int iterations;
+    int max_tokens;
+    Stats ttft;
+    Stats gen_tps;
+    Stats total_tokens;
+    Stats total_ms;
+};
+
+// ============================================================================
+// JSON 输出
 // ============================================================================
 static std::string json_escape(const std::string& s) {
     std::string result;
@@ -311,99 +365,41 @@ static std::string json_escape(const std::string& s) {
     return result;
 }
 
-// ============================================================================
-// JSON 输出: Stats → JSON object
-// ============================================================================
-static void json_write_stats(std::ostream& os, const Stats& s, const std::string& indent) {
-    if (s.count() == 0) {
-        os << indent << "\"count\": 0";
-        return;
-    }
-    os << indent << "\"count\": " << s.count() << ",\n"
-       << indent << "\"mean\": " << std::fixed << std::setprecision(3) << s.mean() << ",\n"
-       << indent << "\"median\": " << s.median() << ",\n"
-       << indent << "\"min\": " << s.min_val() << ",\n"
-       << indent << "\"max\": " << s.max_val() << ",\n"
-       << indent << "\"p95\": " << s.p95() << ",\n"
-       << indent << "\"p99\": " << s.p99() << ",\n"
-       << indent << "\"stddev\": " << s.stddev() << ",\n"
-       << indent << "\"cv_pct\": " << s.cv_pct() << ",\n"
-       << indent << "\"ci95\": " << s.ci95() << ",\n"
-       << indent << "\"trimmed_mean_10pct\": " << s.trimmed_mean(0.10f);
-}
-
-// ============================================================================
-// JSON 输出: 写入完整结果
-// ============================================================================
-static void write_json(const std::string& path, const std::vector<BenchResult>& results,
-                        const BenchConfig& cfg, const core::Qwen35Config& config) {
+static void write_json(const std::string& path,
+                        const std::vector<AggResult>& results,
+                        const BenchConfig& cfg,
+                        const BackendConfig& bcfg) {
     std::ofstream ofs(path);
     if (!ofs.is_open()) {
         fprintf(stderr, "[Error] Cannot open JSON output file: %s\n", path.c_str());
         return;
     }
 
+    ofs << std::fixed;
     ofs << "{\n";
-    ofs << "  \"benchmark\": \"qwen3.5-thor\",\n";
-    ofs << "  \"model_dir\": \"" << json_escape(cfg.model_dir) << "\",\n";
-    ofs << "  \"hidden_size\": " << config.hidden_size << ",\n";
-    ofs << "  \"num_layers\": " << config.num_hidden_layers << ",\n";
-    ofs << "  \"vocab_size\": " << config.vocab_size << ",\n";
+    ofs << "  \"benchmark\": \"qwen3.5-thor-engine\",\n";
+    ofs << "  \"model_dir\": \"" << json_escape(bcfg.model_dir) << "\",\n";
+    ofs << "  \"mtp_mode\": \"" << json_escape(bcfg.mtp_mode) << "\",\n";
+    ofs << "  \"max_chunk_size\": " << bcfg.max_chunk_size << ",\n";
+    ofs << "  \"max_tokens\": " << cfg.max_tokens << ",\n";
+    ofs << "  \"temperature\": " << std::setprecision(2) << cfg.temperature << ",\n";
+    ofs << "  \"seed\": " << cfg.seed << ",\n";
     ofs << "  \"results\": [\n";
 
-    for (size_t ri = 0; ri < results.size(); ++ri) {
-        const auto& r = results[ri];
+    for (size_t i = 0; i < results.size(); ++i) {
+        const auto& r = results[i];
         ofs << "    {\n";
-        ofs << "      \"batch_size\": " << r.batch_size << ",\n";
         ofs << "      \"prompt_len\": " << r.prompt_len << ",\n";
-        ofs << "      \"iteration\": " << r.iteration << ",\n";
-        ofs << "      \"decode_steps\": " << r.decode_steps << ",\n";
-        ofs << "      \"warmup_steps\": " << r.warmup_steps << ",\n";
-        ofs << "      \"cuda_graph\": " << (r.cuda_graph ? "true" : "false") << ",\n";
-        ofs << "      \"cuda_graph_requested\": " << (r.cuda_graph_requested ? "true" : "false") << ",\n";
-        ofs << "      \"cuda_graph_active\": " << (r.cuda_graph_active ? "true" : "false") << ",\n";
-        ofs << "      \"cuda_graph_status\": \"" << json_escape(r.cuda_graph_status) << "\",\n";
-        ofs << "      \"decode_phase_mode\": \"" << decode_phase_mode_label(r) << "\",\n";
-        ofs << "      \"prefill_mode\": \"" << (r.prefill_serialized ? "serialized_single_request" : "batched") << "\",\n";
-        ofs << "      \"weight_bytes_bf16_estimate\": " << std::fixed << std::setprecision(0) << r.weight_bytes << ",\n";
-        ofs << "      \"bandwidth_valid\": " << (r.bandwidth_valid ? "true" : "false") << ",\n";
-
-        // Derived metrics
-        float itl = r.decode_total.median();
-        float decode_tps = (itl > 0) ? (float)r.batch_size * 1000.0f / itl : 0;
-        float bw = (itl > 0 && r.bandwidth_valid) ? r.weight_bytes / (itl / 1000.0f) / 1e9f : 0;
-        float ttft = r.prefill_ttft.median();
-        float prefill_tps = (ttft > 0) ? (float)r.prompt_len * 1000.0f / ttft : 0;
-
-        ofs << "      \"itl_median_ms\": " << std::setprecision(3) << itl << ",\n";
-        ofs << "      \"itl_ci95_ms\": " << r.decode_total.ci95() << ",\n";
-        ofs << "      \"itl_cv_pct\": " << r.decode_total.cv_pct() << ",\n";
-        ofs << "      \"decode_tok_per_sec\": " << std::setprecision(2) << decode_tps << ",\n";
-        if (r.bandwidth_valid) {
-            ofs << "      \"bw_GBs\": " << std::setprecision(1) << bw << ",\n";
-        } else {
-            ofs << "      \"bw_GBs\": null,\n";
-        }
-        ofs << "      \"ttft_median_ms\": " << std::setprecision(3) << ttft << ",\n";
-        ofs << "      \"single_request_prefill_tok_per_sec\": " << std::setprecision(1) << prefill_tps << ",\n";
-
-        // Detailed stats
-        auto write_section = [&](const char* name, const Stats& st) {
-            ofs << "      \"" << name << "\": {\n";
-            json_write_stats(ofs, st, "        ");
-            ofs << "\n      }";
-        };
-
-        write_section("prefill_ttft", r.prefill_ttft);
-        ofs << ",\n";
-        write_section("prefill_forward", r.prefill_forward);
-        ofs << ",\n";
-        write_section("decode_total", r.decode_total);
-        ofs << ",\n";
-        write_section("decode_forward", r.decode_forward);
-        ofs << "\n";
-
-        ofs << "    }" << (ri + 1 < results.size() ? "," : "") << "\n";
+        ofs << "      \"iterations\": " << r.iterations << ",\n";
+        ofs << "      \"max_tokens\": " << r.max_tokens << ",\n";
+        ofs << "      \"ttft_median_ms\": " << std::setprecision(1) << r.ttft.median() << ",\n";
+        ofs << "      \"ttft_ci95_ms\": " << std::setprecision(2) << r.ttft.ci95() << ",\n";
+        ofs << "      \"ttft_cv_pct\": " << std::setprecision(1) << r.ttft.cv_pct() << ",\n";
+        ofs << "      \"gen_tps_median\": " << std::setprecision(2) << r.gen_tps.median() << ",\n";
+        ofs << "      \"gen_tps_ci95\": " << std::setprecision(2) << r.gen_tps.ci95() << ",\n";
+        ofs << "      \"total_tokens_median\": " << std::setprecision(0) << r.total_tokens.median() << ",\n";
+        ofs << "      \"total_time_median_ms\": " << std::setprecision(1) << r.total_ms.median() << "\n";
+        ofs << "    }" << (i + 1 < results.size() ? "," : "") << "\n";
     }
 
     ofs << "  ]\n";
@@ -413,839 +409,155 @@ static void write_json(const std::string& path, const std::vector<BenchResult>& 
 }
 
 // ============================================================================
-// Per-request context
-// ============================================================================
-struct ReqCtx {
-    std::vector<int> block_table;
-    int context_len;
-    std::vector<__nv_bfloat16*> ssm_states;
-    std::vector<__nv_bfloat16*> conv_states;
-    int last_token;
-};
-
-// ============================================================================
-// run_single_bench — 单次 (batch_size, prompt_len) 配置的完整测量
-//
-// 模型和 stream 由外部持有, 这里只分配/释放每次运行的临时资源
-// ============================================================================
-static BenchResult run_single_bench(
-    const BenchConfig& cfg,
-    const core::Qwen35Config& config,
-    core::Qwen35Model* model,
-    cudaStream_t stream,
-    int batch_size,
-    int prompt_len,
-    int iteration,
-    size_t total_weight_bytes,
-    bool bandwidth_valid)
-{
-    BenchResult result;
-    result.batch_size   = batch_size;
-    result.prompt_len   = prompt_len;
-    result.iteration    = iteration;
-    result.decode_steps = cfg.decode_steps;
-    result.warmup_steps = cfg.warmup_steps;
-    result.weight_bytes = (float)total_weight_bytes;
-    result.bandwidth_valid = bandwidth_valid;
-    result.cuda_graph_requested = !cfg.no_graph;
-    result.cuda_graph_active = false;
-    result.cuda_graph_status = cuda_graph_status_for(cfg);
-    result.cuda_graph = result.cuda_graph_active;
-
-    const int hs = config.hidden_size;
-    const int is = config.intermediate_size;
-    const int qp_dim = config.q_proj_dim();
-    const int kv_dim = config.kv_dim();
-    const int qk = config.lin_qk_dim();
-    const int lin_v = config.lin_v_dim();
-    const int nkh = config.linear_num_key_heads;
-    const int in_qkv = 2 * qk + lin_v;
-    const int nv = config.linear_num_value_heads;
-
-    int num_full_attn_layers = config.num_full_attn_layers();
-
-    // Count linear layers
-    int num_lin = 0;
-    for (int i = 0; i < config.num_hidden_layers; ++i)
-        if (!config.is_full_attention(i)) ++num_lin;
-
-    // Allocate KV cache
-    auto allocator = std::make_shared<core::UnifiedAllocator>();
-    cache::ModelCacheParams mcp;
-    mcp.num_full_attn_layers   = num_full_attn_layers;
-    mcp.num_kv_heads           = config.num_key_value_heads;
-    mcp.head_dim               = config.head_dim;
-    mcp.block_size             = 16;
-    mcp.num_linear_attn_layers = config.num_hidden_layers - num_full_attn_layers;
-    mcp.nkh                    = config.linear_num_key_heads;
-    mcp.kd                     = config.linear_key_head_dim;
-    mcp.v_per_kh               = config.lin_v_per_kh();
-    mcp.in_qkv                 = in_qkv;
-    mcp.conv_k_minus_1         = config.linear_conv_kernel_dim - 1;
-
-    cache::CacheConfig cache_cfg;
-    cache_cfg.kv_cache_budget_gb = cfg.kv_cache_gb;
-    auto capacity = cache::CapacityPlanner::plan(cache_cfg, mcp);
-    int num_kv_blocks = capacity.gpu_kv_blocks;
-
-    // Capacity check
-    int total_kv_tokens_needed = batch_size * (prompt_len + 1 + cfg.warmup_steps + cfg.decode_steps);
-    int total_kv_blocks_needed = (total_kv_tokens_needed + 15) / 16;
-    if (total_kv_blocks_needed > num_kv_blocks) {
-        printf("  ⚠ WARNING: need %d KV blocks but only have %d — results may be inaccurate\n",
-               total_kv_blocks_needed, num_kv_blocks);
-    }
-
-    auto kv_manager = std::make_unique<ops::KVCacheManager>(
-        num_kv_blocks, 16, config.num_key_value_heads, config.head_dim,
-        core::DataType::FP16, allocator, num_full_attn_layers);
-
-    // Allocate buffers
-    int total_decode_steps = cfg.warmup_steps + cfg.decode_steps;
-    int max_tokens = std::max(prompt_len + 64, batch_size);
-    int max_kv_blks_per_seq = ((prompt_len + 1 + total_decode_steps + 15) / 16) + 4;
-
-    __nv_bfloat16* d_hidden_states = nullptr;
-    int* d_pos_ids = nullptr;
-    int* d_block_tables = nullptr;
-    int* d_context_lens = nullptr;
-    int* d_argmax_result = nullptr;
-    __nv_bfloat16* d_workspace = nullptr;
-
-    cudaMalloc(&d_hidden_states, (size_t)max_tokens * hs * sizeof(__nv_bfloat16));
-    cudaMalloc(&d_pos_ids, (size_t)max_tokens * sizeof(int));
-    cudaMalloc(&d_block_tables, (size_t)batch_size * max_kv_blks_per_seq * sizeof(int));
-    cudaMalloc(&d_context_lens, (size_t)batch_size * sizeof(int));
-    cudaMallocManaged(&d_argmax_result, (size_t)batch_size * sizeof(int));
-
-    // Workspace sizing
-    size_t ws_full = (size_t)(4*hs + qp_dim + config.q_dim() + 2*kv_dim + 3*is);
-    size_t ws_linear = (size_t)(hs + in_qkv + lin_v + nv + qk + lin_v + hs + hs + 3*is + hs + nkh*2);
-    size_t ws_per_tok = std::max(ws_full, ws_linear);
-    size_t ws_total = ws_per_tok * max_tokens + (size_t)batch_size * config.vocab_size + (size_t)batch_size * hs;
-    cudaMalloc(&d_workspace, ws_total * sizeof(__nv_bfloat16));
-
-    // SSM/Conv states per request
-    size_t ssm_sz = (size_t)nkh * config.linear_key_head_dim * config.lin_v_per_kh() * sizeof(__nv_bfloat16);
-    size_t conv_sz = (size_t)in_qkv * (config.linear_conv_kernel_dim - 1) * sizeof(__nv_bfloat16);
-
-    std::vector<ReqCtx> requests(batch_size);
-    for (int b = 0; b < batch_size; ++b) {
-        requests[b].ssm_states.resize(num_lin);
-        requests[b].conv_states.resize(num_lin);
-        for (int li = 0; li < num_lin; ++li) {
-            cudaMalloc(&requests[b].ssm_states[li], ssm_sz);
-            cudaMemset(requests[b].ssm_states[li], 0, ssm_sz);
-            cudaMalloc(&requests[b].conv_states[li], conv_sz);
-            cudaMemset(requests[b].conv_states[li], 0, conv_sz);
-        }
-    }
-
-    // SSM/Conv pointer arrays
-    __nv_bfloat16** d_ssm_ptrs = nullptr;
-    __nv_bfloat16** d_conv_ptrs = nullptr;
-    cudaMallocManaged(&d_ssm_ptrs, (size_t)num_lin * batch_size * sizeof(__nv_bfloat16*));
-    cudaMallocManaged(&d_conv_ptrs, (size_t)num_lin * batch_size * sizeof(__nv_bfloat16*));
-    for (int li = 0; li < num_lin; ++li) {
-        for (int bi = 0; bi < batch_size; ++bi) {
-            d_ssm_ptrs[li * batch_size + bi] = requests[bi].ssm_states[li];
-            d_conv_ptrs[li * batch_size + bi] = requests[bi].conv_states[li];
-        }
-    }
-
-    // ---- Prefill warmup (1x, no timing) ----
-    {
-        int default_tokens[] = {248045, 846, 198, 3710, 369, 220, 17, 10, 17, 30,
-                                248046, 198, 248045, 74455, 198, 248068, 198};
-        std::vector<int> warm_tokens(prompt_len);
-        for (int i = 0; i < prompt_len; ++i)
-            warm_tokens[i] = (i < 17) ? default_tokens[i] : 1;
-
-        int num_blocks_needed = (prompt_len + 15) / 16;
-        auto btable = kv_manager->allocate_blocks(num_blocks_needed);
-        requests[0].block_table = btable;
-        requests[0].context_len = prompt_len;
-
-        cudaMemcpyAsync(d_pos_ids, warm_tokens.data(), prompt_len * sizeof(int),
-                        cudaMemcpyHostToDevice, stream);
-        ops::invoke_embedding_lookup(d_hidden_states, d_pos_ids, model->get_embed_tokens(),
-                                     prompt_len, hs, stream);
-        std::vector<int> pos_ids(prompt_len);
-        for (int i = 0; i < prompt_len; ++i) pos_ids[i] = i;
-        cudaMemcpyAsync(d_pos_ids, pos_ids.data(), prompt_len * sizeof(int),
-                        cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(d_block_tables, btable.data(),
-                        btable.size() * sizeof(int), cudaMemcpyHostToDevice, stream);
-        int cl = prompt_len;
-        cudaMemcpyAsync(d_context_lens, &cl, sizeof(int), cudaMemcpyHostToDevice, stream);
-
-        std::vector<__nv_bfloat16*> single_ssm(num_lin);
-        std::vector<__nv_bfloat16*> single_conv(num_lin);
-        for (int li = 0; li < num_lin; ++li) {
-            single_ssm[li] = requests[0].ssm_states[li];
-            single_conv[li] = requests[0].conv_states[li];
-        }
-
-        model->forward_prefill(d_hidden_states, d_pos_ids, *kv_manager,
-                       d_block_tables, d_context_lens,
-                       (int)btable.size(), cl, prompt_len,
-                       single_ssm.data(), single_conv.data(),
-                       d_workspace, stream);
-        cudaStreamSynchronize(stream);
-
-        // Release warmup blocks & reset states
-        kv_manager->free_blocks(btable);
-        for (int li = 0; li < num_lin; ++li) {
-            cudaMemset(requests[0].ssm_states[li], 0, ssm_sz);
-            cudaMemset(requests[0].conv_states[li], 0, conv_sz);
-        }
-    }
-
-    // ---- Prefill — measured (prefill_repeat × batch_size) ----
-    {
-        int default_tokens[] = {248045, 846, 198, 3710, 369, 220, 17, 10, 17, 30,
-                                248046, 198, 248045, 74455, 198, 248068, 198};
-        std::vector<int> prompt_tokens(prompt_len);
-        for (int i = 0; i < prompt_len; ++i)
-            prompt_tokens[i] = (i < 17) ? default_tokens[i] : 1;
-
-        EventTimer pf_embed, pf_forward, pf_lmhead, pf_total;
-
-        for (int rep = 0; rep < cfg.prefill_repeat; ++rep) {
-            for (int b = 0; b < batch_size; ++b) {
-                // Reset SSM/Conv state for clean measurement
-                for (int li = 0; li < num_lin; ++li) {
-                    cudaMemset(requests[b].ssm_states[li], 0, ssm_sz);
-                    cudaMemset(requests[b].conv_states[li], 0, conv_sz);
-                }
-
-                // Allocate KV blocks
-                int num_blocks_needed = (prompt_len + 15) / 16;
-                auto btable = kv_manager->allocate_blocks(num_blocks_needed);
-                requests[b].block_table = btable;
-                requests[b].context_len = prompt_len;
-
-                pf_total.record_start(stream);
-
-                // Embedding
-                pf_embed.record_start(stream);
-                cudaMemcpyAsync(d_pos_ids, prompt_tokens.data(), prompt_len * sizeof(int),
-                                cudaMemcpyHostToDevice, stream);
-                ops::invoke_embedding_lookup(d_hidden_states, d_pos_ids, model->get_embed_tokens(),
-                                             prompt_len, hs, stream);
-                std::vector<int> pos_ids(prompt_len);
-                for (int i = 0; i < prompt_len; ++i) pos_ids[i] = i;
-                cudaMemcpyAsync(d_pos_ids, pos_ids.data(), prompt_len * sizeof(int),
-                                cudaMemcpyHostToDevice, stream);
-                pf_embed.record_stop(stream);
-
-                // Block tables & context lens
-                cudaMemcpyAsync(d_block_tables, btable.data(),
-                                btable.size() * sizeof(int), cudaMemcpyHostToDevice, stream);
-                int cl = prompt_len;
-                cudaMemcpyAsync(d_context_lens, &cl, sizeof(int), cudaMemcpyHostToDevice, stream);
-
-                // Single-request state pointers
-                std::vector<__nv_bfloat16*> single_ssm(num_lin);
-                std::vector<__nv_bfloat16*> single_conv(num_lin);
-                for (int li = 0; li < num_lin; ++li) {
-                    single_ssm[li] = requests[b].ssm_states[li];
-                    single_conv[li] = requests[b].conv_states[li];
-                }
-
-                // Forward
-                pf_forward.record_start(stream);
-                model->forward_prefill(d_hidden_states, d_pos_ids, *kv_manager,
-                               d_block_tables, d_context_lens,
-                               (int)btable.size(), cl, prompt_len,
-                               single_ssm.data(), single_conv.data(),
-                               d_workspace, stream);
-                pf_forward.record_stop(stream);
-
-                // Fused Final norm + lm_head + argmax
-                pf_lmhead.record_start(stream);
-                __nv_bfloat16* logits_pf = d_workspace;
-                ops::invoke_dense_gemv_with_rmsnorm(
-                    d_hidden_states + (prompt_len - 1) * hs,
-                    model->get_norm_weight(), config.rms_norm_eps,
-                    model->get_lm_head(), logits_pf, config.vocab_size, hs, stream);
-                ops::invoke_argmax(logits_pf, d_argmax_result, config.vocab_size, stream);
-                pf_lmhead.record_stop(stream);
-
-                pf_total.record_stop(stream);
-                cudaStreamSynchronize(stream);
-
-                float ttft_ms  = pf_total.elapsed_ms();
-                float emb_ms   = pf_embed.elapsed_ms();
-                float fwd_ms   = pf_forward.elapsed_ms();
-                float lmh_ms   = pf_lmhead.elapsed_ms();
-
-                result.prefill_ttft.add(ttft_ms);
-                result.prefill_embed.add(emb_ms);
-                result.prefill_forward.add(fwd_ms);
-                result.prefill_lmhead.add(lmh_ms);
-
-                requests[b].last_token = *d_argmax_result;
-                requests[b].context_len++;
-
-                // Release blocks for next repeat (last repeat keeps them for decode)
-                if (rep < cfg.prefill_repeat - 1) {
-                    kv_manager->free_blocks(btable);
-                }
-            }
-        }
-    }
-
-    // ---- Decode benchmark ----
-    int total_steps = total_decode_steps;
-    const int fixed_max_blks = max_kv_blks_per_seq;
-
-    std::vector<int> h_token_ids(batch_size);
-    std::vector<int> h_pos_ids(batch_size);
-    std::vector<int> h_ctx_lens(batch_size);
-    std::vector<int> h_block_tables_flat(batch_size * fixed_max_blks, 0);
-
-    if (!cfg.no_graph) {
-        printf("    [graph] disabled: forward_decode has per-layer cudaStreamSynchronize, current path is not graph-safe\n");
-    }
-
-    __nv_bfloat16* norm_out_graph = d_workspace + ws_per_tok * max_tokens;
-    __nv_bfloat16* logits_graph = norm_out_graph + batch_size * hs;
-
-    EventTimer t_total, t_embed, t_forward, t_norm, t_lmhead, t_sample;
-
-    for (int step = 0; step < total_steps; ++step) {
-        bool is_warmup = (step < cfg.warmup_steps);
-
-        char nvtx_name[64];
-        snprintf(nvtx_name, sizeof(nvtx_name), "%s_step_%d", is_warmup ? "warmup" : "decode", step);
-        nvtx_push(nvtx_name);
-
-        // Assemble batch input
-        int max_ctx = 0;
-        for (int b = 0; b < batch_size; ++b) {
-            h_token_ids[b] = requests[b].last_token;
-            h_pos_ids[b] = requests[b].context_len - 1;
-            h_ctx_lens[b] = requests[b].context_len;
-            max_ctx = std::max(max_ctx, requests[b].context_len);
-        }
-
-        std::fill(h_block_tables_flat.begin(), h_block_tables_flat.end(), 0);
-        for (int b = 0; b < batch_size; ++b) {
-            for (int j = 0; j < (int)requests[b].block_table.size(); ++j) {
-                h_block_tables_flat[b * fixed_max_blks + j] = requests[b].block_table[j];
-            }
-        }
-
-        t_total.record_start(stream);
-
-        // Embedding
-        nvtx_push("embedding");
-        t_embed.record_start(stream);
-        cudaMemcpyAsync(d_pos_ids, h_token_ids.data(), batch_size * sizeof(int),
-                        cudaMemcpyHostToDevice, stream);
-        ops::invoke_embedding_lookup(d_hidden_states, d_pos_ids,
-                                     model->get_embed_tokens(), batch_size, hs, stream);
-        cudaMemcpyAsync(d_pos_ids, h_pos_ids.data(), batch_size * sizeof(int),
-                        cudaMemcpyHostToDevice, stream);
-        t_embed.record_stop(stream);
-        nvtx_pop();
-
-        // Upload block tables and context lens
-        cudaMemcpyAsync(d_block_tables, h_block_tables_flat.data(),
-                        batch_size * fixed_max_blks * sizeof(int),
-                        cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(d_context_lens, h_ctx_lens.data(), batch_size * sizeof(int),
-                        cudaMemcpyHostToDevice, stream);
-
-        // Forward
-        nvtx_push("forward");
-        t_forward.record_start(stream);
-        model->forward_decode(d_hidden_states, d_pos_ids, *kv_manager,
-                       d_block_tables, d_context_lens,
-                       fixed_max_blks, max_ctx,
-                       batch_size,
-                       d_ssm_ptrs, d_conv_ptrs,
-                       d_workspace, stream);
-        t_forward.record_stop(stream);
-        nvtx_pop();
-
-        // Fused Final Norm + LM Head (B=1: RMSNorm in SMEM → GEMV, B>1: separate)
-        nvtx_push("final_norm_lm_head");
-        t_norm.record_start(stream);
-        if (batch_size == 1) {
-            t_norm.record_stop(stream);  // norm time ≈ 0 (fused into lm_head)
-            t_lmhead.record_start(stream);
-            ops::invoke_dense_gemv_with_rmsnorm(
-                d_hidden_states, model->get_norm_weight(), config.rms_norm_eps,
-                model->get_lm_head(), logits_graph, config.vocab_size, hs, stream);
-            t_lmhead.record_stop(stream);
-        } else {
-            ops::invoke_rmsnorm(norm_out_graph, d_hidden_states, model->get_norm_weight(),
-                                config.rms_norm_eps, batch_size, hs, stream);
-            t_norm.record_stop(stream);
-            t_lmhead.record_start(stream);
-            ops::invoke_dense_gemm(norm_out_graph, model->get_lm_head(), logits_graph,
-                                   batch_size, config.vocab_size, hs, stream);
-            t_lmhead.record_stop(stream);
-        }
-        nvtx_pop();
-
-        // Argmax
-        nvtx_push("sample");
-        t_sample.record_start(stream);
-        ops::invoke_batched_argmax(logits_graph, d_argmax_result, config.vocab_size,
-                                   batch_size, stream);
-        t_sample.record_stop(stream);
-        nvtx_pop();
-
-        t_total.record_stop(stream);
-        float ms_total   = t_total.elapsed_ms();
-        float ms_embed   = t_embed.elapsed_ms();
-        float ms_forward = t_forward.elapsed_ms();
-        float ms_norm    = t_norm.elapsed_ms();
-        float ms_lmhead  = t_lmhead.elapsed_ms();
-        float ms_sample  = t_sample.elapsed_ms();
-
-        // Update request state
-        for (int b = 0; b < batch_size; ++b) {
-            requests[b].last_token = d_argmax_result[b];
-            requests[b].context_len++;
-            if (requests[b].context_len > (int)requests[b].block_table.size() * 16) {
-                auto new_blks = kv_manager->allocate_blocks(1);
-                if (!new_blks.empty()) requests[b].block_table.push_back(new_blks[0]);
-            }
-        }
-
-        if (!is_warmup) {
-            result.decode_total.add(ms_total);
-            result.decode_forward.add(ms_forward);
-            result.decode_embed.add(ms_embed);
-            result.decode_norm.add(ms_norm);
-            result.decode_lmhead.add(ms_lmhead);
-            result.decode_sample.add(ms_sample);
-        }
-
-        if (cfg.per_step || is_warmup) {
-            printf("    [%s %3d] total=%7.2f  fwd=%7.2f  embed=%5.2f  norm=%5.2f  "
-                   "lm=%7.2f  sample=%5.2f  tok=%d\n",
-                   is_warmup ? "warmup" : "decode", step, ms_total, ms_forward, ms_embed,
-                   ms_norm, ms_lmhead, ms_sample, requests[0].last_token);
-        }
-
-        nvtx_pop(); // step
-    }
-
-    // ---- Cleanup ----
-    for (auto& req : requests) {
-        for (auto* p : req.ssm_states)  cudaFree(p);
-        for (auto* p : req.conv_states) cudaFree(p);
-    }
-    cudaFree(d_ssm_ptrs);
-    cudaFree(d_conv_ptrs);
-    cudaFree(d_hidden_states);
-    cudaFree(d_pos_ids);
-    cudaFree(d_workspace);
-    cudaFree(d_block_tables);
-    cudaFree(d_context_lens);
-    cudaFree(d_argmax_result);
-
-    return result;
-}
-
-// ============================================================================
-// 打印单次结果 (紧凑格式)
-// ============================================================================
-static void print_single_result(const BenchResult& r) {
-    float itl = r.decode_total.median();
-    float itl_ci = r.decode_total.ci95();
-    float itl_cv = r.decode_total.cv_pct();
-    float decode_tps = (itl > 0) ? (float)r.batch_size * 1000.0f / itl : 0;
-    float bw = (itl > 0 && r.bandwidth_valid) ? r.weight_bytes / (itl / 1000.0f) / 1e9f : 0;
-    float ttft = r.prefill_ttft.median();
-    float ttft_ci = r.prefill_ttft.ci95();
-    float prefill_tps = (ttft > 0) ? (float)r.prompt_len * 1000.0f / ttft : 0;
-
-    printf("    ┌────────────────────────────────────────────────────────────┐\n");
-    printf("    │ B=%-3d  prompt=%-5d  iter=%d  graph=%s  steps=%d+%d        │\n",
-           r.batch_size, r.prompt_len, r.iteration,
-           r.cuda_graph ? "ON " : "OFF", r.warmup_steps, r.decode_steps);
-    printf("    ├────────────────────────────────────────────────────────────┤\n");
-        printf("    │ Single-req TTFT: %6.1f ms ±%.1f  (N=%d, CV=%.1f%%)       │\n",
-           ttft, ttft_ci, r.prefill_ttft.count(), r.prefill_ttft.cv_pct());
-        printf("    │        prefill tok/s: %.0f  (serialized across batch)     │\n", prefill_tps);
-    printf("    │        embed=%.1fms  fwd=%.1fms  lmhead=%.1fms             │\n",
-           r.prefill_embed.median(), r.prefill_forward.median(), r.prefill_lmhead.median());
-    printf("    │ ITL:   %7.2f ms ±%.2f  (N=%d, CV=%.1f%%)                 │\n",
-           itl, itl_ci, r.decode_total.count(), itl_cv);
-    printf("    │        p95=%.2f  p99=%.2f  trimmed=%.2f                   │\n",
-           r.decode_total.p95(), r.decode_total.p99(), r.decode_total.trimmed_mean());
-        if (r.bandwidth_valid) {
-         printf("    │ Decode tok/s: %.2f   BW: %.1f GB/s (peak=273)             │\n",
-             decode_tps, bw);
-        } else {
-         printf("    │ Decode tok/s: %.2f   BW: N/A (quantized weight path)      │\n",
-             decode_tps);
-        }
-        if (r.decode_phase_aggregated) {
-         printf("    │ Phase:  graph_body=%.2f  embed=%.2f  mode=aggregated      │\n",
-             r.decode_forward.median(), r.decode_embed.median());
-        } else {
-         printf("    │ Phase:  fwd=%.2f  embed=%.2f  norm=%.2f  lm=%.2f  samp=%.2f│\n",
-             r.decode_forward.median(), r.decode_embed.median(), r.decode_norm.median(),
-             r.decode_lmhead.median(), r.decode_sample.median());
-        }
-    printf("    └────────────────────────────────────────────────────────────┘\n");
-}
-
-// ============================================================================
-// 打印扫描结果汇总表
-// ============================================================================
-static void print_sweep_summary(const std::vector<BenchResult>& results, size_t weight_bytes) {
-    if (results.size() <= 1) return;
-
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════════════════════════╗\n");
-    printf("║  Sweep Summary                                                             ║\n");
-    printf("╠═══════╦═══════╦═══════╦══════════╦════════╦════════╦═══════╦═══════╦════════╣\n");
-    printf("║ Batch ║Prompt ║ Iter  ║S-TTFT(ms)║ITL(ms) ║tok/s   ║BW GB/s║CV(%%) ║±CI95ms║\n");
-    printf("╠═══════╬═══════╬═══════╬══════════╬════════╬════════╬═══════╬═══════╬════════╣\n");
-
-    for (const auto& r : results) {
-        float itl = r.decode_total.median();
-        float tps = (itl > 0) ? (float)r.batch_size * 1000.0f / itl : 0;
-        float bw = (itl > 0 && r.bandwidth_valid) ? r.weight_bytes / (itl / 1000.0f) / 1e9f : -1.0f;
-        float ttft = r.prefill_ttft.median();
-
-        if (r.bandwidth_valid) {
-            printf("║ %5d ║ %5d ║ %5d ║ %8.1f ║%7.2f ║%7.2f ║%6.1f ║%5.1f ║ %5.2f ║\n",
-                   r.batch_size, r.prompt_len, r.iteration,
-                   ttft, itl, tps, bw, r.decode_total.cv_pct(), r.decode_total.ci95());
-        } else {
-            printf("║ %5d ║ %5d ║ %5d ║ %8.1f ║%7.2f ║%7.2f ║   N/A ║%5.1f ║ %5.2f ║\n",
-                   r.batch_size, r.prompt_len, r.iteration,
-                   ttft, itl, tps, r.decode_total.cv_pct(), r.decode_total.ci95());
-        }
-    }
-
-    printf("╚═══════╩═══════╩═══════╩══════════╩════════╩════════╩═══════╩═══════╩════════╝\n");
-}
-
-// ============================================================================
-// CSV 输出
-// ============================================================================
-static void print_csv(const std::vector<BenchResult>& results) {
-    printf("\n--- CSV ---\n");
-    printf("batch_size,prompt_len,iteration,prefill_mode,decode_phase_mode,"
-        "single_req_ttft_median_ms,single_req_ttft_ci95_ms,single_req_ttft_cv_pct,"
-        "single_req_prefill_tok_per_sec,itl_median_ms,itl_p95_ms,itl_p99_ms,itl_ci95_ms,itl_cv_pct,"
-        "itl_trimmed_mean_ms,decode_tok_per_sec,bw_GBs,weight_bf16_estimate_MB,"
-        "graph_or_forward_ms,embed_ms,norm_ms,lmhead_ms,sample_ms\n");
-
-    for (const auto& r : results) {
-        float itl = r.decode_total.median();
-        float tps = (itl > 0) ? (float)r.batch_size * 1000.0f / itl : 0;
-     float bw = (itl > 0 && r.bandwidth_valid) ? r.weight_bytes / (itl / 1000.0f) / 1e9f : -1.0f;
-        float ttft = r.prefill_ttft.median();
-        float prefill_tps = (ttft > 0) ? (float)r.prompt_len * 1000.0f / ttft : 0;
-
-     printf("%d,%d,%d,%s,%s,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,",
-               r.batch_size, r.prompt_len, r.iteration,
-         r.prefill_serialized ? "serialized_single_request" : "batched",
-         decode_phase_mode_label(r),
-         ttft, r.prefill_ttft.ci95(), r.prefill_ttft.cv_pct(),
-               prefill_tps,
-               itl, r.decode_total.p95(), r.decode_total.p99(),
-         r.decode_total.ci95(), r.decode_total.cv_pct(), r.decode_total.trimmed_mean(),
-         tps);
-     if (r.bandwidth_valid) printf("%.1f,", bw);
-     else printf("N/A,");
-     printf("%.1f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
-         r.weight_bytes / 1e6f,
-         r.decode_forward.median(), r.decode_embed.median(),
-         r.decode_norm.median(), r.decode_lmhead.median(), r.decode_sample.median());
-    }
-}
-
-// ============================================================================
 // 主程序
 // ============================================================================
 int run_benchmark(int argc, char** argv) {
-    BenchConfig cfg = parse_args(argc, argv);
-    g_nvtx_enabled = cfg.nsys_mode;
+    BenchConfig cfg = parse_bench_args(argc, argv);
 
-    cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+    int total_configs = (int)cfg.prompt_lens.size() * cfg.iterations;
+    int total_requests = cfg.warmup_requests + total_configs;
 
-    int total_configs = (int)cfg.batch_sizes.size() * (int)cfg.prompt_lens.size() * cfg.iterations;
-
-    std::cout << "========================================\n"
-              << "  Qwen3.5 Benchmark (SM110 Thor)\n"
-              << "========================================\n"
-              << "  Warmup steps  : " << cfg.warmup_steps << "\n"
-              << "  Decode steps  : " << cfg.decode_steps  << "\n"
-              << "  Prompt lens   : ";
+    printf("========================================\n");
+    printf("  Qwen3.5 Engine Benchmark\n");
+    printf("========================================\n");
+    printf("  Prompt lens   : ");
     for (size_t i = 0; i < cfg.prompt_lens.size(); ++i)
-        std::cout << (i ? "," : "") << cfg.prompt_lens[i];
-    std::cout << "\n"
-              << "  Batch sizes   : ";
-    for (size_t i = 0; i < cfg.batch_sizes.size(); ++i)
-        std::cout << (i ? "," : "") << cfg.batch_sizes[i];
-    std::cout << "\n"
-              << "  Iterations    : " << cfg.iterations << "\n"
-              << "  Prefill repeat: " << cfg.prefill_repeat << "\n"
-              << "  KV Cache GB   : " << cfg.kv_cache_gb   << "\n"
-              << "  CUDA Graph req: " << (cfg.no_graph ? "OFF" : "ON") << "\n"
-              << "  CUDA Graph act: OFF (decode path not graph-safe)\n"
-              << "  NVTX markers  : " << (cfg.nsys_mode ? "ON" : "OFF") << "\n"
-              << "  Total configs : " << total_configs << "\n"
-              << "  JSON output   : " << (cfg.json_output.empty() ? "(none)" : cfg.json_output) << "\n"
-              << "========================================\n\n";
+        printf("%s%d", i ? "," : "", cfg.prompt_lens[i]);
+    printf("\n");
+    printf("  Max tokens    : %d\n", cfg.max_tokens);
+    printf("  Iterations    : %d\n", cfg.iterations);
+    printf("  Warmup reqs   : %d\n", cfg.warmup_requests);
+    printf("  Temperature   : %.2f%s\n", cfg.temperature, cfg.temperature == 0 ? " (greedy)" : "");
+    printf("  Seed          : %lld\n", (long long)cfg.seed);
+    printf("  Total requests: %d (%d warmup + %d measured)\n",
+           total_requests, cfg.warmup_requests, total_configs);
+    printf("  JSON output   : %s\n", cfg.json_output.empty() ? "(none)" : cfg.json_output.c_str());
+    printf("========================================\n\n");
 
     // ========================================================================
-    // 1. Load model (once)
+    // 1. 初始化 Engine
     // ========================================================================
-    nvtx_push("model_init");
-    core::Qwen35Config config;
-    config.model_dir = cfg.model_dir;
-    config.load_from_model_dir(cfg.model_dir);
+    printf("[1/3] Initializing engine...\n");
+    BackendConfig bcfg = build_backend_config(cfg);
+    InferenceBackend backend(bcfg);
+    backend.start();
+    printf("      Engine ready.\n\n");
 
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-
-    std::cout << "[1/3] Loading model weights...\n";
-    auto model = std::make_unique<core::Qwen35Model>(config);
-    model->load_weights(cfg.model_dir);
-    std::cout << "      Model loaded. (hidden=" << config.hidden_size
-              << " layers=" << config.num_hidden_layers
-              << " vocab=" << config.vocab_size << ")\n";
-
-    // L2 Cache Persistence
-    {
-        cudaDeviceProp prop;
-        cudaGetDeviceProperties(&prop, 0);
-        if (prop.persistingL2CacheMaxSize > 0) {
-            size_t persist_size = std::min((size_t)4 * 1024 * 1024, (size_t)prop.persistingL2CacheMaxSize);
-            cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist_size);
-
-            auto set_persist = [&](const void* ptr, size_t bytes) {
-                if (!ptr || bytes == 0) return;
-                cudaStreamAttrValue attr = {};
-                attr.accessPolicyWindow.base_ptr  = const_cast<void*>(ptr);
-                attr.accessPolicyWindow.num_bytes  = bytes;
-                attr.accessPolicyWindow.hitRatio   = 1.0f;
-                attr.accessPolicyWindow.hitProp    = cudaAccessPropertyPersisting;
-                attr.accessPolicyWindow.missProp   = cudaAccessPropertyStreaming;
-                cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
-            };
-
-            size_t norm_bytes = config.hidden_size * sizeof(__nv_bfloat16);
-            set_persist(model->get_norm_weight(), norm_bytes);
-            std::cout << "      L2 Cache Persistence: " << persist_size / 1024 << " KB\n";
+    // ========================================================================
+    // 2. Warmup
+    // ========================================================================
+    uint64_t next_id = 1;
+    if (cfg.warmup_requests > 0) {
+        printf("[2/3] Warmup (%d request%s)...\n",
+               cfg.warmup_requests, cfg.warmup_requests > 1 ? "s" : "");
+        for (int w = 0; w < cfg.warmup_requests; ++w) {
+            int wpl = cfg.prompt_lens[0];
+            auto r = run_single_request(backend, cfg, wpl, next_id++);
+            printf("      Warmup %d: TTFT=%.1fms, %d tokens, %.1f tok/s\n",
+                   w + 1, r.ttft_ms, r.total_tokens, r.gen_tps);
         }
-    }
-    nvtx_pop();
-
-    bool model_has_quantized_weights = false;
-    for (int layer_idx = 0; layer_idx < model->num_layers(); ++layer_idx) {
-        if (model->get_layer(layer_idx).is_quantized()) {
-            model_has_quantized_weights = true;
-            break;
-        }
-    }
-
-    // Compute total weight bytes
-    const int hs = config.hidden_size;
-    const int is_dim = config.intermediate_size;
-    const int qp_dim = config.q_proj_dim();
-    const int kv_dim = config.kv_dim();
-    const int qk = config.lin_qk_dim();
-    const int lin_v = config.lin_v_dim();
-    const int nkh = config.linear_num_key_heads;
-    const int in_qkv = 2 * qk + lin_v;
-    const int nv = config.linear_num_value_heads;
-    int num_full_attn_layers = config.num_full_attn_layers();
-    int n_linear_layers = config.num_hidden_layers - num_full_attn_layers;
-
-    // MLP weight params per layer: MoE vs dense
-    size_t mlp_params_per_layer;
-    if (config.is_moe) {
-        const int moe_is = config.moe_intermediate_size;
-        const int shared_is = config.shared_expert_intermediate_size;
-        const int top_k = config.num_experts_per_tok;
-        const int E = config.num_experts;
-        // Per-step reads: router (full) + top_k active experts + shared expert
-        mlp_params_per_layer = (size_t)E * hs                           // router
-                             + (size_t)top_k * 2 * moe_is * hs          // expert gate+up
-                             + (size_t)top_k * hs * moe_is              // expert down
-                             + (size_t)2 * shared_is * hs               // shared gate+up
-                             + (size_t)hs * shared_is                   // shared down
-                             + (size_t)hs;                              // shared_expert_gate
-    } else {
-        mlp_params_per_layer = (size_t)is_dim * hs + is_dim * hs + hs * is_dim;
-    }
-
-    size_t la_attn_params = (size_t)in_qkv * hs + (lin_v + 2*nv) * hs + hs * lin_v;
-    size_t fa_attn_params = (size_t)(qp_dim + 2*kv_dim) * hs + hs * config.q_dim();
-    size_t la_params = la_attn_params + mlp_params_per_layer;
-    size_t fa_params = fa_attn_params + mlp_params_per_layer;
-    size_t total_weight_bytes = (n_linear_layers * la_params + num_full_attn_layers * fa_params
-                                 + (size_t)config.vocab_size * hs) * 2;
-
-    if (model_has_quantized_weights) {
-        printf("      Weight size estimate: %.1f MB (dense BF16 equivalent, bandwidth disabled)\n\n",
-               (float)total_weight_bytes / 1e6);
-    } else if (config.is_moe) {
-        printf("      Weight size estimate: %.1f MB (MoE per-step active weights, top-%d of %d experts)\n\n",
-               (float)total_weight_bytes / 1e6, config.num_experts_per_tok, config.num_experts);
-    } else {
-        printf("      Weight size estimate: %.1f MB (dense BF16 path)\n\n",
-               (float)total_weight_bytes / 1e6);
+        printf("\n");
     }
 
     // ========================================================================
-    // 2. Run sweep
+    // 3. Measured runs
     // ========================================================================
-    std::vector<BenchResult> all_results;
-    int config_idx = 0;
+    printf("[3/3] Measuring...\n\n");
+
+    std::vector<AggResult> agg_results;
 
     for (int pl : cfg.prompt_lens) {
-        for (int bs : cfg.batch_sizes) {
-            for (int iter = 0; iter < cfg.iterations; ++iter) {
-                config_idx++;
-                printf("[2/3] Config %d/%d: B=%d, prompt=%d, iter=%d/%d\n",
-                       config_idx, total_configs, bs, pl, iter + 1, cfg.iterations);
+        AggResult agg;
+        agg.prompt_len = pl;
+        agg.iterations = cfg.iterations;
+        agg.max_tokens = cfg.max_tokens;
 
-                auto result = run_single_bench(cfg, config, model.get(), stream,
-                                               bs, pl, iter + 1, total_weight_bytes,
-                                               !model_has_quantized_weights);
+        for (int iter = 0; iter < cfg.iterations; ++iter) {
+            auto r = run_single_request(backend, cfg, pl, next_id++);
 
-                print_single_result(result);
-                all_results.push_back(std::move(result));
-            }
+            agg.ttft.add(r.ttft_ms);
+            agg.gen_tps.add(r.gen_tps);
+            agg.total_tokens.add((float)r.total_tokens);
+            agg.total_ms.add(r.total_ms);
+
+            printf("    [prompt=%d iter=%d] TTFT=%.1fms  gen=%.1f tok/s  "
+                   "tokens=%d  total=%.0fms\n",
+                   pl, iter + 1, r.ttft_ms, r.gen_tps, r.total_tokens, r.total_ms);
         }
+
+        agg_results.push_back(std::move(agg));
     }
 
     // ========================================================================
-    // 3. Summary
+    // 4. Summary
     // ========================================================================
-    std::cout << "\n[3/3] Results\n";
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════════════════════╗\n");
+    printf("║  Engine Benchmark Summary                                                  ║\n");
+    printf("║  MTP: %-6s  chunk: %-5d  temp: %.1f  seed: %-6lld  max_tokens: %-4d     ║\n",
+           bcfg.mtp_mode.c_str(), bcfg.max_chunk_size, cfg.temperature,
+           (long long)cfg.seed, cfg.max_tokens);
+    printf("╠═══════╦════════════════════╦══════════════════╦════════╦════════╦═══════════╣\n");
+    printf("║Prompt ║  TTFT (ms)         ║  Gen tok/s       ║ Tokens ║Time ms║ Iters     ║\n");
+    printf("║       ║  med    ±ci95  cv%%  ║  med    ±ci95    ║  med   ║  med  ║           ║\n");
+    printf("╠═══════╬════════════════════╬══════════════════╬════════╬════════╬═══════════╣\n");
 
-    if (all_results.size() == 1) {
-        // Single config — detailed output (backward compatible)
-        const auto& r = all_results[0];
-        float itl = r.decode_total.median();
-        float itl_p95 = r.decode_total.p95();
-        float itl_p99 = r.decode_total.p99();
-        float decode_tps = (float)r.batch_size * 1000.0f / itl;
-        float decode_tps_mean = (float)r.batch_size * 1000.0f / r.decode_total.mean();
-        float bw_median = (r.bandwidth_valid && itl > 0) ? r.weight_bytes / (itl / 1000.0f) / 1e9f : 0;
-        float bw_mean = (r.bandwidth_valid && r.decode_total.mean() > 0) ? r.weight_bytes / (r.decode_total.mean() / 1000.0f) / 1e9f : 0;
-        float ttft = r.prefill_ttft.median();
-        float ttft_p95 = r.prefill_ttft.p95();
-        float ttft_p99 = r.prefill_ttft.p99();
-        float prefill_tps = (float)r.prompt_len * 1000.0f / ttft;
+    for (const auto& r : agg_results) {
+        printf("║ %5d ║ %6.1f ±%5.1f %4.1f%% ║ %6.1f ±%5.2f    ║ %5.0f  ║%6.0f ║ %4d      ║\n",
+               r.prompt_len,
+               r.ttft.median(), r.ttft.ci95(), r.ttft.cv_pct(),
+               r.gen_tps.median(), r.gen_tps.ci95(),
+               r.total_tokens.median(),
+               r.total_ms.median(),
+               r.iterations);
+    }
 
+    printf("╚═══════╩════════════════════╩══════════════════╩════════╩════════╩═══════════╝\n");
+
+    // 单配置时打印详细信息
+    if (agg_results.size() == 1 && agg_results[0].ttft.count() >= 1) {
+        const auto& r = agg_results[0];
         printf("\n");
         printf("╔══════════════════════════════════════════════════════════════════╗\n");
-        printf("║        Standard LLM Inference Metrics (batch=%d, prompt=%d)  ║\n", r.batch_size, r.prompt_len);
+        printf("║  Detailed Results (prompt=%d, max_tokens=%d)                ║\n",
+               r.prompt_len, r.max_tokens);
         printf("╠══════════════════════════════════════════════════════════════════╣\n");
         printf("║                                                                ║\n");
-        printf("║  ▸ Single-Request TTFT                                          ║\n");
+        printf("║  ▸ TTFT (Time to First Token)                                  ║\n");
         printf("║      Median:  %8.1f ms ±%.1f  (N=%d, CV=%.1f%%)               ║\n",
-               ttft, r.prefill_ttft.ci95(), r.prefill_ttft.count(), r.prefill_ttft.cv_pct());
-        printf("║      P95:     %8.1f ms                                      ║\n", ttft_p95);
-        printf("║      P99:     %8.1f ms                                      ║\n", ttft_p99);
+               r.ttft.median(), r.ttft.ci95(), r.ttft.count(), r.ttft.cv_pct());
+        if (r.ttft.count() > 1) {
+            printf("║      P95:     %8.1f ms                                      ║\n", r.ttft.p95());
+            printf("║      Min:     %8.1f ms  Max: %.1f ms                        ║\n",
+                   r.ttft.min_val(), r.ttft.max_val());
+        }
         printf("║                                                                ║\n");
-         printf("║  ▸ Prefill Throughput                                          ║\n");
-         printf("║      Single-req tok/s: %7.0f  (%d tokens / %.1f ms)            ║\n",
-               prefill_tps, r.prompt_len, ttft);
-         printf("║      Mode: serialized per request across batch                 ║\n");
-        printf("║      Breakdown:  embed=%.1fms  fwd=%.1fms  lmhead=%.1fms       ║\n",
-               r.prefill_embed.median(), r.prefill_forward.median(),
-               r.prefill_lmhead.median());
+        printf("║  ▸ Generation Throughput (first → last token)                  ║\n");
+        printf("║      Median:  %8.1f tok/s ±%.2f (N=%d, CV=%.1f%%)             ║\n",
+               r.gen_tps.median(), r.gen_tps.ci95(), r.gen_tps.count(), r.gen_tps.cv_pct());
+        if (r.gen_tps.count() > 1) {
+            printf("║      Min:     %8.1f tok/s  Max: %.1f tok/s                   ║\n",
+                   r.gen_tps.min_val(), r.gen_tps.max_val());
+        }
         printf("║                                                                ║\n");
-        printf("║  ▸ ITL (Inter-Token Latency) — Decode                         ║\n");
-        printf("║      Median:  %8.2f ms ±%.2f  (N=%d, CV=%.1f%%)              ║\n",
-               itl, r.decode_total.ci95(), r.decode_total.count(), r.decode_total.cv_pct());
-        printf("║      P95:     %8.2f ms                                      ║\n", itl_p95);
-        printf("║      P99:     %8.2f ms                                      ║\n", itl_p99);
-        printf("║      Trimmed: %8.2f ms (10%% trim)                           ║\n",
-               r.decode_total.trimmed_mean());
+        printf("║  ▸ Total                                                       ║\n");
+        printf("║      Tokens:  %8.0f (median per request)                    ║\n",
+               r.total_tokens.median());
+        printf("║      Time:    %8.0f ms (median per request)                 ║\n",
+               r.total_ms.median());
         printf("║                                                                ║\n");
-        printf("║  ▸ Decode Throughput                                           ║\n");
-        printf("║      tok/s (median): %8.2f  (%d tok/step)                    ║\n",
-               decode_tps, r.batch_size);
-        printf("║      tok/s (mean):   %8.2f                                   ║\n", decode_tps_mean);
-        printf("║                                                                ║\n");
-        printf("║  ▸ Memory Bandwidth                                           ║\n");
-         if (r.bandwidth_valid) {
-             printf("║      Weight BW (median): %6.1f GB/s  (peak=273 GB/s)         ║\n", bw_median);
-             printf("║      Weight BW (mean):   %6.1f GB/s                          ║\n", bw_mean);
-         } else {
-             printf("║      Weight BW:         N/A  (quantized weight path)         ║\n");
-             printf("║      Mean BW:           N/A                                  ║\n");
-         }
-         printf("║      Weight estimate:   %6.1f MB (per-step active weights)   ║\n",
-             r.weight_bytes / 1e6f);
-        printf("║                                                                ║\n");
-        printf("╠══════════════════════════════════════════════════════════════════╣\n");
-        printf("║  Decode Phase Breakdown                                        ║\n");
-        printf("║  ┌──────────┬────────┬────────┬────────┬───────┬──────┐        ║\n");
-        printf("║  │ Phase    │Mean ms │Med  ms │Min  ms │Max ms │ P95  │        ║\n");
-        printf("║  ├──────────┼────────┼────────┼────────┼───────┼──────┤        ║\n");
-        printf("║  │ Total    │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
-               r.decode_total.mean(), r.decode_total.median(), r.decode_total.min_val(),
-               r.decode_total.max_val(), r.decode_total.p95());
-         printf("║  │ Embed    │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
-             r.decode_embed.mean(), r.decode_embed.median(), r.decode_embed.min_val(),
-             r.decode_embed.max_val(), r.decode_embed.p95());
-         if (r.decode_phase_aggregated) {
-             printf("║  │ GraphBody│%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
-                 r.decode_forward.mean(), r.decode_forward.median(), r.decode_forward.min_val(),
-                 r.decode_forward.max_val(), r.decode_forward.p95());
-             printf("║  │ Norm     │   N/A  │   N/A  │   N/A  │  N/A  │  N/A │        ║\n");
-             printf("║  │ LM Head  │   N/A  │   N/A  │   N/A  │  N/A  │  N/A │        ║\n");
-             printf("║  │ Sample   │   N/A  │   N/A  │   N/A  │  N/A  │  N/A │        ║\n");
-         } else {
-             printf("║  │ Forward  │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
-                 r.decode_forward.mean(), r.decode_forward.median(), r.decode_forward.min_val(),
-                 r.decode_forward.max_val(), r.decode_forward.p95());
-             printf("║  │ Norm     │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
-                 r.decode_norm.mean(), r.decode_norm.median(), r.decode_norm.min_val(),
-                 r.decode_norm.max_val(), r.decode_norm.p95());
-             printf("║  │ LM Head  │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
-                 r.decode_lmhead.mean(), r.decode_lmhead.median(), r.decode_lmhead.min_val(),
-                 r.decode_lmhead.max_val(), r.decode_lmhead.p95());
-             printf("║  │ Sample   │%7.2f │%7.2f │%7.2f │%6.1f │%5.1f │        ║\n",
-                 r.decode_sample.mean(), r.decode_sample.median(), r.decode_sample.min_val(),
-                 r.decode_sample.max_val(), r.decode_sample.p95());
-         }
-        printf("║  └──────────┴────────┴────────┴────────┴───────┴──────┘        ║\n");
-         printf("║  Config: %d warmup + %d decode steps, CUDA Graph: %s           ║\n",
-             r.warmup_steps, r.decode_steps, r.cuda_graph ? "ON" : "OFF");
-         printf("║  Decode phase mode: %-42s║\n", decode_phase_mode_label(r));
-        printf("║  Prefill: %d repeats, N=%d total measurements                  ║\n",
-               cfg.prefill_repeat, r.prefill_ttft.count());
         printf("╚══════════════════════════════════════════════════════════════════╝\n");
     }
 
-    // Sweep summary table (always, if >1 config)
-    print_sweep_summary(all_results, total_weight_bytes);
-
-    // CSV output
-    if (cfg.csv_output) {
-        print_csv(all_results);
-    }
-
-    // JSON output
+    // JSON 输出
     if (!cfg.json_output.empty()) {
-        write_json(cfg.json_output, all_results, cfg, config);
+        write_json(cfg.json_output, agg_results, cfg, bcfg);
     }
 
     // ========================================================================
     // Cleanup
     // ========================================================================
-    cudaStreamDestroy(stream);
+    backend.stop();
 
     return 0;
 }
