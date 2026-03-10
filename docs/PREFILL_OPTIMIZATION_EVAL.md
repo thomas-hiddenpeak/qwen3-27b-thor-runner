@@ -143,22 +143,11 @@ per KV group (4 groups):
 
 **工作量**: 低。~1 天。
 
-#### ④ cuBLAS → CUTLASS 切换阈值调优
+#### ④ cuBLAS → CUTLASS 切换阈值调优 ✅ 已完成
 
-**现状**: M < 128 全部走 cuBLAS, M ≥ 128 走 CUTLASS。但 CUTLASS SM110 的 TileShape=128×128×64, 理论上 M=64 也可以 (1 个 M tile)。
+**现状**: ✅ 已实现。M≥17 全部走 CUTLASS (M pad 到 8 对齐), 消除了 M=17-31 的 cuBLAS shortcut。
 
-**方案**: 
-- 尝试降低 CUTLASS 阈值到 M=64
-- 或为 M=32-127 实现专用 TileShape (如 64×128×64)
-- 对齐 M padding 策略
-
-**预期收益**:
-- 可能在 M=64-127 范围获得 10-20% GEMM 加速
-- T=64-128 forward: ~5-10ms 改善
-
-**风险**: 中。CUTLASS 对小 M 的 TMA 描述符创建可能失败 (已有 guard)。
-
-**工作量**: 中。需要测试多种 TileShape 配置。
+**实际收益**: T=17 TTFT 343.8→230.7ms (**-32.9%**), T=24 TTFT 332.7→225.2ms (**-32.3%**)。远超原预估的 -2~5%。cuBLAS 对小 M 的带宽利用率仅 ~50%, CUTLASS 通过编译期 TileShape 和 TMA 描述符达到 84-86%。
 
 ### 3.3 低收益 — 不推荐当前投入
 
@@ -276,7 +265,7 @@ engine.cpp::process_request()
 | P0 | 扩展 multi-row GEMV (M=9-64) | -15~25% (T≤64) | 中 | 中 |
 | P1 | Fused flash attention | -2~5% (T≥256) | 中 | 低-中 |
 | P2 | A+B 投影超级合并 (T>1) | -0.5~1% | 低 | 低 |
-| P3 | CUTLASS 切换阈值调优 | -2~5% (M=64-127) | 中 | 中 |
+| P3 | CUTLASS 接管 M=17-31 | **-32.9%** (T=17) | 中 | 低 | ✅ 完成 |
 
 ### 关键结论
 

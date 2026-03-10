@@ -334,22 +334,8 @@ void invoke_dense_gemm(
         }
         return;
     }
-    // M=17-127: cuBLAS (CUTLASS TMA requires M_padded ≥ 64)
-    if (M > 16 && M < 128) {
-        auto h = get_cublas_handle();
-        cublasSetStream(h, stream);
-        float alpha = 1.0f, beta_val = 0.0f;
-        cublasGemmEx(h,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            N, M, K,
-            &alpha,
-            B, CUDA_R_16BF, K,
-            A, CUDA_R_16BF, K,
-            &beta_val,
-            C, CUDA_R_16BF, N,
-            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
-        return;
-    }
+    // M≥17: 尝试 CUTLASS (can_implement 失败自动回退 cuBLAS)
+    // M=17-31 需要 8-aligned padding (17→24, 24→24, 31→32)
 
     // M padding to 8-aligned (required by CUTLASS tensor core)
     int M_padded = M;
@@ -542,26 +528,7 @@ void invoke_dense_gemm_add(
         }
         return;
     }
-    // M=17-127: cuBLAS with residual add
-    if (M > 16 && M < 128) {
-        auto h = get_cublas_handle();
-        cublasSetStream(h, stream);
-        if (D != residual) {
-            cudaMemcpyAsync(D, residual, (size_t)M * N * sizeof(__nv_bfloat16),
-                            cudaMemcpyDeviceToDevice, stream);
-        }
-        float alpha = 1.0f, beta_val = 1.0f;
-        cublasGemmEx(h,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            N, M, K,
-            &alpha,
-            B, CUDA_R_16BF, K,
-            A, CUDA_R_16BF, K,
-            &beta_val,
-            D, CUDA_R_16BF, N,
-            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
-        return;
-    }
+    // M≥17: 尝试 CUTLASS (can_implement 失败自动回退 cuBLAS with residual add)
 
     int M_padded = M;
     const __nv_bfloat16* A_eff = A;

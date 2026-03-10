@@ -4725,4 +4725,61 @@ Engine 的 chunked prefill 以 `max_chunk_size=256` 分块处理长 prompt。每
 
 **文件**: `src/engine/cache_config.h`, `src/engine/backend.h/cpp`, `src/engine/engine.h/cpp`, `src/engine/cache_manager.h/cpp`, `configs/qwen3.5-27b.conf`
 
+---
+
+## Phase 22: CUTLASS 接管 M=17-31 GEMM (cuBLAS 消除)
+
+**日期**: 2025-07-09
+**状态**: ✅ 完成
+
+### 问题
+
+Prefill 的 GEMM dispatch 逻辑分三段:
+- M ≤ 16: 自研 multi-row GEMV (register-based, L2 cache, 高效)
+- M = 17-31: cuBLAS 回退 (library call, 对小 M 效率低)
+- M ≥ 32: CUTLASS SM110 GEMM (TileShape=128×128×64, 高效)
+
+cuBLAS 对 M=17-31 的矩阵带宽利用率仅 ~50%, 远低于 CUTLASS。原代码保守地将 CUTLASS 阈值设在 M=32, 但 CUTLASS 支持 8-aligned padding, M=17 仅需 pad 到 24 即可运行。
+
+### 方法
+
+1. Benchmark baseline: T=17 TTFT=343.8ms, T=24 TTFT=332.7ms (cuBLAS path)
+2. 移除 `invoke_dense_gemm` 和 `invoke_dense_gemm_add` 中 M=17-31 的 cuBLAS shortcut
+3. 让 M≥17 全部走 CUTLASS (M pad 到 8 的倍数), `can_implement()` 失败自动回退 cuBLAS
+4. Benchmark + 3 iteration 稳定性验证 + 正确性测试
+
+### 实现
+
+- `invoke_dense_gemm`: 移除 `M < 32` 的 cuBLAS 分支, 让 M≥17 统一进入 CUTLASS path
+- `invoke_dense_gemm_add`: 同上
+- CUTLASS 对 M=17 自动 pad 到 M_padded=24, M=24 保持不变, M=31 pad 到 32
+- `can_implement()` + `initialize()` guard 保证安全回退
+
+### 结果 (27B BF16, Benchmark TTFT, 3 iterations, CV<0.5%)
+
+| Prompt T | 旧 (cuBLAS M=17-31) | 新 (CUTLASS M≥17) | 变化 |
+|:-:|:-:|:-:|:-:|
+| 17 | 343.8 ms | **230.7 ms** | **-32.9%** |
+| 24 | 332.7 ms | **225.2 ms** | **-32.3%** |
+| 32 | 231.4 ms | 231.5 ms | 0% (已是 CUTLASS) |
+| 64 | 246.9 ms | 241.0 ms | -2.4% |
+| 128 | 276.8 ms | 277.5 ms | 0% |
+| 256 | 307.2 ms | 307.4 ms | 0% |
+
+- **T=17**: Forward 332.5→222.6ms, 带宽等效 51.2GB / 0.222s = **230 GB/s** (接近理论 84%)
+- **T=24**: Forward 322.5→217.1ms, 等效 **236 GB/s** (86%)
+- Decode 性能不变: ITL 214.5ms, BW 238 GB/s
+- 正确性测试全部通过 (dense_gemm PASS, paged_attention PASS, 端到端生成正常)
+
+### 分析
+
+M=17-31 的 cuBLAS 是 prefill 在短 prompt 下的主要瓶颈。cuBLAS 作为 library call:
+- 需要内部 dispatch + heuristic 选择 kernel
+- 对小 M 的 tile 配置不够高效 (带宽利用率 ~50%)
+- CUTLASS SM110 直接使用 TMA 描述符和编译期 TileShape, 即使 M pad 有浪费, 总效率仍远高于 cuBLAS
+
+**这是 PREFILL_OPTIMIZATION_EVAL.md P3 的实现, 原预估 -2~5%, 实际 -32%。**
+
+**文件**: `src/engine/dense_gemm_sm110.cu`
+
 **累计 MTP 提速**: +51% (5.1 → 7.7-7.8 tok/s)

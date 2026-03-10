@@ -108,7 +108,7 @@ src/
   - LinearAttn QKVZAB 超级合并: [10240+6144+48+48, 5120] → 4 GEMV→1, 48 层 × 3 = 144 launches saved
   - 合并后释放原始权重, net zero 内存; T>1 GEMM 用子指针偏移
 - Fused RMSNorm+GEMV: Input RMSNorm 在 GEMV SMEM 内完成, 省 norm_out GMEM I/O + 64 launches
-- CUTLASS SM110 GEMM, can_implement() 失败自动回退 cuBLAS
+- CUTLASS SM110 GEMM (M≥17 全走 CUTLASS, M pad 到 8 对齐), can_implement() 失败自动回退 cuBLAS
 
 ### Kernel Fusion
 - Fused Add+RMSNorm, Deinterleave+RMSNorm, RMSNorm+SiLU Gate
@@ -206,6 +206,7 @@ src/
 - ✅ Prefill max_chunk_size 256→2048 (减少权重重复读取, TTFT -17%~-37%)
   - T~256: 694→438ms (-37%), T~512: 980→734ms (-25%), T~1024: 1720→1432ms (-17%)
   - CLI: --max-chunk-size, 配置: max_chunk_size=2048, 上限 4096
+- ✅ CUTLASS 接管 M=17-31 (消除 cuBLAS shortcut, TTFT T=17: -33%, T=24: -32%)
 
 ### 稳定性
 - 统一内存 SMMU 资源有限, 大规模并发访问可致 GPU hard-reset
