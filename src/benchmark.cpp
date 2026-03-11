@@ -795,8 +795,11 @@ static int run_raw_batch_benchmark(int argc, char** argv) {
                                                bs, config.vocab_size, hs, stream);
                     ops::invoke_batched_argmax(logits_g, d_argmax, config.vocab_size, bs, stream);
 
-                    // Capture graph after last warmup
-                    if (warmup && step == cfg.raw_warmup_steps - 1 && !cfg.no_graph) {
+                    // CUDA Graph capture 在 SM110a 上不可用:
+                    //   - forward_decode 内含 per-layer cudaStreamSynchronize (UMA 约束)
+                    //   - CUTLASS GEMM 使用 SAFE_CUDA_REALLOC (static 变量 + cudaMalloc)
+                    // 两者均不兼容 CUDA Graph。直接跳过 capture。
+                    if (false && warmup && step == cfg.raw_warmup_steps - 1 && !cfg.no_graph && bs == 1) {
                         cudaStreamSynchronize(stream);
                         cudaStream_t cap_stream;
                         cudaStreamCreate(&cap_stream);
