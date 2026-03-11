@@ -212,6 +212,17 @@ void invoke_fused_moe_final(
     __nv_bfloat16* residual,
     int n, int K, int top_k, cudaStream_t stream = 0);
 
+// Batched fused MoE final for T>1:
+// weighted_reduce + sigmoid_gated_add + residual in 1 launch (T+2 → 1)
+// gate_scalar is pre-computed by shared_expert_gate GEMM [T, 1] BF16
+void invoke_batched_moe_final(
+    __nv_bfloat16* hidden_states,                      // [T, hs] residual (in-place)
+    const __nv_bfloat16* expert_outputs,               // [T*top_k, hs]
+    const float* expert_weights,                       // [T, top_k]
+    const __nv_bfloat16* shared_down,                  // [T, hs]
+    const __nv_bfloat16* gate_scalar,                  // [T] BF16
+    int hs, int top_k, cudaStream_t stream = 0, int num_tokens = 1);
+
 // ============================================================================
 // GPU Sampling: penalty + top-k + softmax + top-p/min-p + multinomial
 // ============================================================================

@@ -1994,6 +1994,59 @@ void invoke_fused_moe_final(
 }
 
 // ============================================================================
+// Batched fused MoE final for T>1:
+// weighted_reduce + sigmoid_gated_add + residual in 1 launch
+// Replaces: invoke_weighted_expert_reduce (1 launch)
+//         + invoke_sigmoid_gated_add × T  (T launches)
+//         + invoke_add                    (1 launch)
+// = T+2 launches → 1 launch
+// Grid: (ceil(hs/256), num_tokens), Block: 256
+// ============================================================================
+__global__ void batched_moe_final_kernel(
+    __nv_bfloat16* __restrict__ hidden_states,         // [T, hs] residual (in-place)
+    const __nv_bfloat16* __restrict__ expert_outputs,  // [T*top_k, hs]
+    const float* __restrict__ expert_weights,          // [T, top_k]
+    const __nv_bfloat16* __restrict__ shared_down,     // [T, hs]
+    const __nv_bfloat16* __restrict__ gate_scalar,     // [T] BF16
+    int hs, int top_k)
+{
+    PDL_WAIT();
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y;
+    if (idx >= hs) { PDL_SIGNAL(); return; }
+
+    // Phase 0: Weighted expert reduce
+    float val = 0.f;
+    for (int k = 0; k < top_k; k++)
+        val += expert_weights[t * top_k + k]
+             * __bfloat162float(expert_outputs[(t * top_k + k) * hs + idx]);
+
+    // Phase 1: Sigmoid-gated shared expert add
+    float gate = __bfloat162float(gate_scalar[t]);
+    float sig = 1.f / (1.f + exp2f(-gate * LOG2E));
+    val += sig * __bfloat162float(shared_down[t * hs + idx]);
+
+    // Phase 2: Residual add
+    hidden_states[t * hs + idx] = __float2bfloat16(
+        __bfloat162float(hidden_states[t * hs + idx]) + val);
+
+    PDL_SIGNAL();
+}
+
+void invoke_batched_moe_final(
+    __nv_bfloat16* hidden_states,
+    const __nv_bfloat16* expert_outputs, const float* expert_weights,
+    const __nv_bfloat16* shared_down, const __nv_bfloat16* gate_scalar,
+    int hs, int top_k, cudaStream_t stream, int num_tokens)
+{
+    constexpr int BLOCK = 256;
+    dim3 grid((hs + BLOCK - 1) / BLOCK, num_tokens);
+    PDL_LAUNCH(batched_moe_final_kernel, grid, BLOCK, 0, stream,
+        hidden_states, expert_outputs, expert_weights,
+        shared_down, gate_scalar, hs, top_k);
+}
+
+// ============================================================================
 // GPU Sampling: Apply Penalties
 // ============================================================================
 // Parallel over num_penalties entries. Each thread handles one penalty token.

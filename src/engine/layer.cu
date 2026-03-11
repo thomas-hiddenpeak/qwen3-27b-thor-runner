@@ -307,11 +307,7 @@ static void run_moe_mlp(
                 expert_indices, hs, moe_is, dn_stride,
                 top_k, stream, num_tokens);
         }
-
-        // 5d. Batched weighted expert reduce: moe_acc[T, hs] = sum_k(w[t,k] * expert_down[t*topk+k, hs])
-        ops::invoke_weighted_expert_reduce(
-            moe_acc, expert_down_all, expert_weights,
-            hs, top_k, stream, num_tokens);
+        // (weighted_reduce + sigmoid_gated_add + residual deferred to batched_moe_final below)
     }
 
     // Shared expert MLP (T>1 only — T=1 handled above with fused_moe_final)
@@ -341,13 +337,12 @@ static void run_moe_mlp(
         }
         // shared_down_buf is at expert_scratch — same location for both paths
         __nv_bfloat16* shared_down_buf = expert_scratch;
-        // Per-token sigmoid-gated add + residual
-        for (int t = 0; t < num_tokens; ++t) {
-            ops::invoke_sigmoid_gated_add(moe_acc + t * hs, shared_down_buf + t * hs,
-                                           gate_scalar + t, hs, stream);
-        }
-        // T>1 residual add
-        ops::invoke_add(hidden_states, hidden_states, moe_acc, num_tokens * hs, stream);
+        // expert_down_all starts after expert_gu_all [T*top_k, 2*moe_is]
+        __nv_bfloat16* expert_down_all = expert_scratch + (size_t)num_tokens * top_k * 2 * moe_is;
+        // Fused: weighted_reduce + sigmoid_gated_add + residual (T+2 launches → 1)
+        ops::invoke_batched_moe_final(
+            hidden_states, expert_down_all, expert_weights,
+            shared_down_buf, gate_scalar, hs, top_k, stream, num_tokens);
     }
 
     // MoE timing reporting
