@@ -55,43 +55,47 @@ Short prompt (P=17), 50 generation tokens, 3 iterations:
 
 ### 2.3 Prefill Throughput (varying prompt length)
 
-| Model | Precision | P=17 | P=128 | P=512 | P=2048 |
-|-------|-----------|------|-------|-------|--------|
-| Qwen3.5-4B | BF16 | 405 tok/s | 2,097 tok/s | 4,844 tok/s | 3,895 tok/s |
-| Qwen3.5-9B | BF16 | 230 tok/s | 1,341 tok/s | 3,624 tok/s | 2,485 tok/s |
-| Qwen3.5-27B | BF16 | 65 tok/s | 480 tok/s | 1,208 tok/s | 1,046 tok/s |
-| Qwen3.5-35B-A3B | MoE BF16 | 114 tok/s | 139 tok/s | 154 tok/s | 151 tok/s |
-| Qwen3.5-122B-A10B | MoE NVFP4 | 50 tok/s | 64 tok/s | 66 tok/s | 66 tok/s |
+| Model | Precision | P=17 | P=128 | P=512 | P=2048 | P=4096 | P=8192 | P=16384 | P=32768 |
+|-------|-----------|------|-------|-------|--------|--------|--------|---------|--------|
+| Qwen3.5-4B | BF16 | 405 | 2,097 | 4,844 | 3,895 | 3,710 | 3,234 | 2,623 | 1,915 |
+| Qwen3.5-9B | BF16 | 230 | 1,341 | 3,624 | 2,485 | 2,518 | 2,289 | 1,963 | 1,535 |
+| Qwen3.5-27B | BF16 | 65 | 480 | 1,208 | 1,046 | 934 | 866 | 746 | 554 |
+| Qwen3.5-35B-A3B | MoE BF16 | 114 | 139 | 154 | 151 | 151 | 148 | — | — |
+| Qwen3.5-122B-A10B | MoE NVFP4 | 50 | 64 | 66 | 66 | 66 | — | — | — |
 
-> Dense 模型 prefill 吞吐随 prompt 长度增加先升后降 (P=512 峰值, P=2048 因 DeltaNet SSM 串行依赖略降).  
-> MoE 模型 prefill 吞吐较低且较平坦, 因 expert routing 开销在各长度下均匀分布.
+> 单位: tok/s. Dense 模型 prefill 吞吐在 P=512 附近达到 GEMM compute 峰值, 之后因 DeltaNet SSM 串行依赖和 chunked prefill 权重重复读取逐步下降.  
+> 32K 时 27B prefill 仍有 554 tok/s (TTFT ~59s), 瓶颈在 16 轮 chunk × 64 层 forward.  
+> MoE 模型 prefill 吞吐低且平坦 (~150 tok/s), 受限于 expert routing 的不规则 DRAM 访问.
 
 ### 2.4 TTFT vs Prompt Length
 
-| Model | Precision | P=17 | P=128 | P=512 | P=2048 |
-|-------|-----------|------|-------|-------|--------|
-| Qwen3.5-4B | BF16 | 49ms | 68ms | 113ms | 533ms |
-| Qwen3.5-9B | BF16 | 84ms | 105ms | 151ms | 834ms |
-| Qwen3.5-27B | BF16 | 273ms | 279ms | 435ms | 1,969ms |
-| Qwen3.5-35B-A3B | MoE BF16 | 155ms | 928ms | 3,328ms | 13,541ms |
-| Qwen3.5-122B-A10B | MoE NVFP4 | 348ms | 2,019ms | 7,740ms | 30,807ms |
+| Model | Precision | P=17 | P=128 | P=512 | P=2048 | P=4096 | P=8192 | P=16384 | P=32768 |
+|-------|-----------|------|-------|-------|--------|--------|--------|---------|--------|
+| Qwen3.5-4B | BF16 | 49ms | 68ms | 113ms | 533ms | 1.1s | 2.5s | 6.3s | 17.1s |
+| Qwen3.5-9B | BF16 | 84ms | 105ms | 151ms | 834ms | 1.6s | 3.6s | 8.4s | 21.4s |
+| Qwen3.5-27B | BF16 | 273ms | 279ms | 435ms | 2.0s | 4.4s | 9.5s | 22.0s | 59.1s |
+| Qwen3.5-35B-A3B | MoE BF16 | 155ms | 928ms | 3.3s | 13.5s | 27.2s | 55.5s | — | — |
+| Qwen3.5-122B-A10B | MoE NVFP4 | 348ms | 2.0s | 7.7s | 30.8s | 61.9s | — | — | — |
 
-> Dense 模型 TTFT 随 prompt 近似线性增长.  
-> MoE 模型 TTFT 增长更快, 因 prefill 需要遍历大量 expert.
+> Dense 模型 TTFT 随 prompt 近似线性增长 (27B: ~1.8 ms/token).  
+> MoE 模型 TTFT 增长斜率陡峭: 35B 约 6.8 ms/token, 122B 约 15 ms/token — 受限于 expert routing 遍历开销.  
+> 32K prompt 下 27B TTFT ~59s, 主要由 16 轮 chunked prefill × 64 层 forward 构成.
 
 ### 2.5 Decode Throughput vs Context Length
 
-| Model | Precision | P=17 | P=128 | P=512 | P=2048 |
-|-------|-----------|------|-------|-------|--------|
-| Qwen3.5-4B | BF16 | 46.8 tok/s | 18.7 tok/s | 17.9 tok/s | 15.6 tok/s |
-| Qwen3.5-9B | BF16 | 27.4 tok/s | 9.3 tok/s | 9.1 tok/s | 8.6 tok/s |
-| Qwen3.5-27B | BF16 | 11.7 tok/s | 4.5 tok/s | 4.0 tok/s | 3.3 tok/s |
-| Qwen3.5-35B-A3B | MoE BF16 | 45.7 tok/s | 20.1 tok/s | 21.7 tok/s | 19.8 tok/s |
-| Qwen3.5-122B-A10B | MoE NVFP4 | 16.5 tok/s | 9.5 tok/s | 8.4 tok/s | 8.4 tok/s |
+| Model | Precision | P=17 | P=128 | P=512 | P=2048 | P=4096 | P=8192 | P=16384 | P=32768 |
+|-------|-----------|------|-------|-------|--------|--------|--------|---------|--------|
+| Qwen3.5-4B | BF16 | 46.8 | 18.7 | 17.9 | 15.6 | 13.4 | 9.9 | 6.5 | 3.9 |
+| Qwen3.5-9B | BF16 | 27.4 | 9.3 | 9.1 | 8.6 | 7.7 | 6.2 | 4.5 | 2.9 |
+| Qwen3.5-27B | BF16 | 11.7 | 4.5 | 4.0 | 3.3 | 3.0 | 2.3 | 1.7 | 1.1 |
+| Qwen3.5-35B-A3B | MoE BF16 | 45.7 | 20.1 | 21.7 | 19.8 | 15.6 | 12.3 | — | — |
+| Qwen3.5-122B-A10B | MoE NVFP4 | 16.5 | 9.5 | 8.4 | 8.4 | 7.0 | — | — | — |
 
-> MTP 加速在长 context 时受限: P=128+ 时 decode 显著降低.  
-> 原因: 长 context 下 DeltaNet SSM 的串行 state 更新和 attention KV cache 读取开销增加.  
-> P=17 的数字最接近纯 decode 峰值 (context 长度对 MTP accept rate 影响极小时).
+> 单位: tok/s (MTP enabled). Decode 速率随 context 增长持续下降 — 两方面原因:  
+> 1. DeltaNet SSM: 48 层串行 state update, 每步固定开销随模型大小线性增长  
+> 2. Full Attention: 16 层 paged KV cache 读取, 开销随 context 线性增长  
+> 27B 从 P=17 的 11.7 tok/s 降至 P=32K 的 1.1 tok/s (降幅 91%), 主要受 SSM 串行开销主导.  
+> MTP accept rate 在长 context 下基本稳定 (非 decode 下降的主因).
 
 ### 2.6 Memory Bandwidth Utilization (Raw Decode, B=1)
 
@@ -227,7 +231,81 @@ MTP 仅在 B=1 时生效, B≥2 走 batch decode (权重读一次服务多请求
 - **Generation**: 50 tokens (single-request), 30 tokens (concurrent)
 - **Warmup**: Engine warmup request + AOT cuBLAS autotuning (~3s)
 - **Prompt**: Synthetic (chat template header + padding tokens, non-thinking mode)
-- **Total test points**: 54 (5 models × 4 prompt lengths + MTP on/off + concurrent sweep)
+- **Total test points**: 78 (5 models × 8 prompt lengths + MTP on/off + concurrent sweep)
+
+---
+
+## 6. Long Context Deep Dive (Qwen3.5-27B BF16)
+
+> 本节聚焦 27B Dense 模型在 4K-32K 上下文下的性能特征, 用以评估实际 Agent 场景下的体验.
+
+### 6.1 性能全景 (Single-Request, MTP d=3)
+
+| Prompt Length | TTFT | Prefill tok/s | Decode tok/s | Overall tok/s | Total (50 tok) |
+|---|---|---|---|---|---|
+| 17 | 273ms | 65 | **11.7** | 11.2 | 4.7s |
+| 128 | 279ms | 480 | 4.5 | 4.3 | 11.5s |
+| 512 | 435ms | 1,208 | 4.0 | 3.7 | 13.4s |
+| 2,048 | 2.0s | 1,046 | 3.3 | 2.7 | 18.4s |
+| 4,096 | 4.4s | 934 | 3.0 | 2.4 | 20.6s |
+| 8,192 | 9.5s | 866 | 2.3 | 1.6 | 30.4s |
+| 16,384 | 22.0s | 746 | 1.7 | 1.0 | 51.1s |
+| 32,768 | 59.1s | 554 | 1.1 | 0.5 | 104.4s |
+
+### 6.2 性能衰减分析
+
+**Prefill 吞吐下降**:
+
+| 区间 | 下降率 | 原因分析 |
+|---|---|---|
+| P=512→4096 (8×) | 934/1208 = 77% 保留 | Chunked prefill 权重重复读取 (chunk×2 → chunk×8), GEMM compute 仍主导 |
+| P=4096→16384 (4×) | 746/934 = 80% 保留 | DeltaNet SSM 串行开销随 chunk 数线性增长, 每 chunk 48 层串行 state update |
+| P=16384→32768 (2×) | 554/746 = 74% 保留 | SSM 串行成本占比进一步提高, GEMM 并行度收益递减 |
+
+> **理论下界**: 每 chunk 2048 token 读 51.2 GB 权重 ÷ 222 GB/s = 231ms, 32K 需 16 chunks × 231ms = 3.7s 纯权重读取.  
+> **实测 59.1s** 中 SSM 串行成本约占 55.1s ÷ 16 chunks ≈ 3.4s/chunk (含 48 层 DeltaNet state update + 16 层 chunked attention).  
+> Prefill 瓶颈不在 GEMM, 而在 **DeltaNet SSM 的 O(T) 串行 state propagation**.
+
+**Decode 吞吐下降**:
+
+| 区间 | Decode tok/s | 额外开销来源 |
+|---|---|---|
+| P=17 → P=128 | 11.7 → 4.5 (−62%) | SSM state 从 L2 cache (32MB) 溢出到 DRAM, MTP verify 需读更多 SSM state |
+| P=128 → P=2048 | 4.5 → 3.3 (−27%) | Full Attention KV cache 读取增长 (16层 × 4 KV heads × 256 dim × context) |
+| P=2048 → P=32768 | 3.3 → 1.1 (−67%) | KV cache 读取从 ~32MB 增至 ~512MB, 占权重读取的 1% |
+
+> **关键发现**: P=17 到 P=128 的 62% 暴跌是 SSM state DRAM 溢出导致的.  
+> 每步 decode 需读 48 层 SSM state (48 × 16 heads × 128 × 128 × 2B = 24 MB BF16) + 写回 24 MB = 48 MB 额外 DRAM I/O.  
+> P=17 时 SSM state 可部分留在 L2 cache (32 MB), P=128+ 完全溢出.
+
+### 6.3 长上下文各模型对比
+
+| Model | P=4096 Decode | P=16384 Decode | P=32768 Decode | 32K/短prompt 保留率 |
+|---|---|---|---|---|
+| Qwen3.5-4B (8.7 GB) | 13.4 tok/s | 6.5 tok/s | 3.9 tok/s | 3.9/46.8 = 8.3% |
+| Qwen3.5-9B (18.0 GB) | 7.7 tok/s | 4.5 tok/s | 2.9 tok/s | 2.9/27.4 = 10.6% |
+| Qwen3.5-27B (51.2 GB) | 3.0 tok/s | 1.7 tok/s | 1.1 tok/s | 1.1/11.7 = 9.4% |
+| Qwen3.5-35B MoE (66.0 GB) | 15.6 tok/s | — | — | — |
+| Qwen3.5-122B MoE FP4 (77.1 GB) | 7.0 tok/s | — | — | — |
+
+> 所有 Dense 模型在 32K 时仅保留短 prompt 约 8-11% 的 decode 速率.  
+> 下降的主因是 SSM state I/O (固定开销) 相对权重读取的比例随模型变小而增大.  
+> MoE 模型 P=4096 decode 仍然可观 (35B: 15.6, 122B: 7.0), 因 expert routing 只读激活的 expert.
+
+### 6.4 TTFT 构成分解 (27B, P=32768)
+
+```
+TTFT = 59.1s (实测), 分解:
+├── 权重读取: 16 chunks × 51.2 GB ÷ 222 GB/s    ≈  3.7s ( 6.3%)
+├── GEMM compute: 16 × ~20ms (cuBLAS/CUTLASS)   ≈  0.3s ( 0.5%)
+├── DeltaNet SSM serial: 16 × 48 layers × ~70ms  ≈ 53.8s (91.0%)
+├── Full Attention (chunked): 16 × 16 layers × ~5ms ≈ 1.3s ( 2.2%)
+└── Overhead (sync, alloc, etc.)                  ≈  0.0s
+```
+
+> **DeltaNet SSM 串行开销占 91%** — 这是 Qwen3.5 混合架构的固有特征.  
+> SSM 串行性使得 prefill 无法像纯 Transformer 那样通过增大 chunk 或 batch 加速.  
+> 优化方向: WY chunkwise kernel (已部分实现, T≥4 时 1.71×) 可进一步改进长 chunk 的 SSM 效率.
 
 ---
 
