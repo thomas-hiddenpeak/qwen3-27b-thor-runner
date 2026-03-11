@@ -115,6 +115,7 @@ private:
     // on_reasoning: 可选回调, 接收 thinking 内容 (用于 reasoning_content 输出)
     // on_tool_call: 可选回调, 当检测到完整 <tool_call>...</tool_call> 时调用
     // out_finish_reason: 输出 finish_reason ("stop" 或 "tool_calls")
+    // out_cached_tokens: 输出 prefix cache 命中的 token 数
     int poll_tokens(uint64_t request_id,
                     const std::function<void(const std::string&)>& on_token,
                     int timeout_s = 300,
@@ -123,7 +124,8 @@ private:
                     const std::function<void(const std::string&)>& on_reasoning = {},
                     const std::function<void(const ToolCallInfo&)>& on_tool_call = {},
                     std::string* out_finish_reason = nullptr,
-                    std::atomic<bool>* abort_flag = nullptr);
+                    std::atomic<bool>* abort_flag = nullptr,
+                    int* out_cached_tokens = nullptr);
 
     // ---- API 路由 ----
     void handle_health(const HttpRequest& req, int client_fd);

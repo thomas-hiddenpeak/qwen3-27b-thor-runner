@@ -76,6 +76,7 @@ struct InferResponse {
     bool        is_finished;
     int32_t     error_code;     // 0 = 成功
     float       prefill_time_ms = 0;  // Prefill 耗时 (ms), 仅首 token 有效
+    int32_t     cached_tokens = 0;    // Prefix cache 命中的 token 数, 仅首 token 有效
 };
 
 // ============================================================================

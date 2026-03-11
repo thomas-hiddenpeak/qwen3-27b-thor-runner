@@ -1323,6 +1323,7 @@ void InferenceEngine::step(std::vector<RequestContext*>& active_requests) {
                 resp.is_finished = eos;
                 resp.error_code  = 0;
                 resp.prefill_time_ms = profiler_.prefill_elapsed_ms();
+                resp.cached_tokens = ctx->prefill_cached_tokens;
                 while (!ipc_resp_queue_->push(resp))
                     std::this_thread::sleep_for(std::chrono::microseconds(100));
                 if (eos) ctx->is_finished = true;
@@ -2508,6 +2509,7 @@ int InferenceEngine::batch_prefill_step(
         resp.is_finished = eos;
         resp.error_code  = 0;
         resp.prefill_time_ms = profiler_.prefill_elapsed_ms();
+        resp.cached_tokens = ctx->prefill_cached_tokens;
         while (!ipc_resp_queue_->push(resp))
             std::this_thread::sleep_for(std::chrono::microseconds(100));
 

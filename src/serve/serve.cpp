@@ -1613,7 +1613,8 @@ int ServeApp::poll_tokens(uint64_t request_id,
                           const std::function<void(const std::string&)>& on_reasoning,
                           const std::function<void(const ToolCallInfo&)>& on_tool_call,
                           std::string* out_finish_reason,
-                          std::atomic<bool>* abort_flag) {
+                          std::atomic<bool>* abort_flag,
+                          int* out_cached_tokens) {
     const auto& tok = backend_.tokenizer();
     int count = 0;
     // enable_thinking=true 时, prompt 已以 <think>\n 结尾,
@@ -1640,6 +1641,10 @@ int ServeApp::poll_tokens(uint64_t request_id,
 
         InferResponse resp;
         if (poll_request(request_id, resp, 100)) {
+            // 首 token 携带 cached_tokens 信息
+            if (out_cached_tokens && resp.cached_tokens > 0) {
+                *out_cached_tokens = resp.cached_tokens;
+            }
             if (resp.error_code != 0 || resp.is_finished) break;
 
             int tid = resp.token_id;
@@ -2141,6 +2146,7 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
         std::string finish_reason;
         int tool_call_idx = 0;
         std::atomic<bool> client_disconnected{false};
+        int cached_tokens = 0;
 
         int comp_toks = poll_tokens(infer_req.request_id,
             // on_token (content)
@@ -2171,7 +2177,8 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
                 }
             },
             &finish_reason,
-            &client_disconnected
+            &client_disconnected,
+            &cached_tokens
         );
 
         // Finish chunk
@@ -2189,7 +2196,8 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
                 "\",\"system_fingerprint\":\"fp_qwen35_bf16\""
                 ",\"choices\":[],\"usage\":{\"prompt_tokens\":" + std::to_string(prompt_count) +
                 ",\"completion_tokens\":" + std::to_string(comp_toks) +
-                ",\"total_tokens\":" + std::to_string(total) + "}}";
+                ",\"total_tokens\":" + std::to_string(total) +
+                ",\"prompt_tokens_details\":{\"cached_tokens\":" + std::to_string(cached_tokens) + "}}}";
             send_sse_event(client_fd, usage_chunk);
         }
 
@@ -2200,6 +2208,7 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
         std::string reasoning;
         std::vector<ToolCallInfo> tool_calls;
         std::string finish_reason;
+        int cached_tokens = 0;
 
         int comp_toks = poll_tokens(infer_req.request_id,
             [&](const std::string& piece) { content += piece; },
@@ -2208,7 +2217,9 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
             stop_seqs,
             [&](const std::string& piece) { reasoning += piece; },
             [&](const ToolCallInfo& tc) { tool_calls.push_back(tc); },
-            &finish_reason
+            &finish_reason,
+            nullptr,
+            &cached_tokens
         );
 
         auto now_t = std::time(nullptr);
@@ -2247,7 +2258,8 @@ void ServeApp::handle_openai_chat(const HttpRequest& req, int client_fd) {
             "\"finish_reason\":\"" + finish_reason + "\"}],"
             "\"usage\":{\"prompt_tokens\":" + std::to_string(prompt_count) +
             ",\"completion_tokens\":" + std::to_string(comp_toks) +
-            ",\"total_tokens\":" + std::to_string(total) + "}}";
+            ",\"total_tokens\":" + std::to_string(total) +
+            ",\"prompt_tokens_details\":{\"cached_tokens\":" + std::to_string(cached_tokens) + "}}}";
         send_response(client_fd, http_resp);
     }
 }
@@ -2463,7 +2475,8 @@ void ServeApp::handle_openai_completions(const HttpRequest& req, int client_fd) 
             "\"index\":0,\"finish_reason\":\"stop\"}],"
             "\"usage\":{\"prompt_tokens\":" + std::to_string(prompt_count) +
             ",\"completion_tokens\":" + std::to_string(comp_toks) +
-            ",\"total_tokens\":" + std::to_string(total) + "}}";
+            ",\"total_tokens\":" + std::to_string(total) +
+            ",\"prompt_tokens_details\":{\"cached_tokens\":0}}}";
         send_response(client_fd, http_resp);
     }
 }

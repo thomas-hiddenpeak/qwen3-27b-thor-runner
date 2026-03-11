@@ -42,6 +42,8 @@ struct InferenceResponse {
     int32_t error_code; 
     // Prefill 耗时 (ms), 仅首 token 有效 (>0), 后续 token 为 0
     float prefill_time_ms = 0;
+    // Prefix cache 命中的 token 数, 仅首 token 有效
+    int32_t cached_tokens = 0;
 };
 
 // -----------------------------------------------------------------------------
