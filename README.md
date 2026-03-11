@@ -14,6 +14,9 @@ High-performance BF16 / NVFP4 inference engine for **Qwen3.5** model family (4B 
 - **Hybrid architecture** — DeltaNet SSM + GQA Full Attention (e.g. 27B: 48+16 = 64 layers)
 - **MTP speculative decoding** — built-in Multi-Token Prediction with partial accept (d=3, +27.5%)
 - **Paged KV Cache** — dynamic block allocation with continuous batching
+- **Continuous Batching** — batch decode (B=1~128) with dynamic scheduling, LRU swap-out, chunk preemption
+- **Batch Prefill** — multiple requests merged into single forward pass, TTFT -75~89%
+- **AOT cuBLAS Warmup** — pre-profiles GEMM shapes at startup (~3s), eliminates first-inference latency
 - **Split-K Paged Attention** — decode attention parallelized across partitions
 - **SSD prefix caching** — KV + SSM/Conv state offload to NVMe, LRU eviction
 - **Streaming Attention** — GPU + SSD hybrid paged attention for 256K+ context
@@ -21,7 +24,7 @@ High-performance BF16 / NVFP4 inference engine for **Qwen3.5** model family (4B 
 - **Dual-port HTTP API** — Ollama-compatible (port 11434) + OpenAI-compatible (port 8080)
 - **TUI Chat** — interactive terminal chat interface
 - **GPU Sampling** — Gumbel-Max fast path + top_k / top_p / min_p / presence penalty
-- **Benchmark** — parameter sweep, multi-iteration statistics, 95% CI, JSON export
+- **Benchmark** — parameter sweep, multi-iteration statistics, 95% CI, JSON export, concurrent throughput
 - **Test Framework** — 16 tests across 3 categories with filtering & timing
 
 ## Hardware Requirements
@@ -322,6 +325,25 @@ MTP speculative decoding is enabled by default when the model has MTP weights (`
 > Baseline measured with `bench --decode 30 --iterations 3`. MTP throughput measured via serve mode.
 > 122B MoE NVFP4 achieves 98% of peak memory bandwidth (268/273 GB/s).
 
+### Concurrent Throughput (Qwen3.5-27B BF16)
+
+Measured with `bench --concurrent B --decode 30 --iterations 3`. Decode tok/s excludes TTFT.
+
+| Concurrent Requests | Raw Baseline (tok/s) | Serve Decode (tok/s) | Serve/Raw | Serve Aggregate (tok/s) |
+|-------|-----------|--------------------|-----------|---------|
+| 1 | 4.4 | 12.1 (MTP d=3) | 275% | 12.1 |
+| 2 | 8.8 | 9.0 | 102% | 8.7 |
+| 4 | 16.5 | 17.1 | 104% | 16.4 |
+| 8 | 25.6 | 26.3 | 103% | 25.5 |
+| 16 | 65.7 | 68.9 | 105% | 65.3 |
+| 32 | 127.9 | 133.0 | 104% | 121.3 |
+| 64 | 230.0 | 239.5 | 104% | 207.5 |
+| 128 | 379.0 | 390.1 | 103% | 309.7 |
+
+> B=1 uses MTP speculative decoding (2.75× boost). B≥2 uses batch decode (weight reuse across requests).
+> Serve decode tok/s exceeds raw baseline at all batch sizes (≥102%).
+> Aggregate includes TTFT; decode excludes it.
+
 ### MTP Speedup Summary
 
 | Model | MTP off | MTP on | Optimal d | Boost |
@@ -349,7 +371,7 @@ Measured with cold page cache (`echo 3 > /proc/sys/vm/drop_caches`).
 > Loading uses adaptive mmap strategy, scalar bypass (74K FP32 scalars from mmap), and direct-to-packed expert loading (73K expert tensors H2D to pre-allocated packed buffers, eliminating 97% cudaMalloc calls).
 
 Key optimizations applied:
-- **GEMV/GEMM**: Scattered GEMV, Dual GEMV, GEMV+Add fusion, Multi-row GEMV (M=2-8, zero SMEM, L2 cache), CUTLASS SM110 GEMM
+- **GEMV/GEMM**: Scattered GEMV, Dual GEMV, GEMV+Add fusion, Multi-row GEMV (M=2-8, zero SMEM, L2 cache), cuBLAS (M=9-16), CUTLASS SM110 GEMM (M≥17)
 - **Weight merging**: QKV merge (32 launches saved), QKVZAB super-merge (144 launches saved)
 - **Fused RMSNorm+GEMV**: norm in SMEM, 64 launches & ~1ms saved
 - **Fused QK_norm+RoPE**: deinterleave + norm + RoPE in single kernel (32 launches saved)
@@ -359,7 +381,9 @@ Key optimizations applied:
 - **Sampling**: GPU-resident Gumbel-Max + top-k/top-p/min_p/presence penalty
 - **FP4**: V2 GEMV with SMEM LUT + vectorized loads, merged FP4 QKV/GateUp projections
 - **SM110a HW primitives**: PDL (launch overlap, -1.8%), f32x2 SIMD FMA, TMA bulk copy (SSM state 4.31×)
-- **exp2f**: FA4-inspired `exp2f` + LOG2E 预乘全量替换 (-1.1%)
+- **Batch decode**: multi-request parallel forward, batched LM head (gather+RMSNorm+single GEMM)
+- **Batch prefill**: B requests merged into single forward, TTFT B=32: 3.8s→596ms, B=64: 17s→1.2s
+- **AOT cuBLAS warmup**: pre-profile 7×3×20 GEMM shapes at startup (~3s), B=1 +5%, B=8 +11%
 - **Weight loading**: Adaptive mmap, scalar bypass, direct-to-packed expert loading (122B: -20.5% load time)
 
 See [docs/OPTIMIZATION_LOG.md](docs/OPTIMIZATION_LOG.md) for the full optimization journal.

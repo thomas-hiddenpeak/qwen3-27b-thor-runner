@@ -413,6 +413,7 @@ struct AggResult {
     int max_tokens;
     Stats ttft;
     Stats gen_tps;
+    Stats overall_tps;
     Stats total_tokens;
     Stats total_ms;
     Stats prefill_ms;
@@ -467,6 +468,8 @@ static void write_json(const std::string& path,
         ofs << "      \"prefill_tps_median\": " << std::setprecision(0) << r.prefill_tps.median() << ",\n";
         ofs << "      \"gen_tps_median\": " << std::setprecision(2) << r.gen_tps.median() << ",\n";
         ofs << "      \"gen_tps_ci95\": " << std::setprecision(2) << r.gen_tps.ci95() << ",\n";
+        ofs << "      \"overall_tps_median\": " << std::setprecision(2) << r.overall_tps.median() << ",\n";
+        ofs << "      \"overall_tps_ci95\": " << std::setprecision(2) << r.overall_tps.ci95() << ",\n";
         ofs << "      \"total_tokens_median\": " << std::setprecision(0) << r.total_tokens.median() << ",\n";
         ofs << "      \"total_time_median_ms\": " << std::setprecision(1) << r.total_ms.median() << "\n";
         ofs << "    }" << (i + 1 < results.size() ? "," : "") << "\n";
@@ -1231,15 +1234,16 @@ int run_benchmark(int argc, char** argv) {
 
             agg.ttft.add(r.ttft_ms);
             agg.gen_tps.add(r.gen_tps);
+            agg.overall_tps.add(r.overall_tps);
             agg.total_tokens.add((float)r.total_tokens);
             agg.total_ms.add(r.total_ms);
             agg.prefill_ms.add(r.prefill_ms);
             agg.prefill_tps.add(r.prefill_tps);
 
             printf("    [prompt=%d iter=%d] TTFT=%.1fms  prefill=%.1fms (%.0f tok/s)  gen=%.1f tok/s  "
-                   "tokens=%d  total=%.0fms\n",
+                   "overall=%.1f tok/s  tokens=%d  total=%.0fms\n",
                    pl, iter + 1, r.ttft_ms, r.prefill_ms, r.prefill_tps,
-                   r.gen_tps, r.total_tokens, r.total_ms);
+                   r.gen_tps, r.overall_tps, r.total_tokens, r.total_ms);
         }
 
         agg_results.push_back(std::move(agg));
@@ -1254,23 +1258,24 @@ int run_benchmark(int argc, char** argv) {
     printf("║  MTP: %-6s  chunk: %-5d  temp: %.1f  seed: %-6lld  max_tokens: %-4d     ║\n",
            bcfg.mtp_mode.c_str(), bcfg.max_chunk_size, cfg.temperature,
            (long long)cfg.seed, cfg.max_tokens);
-    printf("╠═══════╦════════════════════╦═══════════════════════╦══════════════════╦════════╦════════╦═════╣\n");
-    printf("║Prompt ║  TTFT (ms)         ║  Prefill              ║  Gen tok/s       ║ Tokens ║Time ms║Iters║\n");
-    printf("║       ║  med    ±ci95  cv%%  ║  ms     tok/s         ║  med    ±ci95    ║  med   ║  med  ║     ║\n");
-    printf("╠═══════╬════════════════════╬═══════════════════════╬══════════════════╬════════╬════════╬═════╣\n");
+    printf("╠═══════╦════════════════════╦═══════════════════════╦══════════════════╦══════════════════╦════════╦════════╦═════╣\n");
+    printf("║Prompt ║  TTFT (ms)         ║  Prefill              ║  Decode tok/s    ║ Overall tok/s    ║ Tokens ║Time ms║Iters║\n");
+    printf("║       ║  med    ±ci95  cv%%  ║  ms     tok/s         ║  med    ±ci95    ║  med    ±ci95    ║  med   ║  med  ║     ║\n");
+    printf("╠═══════╬════════════════════╬═══════════════════════╬══════════════════╬══════════════════╬════════╬════════╬═════╣\n");
 
     for (const auto& r : agg_results) {
-        printf("║ %5d ║ %6.1f ±%5.1f %4.1f%% ║ %6.1f  %6.0f tok/s  ║ %6.1f ±%5.2f    ║ %5.0f  ║%6.0f ║ %3d ║\n",
+        printf("║ %5d ║ %6.1f ±%5.1f %4.1f%% ║ %6.1f  %6.0f tok/s  ║ %6.1f ±%5.2f    ║ %6.1f ±%5.2f    ║ %5.0f  ║%6.0f ║ %3d ║\n",
                r.prompt_len,
                r.ttft.median(), r.ttft.ci95(), r.ttft.cv_pct(),
                r.prefill_ms.median(), r.prefill_tps.median(),
                r.gen_tps.median(), r.gen_tps.ci95(),
+               r.overall_tps.median(), r.overall_tps.ci95(),
                r.total_tokens.median(),
                r.total_ms.median(),
                r.iterations);
     }
 
-    printf("╚═══════╩════════════════════╩═══════════════════════╩══════════════════╩════════╩════════╩═════╝\n");
+    printf("╚═══════╩════════════════════╩═══════════════════════╩══════════════════╩══════════════════╩════════╩════════╩═════╝\n");
 
     // 单配置时打印详细信息
     if (agg_results.size() == 1 && agg_results[0].ttft.count() >= 1) {
@@ -1299,12 +1304,20 @@ int run_benchmark(int argc, char** argv) {
                    r.prefill_ms.min_val(), r.prefill_ms.max_val());
         }
         printf("║                                                                ║\n");
-        printf("║  ▸ Generation Throughput (first → last token)                  ║\n");
+        printf("║  ▸ Decode Throughput (first → last token)                     ║\n");
         printf("║      Median:  %8.1f tok/s ±%.2f (N=%d, CV=%.1f%%)             ║\n",
                r.gen_tps.median(), r.gen_tps.ci95(), r.gen_tps.count(), r.gen_tps.cv_pct());
         if (r.gen_tps.count() > 1) {
             printf("║      Min:     %8.1f tok/s  Max: %.1f tok/s                   ║\n",
                    r.gen_tps.min_val(), r.gen_tps.max_val());
+        }
+        printf("║                                                                ║\n");
+        printf("║  ▸ Overall Throughput (submit → complete)                      ║\n");
+        printf("║      Median:  %8.1f tok/s ±%.2f (N=%d, CV=%.1f%%)             ║\n",
+               r.overall_tps.median(), r.overall_tps.ci95(), r.overall_tps.count(), r.overall_tps.cv_pct());
+        if (r.overall_tps.count() > 1) {
+            printf("║      Min:     %8.1f tok/s  Max: %.1f tok/s                   ║\n",
+                   r.overall_tps.min_val(), r.overall_tps.max_val());
         }
         printf("║                                                                ║\n");
         printf("║  ▸ Total                                                       ║\n");

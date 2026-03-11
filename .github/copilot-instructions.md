@@ -108,7 +108,8 @@ src/
   - LinearAttn QKVZAB 超级合并: [10240+6144+48+48, 5120] → 4 GEMV→1, 48 层 × 3 = 144 launches saved
   - 合并后释放原始权重, net zero 内存; T>1 GEMM 用子指针偏移
 - Fused RMSNorm+GEMV: Input RMSNorm 在 GEMV SMEM 内完成, 省 norm_out GMEM I/O + 64 launches
-- CUTLASS SM110 GEMM (M≥17 全走 CUTLASS, M pad 到 8 对齐), can_implement() 失败自动回退 cuBLAS
+- GEMM Dispatch: M=1 GEMV, M=2-8 Multi-row GEMV, M=9-16 cuBLAS, M≥17 CUTLASS SM110 (M pad 到 8 对齐), can_implement() 失败自动回退 cuBLAS
+- AOT cuBLAS Autotuning: engine/serve 启动时预热 7 (N,K)×3 M×20 reps (~3s), 消除首次推理延迟
 
 ### Kernel Fusion
 - Fused Add+RMSNorm, Deinterleave+RMSNorm, RMSNorm+SiLU Gate
@@ -225,6 +226,21 @@ src/
 - ✅ SSM/Conv 指针缓存: 跳过 steady-state 下 managed memory 重建, ATS 一致性开销消除
   - B=4: 16.3→17.2 tok/s (93.7%→99.4%), B=16: 36.5→39.4 tok/s (92.9%→100.5%)
   - 所有 B=1~16 达标率 ≥99%
+- ✅ cuBLAS routing M=9-16: 替代 GEMV<16>, B=16 BW 116→220 GB/s (+89%)
+- ✅ AOT cuBLAS autotuning warmup: 7 (N,K)×3 M×20 reps ~3s, 消除首次推理延迟
+- ✅ Benchmark: decode-only + overall throughput 双指标, concurrent benchmark decode_tps 排除 TTFT
+
+### 并发吞吐 (27B BF16, d=30, 3 iterations)
+| B | Raw tok/s | Serve Decode tok/s | Serve/Raw |
+|---|-----------|--------------------|-----------|
+| 1 | 4.4 | 12.1 (MTP) | 275% |
+| 2 | 8.8 | 9.0 | 102% |
+| 4 | 16.5 | 17.1 | 104% |
+| 8 | 25.6 | 26.3 | 103% |
+| 16 | 65.7 | 68.9 | 105% |
+| 32 | 127.9 | 133.0 | 104% |
+| 64 | 230.0 | 239.5 | 104% |
+| 128 | 379.0 | 390.1 | 103% |
 
 ### 稳定性
 - 统一内存 SMMU 资源有限, 大规模并发访问可致 GPU hard-reset
