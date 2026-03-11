@@ -370,6 +370,8 @@ Measured with cold page cache (`echo 3 > /proc/sys/vm/drop_caches`).
 
 > Loading uses adaptive mmap strategy, scalar bypass (74K FP32 scalars from mmap), and direct-to-packed expert loading (73K expert tensors H2D to pre-allocated packed buffers, eliminating 97% cudaMalloc calls).
 
+For the full benchmark report including prefill throughput, context length scaling, MTP speedup, concurrent throughput, and stability analysis, see [docs/BENCHMARK_REPORT.md](docs/BENCHMARK_REPORT.md).
+
 Key optimizations applied:
 - **GEMV/GEMM**: Scattered GEMV, Dual GEMV, GEMV+Add fusion, Multi-row GEMV (M=2-8, zero SMEM, L2 cache), cuBLAS (M=9-16), CUTLASS SM110 GEMM (M≥17)
 - **Weight merging**: QKV merge (32 launches saved), QKVZAB super-merge (144 launches saved)
