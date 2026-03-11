@@ -314,11 +314,10 @@ void invoke_dense_gemm(
     cudaStream_t stream
 ) {
     // Small M: multi-row GEMV (reads B weights once, A from L2 cache).
-    // Much faster than cuBLAS for M=2-8: cuBLAS reads B ~1.5-2× for small M.
-    // A[M,K] fits in 32MB L2 cache for M≤8, K≤17408 (A = 280KB max).
-    // M=9-16: CUTLASS GEMM with tensor cores is faster than GEMV<16>
-    //   (GEMV<16> has severe register pressure → 4.5× slowdown per step).
-    // NOTE: SMEM variant tested but regressed (-24%) due to occupancy drop (5→6 blocks/SM).
+    // GEMV<4>: 225 GB/s for M=2-4 (register-based, zero SMEM, L2 for A).
+    // GEMV<8>: 144 GB/s for M=5-8 (instruction-bound: 2× instructions vs GEMV<4>).
+    // M=9-16: cuBLAS beats CUTLASS 128×128 (211 vs 116 GB/s at M=16).
+    // M≥17: CUTLASS 128×128 beats cuBLAS (205 vs 199 GB/s at M=32).
     if (M > 1 && M <= 8) {
         constexpr int BLOCK_THREADS = 256;  // 8 warps
         constexpr int WARPS = BLOCK_THREADS / 32;
@@ -332,8 +331,23 @@ void invoke_dense_gemm(
         }
         return;
     }
-    // M≥9: CUTLASS GEMM (M=9-16 使用 tensor cores 替代 register-heavy GEMV<16>)
-    // M=17-31 需要 8-aligned padding (17→24, 24→24, 31→32)
+    // M=9-16: cuBLAS (211 GB/s at M=16, replaces CUTLASS 128×128 at 116 GB/s)
+    if (M >= 9 && M <= 16) {
+        auto h = get_cublas_handle();
+        cublasSetStream(h, stream);
+        float alpha = 1.0f, beta = 0.0f;
+        cublasGemmEx(h,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            B, CUDA_R_16BF, K,
+            A, CUDA_R_16BF, K,
+            &beta,
+            C, CUDA_R_16BF, N,
+            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        return;
+    }
+    // M≥17: CUTLASS GEMM (tensor cores, 128×128 tile, 2×2 cluster)
 
     // M padding to 8-aligned (required by CUTLASS tensor core)
     int M_padded = M;
@@ -510,20 +524,32 @@ void invoke_dense_gemm_add(
     cudaStream_t stream
 ) {
     // Small M: multi-row GEMV + residual add (reads B once, A from L2)
-    if (M > 1 && M <= 16) {
+    if (M > 1 && M <= 4) {
         constexpr int BLOCK_THREADS = 256;
         constexpr int WARPS = BLOCK_THREADS / 32;
         int blocks = (N + WARPS - 1) / WARPS;
-        if (M <= 4) {
-            PDL_LAUNCH(gemv_multirow_kernel_scattered_add<4>, blocks, BLOCK_THREADS, 0, stream,
-                A, B, D, residual, M, N, K);
-        } else if (M <= 8) {
-            PDL_LAUNCH(gemv_multirow_kernel_scattered_add<8>, blocks, BLOCK_THREADS, 0, stream,
-                A, B, D, residual, M, N, K);
-        } else {
-            PDL_LAUNCH(gemv_multirow_kernel_scattered_add<16>, blocks, BLOCK_THREADS, 0, stream,
-                A, B, D, residual, M, N, K);
-        }
+        PDL_LAUNCH(gemv_multirow_kernel_scattered_add<4>, blocks, BLOCK_THREADS, 0, stream,
+            A, B, D, residual, M, N, K);
+        return;
+    }
+    // M=5-16: cuBLAS with residual add (beta=1)
+    // cuBLAS beats GEMV<8>/GEMV<16> for M=5-16 (211 vs 116-144 GB/s at M=16)
+    if (M >= 5 && M <= 16) {
+        if (D != residual)
+            cudaMemcpyAsync(D, residual, (size_t)M * N * sizeof(__nv_bfloat16),
+                            cudaMemcpyDeviceToDevice, stream);
+        auto h = get_cublas_handle();
+        cublasSetStream(h, stream);
+        float alpha = 1.0f, beta = 1.0f;
+        cublasGemmEx(h,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            B, CUDA_R_16BF, K,
+            A, CUDA_R_16BF, K,
+            &beta,
+            D, CUDA_R_16BF, N,
+            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
         return;
     }
     // M≥17: 尝试 CUTLASS (can_implement 失败自动回退 cuBLAS with residual add)
