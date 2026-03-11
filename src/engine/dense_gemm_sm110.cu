@@ -314,10 +314,15 @@ void invoke_dense_gemm(
     cudaStream_t stream
 ) {
     // Small M: multi-row GEMV (reads B weights once, A from L2 cache).
-    // GEMV<4>: 225 GB/s for M=2-4 (register-based, zero SMEM, L2 for A).
-    // GEMV<8>: 144 GB/s for M=5-8 (instruction-bound: 2× instructions vs GEMV<4>).
-    // M=9-16: cuBLAS beats CUTLASS 128×128 (211 vs 116 GB/s at M=16).
-    // M≥17: CUTLASS 128×128 beats cuBLAS (205 vs 199 GB/s at M=32).
+    // GEMV<4>: 222 GB/s for M=2-4 (register-based, zero SMEM, L2 for A).
+    // GEMV<8>: 148 GB/s for M=5-8 — instruction-throughput bottleneck (NOT occupancy):
+    //   Both GEMV<4> and GEMV<8> use 40 regs, 100% occupancy (6 blocks/SM).
+    //   GEMV<8> has 2.06× more SASS instructions (3461 vs 1680 lines).
+    //   Each B weight byte generates 2× more FMA/conversion instructions at M=8,
+    //   saturating the 4 warp schedulers/SM instruction pipeline.
+    //   cuBLAS tensor cores also give 146 GB/s at M=8 — same hardware limit.
+    // M=9-16: cuBLAS (tensor cores beat CUTLASS 128×128: 220 vs 116 GB/s at M=16).
+    // M≥17: CUTLASS 128×128 beats cuBLAS (208 vs 199 GB/s at M=32).
     if (M > 1 && M <= 8) {
         constexpr int BLOCK_THREADS = 256;  // 8 warps
         constexpr int WARPS = BLOCK_THREADS / 32;
@@ -331,7 +336,7 @@ void invoke_dense_gemm(
         }
         return;
     }
-    // M=9-16: cuBLAS (211 GB/s at M=16, replaces CUTLASS 128×128 at 116 GB/s)
+    // M=9-16: cuBLAS (tensor cores, 220 GB/s at M=16)
     if (M >= 9 && M <= 16) {
         auto h = get_cublas_handle();
         cublasSetStream(h, stream);
