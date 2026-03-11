@@ -2425,17 +2425,29 @@ int InferenceEngine::batch_prefill_step(
         d_workspace_, compute_stream_);
     profiler_.end("forward", compute_stream_);
 
-    // 5+6+7. Per-request LM head: 逐请求 fused RMSNorm+GEMV + argmax
-    //   直接从 d_hidden_states_ 读取每请求最后 token，避免 gather + batch GEMM
+    // 5+6+7. Batched LM head: gather last tokens → RMSNorm → single GEMM
+    //   旧: B × fused RMSNorm+GEMV → 读 lm_head 权重 B 次 (2.55 GB × B = 81.6 GB @B=32)
+    //   新: gather + RMSNorm + 1× GEMM → 读 lm_head 权重 1 次 (2.55 GB), 节省 ~350ms
     profiler_.begin("lm_head", compute_stream_);
-    __nv_bfloat16* logits_B = d_workspace_;  // [B, vocab]
-    for (int b = 0; b < batch_size; ++b) {
-        ops::invoke_dense_gemv_with_rmsnorm(
-            d_hidden_states_ + (size_t)((b + 1) * T - 1) * hs,
-            model_->get_norm_weight(), config_.rms_norm_eps,
-            model_->get_lm_head(), logits_B + (size_t)b * vocab_size,
-            vocab_size, hs, compute_stream_);
-    }
+    __nv_bfloat16* lm_input = d_workspace_;                         // [B, hs] gather buffer
+    __nv_bfloat16* lm_normed = lm_input + (size_t)batch_size * hs;  // [B, hs] norm output
+    __nv_bfloat16* logits_B = lm_normed + (size_t)batch_size * hs;  // [B, vocab]
+
+    // Gather last token of each request: stride = T tokens apart
+    cudaMemcpy2DAsync(
+        lm_input, (size_t)hs * sizeof(__nv_bfloat16),                       // dst, dpitch
+        d_hidden_states_ + (size_t)(T - 1) * hs,                            // src (first last-token)
+        (size_t)T * hs * sizeof(__nv_bfloat16),                              // spitch
+        (size_t)hs * sizeof(__nv_bfloat16), batch_size,                      // width, height
+        cudaMemcpyDeviceToDevice, compute_stream_);
+
+    // RMSNorm on gathered hidden states (B tokens, centered weight)
+    ops::invoke_rmsnorm(lm_normed, lm_input, model_->get_norm_weight(),
+                        config_.rms_norm_eps, batch_size, hs, compute_stream_);
+
+    // Single GEMM: [B, vocab] = [B, hs] × [hs, vocab] — reads 2.55 GB weight once
+    ops::invoke_dense_gemm(lm_normed, model_->get_lm_head(), logits_B,
+                           batch_size, vocab_size, hs, compute_stream_);
     profiler_.end("lm_head", compute_stream_);
 
     // 7. Batched argmax sampling

@@ -1377,7 +1377,14 @@ void Qwen35Model::forward_prefill_batch(
     int lin_idx = 0;
     int fa_idx  = 0;
 
+    // Profile batch prefill time breakdown
+    double fa_gemm_ms = 0, fa_perreq_ms = 0;
+    double la_gemm_ms = 0, la_perreq_ms = 0;
+    auto tick = [](){ return std::chrono::high_resolution_clock::now(); };
+    auto ms = [](auto a, auto b){ return std::chrono::duration<double, std::milli>(b - a).count(); };
+
     for (int i = 0; i < config_.num_hidden_layers; ++i) {
+        auto t0 = tick();
 
         if (config_.is_full_attention(i)) {
             layers_[i].get_full_attn()->forward(
@@ -1405,7 +1412,24 @@ void Qwen35Model::forward_prefill_batch(
 
         // 逐层 stream sync — SM110 统一内存约束
         cudaStreamSynchronize(stream);
+
+        auto t1 = tick();
+        double layer_ms = ms(t0, t1);
+        if (config_.is_full_attention(i)) {
+            // FullAttn: 粗略按 ~70% GEMM + 30% per-req 估计
+            // 精确测量需要在 layer.cu 内部加 sync 点, 这里用层总时间
+            fa_gemm_ms += layer_ms;
+        } else {
+            la_gemm_ms += layer_ms;
+        }
     }
+
+    fprintf(stderr, "[BatchPrefill Profile] B=%d T=%d M=%d\n", batch_size, tokens_per_seq, num_tokens);
+    fprintf(stderr, "  FullAttn total: %.1fms (%d layers, avg %.2fms/layer)\n",
+            fa_gemm_ms, fa_idx, fa_idx > 0 ? fa_gemm_ms / fa_idx : 0);
+    fprintf(stderr, "  LinearAttn total: %.1fms (%d layers, avg %.2fms/layer)\n",
+            la_gemm_ms, lin_idx, lin_idx > 0 ? la_gemm_ms / lin_idx : 0);
+    fprintf(stderr, "  Forward total: %.1fms\n", fa_gemm_ms + la_gemm_ms);
 }
 
 // ============================================================================
