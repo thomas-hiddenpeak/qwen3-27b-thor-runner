@@ -273,6 +273,22 @@ InferenceEngine::InferenceEngine(const Qwen35Config& config, const std::string& 
                vision_workspace_bytes_ / 1048576.0, max_patches, vcfg.max_pixels);
     }
 
+    // cuBLAS autotuning warmup: pre-profile kernel variants for all model dimensions.
+    // cuBLAS on SM110a runs async profiling over ~60 calls per (M,N,K) before converging
+    // to optimal kernels. Without warmup, first ~60 decode steps run at ~50% slower BW.
+    {
+        std::vector<std::pair<int,int>> cublas_nk = {
+            {qp_dim + 2*kv_dim, hs},       // FullAttn QKV merged
+            {in_qkv + lin_v + nkh*2, hs},  // LinearAttn super-merged
+            {2*is, hs},                     // MLP gate_up
+            {hs, is},                       // MLP down_proj (+residual)
+            {hs, q_dim},                    // FullAttn O_proj
+            {lin_v, hs},                    // LinearAttn out_proj
+            {config_.vocab_size, hs},       // LM head
+        };
+        ops::warmup_cublas_autotuning(cublas_nk, compute_stream_);
+    }
+
     // 确保所有 CUDA 初始化完成 (页面映射、memset 等), 避免首请求时延迟缺页
     cudaDeviceSynchronize();
     fprintf(stderr, "[Engine] Initialization complete, all CUDA pages settled.\n");

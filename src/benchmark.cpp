@@ -594,18 +594,24 @@ static int run_raw_batch_benchmark(int argc, char** argv) {
     };
     std::vector<RawResult> all_results;
 
+    // cuBLAS autotuning warmup: pre-profile kernel variants for model dimensions.
+    // This replaces the previous 5× discarded iteration hack with explicit targeted warmup.
+    {
+        std::vector<std::pair<int,int>> cublas_nk = {
+            {qp_dim + 2*kv_dim, hs},       // FullAttn QKV merged
+            {in_qkv + lin_v + nkh*2, hs},  // LinearAttn super-merged
+            {2*is_dim, hs},                 // MLP gate_up
+            {hs, is_dim},                   // MLP down_proj
+            {hs, (int)config.q_dim()},      // FullAttn O_proj
+            {lin_v, hs},                    // LinearAttn out_proj
+            {config.vocab_size, hs},        // LM head
+        };
+        ops::warmup_cublas_autotuning(cublas_nk, stream);
+    }
+
     for (int bs : cfg.raw_batch_sizes) {
-        // cuBLAS autotuning on SM110a: first ~60 decode steps run ~50% slower as
-        // cuBLAS profiles different kernel variants. Run 3 discarded warmup iterations
-        // to let autotuning complete before measurement. This adds ~15s per batch size
-        // but ensures consistent measurements.
-        constexpr int JIT_WARMUP_ITERS = 5;
-        for (int iter = -JIT_WARMUP_ITERS; iter < cfg.iterations; ++iter) {
-            bool jit_warmup = (iter < 0);
-            if (jit_warmup)
-                printf("[2/3] B=%d, autotuning warmup %d/%d...\n", bs, iter + JIT_WARMUP_ITERS + 1, JIT_WARMUP_ITERS);
-            else
-                printf("[2/3] B=%d, prompt=%d, iter=%d/%d\n", bs, prompt_len, iter+1, cfg.iterations);
+        for (int iter = 0; iter < cfg.iterations; ++iter) {
+            printf("[2/3] B=%d, prompt=%d, iter=%d/%d\n", bs, prompt_len, iter+1, cfg.iterations);
 
             // KV cache
             double kv_gb = cfg.kv_cache_gb > 0 ? cfg.kv_cache_gb : 8.0;
@@ -754,10 +760,9 @@ static int run_raw_batch_benchmark(int argc, char** argv) {
             Stats decode_stats;
 
             // JIT warmup runs the same number of steps as a real iteration
-            // (cuBLAS on SM110a needs a full iteration to finish async kernel compilation)
             int effective_total_steps = total_steps;
             for (int step = 0; step < effective_total_steps; ++step) {
-                bool warmup = jit_warmup || (step < cfg.raw_warmup_steps);
+                bool warmup = (step < cfg.raw_warmup_steps);
 
                 int max_ctx = 0;
                 for (int b = 0; b < bs; ++b) {
@@ -810,30 +815,25 @@ static int run_raw_batch_benchmark(int argc, char** argv) {
                 }
 
                 if (warmup) {
-                    if (!jit_warmup)
-                        printf("    [warmup %3d] step=%.2f ms  tok=%d\n", step, ms, reqs[0].last_token);
+                    printf("    [warmup %3d] step=%.2f ms  tok=%d\n", step, ms, reqs[0].last_token);
                 } else {
                     decode_stats.add(ms);
                 }
             }
 
-            if (jit_warmup) {
-                // Silence — autotuning iterations produce no measured output
-            } else {
-                // Results
-                float step_ms = decode_stats.median();
-                float tok_s = (step_ms > 0) ? bs * 1000.0f / step_ms : 0;
-                float bw = (step_ms > 0) ? total_weight_bytes / (step_ms / 1000.0f) / 1e9f : 0;
+            // Results
+            float step_ms = decode_stats.median();
+            float tok_s = (step_ms > 0) ? bs * 1000.0f / step_ms : 0;
+            float bw = (step_ms > 0) ? total_weight_bytes / (step_ms / 1000.0f) / 1e9f : 0;
 
-                printf("    ┌────────────────────────────────────────────────────┐\n");
-                printf("    │ B=%-3d  Step: %.1f ms  tok/s: %.1f  BW: %.1f GB/s │\n",
-                       bs, step_ms, tok_s, bw);
-                printf("    │ CV=%.1f%%  p95=%.2f  p99=%.2f                     │\n",
-                       decode_stats.cv_pct(), decode_stats.p95(), decode_stats.p99());
-                printf("    └────────────────────────────────────────────────────┘\n\n");
+            printf("    ┌────────────────────────────────────────────────────┐\n");
+            printf("    │ B=%-3d  Step: %.1f ms  tok/s: %.1f  BW: %.1f GB/s │\n",
+                   bs, step_ms, tok_s, bw);
+            printf("    │ CV=%.1f%%  p95=%.2f  p99=%.2f                     │\n",
+                   decode_stats.cv_pct(), decode_stats.p95(), decode_stats.p99());
+            printf("    └────────────────────────────────────────────────────┘\n\n");
 
-                all_results.push_back({bs, step_ms, tok_s, bw});
-            }
+            all_results.push_back({bs, step_ms, tok_s, bw});
 
             // Cleanup
             for (auto& r : reqs) {

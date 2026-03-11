@@ -174,5 +174,14 @@ void invoke_weighted_expert_reduce(
     int num_tokens = 1
 );
 
+// cuBLAS autotuning warmup: pre-profile kernel variants for M=9-16 GEMM dispatch.
+// Call after model weights are loaded to complete cuBLAS kernel autotuning before
+// the first inference request, preventing ~50% slower first ~60 decode steps.
+// nk_pairs: model-specific (N, K) dimension pairs used by GEMM projections.
+void warmup_cublas_autotuning(
+    const std::vector<std::pair<int,int>>& nk_pairs,
+    cudaStream_t stream = nullptr
+);
+
 } // namespace ops
 } // namespace qwen_thor

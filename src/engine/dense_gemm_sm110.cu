@@ -1927,5 +1927,90 @@ void invoke_weighted_expert_reduce(
         accum, expert_outputs, expert_weights, hs, top_k);
 }
 
+// ============================================================================
+// cuBLAS autotuning warmup: pre-profile kernel variants for all (M,N,K) combos
+// cuBLAS on SM110a (Blackwell) runs async kernel profiling on first calls with
+// CUBLAS_GEMM_DEFAULT, taking ~60 decode steps to converge. This function runs
+// dummy GEMMs with the actual model dimensions to complete autotuning before
+// the first user request arrives.
+// ============================================================================
+void warmup_cublas_autotuning(
+    const std::vector<std::pair<int,int>>& nk_pairs,  // (N, K) combos to warm
+    cudaStream_t stream)
+{
+    if (nk_pairs.empty()) return;
+
+    // Find max N and K to allocate scratch buffers
+    int max_N = 0, max_K = 0;
+    for (auto& [n, k] : nk_pairs) {
+        max_N = std::max(max_N, n);
+        max_K = std::max(max_K, k);
+    }
+    constexpr int MAX_M = 16;  // cuBLAS dispatch range upper bound
+
+    // Allocate temporary scratch (zero-initialized, values don't matter for autotuning)
+    __nv_bfloat16 *d_A = nullptr, *d_B = nullptr, *d_C = nullptr;
+    size_t a_sz = (size_t)MAX_M * max_K * sizeof(__nv_bfloat16);
+    size_t b_sz = (size_t)max_K * max_N * sizeof(__nv_bfloat16);  // col-major [K, N]
+    size_t c_sz = (size_t)MAX_M * max_N * sizeof(__nv_bfloat16);
+    if (cudaMalloc(&d_A, a_sz) != cudaSuccess ||
+        cudaMalloc(&d_B, b_sz) != cudaSuccess ||
+        cudaMalloc(&d_C, c_sz) != cudaSuccess) {
+        fprintf(stderr, "[cuBLAS warmup] Allocation failed (need %.1f MB), skipping\n",
+                (a_sz + b_sz + c_sz) / 1048576.0);
+        cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+        return;
+    }
+    cudaMemsetAsync(d_A, 0, a_sz, stream);
+    cudaMemsetAsync(d_B, 0, b_sz, stream);
+    cudaMemsetAsync(d_C, 0, c_sz, stream);
+
+    auto h = get_cublas_handle();
+    cublasSetStream(h, stream);
+
+    // Representative M values within the cuBLAS dispatch range [5..16]
+    // M=9 = first cuBLAS size for invoke_dense_gemm, M=16 = upper bound
+    constexpr int test_ms[] = {9, 12, 16};
+    constexpr int WARMUP_REPS = 20;  // ~60 calls per (N,K) across 3 M values
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    for (auto& [N, K] : nk_pairs) {
+        for (int M : test_ms) {
+            // beta=0 path (invoke_dense_gemm)
+            float alpha = 1.0f, beta0 = 0.0f, beta1 = 1.0f;
+            for (int r = 0; r < WARMUP_REPS; ++r) {
+                cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N,
+                    N, M, K, &alpha,
+                    d_B, CUDA_R_16BF, K,
+                    d_A, CUDA_R_16BF, K,
+                    &beta0, d_C, CUDA_R_16BF, N,
+                    CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+            }
+            // beta=1 path (invoke_dense_gemm_add)
+            for (int r = 0; r < WARMUP_REPS; ++r) {
+                cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N,
+                    N, M, K, &alpha,
+                    d_B, CUDA_R_16BF, K,
+                    d_A, CUDA_R_16BF, K,
+                    &beta1, d_C, CUDA_R_16BF, N,
+                    CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+            }
+        }
+    }
+    cudaStreamSynchronize(stream);
+
+    auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    fprintf(stderr, "[cuBLAS warmup] Autotuned %zu (N,K) pairs × %d M values "
+            "× %d reps in %.1fs\n",
+            nk_pairs.size(), (int)(sizeof(test_ms)/sizeof(test_ms[0])),
+            WARMUP_REPS, elapsed);
+
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+}
+
 } // namespace ops
 } // namespace qwen_thor
