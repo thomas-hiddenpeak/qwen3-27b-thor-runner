@@ -209,7 +209,7 @@ step() 逻辑:
 低占用率), 导致 B=16 反而比 B=8 慢。将 CUTLASS GEMM 接管阈值从 M≥17 降到 M≥9,
 B=16 吞吐 +87%。
 
-### Scaling 曲线
+### Scaling 曲线 (Phase 1-4 完成后, 串行 prefill)
 
 | Batch Size | tok/s | Scaling | GEMM 路径 | per_req_tps | TTFT (avg) |
 |-----------|-------|---------|----------|-------------|------------|
@@ -220,21 +220,38 @@ B=16 吞吐 +87%。
 | 32        | 44.3  | 3.64×   | CUTLASS  | 2.0         | ~10s       |
 | 64        | 69.2  | 6.09×   | CUTLASS  | 1.8         | ~16s       |
 
+### Scaling 曲线 (Batch Prefill + Batched LM Head 完成后, 最终)
+
+| Batch Size | tok/s (d=100) | Scaling | TTFT (avg) | raw ceiling | 效率 |
+|-----------|--------------|---------|------------|-------------|------|
+| 1 (MTP)   | 11.3         | 1.0×    | 290ms      | —           | —    |
+| 32        | 128.0        | 11.4×   | 596ms      | 109.2       | **117%** |
+| 64        | 218.5        | 19.2×   | 1201ms     | 233.2       | **94%**  |
+
 ### 效率分析
 
 理论极限: 51.2 GB 权重 / 220 GB/s 实测带宽 = 233ms/step
 - B=64 理论: 64 tok / 233ms = 275 tok/s
-- B=64 实测: 69.2 tok/s (25% of theoretical)
-- 差距主因: 64 ×串行 prefill ramp-up (~32s of 46s wall time)
+- B=64 实测: 218.5 tok/s (79% of theoretical)
+- B=32 实测: 128.0 tok/s (**超越** raw batch decode ceiling 109.2 tok/s)
+- Batch prefill 消除 ramp-up 后, 吞吐已超过 raw 基线 (serve > raw)
+
+### 性能演进总览
+
+| B | Phase 2 (串行) | Engine优化 | Batch Prefill | +Batched LM Head | 总提升 |
+|---|---------------|-----------|---------------|-----------------|--------|
+| 32 | 44.3 tok/s / ~10s | 90.6 / 3836ms | 123.8 / 929ms | **128.0 / 596ms** | **2.89×吞吐** |
+| 64 | 69.2 tok/s / ~16s | 123.2 / ~17s  | 212.5 / 1868ms | **218.5 / 1201ms** | **3.16×吞吐** |
 
 ### 下一步优化方向
 
-| 优先级 | 方向 | 预期收益 | 复杂度 |
-|--------|------|----------|--------|
-| P0 | 并行/批量 Prefill | 消除 ramp-up, B=64 可达 100+ tok/s | 中 |
-| P1 | Head-Group Batch Attention | 6 Q heads per KV group 合并, 减少 FA 时间 | 中 |
-| P2 | Batch MTP (B=4-8 开启投机) | 小 batch +50-80% | 高 |
-| P3 | SSM State 压缩 | 减少每 slot 75 MB, 支持更多并发 | 中 |
+| 优先级 | 方向 | 预期收益 | 复杂度 | 状态 |
+|--------|------|----------|--------|------|
+| P0 | 批量 Prefill + Batched LM Head | 消除 ramp-up, serve 超越 raw | 中 | ✅ 完成 |
+| P1 | Head-Group Batch Attention | 6 Q heads per KV group 合并, 减少 FA 时间 | 中 | 未实现 |
+| P2 | Batch MTP (B=4-8 开启投机) | 小 batch +50-80% | 高 | 标记 future |
+| P3 | SSM State 压缩 | 减少每 slot 75 MB, 支持更多并发 | 中 | 未实现 |
+| **P4** | **raw vs serve 差距消除** | **serve steady-state = raw** | 中 | **进行中** |
 
 ### Batch MTP 可行性分析
 
@@ -245,3 +262,35 @@ B=16 吞吐 +87%。
 - 异步验证: 各请求 accept count 不同, 无法 batch rollback
 - forward 重构: B 请求各 T 个 token, 需拆分为 per-request block/position 映射
 - 对目标场景 (B=32-64) 收益有限 (已接近带宽极限)
+
+---
+
+## Batch Prefill + Batched LM Head 优化 (2026-03-11)
+
+### 实现内容
+
+1. **Batch Prefill** (commit bb69967): B 个等长请求的 prompt 合并为单次 forward_prefill_batch
+   - 共享 GEMM: [B*T, K] × [K, N], 权重只读一次
+   - Per-request attention/SSM/conv1d: 各请求独立缓存操作
+   - IPC burst accumulation: 1ms × 20 retries 收集所有请求
+   - Q aliasing fix: fused_qk_norm_rope_kernel 输入输出 buffer 分离
+
+2. **Batched LM Head** (commit a4dff9e): B × GEMV → gather + RMSNorm + single GEMM
+   - 旧: B × fused RMSNorm+GEMV → 读 lm_head 权重 B 次 (2.55 GB × B)
+   - 新: cudaMemcpy2D gather + RMSNorm + invoke_dense_gemm → 读 1 次 (2.55 GB)
+
+### 结果 (d=100, 3 iterations)
+
+| B | Metric | Before Batch Prefill | After Batch Prefill | +Batched LM Head |
+|---|--------|---------------------|--------------------|-----------------|
+| 32 | TTFT | 3836ms | 929ms (-75.8%) | **596ms (-84.5%)** |
+| 32 | tok/s | 90.6 | 123.8 (+36.6%) | **128.0 (+41.3%)** |
+| 64 | TTFT | ~17s | 1868ms (-89.0%) | **1201ms (-92.9%)** |
+| 64 | tok/s | 123.2 | 212.5 (+72.5%) | **218.5 (+77.4%)** |
+
+### Forward Profile (Batch Prefill)
+
+| B | M | FA (16层) | LA (48层) | Forward Total |
+|---|---|-----------|-----------|---------------|
+| 32 | 544 | 106ms (6.6ms/层) | 466ms (9.7ms/层) | 570ms |
+| 64 | 1088 | 216ms (13.5ms/层) | 937ms (19.5ms/层) | 1153ms |

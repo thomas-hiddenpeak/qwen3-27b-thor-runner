@@ -216,9 +216,12 @@ src/
   - Prefill-first ramp-up: 有 pending prefill 时跳过 batch decode, 1× 权重读取
   - Bulk IPC admission: 一次 pop 所有请求, 消除队列延迟
   - Cleanup fast sync: 替代 polling+sleep, 利用 step 已 sync 特性
-  - B=32/d=100: 90.6 tok/s (raw ceiling 109.2, 83%), 19.5× scaling
-  - B=64/d=100: 123.2 tok/s (raw ceiling 233.2, 53%), 26.5× scaling
-  - Steady-state per-step 效率 ~90%, 差距主要来自串行 prefill ramp-up
+- ✅ Batch Prefill: B 请求合并单次 forward, Q aliasing fix
+  - B=32: TTFT 3836→929ms (-75.8%), 90.6→123.8 tok/s (+36.6%)
+  - B=64: TTFT ~17s→1868ms (-89.0%), 123.2→212.5 tok/s (+72.5%)
+- ✅ Batched LM Head: B×GEMV → gather+RMSNorm+single GEMM
+  - B=32: TTFT 929→596ms (-35.8%), 128.0 tok/s (超越 raw ceiling 109.2)
+  - B=64: TTFT 1868→1201ms (-35.7%), 218.5 tok/s (raw ceiling 233.2 的94%)
 
 ### 稳定性
 - 统一内存 SMMU 资源有限, 大规模并发访问可致 GPU hard-reset

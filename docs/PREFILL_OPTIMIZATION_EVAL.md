@@ -278,3 +278,23 @@ engine.cpp::process_request()
 4. **对于短 prompt (T<64), 优化空间最大** — 自研 small-M GEMM 有望获得 15-25% TTFT 改善。
 
 5. **Prefill 路径代码质量高, 架构清晰**, 支持 chunked prefill + prefix cache + SSD streaming + vision 等完整功能。适合在当前架构上添加业务插件 hook。
+
+---
+
+## 7. 后续实施结果 (2026-03-11)
+
+### Batch Prefill + Batched LM Head 已实现
+
+上述评估中的多项优化已通过 **Batch Prefill** 架构一次性解决:
+
+- P3 CUTLASS 接管 M=17-31: ✅ 已完成 (实际 -32.9%, 远超预估)
+- **Batch Prefill**: B 个请求合并为 M=B*T 的单次 forward, CUTLASS GEMM 对大 M 效率最优
+- **Batched LM Head**: B×GEMV → gather + RMSNorm + single GEMM, 消除 B 次权重读取
+
+| B | 优化前 (Engine串行prefill) | 优化后 (Batch+LM Head) | TTFT 改善 |
+|---|--------------------------|--------------------------|----------|
+| 32 | 90.6 tok/s / 3836ms | **128.0 tok/s / 596ms** | **-84.5%** |
+| 64 | 123.2 tok/s / ~17s | **218.5 tok/s / 1201ms** | **-92.9%** |
+
+关键发现: B=32 serve 吞吐 128.0 tok/s **超越** raw batch decode 基线 109.2 tok/s。
+Batch prefill 的 CUTLASS GEMM (M=544) 带宽利用率远高于 raw decode GEMV (M=32)。

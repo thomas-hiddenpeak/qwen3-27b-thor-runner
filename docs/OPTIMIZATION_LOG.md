@@ -4783,3 +4783,88 @@ M=17-31 的 cuBLAS 是 prefill 在短 prompt 下的主要瓶颈。cuBLAS 作为 
 **文件**: `src/engine/dense_gemm_sm110.cu`
 
 **累计 MTP 提速**: +51% (5.1 → 7.7-7.8 tok/s)
+
+---
+
+## Phase 23: Batch Prefill — B 请求一次 forward
+
+**日期**: 2026-03-11
+**状态**: ✅ 完成 (commit bb69967)
+
+### 问题
+
+Engine 处理 N 个并发请求时，每个 prefill 串行执行 (读权重 N 次 = N × 51 GB)。
+B=32 时 ramp-up 约 32×230ms ≈ 7.3s，占 wall time 的 70%+，严重拖累吞吐和 TTFT。
+
+### 方法
+
+**Hybrid Batch Prefill**: 等长 prompt 的 B 请求合并为单次 `forward_prefill_batch`:
+1. GEMM 层: `[B*T, K] × [K, N]`，权重只读一次
+2. Attention/SSM/Conv1d: per-request 循环，各自独立 block_table/ssm_slot
+
+关键设计:
+- IPC burst accumulation: 1ms × 20 retries 收集所有同时到达的请求
+- 不等长 → 回退串行 prefill
+- total_tokens > max_chunk_size → 截取前 max_B = max_chunk_size / T 个请求
+
+### 发现并修复的 Bug
+
+**Q Aliasing**: `fused_qk_norm_rope_kernel` 中 `q_out == qg_in`（共用 `qg_proj` buffer），
+输出 stride (q_dim=6144) ≠ 输入 stride (qp_dim=12288)，导致跨 block 数据竞争。
+T=1 时不暴露（stride 无关），T>1 多 block 并行写导致数据覆盖。
+Fix: `__nv_bfloat16* q = (num_tokens > 1) ? swiglu_out : qg_proj;`
+
+### 实现
+
+- `src/engine/model.h/cpp`: `forward_prefill_batch()` — 共享 GEMM + per-request attention/SSM
+- `src/engine/layer.h/cu`: FullAttn/LinearAttn `forward()` 增加 `tokens_per_seq` 参数
+- `src/engine/engine.h/cpp`: `batch_prefill_step()` — IPC burst + block 分配 + batch dispatch
+
+### 结果 (27B BF16, d=100, 3 iterations)
+
+| Batch | 指标 | Engine 优化 (串行 prefill) | Batch Prefill | 变化 |
+|-------|------|---------------------------|---------------|------|
+| 32 | TTFT | 3836ms | 929ms | **-75.8%** |
+| 32 | tok/s | 90.6 | 123.8 | **+36.6%** |
+| 64 | TTFT | ~17,000ms | 1868ms | **-89.0%** |
+| 64 | tok/s | 123.2 | 212.5 | **+72.5%** |
+
+**文件**: `src/engine/model.h/cpp`, `src/engine/layer.h/cu`, `src/engine/engine.h/cpp`
+
+---
+
+## Phase 24: Batched LM Head — B×GEMV → gather + RMSNorm + single GEMM
+
+**日期**: 2026-03-11
+**状态**: ✅ 完成 (commit a4dff9e)
+
+### 问题
+
+Batch prefill 后的 LM head 逐请求执行 fused RMSNorm + GEMV，
+每次读取 lm_head 权重 2.55 GB。B=32 时读 B 次 = 81.6 GB，占 engine overhead ~350ms。
+
+### 方法
+
+1. `cudaMemcpy2DAsync` gather: 从 `d_hidden_states_[B*T, hs]` 中提取 B 个 last token → `[B, hs]`
+2. `invoke_rmsnorm`: 对 gathered `[B, hs]` 做 centered RMSNorm
+3. `invoke_dense_gemm`: 单次 `[B, hs] × [hs, vocab]` → `[B, vocab]`，权重只读一次
+
+### 结果 (27B BF16, d=100, 3 iterations)
+
+| Batch | 指标 | Batch Prefill Only | +Batched LM Head | 变化 |
+|-------|------|--------------------|-------------------|------|
+| 32 | TTFT | 929ms | **596ms** | **-35.8%** |
+| 32 | tok/s | 123.8 | **128.0** | +3.4% |
+| 64 | TTFT | 1868ms | **1201ms** | **-35.7%** |
+| 64 | tok/s | 212.5 | **218.5** | +2.8% |
+
+Forward profile (batch prefill):
+- B=32 M=544: FA 106ms (6.6ms/层), LA 466ms (9.7ms/层), forward total 570ms
+- B=64 M=1088: FA 216ms (13.5ms/层), LA 937ms (19.5ms/层), forward total 1153ms
+
+TTFT 瓶颈现已完全在 forward 本身，LM head 开销近乎消除。
+
+**关键发现**: B=32 serve 吞吐 128.0 tok/s **超过** raw batch decode ceiling 109.2 tok/s。
+Batch prefill 的 CUTLASS GEMM (M=544) 比 raw decode GEMV (M=32) 更高效地利用带宽。
+
+**文件**: `src/engine/engine.cpp`, `src/engine/model.cpp`
