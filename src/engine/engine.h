@@ -163,6 +163,10 @@ private:
     __nv_bfloat16** d_batch_conv_ptrs_ = nullptr;  // [num_lin_layers * max_batch] managed
     int max_batch_size_ = 64;                      // from CacheConfig::max_ssm_slots
     int batch_max_blocks_per_seq_ = 0;             // for 2D block table packing
+
+    // SSM/Conv pointer array cache: skip rebuild if batch composition unchanged
+    int last_batch_decode_size_ = 0;
+    std::vector<RequestContext*> last_batch_decode_ptrs_;
     
     std::thread worker_thread_;
     std::atomic<bool> running_{false};

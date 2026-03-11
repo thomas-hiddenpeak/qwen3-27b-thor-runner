@@ -2091,10 +2091,26 @@ void InferenceEngine::batch_decode_step(
     }
 
     // 3. SSM/Conv 指针数组: [num_lin_layers * B], 布局 = ssm[lin_idx * B + batch_idx]
-    for (int li = 0; li < num_linear_layers_; li++) {
-        for (int bi = 0; bi < B; bi++) {
-            d_batch_ssm_ptrs_[li * B + bi] = decode_reqs[bi]->cache_state.ssm_states[li];
-            d_batch_conv_ptrs_[li * B + bi] = decode_reqs[bi]->cache_state.conv_states[li];
+    // 优化: 只在 batch 组成变化时重建 (避免写 managed memory 导致 ATS 一致性开销)
+    {
+        bool need_rebuild = (B != last_batch_decode_size_);
+        if (!need_rebuild) {
+            for (int i = 0; i < B; i++) {
+                if (decode_reqs[i] != last_batch_decode_ptrs_[i]) {
+                    need_rebuild = true;
+                    break;
+                }
+            }
+        }
+        if (need_rebuild) {
+            for (int li = 0; li < num_linear_layers_; li++) {
+                for (int bi = 0; bi < B; bi++) {
+                    d_batch_ssm_ptrs_[li * B + bi] = decode_reqs[bi]->cache_state.ssm_states[li];
+                    d_batch_conv_ptrs_[li * B + bi] = decode_reqs[bi]->cache_state.conv_states[li];
+                }
+            }
+            last_batch_decode_size_ = B;
+            last_batch_decode_ptrs_.assign(decode_reqs.begin(), decode_reqs.end());
         }
     }
 
