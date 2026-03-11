@@ -883,6 +883,7 @@ struct ConcurrentResult {
     int iterations;
     float wall_time_ms;          // 从首个请求提交到最后一个完成的壁钟时间
     float aggregate_tps;         // 总生成 token / wall_time
+    float decode_tps;            // decode-only: total_tokens / (t_end - max_first_token)
     int   total_tokens;          // 所有请求生成的 token 总数
     Stats per_req_ttft;          // 各请求的 TTFT 分布
     Stats per_req_tps;           // 各请求的吞吐量分布
@@ -1049,8 +1050,11 @@ static int run_concurrent_benchmark(int argc, char** argv) {
         // 汇总本轮结果
         float wall_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
         int total_tokens = 0;
+        Clock::time_point max_first_token = t_start;
         for (auto& [id, st] : states) {
             total_tokens += st.token_count;
+            if (st.got_first && st.t_first > max_first_token)
+                max_first_token = st.t_first;
             float ttft = std::chrono::duration<float, std::milli>(st.t_first - t_start).count();
             float req_ms = std::chrono::duration<float, std::milli>(t_end - st.t_first).count();
             float req_tps = (st.token_count > 1 && req_ms > 0)
@@ -1062,14 +1066,17 @@ static int run_concurrent_benchmark(int argc, char** argv) {
         cr.wall_time_ms = wall_ms;
         cr.total_tokens = total_tokens;
         cr.aggregate_tps = (wall_ms > 0) ? total_tokens * 1000.0f / wall_ms : 0;
+        // Decode-only throughput: exclude TTFT, count tokens from when ALL requests
+        // have received their first token (all in decode mode)
+        float decode_ms = std::chrono::duration<float, std::milli>(t_end - max_first_token).count();
+        cr.decode_tps = (decode_ms > 0) ? total_tokens * 1000.0f / decode_ms : 0;
         cr.batch_efficiency = (baseline_tps > 0)
                               ? cr.aggregate_tps / (cfg.concurrent * baseline_tps) : 0;
 
-        printf("  [iter=%d] wall=%.0fms  tokens=%d  agg_tps=%.1f  "
-               "per_req_tps=%.1f±%.1f  ttft=%.1f±%.1fms  efficiency=%.1f%%\n",
+        printf("  [iter=%d] wall=%.0fms  tokens=%d  agg=%.1f  decode=%.1f tok/s  "
+               "ttft=%.1f±%.1fms  efficiency=%.1f%%\n",
                iter + 1, wall_ms, total_tokens,
-               cr.aggregate_tps,
-               cr.per_req_tps.mean(), cr.per_req_tps.stddev(),
+               cr.aggregate_tps, cr.decode_tps,
                cr.per_req_ttft.mean(), cr.per_req_ttft.stddev(),
                cr.batch_efficiency * 100);
 
@@ -1077,9 +1084,10 @@ static int run_concurrent_benchmark(int argc, char** argv) {
     }
 
     // 汇总
-    Stats agg_tps_stats, agg_wall_stats, agg_eff_stats;
+    Stats agg_tps_stats, agg_wall_stats, agg_eff_stats, decode_tps_stats;
     for (auto& r : all_results) {
         agg_tps_stats.add(r.aggregate_tps);
+        decode_tps_stats.add(r.decode_tps);
         agg_wall_stats.add(r.wall_time_ms);
         agg_eff_stats.add(r.batch_efficiency * 100);
     }
@@ -1096,6 +1104,8 @@ static int run_concurrent_benchmark(int argc, char** argv) {
     printf("╠══════════════════════════════════════════════════════════════════════════╣\n");
     printf("║  Aggregate throughput: %6.1f tok/s ±%.1f (median: %.1f)                ║\n",
            agg_tps_stats.mean(), agg_tps_stats.ci95(), agg_tps_stats.median());
+    printf("║  Decode throughput   : %6.1f tok/s ±%.1f (excl. TTFT)                  ║\n",
+           decode_tps_stats.mean(), decode_tps_stats.ci95());
     printf("║  Wall time           : %6.0f ms ±%.0f                                  ║\n",
            agg_wall_stats.mean(), agg_wall_stats.ci95());
     printf("║  Batch efficiency    : %5.1f%%                                          ║\n",
@@ -1119,6 +1129,8 @@ static int run_concurrent_benchmark(int argc, char** argv) {
             ofs << "  \"baseline_tps\": " << std::setprecision(2) << baseline_tps << ",\n";
             ofs << "  \"aggregate_tps_mean\": " << std::setprecision(2) << agg_tps_stats.mean() << ",\n";
             ofs << "  \"aggregate_tps_median\": " << std::setprecision(2) << agg_tps_stats.median() << ",\n";
+            ofs << "  \"decode_tps_mean\": " << std::setprecision(2) << decode_tps_stats.mean() << ",\n";
+            ofs << "  \"decode_tps_median\": " << std::setprecision(2) << decode_tps_stats.median() << ",\n";
             ofs << "  \"wall_time_mean_ms\": " << std::setprecision(1) << agg_wall_stats.mean() << ",\n";
             ofs << "  \"batch_efficiency_pct\": " << std::setprecision(1) << agg_eff_stats.mean() << ",\n";
             ofs << "  \"scaling_factor\": " << std::setprecision(2) << (baseline_tps > 0 ? agg_tps_stats.mean() / baseline_tps : 0) << ",\n";
