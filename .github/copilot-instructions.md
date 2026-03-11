@@ -222,6 +222,9 @@ src/
 - ✅ Batched LM Head: B×GEMV → gather+RMSNorm+single GEMM
   - B=32: TTFT 929→596ms (-35.8%), 128.0 tok/s (raw 达标基线 130.1, 98.4%)
   - B=64: TTFT 1868→1201ms (-35.7%), 218.5 tok/s (raw 达标基线 232.3, 94.1%)
+- ✅ SSM/Conv 指针缓存: 跳过 steady-state 下 managed memory 重建, ATS 一致性开销消除
+  - B=4: 16.3→17.2 tok/s (93.7%→99.4%), B=16: 36.5→39.4 tok/s (92.9%→100.5%)
+  - 所有 B=1~16 达标率 ≥99%
 
 ### 稳定性
 - 统一内存 SMMU 资源有限, 大规模并发访问可致 GPU hard-reset
