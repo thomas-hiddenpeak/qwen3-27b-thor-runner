@@ -96,6 +96,9 @@ struct BackendConfig {
     // Prefill 分块大小 (默认 2048, 上限 4096)
     int         max_chunk_size   = 2048;
 
+    // SSM/Conv 并发槽位
+    int         max_ssm_slots    = 64;
+
     // MTP 投机解码
     std::string mtp_mode         = "auto";
     int         mtp_kv_blocks    = 256;

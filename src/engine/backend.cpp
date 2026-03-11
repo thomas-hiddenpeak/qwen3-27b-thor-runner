@@ -50,6 +50,8 @@ BackendConfig BackendConfig::from_args(int argc, char** argv) {
             cfg.cache_ssm_state = false;
         } else if (arg == "--max-chunk-size" && i + 1 < argc) {
             cfg.max_chunk_size = std::max(64, std::min(4096, std::stoi(argv[++i])));
+        } else if (arg == "--max-ssm-slots" && i + 1 < argc) {
+            cfg.max_ssm_slots = std::max(1, std::stoi(argv[++i]));
         } else if (arg == "--mtp-enable") {
             cfg.mtp_mode = "on";
         } else if (arg == "--mtp-disable") {
@@ -101,6 +103,7 @@ BackendConfig BackendConfig::from_file(const std::string& path) {
         else if (key == "cache_ssm_state")    cfg.cache_ssm_state = (val == "true" || val == "1");
         else if (key == "eviction_policy")    cfg.eviction_policy = val;
         else if (key == "max_chunk_size")     cfg.max_chunk_size = std::max(64, std::min(4096, std::stoi(val)));
+        else if (key == "max_ssm_slots")      cfg.max_ssm_slots = std::max(1, std::stoi(val));
         else if (key == "mtp_mode")           cfg.mtp_mode = val;
         else if (key == "mtp_kv_blocks")      cfg.mtp_kv_blocks = std::stoi(val);
         else if (key == "mtp_num_drafts" || key == "mtp_drafts")
@@ -120,6 +123,7 @@ cache::CacheConfig BackendConfig::to_cache_config() const {
     cc.cache_ssm_state    = cache_ssm_state;
     cc.eviction_policy    = eviction_policy;
     cc.max_chunk_size     = max_chunk_size;
+    cc.max_ssm_slots      = max_ssm_slots;
     cc.mtp_mode           = mtp_mode;
     cc.mtp_kv_blocks      = mtp_kv_blocks;
     cc.mtp_num_drafts     = mtp_num_drafts;
