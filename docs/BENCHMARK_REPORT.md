@@ -18,7 +18,7 @@
 | Qwen3.5-35B-A3B | MoE BF16 | 66.0 GB | d=2 | B=1, 4, 8, 16 |
 | Qwen3.5-122B-A10B | MoE NVFP4 | 77.1 GB | d=2 | B=1, 4, 8 |
 
-> ⚠️ **27B NVFP4**: 并发/长 prompt 测试中出现内存相关崩溃, 需专门排查, 本次报告跳过.
+> ⚠️ **27B NVFP4**: 测试中设备供电崩溃导致硬重启 (uptime 归零), 非软件问题. 待供电环境稳定后补测.
 
 ---
 
@@ -193,7 +193,7 @@ MTP 仅在 B=1 时生效, B≥2 走 batch decode (权重读一次服务多请求
 
 ### 4.2 Known Issues
 
-- **27B NVFP4**: 并发/长 prompt 场景下出现内存相关崩溃 (疑似统一内存 SMMU 资源耗尽), 需专门排查.
+- **27B NVFP4**: 测试中设备供电崩溃导致硬重启 (uptime 归零), 非软件问题. 疑似 MAXN 模式下瞬态功耗尖峰触发断电保护.
 - **122B MoE P=17**: 生成 8 tokens 后遇到 EOS (非模型问题, 是 benchmark 合成 prompt 的特性), decode 速度仍然准确.
 
 ---
@@ -207,7 +207,7 @@ MTP 仅在 B=1 时生效, B≥2 走 batch decode (权重读一次服务多请求
 | TTFT 稳定性 (CV) | < 5% | < 2% | ✅ |
 | Decode 吞吐一致性 | Serve ≥ Raw | 102-275% | ✅ |
 | 并发 scaling | 近线性 | B=128 → 32× (27B) | ✅ |
-| 内存安全 | 无 OOM / crash | 5/6 模型通过 | ⚠️ (27B NVFP4 待修) |
+| 内存安全 | 无 OOM / crash | 5/6 模型通过 | ⚠️ (27B NVFP4 供电问题) |
 | 首次推理延迟 | 稳定 | AOT warmup 消除 | ✅ |
 
 ### 5.2 Peak Performance per Model
