@@ -4864,7 +4864,10 @@ Forward profile (batch prefill):
 
 TTFT 瓶颈现已完全在 forward 本身，LM head 开销近乎消除。
 
-**关键发现**: B=32 serve 吞吐 128.0 tok/s **超过** raw batch decode ceiling 109.2 tok/s。
-Batch prefill 的 CUTLASS GEMM (M=544) 比 raw decode GEMV (M=32) 更高效地利用带宽。
+**关键发现**: RAW batch decode 是性能达标基线 (非天花板)。
+- B=32: serve 128.0 tok/s vs raw 130.1 tok/s (达标率 98.4%)
+- B=64: serve 218.5 tok/s vs raw 232.3 tok/s (达标率 94.1%)
+- 注: 早期 109.2/233.2 数据来自 CUDA Graph 损坏状态, 已修正
+- 目标: 通过 Batch MTP 等优化超越 raw 达标线
 
 **文件**: `src/engine/engine.cpp`, `src/engine/model.cpp`

@@ -175,11 +175,10 @@ struct BenchConfig {
     int concurrent          = 1;     // 并发请求数 (1=顺序, >1=同时提交)
     bool shared_prefix      = false; // 并发请求使用相同 prefix
 
-    // Raw batch decode 参数 (直接 model->forward_decode, 无 engine/serve 开销, 作为性能天花板参考)
+    // Raw batch decode 参数 (直接 model->forward_decode, 无 engine/serve 开销, 作为性能达标基线)
     std::vector<int> raw_batch_sizes;  // 非空则走 raw batch decode 模式
     int raw_warmup_steps    = 5;
     int raw_decode_steps    = 10;
-    bool no_graph           = false;
 
     // 采样参数
     float temperature       = 0.0f;  // 0 = greedy
@@ -220,7 +219,6 @@ static BenchConfig parse_bench_args(int argc, char** argv) {
         else if (arg == "--raw-batch" && i + 1 < argc) cfg.raw_batch_sizes = parse_int_list(argv[++i]);
         else if (arg == "--raw-warmup" && i + 1 < argc) cfg.raw_warmup_steps = std::max(1, std::atoi(argv[++i]));
         else if (arg == "--raw-decode" && i + 1 < argc) cfg.raw_decode_steps = std::max(1, std::atoi(argv[++i]));
-        else if (arg == "--no-graph") cfg.no_graph = true;
         else if (arg == "--verbose")       cfg.verbose = true;
         else if (arg == "--help" || arg == "-h") {
             printf("Usage: qwen35-thor bench [options]\n\n"
@@ -244,11 +242,10 @@ static BenchConfig parse_bench_args(int argc, char** argv) {
                    "  --top-p F               Top-p threshold (default: 0.95)\n"
                    "  --top-k N               Top-k (default: 20)\n"
                    "  --seed N                Random seed (default: 42)\n"
-                   "\nRaw batch decode options (direct model forward, reference baseline):\n"
+                   "\nRaw batch decode options (direct model forward, performance baseline):\n"
                    "  --raw-batch N[,N..]     Batch sizes for raw decode (bypasses engine/serve)\n"
                    "  --raw-warmup N          Raw decode warmup steps (default: 5)\n"
                    "  --raw-decode N          Raw decode measured steps (default: 10)\n"
-                   "  --no-graph              Disable CUDA Graph\n"
                    "\nConcurrency options:\n"
                    "  --concurrent N          Submit N requests simultaneously (default: 1)\n"
                    "  --shared-prefix         All concurrent requests share same prefix tokens\n"
@@ -514,7 +511,7 @@ static int run_raw_batch_benchmark(int argc, char** argv) {
 
     printf("========================================\n");
     printf("  Raw Model Decode Benchmark\n");
-    printf("  (reference baseline, no engine overhead)\n");
+    printf("  (performance baseline, no engine overhead)\n");
     printf("========================================\n");
     printf("  Batch sizes   : ");
     for (size_t i = 0; i < cfg.raw_batch_sizes.size(); ++i)
@@ -523,7 +520,6 @@ static int run_raw_batch_benchmark(int argc, char** argv) {
     printf("  Prompt len    : %d\n", cfg.prompt_lens[0]);
     printf("  Warmup steps  : %d\n", cfg.raw_warmup_steps);
     printf("  Decode steps  : %d\n", cfg.raw_decode_steps);
-    printf("  CUDA Graph    : %s\n", cfg.no_graph ? "OFF" : "ON");
     printf("  Iterations    : %d\n", cfg.iterations);
     printf("========================================\n\n");
 
@@ -742,10 +738,6 @@ static int run_raw_batch_benchmark(int argc, char** argv) {
             __nv_bfloat16* norm_out_g = d_ws + ws_per_tok * max_tokens;
             __nv_bfloat16* logits_g = norm_out_g + (size_t)bs * hs;
 
-            cudaGraph_t decode_graph = nullptr;
-            cudaGraphExec_t decode_graph_exec = nullptr;
-            bool graph_captured = false;
-
             std::vector<int> h_tids(bs), h_pids(bs), h_clens(bs);
             std::vector<int> h_bt_flat(bs * max_kv_blks, 0);
 
@@ -777,61 +769,20 @@ static int run_raw_batch_benchmark(int argc, char** argv) {
                                 cudaMemcpyHostToDevice, stream);
                 cudaMemcpyAsync(d_ctx_lens, h_clens.data(), bs * sizeof(int), cudaMemcpyHostToDevice, stream);
 
-                if (graph_captured) {
-                    cudaGraphLaunch(decode_graph_exec, stream);
-                } else {
-                    model->forward_decode(d_hidden, d_pos, *kv_manager,
-                                   d_btables, d_ctx_lens,
-                                   max_kv_blks, max_ctx, bs,
-                                   d_ssm_ptrs, d_conv_ptrs,
-                                   d_ws, stream);
-                    ops::invoke_rmsnorm(norm_out_g, d_hidden, model->get_norm_weight(),
-                                        config.rms_norm_eps, bs, hs, stream);
-                    if (bs == 1)
-                        ops::invoke_dense_gemv(norm_out_g, model->get_lm_head(), logits_g,
-                                               config.vocab_size, hs, stream);
-                    else
-                        ops::invoke_dense_gemm(norm_out_g, model->get_lm_head(), logits_g,
-                                               bs, config.vocab_size, hs, stream);
-                    ops::invoke_batched_argmax(logits_g, d_argmax, config.vocab_size, bs, stream);
-
-                    // CUDA Graph capture 在 SM110a 上不可用:
-                    //   - forward_decode 内含 per-layer cudaStreamSynchronize (UMA 约束)
-                    //   - CUTLASS GEMM 使用 SAFE_CUDA_REALLOC (static 变量 + cudaMalloc)
-                    // 两者均不兼容 CUDA Graph。直接跳过 capture。
-                    if (false && warmup && step == cfg.raw_warmup_steps - 1 && !cfg.no_graph && bs == 1) {
-                        cudaStreamSynchronize(stream);
-                        cudaStream_t cap_stream;
-                        cudaStreamCreate(&cap_stream);
-                        cudaStreamBeginCapture(cap_stream, cudaStreamCaptureModeGlobal);
-
-                        model->forward_decode(d_hidden, d_pos, *kv_manager,
-                                       d_btables, d_ctx_lens,
-                                       max_kv_blks, max_ctx, bs,
-                                       d_ssm_ptrs, d_conv_ptrs,
-                                       d_ws, cap_stream);
-                        ops::invoke_rmsnorm(norm_out_g, d_hidden, model->get_norm_weight(),
-                                            config.rms_norm_eps, bs, hs, cap_stream);
-                        if (bs == 1)
-                            ops::invoke_dense_gemv(norm_out_g, model->get_lm_head(), logits_g,
-                                                   config.vocab_size, hs, cap_stream);
-                        else
-                            ops::invoke_dense_gemm(norm_out_g, model->get_lm_head(), logits_g,
-                                                   bs, config.vocab_size, hs, cap_stream);
-                        ops::invoke_batched_argmax(logits_g, d_argmax, config.vocab_size, bs, cap_stream);
-
-                        cudaStreamEndCapture(cap_stream, &decode_graph);
-                        auto err = cudaGraphInstantiate(&decode_graph_exec, decode_graph, 0);
-                        cudaStreamDestroy(cap_stream);
-                        if (err == cudaSuccess) {
-                            graph_captured = true;
-                            printf("    [graph] CUDA Graph captured (%d kernels)\n", bs);
-                        } else {
-                            printf("    [graph] capture failed: %s — using non-graph path\n",
-                                   cudaGetErrorString(err));
-                        }
-                    }
-                }
+                model->forward_decode(d_hidden, d_pos, *kv_manager,
+                               d_btables, d_ctx_lens,
+                               max_kv_blks, max_ctx, bs,
+                               d_ssm_ptrs, d_conv_ptrs,
+                               d_ws, stream);
+                ops::invoke_rmsnorm(norm_out_g, d_hidden, model->get_norm_weight(),
+                                    config.rms_norm_eps, bs, hs, stream);
+                if (bs == 1)
+                    ops::invoke_dense_gemv(norm_out_g, model->get_lm_head(), logits_g,
+                                           config.vocab_size, hs, stream);
+                else
+                    ops::invoke_dense_gemm(norm_out_g, model->get_lm_head(), logits_g,
+                                           bs, config.vocab_size, hs, stream);
+                ops::invoke_batched_argmax(logits_g, d_argmax, config.vocab_size, bs, stream);
 
                 t_total.record_stop(stream);
                 float ms = t_total.elapsed_ms();
@@ -868,8 +819,6 @@ static int run_raw_batch_benchmark(int argc, char** argv) {
             all_results.push_back({bs, step_ms, tok_s, bw});
 
             // Cleanup
-            if (decode_graph_exec) cudaGraphExecDestroy(decode_graph_exec);
-            if (decode_graph) cudaGraphDestroy(decode_graph);
             for (auto& r : reqs) {
                 for (auto* p : r.ssm_states) cudaFree(p);
                 for (auto* p : r.conv_states) cudaFree(p);
@@ -1178,7 +1127,7 @@ static int run_concurrent_benchmark(int argc, char** argv) {
 int run_benchmark(int argc, char** argv) {
     BenchConfig cfg = parse_bench_args(argc, argv);
 
-    // Raw batch decode 模式: 直接调 model->forward_decode(), 作为性能天花板参考
+    // Raw batch decode 模式: 直接调 model->forward_decode(), 作为性能达标基线
     if (!cfg.raw_batch_sizes.empty()) {
         return run_raw_batch_benchmark(argc, argv);
     }

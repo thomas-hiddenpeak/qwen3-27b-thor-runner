@@ -220,8 +220,8 @@ src/
   - B=32: TTFT 3836→929ms (-75.8%), 90.6→123.8 tok/s (+36.6%)
   - B=64: TTFT ~17s→1868ms (-89.0%), 123.2→212.5 tok/s (+72.5%)
 - ✅ Batched LM Head: B×GEMV → gather+RMSNorm+single GEMM
-  - B=32: TTFT 929→596ms (-35.8%), 128.0 tok/s (超越 raw ceiling 109.2)
-  - B=64: TTFT 1868→1201ms (-35.7%), 218.5 tok/s (raw ceiling 233.2 的94%)
+  - B=32: TTFT 929→596ms (-35.8%), 128.0 tok/s (raw 达标基线 130.1, 98.4%)
+  - B=64: TTFT 1868→1201ms (-35.7%), 218.5 tok/s (raw 达标基线 232.3, 94.1%)
 
 ### 稳定性
 - 统一内存 SMMU 资源有限, 大规模并发访问可致 GPU hard-reset

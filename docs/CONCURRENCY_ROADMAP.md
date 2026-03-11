@@ -222,19 +222,22 @@ B=16 吞吐 +87%。
 
 ### Scaling 曲线 (Batch Prefill + Batched LM Head 完成后, 最终)
 
-| Batch Size | tok/s (d=100) | Scaling | TTFT (avg) | raw ceiling | 效率 |
+| Batch Size | tok/s (d=100) | Scaling | TTFT (avg) | raw 达标基线 | 达标率 |
 |-----------|--------------|---------|------------|-------------|------|
 | 1 (MTP)   | 11.3         | 1.0×    | 290ms      | —           | —    |
-| 32        | 128.0        | 11.4×   | 596ms      | 109.2       | **117%** |
-| 64        | 218.5        | 19.2×   | 1201ms     | 233.2       | **94%**  |
+| 32        | 128.0        | 11.4×   | 596ms      | 130.1       | 98.4% |
+| 64        | 218.5        | 19.2×   | 1201ms     | 232.3       | 94.1% |
+| 128        | —            | —       | —          | 381.8       | —     |
 
 ### 效率分析
 
 理论极限: 51.2 GB 权重 / 220 GB/s 实测带宽 = 233ms/step
 - B=64 理论: 64 tok / 233ms = 275 tok/s
 - B=64 实测: 218.5 tok/s (79% of theoretical)
-- B=32 实测: 128.0 tok/s (**超越** raw batch decode ceiling 109.2 tok/s)
-- Batch prefill 消除 ramp-up 后, 吞吐已超过 raw 基线 (serve > raw)
+- B=32 实测: 128.0 tok/s (raw 达标基线 130.1 tok/s, 达标率 98.4%)
+- B=64 实测: 218.5 tok/s (raw 达标基线 232.3 tok/s, 达标率 94.1%)
+- RAW 是性能达标线 (最低可接受标准), 目标是超越而非接近
+- 注: 早期 109.2/233.2 数据来自 CUDA Graph 损坏状态, 已作废
 
 ### 性能演进总览
 
@@ -251,7 +254,7 @@ B=16 吞吐 +87%。
 | P1 | Head-Group Batch Attention | 6 Q heads per KV group 合并, 减少 FA 时间 | 中 | 未实现 |
 | P2 | Batch MTP (B=4-8 开启投机) | 小 batch +50-80% | 高 | 标记 future |
 | P3 | SSM State 压缩 | 减少每 slot 75 MB, 支持更多并发 | 中 | 未实现 |
-| **P4** | **raw vs serve 差距消除** | **serve steady-state = raw** | 中 | **进行中** |
+| **P4** | **超越 raw 达标基线** | **serve > raw (尤其 B=32~64)** | 中 | **进行中** |
 
 ### Batch MTP 可行性分析
 
@@ -294,3 +297,19 @@ B=16 吞吐 +87%。
 |---|---|-----------|-----------|---------------|
 | 32 | 544 | 106ms (6.6ms/层) | 466ms (9.7ms/层) | 570ms |
 | 64 | 1088 | 216ms (13.5ms/层) | 937ms (19.5ms/层) | 1153ms |
+
+### RAW 达标基线定义
+
+**RAW batch decode = 性能达标基线, 非天花板**: 直接调 `model->forward_decode()`, 无 engine/serve 开销。
+Serve 吞吐至少需要达到 raw 水平, 超越 raw 才是优化目标。
+
+**实测 raw 基线** (27B BF16, --raw-decode 30, 3 iterations, 无 CUDA Graph):
+
+| B | Step(ms) | tok/s | BW(GB/s) | GEMM 路径 |
+|---|----------|-------|----------|----------|
+| 1 | 226.3 | 4.4 | 226.5 | GEMV |
+| 32 | 246.0 | 130.1 | 208.3 | CUTLASS M=32 |
+| 64 | 273.3 | 234.1 | 187.5 | CUTLASS M=64 |
+| 128 | 332.0 | 385.5 | 154.3 | CUTLASS M=128 |
+
+**实用范围**: B=128 为实用上限, B=32~64 为甜点区。B≤32 可采用不同优化路径。
