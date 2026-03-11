@@ -4870,4 +4870,50 @@ TTFT 瓶颈现已完全在 forward 本身，LM head 开销近乎消除。
 - 注: 早期 109.2/233.2 数据来自 CUDA Graph 损坏状态, 已修正
 - 目标: 通过 Batch MTP 等优化超越 raw 达标线
 
+---
+
+## Phase 25: SSM/Conv 指针缓存 — 消除 ATS 一致性开销
+
+**日期**: 2026-03-12
+**状态**: ✅ 完成 (commit 7fd38d1)
+
+### 问题
+
+`batch_decode_step` 每步重建 SSM/Conv 指针数组 (48层 × B × 2 次 `cudaMallocManaged` 写入)。
+在 Jetson Thor 的 ATS (Address Translation Service) 架构下，CPU 写入 managed memory 会触发
+GPU↔CPU 缓存一致性流量，降低同步进行的 forward_decode 权重读取带宽。
+
+B=4 时：serve 16.3 tok/s vs raw 17.4 tok/s (达标率 93.7%)
+B=16 时：serve 36.5 tok/s vs raw 39.3 tok/s (达标率 92.9%)
+
+### 排查过程
+
+1. CUDA event 计时隔离 → forward_decode 内部 +11ms，非 LM head 或 CPU 开销
+2. 逐层计时对比 → per-layer 时间 raw 与 engine 完全一致
+3. 给 raw benchmark 加同样的 CUDA events → raw 也变慢 11ms
+4. **发现**: CUDA event API 本身在 Jetson Thor 的 per-layer sync 架构下增加 ~11ms/step
+5. 真实根因：per-step managed memory 写入触发 ATS 一致性开销
+
+### 方法
+
+缓存 SSM/Conv 指针数组：若 batch 组成（大小 + RequestContext 指针）未变，则跳过重建。
+稳态 decode 时 batch 组成不变，消除全部 48×B×2 managed memory 写入。
+
+### 结果 (27B BF16, d=30, 3 iterations)
+
+| B | Raw tok/s | 优化前 Serve | 达标率 | 优化后 Serve | 达标率 |
+|---|-----------|--------------|---------|--------------|---------
+| 1 | 4.4 | 11.5 (MTP) | 261% | 11.5 (MTP) | 261% |
+| 2 | 8.7 | 8.7 | 98.9% | **9.1** | **104.6%** |
+| 4 | 17.3 | 16.3 | 93.7% | **17.2** | **99.4%** |
+| 8 | 22.5 | 22.6 | 100.4% | **22.7** | **100.9%** |
+| 16 | 39.1 | 36.5 | 92.9% | **39.4** | **100.5%** |
+
+所有 B=1~16 达标率 ≥99%。18/18 测试通过。
+
+**关键教训**: 在 Jetson Thor ATS 架构下，即使少量 `cudaMallocManaged` CPU 写入
+也会因一致性协议降低 GPU 带宽。CUDA event API 在 per-layer sync 场景下也有 ~11ms 额外开销。
+
+**文件**: `src/engine/engine.cpp`, `src/engine/engine.h`
+
 **文件**: `src/engine/engine.cpp`, `src/engine/model.cpp`
