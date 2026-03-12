@@ -86,7 +86,7 @@ src/
 │   ├── sm110a_primitives.h — SM110a 硬件特性常量
 │   ├── sm110a_probe.cu   — SM110a 硬件能力探测
 │   ├── deltanet_chunkwise.cu — WY chunkwise 评估原型 (独立 micro-benchmark, 不参与推理)
-│   └── moe_*.h/cpp, grouped_gemm.h, cutlass_grouped_gemm_sm110.cuh — MoE 预留
+│   └── moe_*.h/cpp, grouped_gemm.h, cutlass_grouped_gemm_sm110.cuh — MoE 层实现
 ├── serve/
 │   └── serve.h/cpp       — HTTP API 服务 (Ollama/OpenAI 兼容)
 └── tui/
@@ -229,6 +229,11 @@ src/
 - ✅ cuBLAS routing M=9-16: 替代 GEMV<16>, B=16 BW 116→220 GB/s (+89%)
 - ✅ AOT cuBLAS autotuning warmup: 7 (N,K)×3 M×20 reps ~3s, 消除首次推理延迟
 - ✅ Benchmark: decode-only + overall throughput 双指标, concurrent benchmark decode_tps 排除 TTFT
+- ✅ MoE Sorted Expert GEMV: counting sort by expert_id, L2-friendly 访问顺序, prefill +40%
+- ✅ MoE Per-Expert GEMM: T≥128 时 256 CUTLASS GEMMs 替代 T×top_k GEMVs, tensor cores
+  - 35B P=2048: TTFT 9682→837ms (-91.4%), prefill 212→2465 tok/s (+1063%)
+  - 35B P=4096: TTFT 27.2s→1.7s (-94%), prefill 151→2386 tok/s (+16×)
+- ✅ Prompt Caching API: OpenAI-compatible prompt_tokens_details.cached_tokens
 
 ### 并发吞吐 (27B BF16, d=30, 3 iterations)
 | B | Raw tok/s | Serve Decode tok/s | Serve/Raw |
