@@ -60,12 +60,12 @@ Short prompt (P=17), 50 generation tokens, 3 iterations:
 | Qwen3.5-4B | BF16 | 405 | 2,097 | 4,844 | 3,895 | 3,710 | 3,234 | 2,623 | 1,915 |
 | Qwen3.5-9B | BF16 | 230 | 1,341 | 3,624 | 2,485 | 2,518 | 2,289 | 1,963 | 1,535 |
 | Qwen3.5-27B | BF16 | 65 | 480 | 1,208 | 1,046 | 934 | 866 | 746 | 554 |
-| Qwen3.5-35B-A3B | MoE BF16 | 136 | 190 | 212 | 212 | 215 | — | — | — |
+| Qwen3.5-35B-A3B | MoE BF16 | 136 | 407 | 1329 | 2465 | 2386 | — | — | — |
 | Qwen3.5-122B-A10B | MoE NVFP4 | 50 | 64 | 66 | 66 | 66 | — | — | — |
 
 > 单位: tok/s. Dense 模型 prefill 吞吐在 P=512 附近达到 GEMM compute 峰值, 之后因 DeltaNet SSM 串行依赖和 chunked prefill 权重重复读取逐步下降.  
 > 32K 时 27B prefill 仍有 554 tok/s (TTFT ~59s), 瓶颈在 16 轮 chunk × 64 层 forward.  
-> MoE 35B prefill 通过 sorted expert GEMV 从 ~150 提升到 ~212 tok/s (+40%), L2 cache 友好排序消除因 256 expert 随机访存导致的 cache thrashing.  
+> MoE 35B prefill 通过 per-expert GEMM (CUTLASS tensor cores) 从 ~150 提升到 ~2465 tok/s (+16×), 将 T*top_k 个独立 GEMV 转为 256 个 CUTLASS GEMM (avg M≈64).  
 > MoE 122B NVFP4 尚未优化 (FP4 kernel 已具备排序接口, 待测试).
 
 ### 2.4 TTFT vs Prompt Length
@@ -75,11 +75,11 @@ Short prompt (P=17), 50 generation tokens, 3 iterations:
 | Qwen3.5-4B | BF16 | 49ms | 68ms | 113ms | 533ms | 1.1s | 2.5s | 6.3s | 17.1s |
 | Qwen3.5-9B | BF16 | 84ms | 105ms | 151ms | 834ms | 1.6s | 3.6s | 8.4s | 21.4s |
 | Qwen3.5-27B | BF16 | 273ms | 279ms | 435ms | 2.0s | 4.4s | 9.5s | 22.0s | 59.1s |
-| Qwen3.5-35B-A3B | MoE BF16 | 131ms | 678ms | 2.4s | 9.7s | 19.1s | — | — | — |
+| Qwen3.5-35B-A3B | MoE BF16 | 131ms | 321ms | 391ms | 837ms | 1.7s | — | — | — |
 | Qwen3.5-122B-A10B | MoE NVFP4 | 348ms | 2.0s | 7.7s | 30.8s | 61.9s | — | — | — |
 
 > Dense 模型 TTFT 随 prompt 近似线性增长 (27B: ~1.8 ms/token).  
-> MoE 35B TTFT 优化后改善: P=2048 从 13.5s 降至 9.7s (-28%), P=4096 从 27.2s 降至 19.1s (-30%), 通过 sorted expert GEMV 实现.  
+> MoE 35B TTFT 优化 (per-expert GEMM): P=2048 从 13.5s 降至 837ms (-94%), P=4096 从 27.2s 降至 1.7s (-94%), GEMV→GEMM 切换阈值 T≥128.  
 > 32K prompt 下 27B TTFT ~59s, 主要由 16 轮 chunked prefill × 64 层 forward 构成.
 
 ### 2.5 Decode Throughput vs Context Length

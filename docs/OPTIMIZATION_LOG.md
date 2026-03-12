@@ -5056,3 +5056,63 @@ expert 权重 (~4MB gate_up + ~2MB down) 保持在 L2 cache 中, 避免 256 expe
 `src/engine/light_ops.h`, `src/engine/dense_gemm.h`, `src/engine/dense_gemm_fp4.h`
 
 **文件**: `src/engine/engine.cpp`, `src/engine/model.cpp`
+
+---
+
+## Per-Expert GEMM: MoE Prefill TTFT 11.6× 加速
+
+### 背景
+
+MoE 35B-A3B 即使经过 sorted expert GEMV 优化后, P=2048 TTFT 仍需 9.7s.
+根因: T×top_k=16384 个**独立 GEMV** (M=1), 尽管 L2 cache 友好排序减少了 DRAM 访问,
+但每个 assignment 仍是 CUDA core dot product (无法利用 tensor core).
+
+### 核心优化
+
+将 T>1 路径的 MoE expert 计算从 **16384 个 M=1 GEMV** 转为 **256 个 per-expert GEMM**:
+
+1. **Counting sort 扩展**: 输出 `expert_offsets[E+1]` 前缀和 (cudaMallocManaged, host 可读)
+2. **cudaStreamSynchronize**: 读取 offsets 用于 CPU 端 GEMM dispatch 循环
+3. **Gather kernel**: `hidden_states[token_idx, :]` → `gathered[sorted_pos, :]` (64 MB for T=2048)
+4. **Per-expert Gate+Up GEMM**: 256 次 `invoke_dense_gemm(M_e, 2*moe_is, hs)`, avg M≈64
+   - 走 CUTLASS SM110 tensor core path (M≥17 自动 dispatch)
+5. **SwiGLU**: `invoke_swiglu_merged()` on [A, 2*moe_is] → [A, moe_is]
+6. **Per-expert Down GEMM**: 256 次 `invoke_dense_gemm(M_e, hs, moe_is)`, 输出到 gathered 区 (alias)
+7. **Inverse permutation**: `inv_sorted[sorted_indices[i]] = i`, 用于 batched_moe_final_sorted 间接读取
+8. **batched_moe_final_sorted**: 新 kernel, 通过 inv_sorted 从 sorted order 读 expert 输出
+
+### 理论分析
+
+- **GEMV** (旧): 每个 assignment 是 M=1 dot product, compute intensity ≈ 1 FLOP/byte, CUDA cores only
+- **GEMM** (新): 每个 expert M≈64, compute intensity ≈ 59 FLOPS/byte, tensor cores → compute-bound
+- Expert 权重: GEMV 路径每 assignment 读一次 (~2.1MB), GEMM 路径每 expert 读一次
+- 256 GEMM 启动开销: 256 × ~5-10μs ≈ 1-2.5ms/layer × 40层 = 40-100ms (vs 旧 ~200ms/layer 的 GEMV 计算)
+
+### 阈值
+
+`use_expert_gemm = !fp4 && (num_assigns >= E * 4)` → T ≥ 128 (top_k=8)
+- T < 128: 保持 sorted GEMV 路径 (avg M < 4, GEMM 无优势)
+- FP4 路径保持 GEMV (FP4 GEMM 需额外适配)
+
+### 结果 (35B-A3B MoE BF16, d=5, 3 iterations)
+
+| P (prompt) | 旧 TTFT | 新 TTFT | 变化 | 旧 Prefill | 新 Prefill | Prefill 变化 |
+|------------|---------|---------|------|------------|------------|--------------|
+| 17 | 131ms | 131ms | — (GEMV) | 136 | 136 | — |
+| 128 | 678ms | **321ms** | **-52.7%** | 190 | **407** | **+114%** |
+| 512 | 2,400ms | **391ms** | **-83.7%** | 212 | **1,329** | **+527%** |
+| 2,048 | 9,682ms | **837ms** | **-91.4%** | 212 | **2,465** | **+1,063%** |
+| 4,096 | 19,100ms | **1,723ms** | **-91.0%** | 215 | **2,386** | **+1,010%** |
+
+Decode 无影响: P=17 47.1 tok/s, P=2048 15.7 tok/s (与基线一致).
+27B Dense 无回退: P=17 65 tok/s, P=512 1069 tok/s (与基线一致).
+
+### Workspace 变化
+
+新增 `hs + top_k*2` bf16 per token (~4 KB), 用于:
+- shared_down_buf 在 GEMM path 中移到 swiglu 后方 (不复用 expert_scratch[0])
+- inv_sorted: T*top_k ints = 64 KB (T=2048)
+总增量: max_tokens=2048 时 ~8 MB, 对 128 GB 系统无影响.
+
+**文件**: `src/engine/light_ops.cu`, `src/engine/light_ops.h`,
+`src/engine/layer.cu`, `src/engine/layer.h`
