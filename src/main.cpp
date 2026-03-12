@@ -17,6 +17,9 @@
 #include "engine/backend.h"
 #include "serve/serve.h"
 #include "tui/tui.h"
+#include "plugins/asr/asr_plugin.h"
+#include "plugins/asr/asr_engine.h"
+#include "plugins/tts/tts_plugin.h"
 
 // SM110a hardware probe (Level 0)
 namespace sm110a_probe { void run_sm110a_probes(); }
@@ -66,6 +69,7 @@ static void print_usage() {
     printf("    serve       Start HTTP API server (Ollama/OpenAI compatible)\n");
     printf("    chat        Start interactive TUI chat\n");
     printf("    bench       Run inference benchmarks\n");
+    printf("    asr         Transcribe audio file (native Qwen3-ASR)\n");
     printf("    test        Run unit tests\n");
     printf("    probe       SM110a hardware primitives micro-benchmark\n");
     printf("    version     Print version information\n\n");
@@ -92,6 +96,15 @@ static void print_usage() {
     printf("    --max-conns <N>       Max concurrent connections (default: 64)\n");
     printf("    --model-name <name>   Model display name (default: qwen3.5-27b)\n");
     printf("    --serve-config <file> Override serve config from separate file\n\n");
+    printf("  Plugin Options (ASR / TTS):\n");
+    printf("    --asr-enabled         Enable ASR (speech-to-text) plugin\n");
+    printf("    --asr-executable <p>  Path to ASR executable (e.g., whisper-cli)\n");
+    printf("    --asr-model <path>    ASR model path\n");
+    printf("    --asr-language <lang> Default ASR language (auto/zh/en/ja, default: auto)\n");
+    printf("    --tts-enabled         Enable TTS (text-to-speech) plugin\n");
+    printf("    --tts-executable <p>  Path to TTS executable (e.g., piper)\n");
+    printf("    --tts-model <path>    TTS model path\n");
+    printf("    --tts-voice <name>    Default TTS voice name\n\n");
     printf("  Chat Options:\n");
     printf("    --max-tokens <N>      Max new tokens per response (default: 2048)\n");
     printf("    --temperature <F>     Sampling temperature (default: 1.0)\n");
@@ -180,9 +193,35 @@ static int cmd_serve(int argc, char** argv) {
     // CLI 参数最终覆盖
     serve_config = serve::ServeConfig::merge_args(serve_config, argc, argv);
 
+    // 加载 ASR / TTS 插件配置 (从同一个 config 文件或 CLI 参数)
+    plugins::AsrConfig asr_config;
+    plugins::TtsConfig tts_config;
+    if (!config_file.empty()) {
+        asr_config = plugins::AsrConfig::from_file(config_file);
+        tts_config = plugins::TtsConfig::from_file(config_file);
+    }
+    // CLI 覆盖: --asr-executable, --tts-executable 等
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--asr-enabled")       asr_config.enabled = true;
+        else if (arg == "--asr-executable" && i + 1 < argc) asr_config.executable = argv[++i];
+        else if (arg == "--asr-model"      && i + 1 < argc) asr_config.model_path = argv[++i];
+        else if (arg == "--asr-language"   && i + 1 < argc) asr_config.language   = argv[++i];
+        else if (arg == "--tts-enabled")       tts_config.enabled = true;
+        else if (arg == "--tts-executable" && i + 1 < argc) tts_config.executable = argv[++i];
+        else if (arg == "--tts-model"      && i + 1 < argc) tts_config.model_path = argv[++i];
+        else if (arg == "--tts-voice"      && i + 1 < argc) tts_config.voice      = argv[++i];
+    }
+
+    auto asr_plugin = plugins::create_asr_plugin(asr_config);
+    auto tts_plugin = plugins::create_tts_plugin(tts_config);
+    if (asr_config.enabled) asr_config.print();
+    if (tts_config.enabled) tts_config.print();
+
     try {
         InferenceBackend backend(backend_config);
-        serve::ServeApp app(serve_config, backend);
+        serve::ServeApp app(serve_config, backend,
+                            std::move(asr_plugin), std::move(tts_plugin));
 
         // 信号处理
         signal(SIGINT, signal_handler);
@@ -257,6 +296,61 @@ static int cmd_test(int argc, char** argv) {
 }
 
 // ============================================================================
+// 命令: asr (原生 Qwen3-ASR 语音转录)
+// ============================================================================
+
+static int cmd_asr(int argc, char** argv) {
+    std::string model_dir;
+    std::string wav_path;
+    float temperature = 0.0f;
+    int max_tokens = 448;
+
+    // Parse args
+    for (int i = 2; i < argc; i++) {
+        std::string arg = argv[i];
+        if ((arg == "--model-dir" || arg == "--model") && i + 1 < argc)
+            model_dir = argv[++i];
+        else if (arg == "--temperature" && i + 1 < argc)
+            temperature = std::stof(argv[++i]);
+        else if (arg == "--max-tokens" && i + 1 < argc)
+            max_tokens = std::stoi(argv[++i]);
+        else if (arg[0] != '-')
+            wav_path = arg;
+    }
+
+    if (model_dir.empty()) {
+        // Try env
+        const char* env = getenv("QWEN_ASR_MODEL_DIR");
+        if (env) model_dir = env;
+    }
+
+    if (model_dir.empty() || wav_path.empty()) {
+        fprintf(stderr, "Usage: qwen35-thor asr --model-dir <path/to/Qwen3-ASR-1.7B> <audio.wav>\n");
+        fprintf(stderr, "Options:\n");
+        fprintf(stderr, "  --model-dir <path>    ASR model directory (or set QWEN_ASR_MODEL_DIR)\n");
+        fprintf(stderr, "  --temperature <F>     Sampling temperature (default: 0.0 = greedy)\n");
+        fprintf(stderr, "  --max-tokens <N>      Max output tokens (default: 448)\n");
+        return 1;
+    }
+
+    fprintf(stderr, "[ASR] Model: %s\n", model_dir.c_str());
+    fprintf(stderr, "[ASR] Audio: %s\n", wav_path.c_str());
+
+    qwen_thor::asr::ASREngine engine;
+    engine.load_model(model_dir);
+
+    if (!engine.is_loaded()) {
+        fprintf(stderr, "[ASR] ERROR: failed to load model\n");
+        return 1;
+    }
+
+    std::string text = engine.transcribe_file(wav_path, temperature, max_tokens);
+    // Output transcription to stdout (clean, no prefix)
+    printf("%s\n", text.c_str());
+    return 0;
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -282,6 +376,7 @@ int main(int argc, char** argv) {
     if (cmd == "serve")   rc = cmd_serve(argc, argv);
     else if (cmd == "chat")    rc = cmd_chat(argc, argv);
     else if (cmd == "bench")   rc = cmd_bench(argc, argv);
+    else if (cmd == "asr")     rc = cmd_asr(argc, argv);
     else if (cmd == "test")    rc = cmd_test(argc, argv);
     else if (cmd == "probe")   { sm110a_probe::run_sm110a_probes(); }
     else if (cmd == "version" || cmd == "--version" || cmd == "-v") {

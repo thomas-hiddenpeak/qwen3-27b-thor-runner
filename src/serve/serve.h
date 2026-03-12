@@ -14,6 +14,8 @@
 #pragma once
 
 #include "../engine/backend.h"
+#include "../plugins/asr/asr_plugin.h"
+#include "../plugins/tts/tts_plugin.h"
 #include <string>
 #include <thread>
 #include <atomic>
@@ -73,7 +75,9 @@ struct HttpResponse {
 // ============================================================================
 class ServeApp {
 public:
-    ServeApp(const ServeConfig& config, InferenceBackend& backend);
+    ServeApp(const ServeConfig& config, InferenceBackend& backend,
+            std::unique_ptr<plugins::AsrPlugin> asr = nullptr,
+            std::unique_ptr<plugins::TtsPlugin> tts = nullptr);
     ~ServeApp();
 
     // 启动 HTTP 服务 (阻塞主线程)
@@ -142,6 +146,28 @@ private:
     void handle_ollama_chat(const HttpRequest& req, int client_fd);
     void handle_cors_preflight(const HttpRequest& req, int client_fd);
 
+    // ---- 音频 API (ASR / TTS 插件) ----
+    void handle_audio_transcriptions(const HttpRequest& req, int client_fd);
+    void handle_audio_speech(const HttpRequest& req, int client_fd);
+
+    // 发送二进制响应 (音频数据)
+    void send_binary_response(int client_fd, int status_code,
+                              const std::string& content_type,
+                              const uint8_t* data, size_t size);
+
+    // 解析 multipart/form-data
+    struct MultipartFile {
+        std::string field_name;    // 字段名
+        std::string filename;      // 文件名
+        std::string content_type;  // MIME type
+        std::string data;          // 文件内容 (二进制)
+    };
+    struct MultipartForm {
+        std::vector<MultipartFile> files;
+        std::unordered_map<std::string, std::string> fields; // 文本字段
+    };
+    MultipartForm parse_multipart(const HttpRequest& req);
+
     // JSON 辅助
     std::string make_chat_chunk(const std::string& model, const std::string& content,
                                 const std::string& finish_reason, const std::string& id,
@@ -168,6 +194,8 @@ private:
 
     ServeConfig config_;
     InferenceBackend& backend_;
+    std::unique_ptr<plugins::AsrPlugin> asr_plugin_;
+    std::unique_ptr<plugins::TtsPlugin> tts_plugin_;
     int ollama_fd_ = -1;
     int openai_fd_ = -1;
     std::atomic<bool> running_{false};

@@ -1,0 +1,88 @@
+// asr_engine.h — Qwen3-ASR 推理引擎
+//
+// 顶层 ASR 引擎:
+//   1. 加载权重 (SafetensorsLoader, cudaMalloc)
+//   2. 编排 AudioEncoder + TextDecoder
+//   3. 提供 transcribe() 接口: PCM → 文字
+//
+// 用法:
+//   ASREngine engine;
+//   engine.load_model("/path/to/Qwen3-ASR-1.7B");
+//   std::string text = engine.transcribe(pcm_samples, num_samples, sample_rate);
+
+#pragma once
+
+#include "asr_config.h"
+#include "asr_encoder.h"
+#include "asr_decoder.h"
+#include "engine/tokenizer.h"
+#include <string>
+#include <vector>
+#include <memory>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
+namespace qwen_thor {
+namespace asr {
+
+class ASREngine {
+public:
+    ASREngine();
+    ~ASREngine();
+
+    // 加载模型: model_dir 需含 config.json + safetensors + tokenizer
+    void load_model(const std::string& model_dir);
+
+    // 转录: PCM 浮点 → 文本
+    // samples: 单声道 float32, sample_rate: 采样率 (自动重采样到 16kHz)
+    std::string transcribe(const float* samples, int num_samples,
+                           int sample_rate = 16000,
+                           float temperature = 0.0f,
+                           int max_new_tokens = 448);
+
+    // 转录: WAV 文件路径 → 文本
+    std::string transcribe_file(const std::string& wav_path,
+                                float temperature = 0.0f,
+                                int max_new_tokens = 448);
+
+    bool is_loaded() const { return loaded_; }
+    const ASRConfig& config() const { return config_; }
+
+private:
+    ASRConfig config_;
+    std::unique_ptr<AudioEncoder> encoder_;
+    std::unique_ptr<TextDecoder> decoder_;
+
+    // BPE tokenizer (复用现有 Tokenizer)
+    Tokenizer tokenizer_;
+    std::string model_dir_;
+
+    // GPU buffers
+    __nv_bfloat16* mel_gpu_ = nullptr;       // [128, max_mel_frames]
+    __nv_bfloat16* encoder_out_ = nullptr;    // [max_tokens, 2048]
+    __nv_bfloat16* input_embeds_ = nullptr;   // [max_prompt_len, 2048]
+    __nv_bfloat16* logits_ = nullptr;         // [vocab_size]
+    int* position_ids_ = nullptr;             // [3, max_seq_len]
+    int* token_id_gpu_ = nullptr;             // [1]
+
+    // Embed weight pointer (shared with decoder, not owned separately)
+    __nv_bfloat16* embed_tokens_w_ = nullptr;
+
+    // 权重所有权
+    std::vector<void*> device_weights_;
+
+    // 容量
+    int max_mel_frames_ = 0;
+    int max_prompt_len_ = 0;
+
+    cudaStream_t stream_ = 0;
+    bool loaded_ = false;
+
+    // 内部方法
+    void load_weights(const std::string& model_dir);
+    void build_prompt(int encoder_out_len, std::vector<int>& token_ids);
+    int greedy_decode(__nv_bfloat16* logits, int vocab_size);
+};
+
+} // namespace asr
+} // namespace qwen_thor

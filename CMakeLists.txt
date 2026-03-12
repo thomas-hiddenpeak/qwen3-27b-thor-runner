@@ -27,6 +27,8 @@ find_package(CUDAToolkit REQUIRED)
 # ============================================================================
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/engine
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/asr
     ${CUDAToolkit_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/tools/util/include
@@ -36,7 +38,7 @@ include_directories(
 add_definitions(-DFLAT_SM90A_ENABLED)
 
 # ============================================================================
-# 核心引擎静态库 (engine)
+# 核心引擎静态库 (engine — LLM 推理)
 # ============================================================================
 file(GLOB_RECURSE ENGINE_SOURCES
     "src/engine/*.cpp"
@@ -45,6 +47,17 @@ file(GLOB_RECURSE ENGINE_SOURCES
 
 add_library(qwen35_thor_engine STATIC ${ENGINE_SOURCES})
 target_link_libraries(qwen35_thor_engine PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt rt dl)
+
+# ============================================================================
+# 插件静态库 (plugins — ASR/TTS, 独立于 LLM)
+# ============================================================================
+file(GLOB_RECURSE PLUGIN_SOURCES
+    "src/plugins/*.cpp"
+    "src/plugins/*.cu"
+)
+
+add_library(qwen35_thor_plugins STATIC ${PLUGIN_SOURCES})
+target_link_libraries(qwen35_thor_plugins PRIVATE CUDA::cudart CUDA::cublas rt dl)
 
 # ============================================================================
 # 主可执行文件: qwen35-thor
@@ -56,4 +69,4 @@ add_executable(qwen35-thor
     src/serve/serve.cpp
     src/tui/tui.cpp
 )
-target_link_libraries(qwen35-thor PRIVATE qwen35_thor_engine)
+target_link_libraries(qwen35-thor PRIVATE qwen35_thor_engine qwen35_thor_plugins stdc++fs)

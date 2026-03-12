@@ -16,6 +16,7 @@
 #include <thread>
 #include <random>
 #include <cctype>
+#include <filesystem>
 
 // stb_image for decoding JPEG/PNG
 #define STB_IMAGE_IMPLEMENTATION
@@ -1183,8 +1184,22 @@ void ServeConfig::print() const {
 // ServeApp
 // ============================================================================
 
-ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend)
-    : config_(config), backend_(backend) {}
+ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
+                   std::unique_ptr<plugins::AsrPlugin> asr,
+                   std::unique_ptr<plugins::TtsPlugin> tts)
+    : config_(config), backend_(backend),
+      asr_plugin_(std::move(asr)), tts_plugin_(std::move(tts)) {
+    if (asr_plugin_) {
+        fprintf(stderr, "[Serve] ASR plugin loaded: %s (available=%s)\n",
+                asr_plugin_->name().c_str(),
+                asr_plugin_->is_available() ? "yes" : "no");
+    }
+    if (tts_plugin_) {
+        fprintf(stderr, "[Serve] TTS plugin loaded: %s (available=%s)\n",
+                tts_plugin_->name().c_str(),
+                tts_plugin_->is_available() ? "yes" : "no");
+    }
+}
 
 ServeApp::~ServeApp() {
     stop();
@@ -1409,6 +1424,10 @@ void ServeApp::handle_connection(int client_fd, int protocol) {
             handle_openai_chat(req, client_fd);
         } else if (req.path == "/v1/completions" && req.method == "POST") {
             handle_openai_completions(req, client_fd);
+        } else if (req.path == "/v1/audio/transcriptions" && req.method == "POST") {
+            handle_audio_transcriptions(req, client_fd);
+        } else if (req.path == "/v1/audio/speech" && req.method == "POST") {
+            handle_audio_speech(req, client_fd);
         } else {
             HttpResponse resp;
             resp.status_code = 404;
@@ -3159,6 +3178,380 @@ std::string ServeApp::make_completion_chunk(const std::string& model, const std:
 
 uint64_t ServeApp::next_request_id() {
     return req_id_counter_.fetch_add(1);
+}
+
+// ============================================================================
+// Multipart/Form-Data 解析
+// ============================================================================
+
+ServeApp::MultipartForm ServeApp::parse_multipart(const HttpRequest& req) {
+    MultipartForm form;
+
+    // 从 Content-Type 中提取 boundary
+    auto ct_it = req.headers.find("content-type");
+    if (ct_it == req.headers.end()) return form;
+
+    std::string ct = ct_it->second;
+    auto bpos = ct.find("boundary=");
+    if (bpos == std::string::npos) return form;
+    std::string boundary = ct.substr(bpos + 9);
+    // 去掉可能的引号
+    if (!boundary.empty() && boundary.front() == '"') boundary.erase(boundary.begin());
+    if (!boundary.empty() && boundary.back() == '"')  boundary.pop_back();
+
+    std::string delim = "--" + boundary;
+    std::string end_delim = delim + "--";
+
+    const std::string& body = req.body;
+    size_t pos = body.find(delim);
+    if (pos == std::string::npos) return form;
+
+    while (true) {
+        // 找到当前 part 的起始
+        pos = body.find(delim, pos);
+        if (pos == std::string::npos) break;
+        pos += delim.size();
+
+        // 检查是否是结束标记
+        if (body.substr(pos, 2) == "--") break;
+
+        // 跳过 \r\n
+        if (pos < body.size() && body[pos] == '\r') pos++;
+        if (pos < body.size() && body[pos] == '\n') pos++;
+
+        // 找到 part headers 的结束 (空行 \r\n\r\n)
+        auto header_end = body.find("\r\n\r\n", pos);
+        if (header_end == std::string::npos) break;
+
+        std::string headers_str = body.substr(pos, header_end - pos);
+        size_t data_start = header_end + 4;
+
+        // 找到下一个 boundary
+        auto next_boundary = body.find(delim, data_start);
+        if (next_boundary == std::string::npos) break;
+
+        // data 在 boundary 前 2 字节 (\r\n)
+        size_t data_end = next_boundary;
+        if (data_end >= 2 && body[data_end - 2] == '\r' && body[data_end - 1] == '\n') {
+            data_end -= 2;
+        }
+
+        std::string data = body.substr(data_start, data_end - data_start);
+
+        // 解析 Content-Disposition
+        std::string field_name, filename, part_ct;
+        // 逐行解析 headers
+        std::istringstream hss(headers_str);
+        std::string hline;
+        while (std::getline(hss, hline)) {
+            if (!hline.empty() && hline.back() == '\r') hline.pop_back();
+
+            // Content-Disposition: form-data; name="file"; filename="audio.wav"
+            std::string hline_lower = hline;
+            std::transform(hline_lower.begin(), hline_lower.end(), hline_lower.begin(), ::tolower);
+
+            if (hline_lower.find("content-disposition:") == 0) {
+                auto npos = hline.find("name=\"");
+                if (npos != std::string::npos) {
+                    npos += 6;
+                    auto nend = hline.find("\"", npos);
+                    if (nend != std::string::npos) field_name = hline.substr(npos, nend - npos);
+                }
+                auto fpos = hline.find("filename=\"");
+                if (fpos != std::string::npos) {
+                    fpos += 10;
+                    auto fend = hline.find("\"", fpos);
+                    if (fend != std::string::npos) filename = hline.substr(fpos, fend - fpos);
+                }
+            } else if (hline_lower.find("content-type:") == 0) {
+                part_ct = hline.substr(14);
+                while (!part_ct.empty() && part_ct.front() == ' ') part_ct.erase(part_ct.begin());
+            }
+        }
+
+        if (!filename.empty()) {
+            // 文件字段
+            MultipartFile mf;
+            mf.field_name = field_name;
+            mf.filename = filename;
+            mf.content_type = part_ct;
+            mf.data = std::move(data);
+            form.files.push_back(std::move(mf));
+        } else {
+            // 文本字段
+            form.fields[field_name] = data;
+        }
+    }
+
+    return form;
+}
+
+// ============================================================================
+// 发送二进制响应
+// ============================================================================
+
+void ServeApp::send_binary_response(int client_fd, int status_code,
+                                     const std::string& content_type,
+                                     const uint8_t* data, size_t size) {
+    std::string status_text = (status_code == 200) ? "OK" : "Error";
+    std::ostringstream oss;
+    oss << "HTTP/1.1 " << status_code << " " << status_text << "\r\n";
+    oss << "Content-Type: " << content_type << "\r\n";
+    oss << "Content-Length: " << size << "\r\n";
+    oss << "Access-Control-Allow-Origin: *\r\n";
+    oss << "\r\n";
+
+    auto header_str = oss.str();
+    send(client_fd, header_str.c_str(), header_str.size(), MSG_NOSIGNAL);
+
+    // 分块发送大文件
+    size_t sent = 0;
+    while (sent < size) {
+        size_t chunk = std::min(size - sent, (size_t)65536);
+        ssize_t n = send(client_fd, data + sent, chunk, MSG_NOSIGNAL);
+        if (n <= 0) break;
+        sent += n;
+    }
+}
+
+// ============================================================================
+// POST /v1/audio/transcriptions — ASR 语音转文本
+// ============================================================================
+
+void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd) {
+    // 检查 ASR 插件是否已启用
+    if (!asr_plugin_) {
+        HttpResponse resp;
+        resp.status_code = 501;
+        resp.status_text = "Not Implemented";
+        resp.body = "{\"error\":{\"message\":\"ASR plugin not configured\","
+                    "\"type\":\"invalid_request_error\"}}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    if (!asr_plugin_->is_available()) {
+        HttpResponse resp;
+        resp.status_code = 503;
+        resp.status_text = "Service Unavailable";
+        resp.body = "{\"error\":{\"message\":\"ASR executable not available\","
+                    "\"type\":\"service_unavailable\"}}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    // 解析 multipart/form-data
+    auto form = parse_multipart(req);
+
+    // 提取音频文件
+    std::string audio_data;
+    std::string audio_filename = "upload.wav";
+    for (auto& f : form.files) {
+        if (f.field_name == "file") {
+            audio_data = std::move(f.data);
+            audio_filename = f.filename;
+            break;
+        }
+    }
+
+    if (audio_data.empty()) {
+        HttpResponse resp;
+        resp.status_code = 400;
+        resp.status_text = "Bad Request";
+        resp.body = "{\"error\":{\"message\":\"No audio file provided. "
+                    "Use multipart/form-data with field name 'file'\","
+                    "\"type\":\"invalid_request_error\"}}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    // 提取其他参数
+    std::string language = form.fields.count("language") ? form.fields["language"] : "auto";
+    std::string response_format = form.fields.count("response_format") ?
+                                  form.fields["response_format"] : "json";
+
+    // 写入临时文件
+    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    // 提取文件扩展名
+    std::string ext = ".wav";
+    auto dot = audio_filename.rfind('.');
+    if (dot != std::string::npos) ext = audio_filename.substr(dot);
+    std::string tmp_path = "tmp/asr_upload_" + std::to_string(now) + "_" +
+                           std::to_string(getpid()) + ext;
+
+    {
+        std::ofstream af(tmp_path, std::ios::binary);
+        if (!af.is_open()) {
+            HttpResponse resp;
+            resp.status_code = 500;
+            resp.status_text = "Internal Server Error";
+            resp.body = "{\"error\":{\"message\":\"Failed to save audio file\","
+                        "\"type\":\"server_error\"}}";
+            send_response(client_fd, resp);
+            close(client_fd);
+            return;
+        }
+        af.write(audio_data.data(), audio_data.size());
+    }
+
+    fprintf(stderr, "[Serve] ASR: received %zu bytes audio (%s), language=%s\n",
+            audio_data.size(), audio_filename.c_str(), language.c_str());
+
+    // 调用 ASR 插件
+    auto result = asr_plugin_->transcribe(tmp_path, language);
+
+    // 清理临时文件
+    std::filesystem::remove(tmp_path);
+
+    if (result.error_code != 0) {
+        HttpResponse resp;
+        resp.status_code = 500;
+        resp.status_text = "Internal Server Error";
+        resp.body = "{\"error\":{\"message\":\"" + json_escape(result.error_message) +
+                    "\",\"type\":\"server_error\"}}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    // 构建响应
+    HttpResponse resp;
+    if (response_format == "text") {
+        resp.content_type = "text/plain";
+        resp.body = result.text;
+    } else if (response_format == "verbose_json") {
+        resp.body = "{\"task\":\"transcribe\",\"language\":\"" +
+                    json_escape(result.language) +
+                    "\",\"duration\":" + std::to_string(result.duration_s) +
+                    ",\"text\":\"" + json_escape(result.text) + "\"}";
+    } else {
+        // 默认 json
+        resp.body = "{\"text\":\"" + json_escape(result.text) + "\"}";
+    }
+
+    send_response(client_fd, resp);
+    close(client_fd);
+}
+
+// ============================================================================
+// POST /v1/audio/speech — TTS 文本转语音
+// ============================================================================
+
+void ServeApp::handle_audio_speech(const HttpRequest& req, int client_fd) {
+    // 检查 TTS 插件是否已启用
+    if (!tts_plugin_) {
+        HttpResponse resp;
+        resp.status_code = 501;
+        resp.status_text = "Not Implemented";
+        resp.body = "{\"error\":{\"message\":\"TTS plugin not configured\","
+                    "\"type\":\"invalid_request_error\"}}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    if (!tts_plugin_->is_available()) {
+        HttpResponse resp;
+        resp.status_code = 503;
+        resp.status_text = "Service Unavailable";
+        resp.body = "{\"error\":{\"message\":\"TTS executable not available\","
+                    "\"type\":\"service_unavailable\"}}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    // 解析 JSON body
+    // {"model": "...", "input": "text to speak", "voice": "alloy", "speed": 1.0, "response_format": "wav"}
+    std::string input_text, voice, format;
+    float speed = 1.0f;
+
+    // 简单 JSON 提取 (复用已有的 json_get_string / json_get_number)
+    auto get_str = [&](const std::string& key) -> std::string {
+        std::string search = "\"" + key + "\"";
+        auto kpos = req.body.find(search);
+        if (kpos == std::string::npos) return "";
+        auto colon = req.body.find(':', kpos + search.size());
+        if (colon == std::string::npos) return "";
+        auto vstart = req.body.find('"', colon + 1);
+        if (vstart == std::string::npos) return "";
+        vstart++;
+        std::string result;
+        for (size_t i = vstart; i < req.body.size(); i++) {
+            if (req.body[i] == '"' && (i == 0 || req.body[i-1] != '\\')) break;
+            if (req.body[i] == '\\' && i + 1 < req.body.size()) {
+                char next = req.body[i + 1];
+                if (next == '"' || next == '\\') { result += next; i++; continue; }
+                if (next == 'n') { result += '\n'; i++; continue; }
+                if (next == 't') { result += '\t'; i++; continue; }
+            }
+            result += req.body[i];
+        }
+        return result;
+    };
+
+    auto get_num = [&](const std::string& key, float def) -> float {
+        std::string search = "\"" + key + "\"";
+        auto kpos = req.body.find(search);
+        if (kpos == std::string::npos) return def;
+        auto colon = req.body.find(':', kpos + search.size());
+        if (colon == std::string::npos) return def;
+        auto vstart = colon + 1;
+        while (vstart < req.body.size() && req.body[vstart] == ' ') vstart++;
+        try { return std::stof(req.body.substr(vstart)); }
+        catch (...) { return def; }
+    };
+
+    input_text = get_str("input");
+    voice = get_str("voice");
+    format = get_str("response_format");
+    speed = get_num("speed", 1.0f);
+
+    if (input_text.empty()) {
+        HttpResponse resp;
+        resp.status_code = 400;
+        resp.status_text = "Bad Request";
+        resp.body = "{\"error\":{\"message\":\"'input' field is required\","
+                    "\"type\":\"invalid_request_error\"}}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    fprintf(stderr, "[Serve] TTS: text=%zu chars, voice=%s, speed=%.1f, format=%s\n",
+            input_text.size(), voice.c_str(), speed, format.c_str());
+
+    // 调用 TTS 插件
+    auto result = tts_plugin_->synthesize(input_text, voice, speed, format);
+
+    if (result.error_code != 0) {
+        HttpResponse resp;
+        resp.status_code = 500;
+        resp.status_text = "Internal Server Error";
+        resp.body = "{\"error\":{\"message\":\"" + json_escape(result.error_message) +
+                    "\",\"type\":\"server_error\"}}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    // MIME type
+    std::string content_type = "application/octet-stream";
+    if (result.format == "wav")  content_type = "audio/wav";
+    else if (result.format == "mp3")  content_type = "audio/mpeg";
+    else if (result.format == "opus") content_type = "audio/opus";
+    else if (result.format == "ogg")  content_type = "audio/ogg";
+    else if (result.format == "flac") content_type = "audio/flac";
+    else if (result.format == "aac")  content_type = "audio/aac";
+    else if (result.format == "pcm")  content_type = "audio/pcm";
+
+    // 返回二进制音频数据
+    send_binary_response(client_fd, 200, content_type,
+                         result.audio_data.data(), result.audio_data.size());
+    close(client_fd);
 }
 
 } // namespace serve
