@@ -47,7 +47,7 @@ Short prompt (P=17), 50 generation tokens, 3 iterations:
 | Qwen3.5-4B | BF16 | 26.0 | **46.8** | d=2 | **+80%** |
 | Qwen3.5-9B | BF16 | 14.1 | **27.4** | d=3 | **+94%** |
 | Qwen3.5-27B | BF16 | 4.5 | **11.7** | d=3 | **+160%** |
-| Qwen3.5-35B-A3B | MoE BF16 | 32.2 | **45.7** | d=2 | **+42%** |
+| Qwen3.5-35B-A3B | MoE BF16 | 32.2 | **47.3** | d=2 | **+47%** |
 | Qwen3.5-122B-A10B | MoE NVFP4 | 14.7 | **16.5** | d=2 | **+12%** |
 
 > MTP 加速比随模型增大而增大 (4B: +80%, 27B: +160%), 因为更大模型的 decode step 更长, MTP 的权重复用收益更显著.  
@@ -60,12 +60,13 @@ Short prompt (P=17), 50 generation tokens, 3 iterations:
 | Qwen3.5-4B | BF16 | 405 | 2,097 | 4,844 | 3,895 | 3,710 | 3,234 | 2,623 | 1,915 |
 | Qwen3.5-9B | BF16 | 230 | 1,341 | 3,624 | 2,485 | 2,518 | 2,289 | 1,963 | 1,535 |
 | Qwen3.5-27B | BF16 | 65 | 480 | 1,208 | 1,046 | 934 | 866 | 746 | 554 |
-| Qwen3.5-35B-A3B | MoE BF16 | 114 | 139 | 154 | 151 | 151 | 148 | — | — |
+| Qwen3.5-35B-A3B | MoE BF16 | 136 | 190 | 212 | 212 | 215 | — | — | — |
 | Qwen3.5-122B-A10B | MoE NVFP4 | 50 | 64 | 66 | 66 | 66 | — | — | — |
 
 > 单位: tok/s. Dense 模型 prefill 吞吐在 P=512 附近达到 GEMM compute 峰值, 之后因 DeltaNet SSM 串行依赖和 chunked prefill 权重重复读取逐步下降.  
 > 32K 时 27B prefill 仍有 554 tok/s (TTFT ~59s), 瓶颈在 16 轮 chunk × 64 层 forward.  
-> MoE 模型 prefill 吞吐低且平坦 (~150 tok/s), 受限于 expert routing 的不规则 DRAM 访问.
+> MoE 35B prefill 通过 sorted expert GEMV 从 ~150 提升到 ~212 tok/s (+40%), L2 cache 友好排序消除因 256 expert 随机访存导致的 cache thrashing.  
+> MoE 122B NVFP4 尚未优化 (FP4 kernel 已具备排序接口, 待测试).
 
 ### 2.4 TTFT vs Prompt Length
 
@@ -74,11 +75,11 @@ Short prompt (P=17), 50 generation tokens, 3 iterations:
 | Qwen3.5-4B | BF16 | 49ms | 68ms | 113ms | 533ms | 1.1s | 2.5s | 6.3s | 17.1s |
 | Qwen3.5-9B | BF16 | 84ms | 105ms | 151ms | 834ms | 1.6s | 3.6s | 8.4s | 21.4s |
 | Qwen3.5-27B | BF16 | 273ms | 279ms | 435ms | 2.0s | 4.4s | 9.5s | 22.0s | 59.1s |
-| Qwen3.5-35B-A3B | MoE BF16 | 155ms | 928ms | 3.3s | 13.5s | 27.2s | 55.5s | — | — |
+| Qwen3.5-35B-A3B | MoE BF16 | 131ms | 678ms | 2.4s | 9.7s | 19.1s | — | — | — |
 | Qwen3.5-122B-A10B | MoE NVFP4 | 348ms | 2.0s | 7.7s | 30.8s | 61.9s | — | — | — |
 
 > Dense 模型 TTFT 随 prompt 近似线性增长 (27B: ~1.8 ms/token).  
-> MoE 模型 TTFT 增长斜率陡峭: 35B 约 6.8 ms/token, 122B 约 15 ms/token — 受限于 expert routing 遍历开销.  
+> MoE 35B TTFT 优化后改善: P=2048 从 13.5s 降至 9.7s (-28%), P=4096 从 27.2s 降至 19.1s (-30%), 通过 sorted expert GEMV 实现.  
 > 32K prompt 下 27B TTFT ~59s, 主要由 16 轮 chunked prefill × 64 层 forward 构成.
 
 ### 2.5 Decode Throughput vs Context Length
@@ -88,7 +89,7 @@ Short prompt (P=17), 50 generation tokens, 3 iterations:
 | Qwen3.5-4B | BF16 | 46.8 | 18.7 | 17.9 | 15.6 | 13.4 | 9.9 | 6.5 | 3.9 |
 | Qwen3.5-9B | BF16 | 27.4 | 9.3 | 9.1 | 8.6 | 7.7 | 6.2 | 4.5 | 2.9 |
 | Qwen3.5-27B | BF16 | 11.7 | 4.5 | 4.0 | 3.3 | 3.0 | 2.3 | 1.7 | 1.1 |
-| Qwen3.5-35B-A3B | MoE BF16 | 45.7 | 20.1 | 21.7 | 19.8 | 15.6 | 12.3 | — | — |
+| Qwen3.5-35B-A3B | MoE BF16 | 47.3 | 19.7 | 19.3 | 15.8 | 12.8 | — | — | — |
 | Qwen3.5-122B-A10B | MoE NVFP4 | 16.5 | 9.5 | 8.4 | 8.4 | 7.0 | — | — | — |
 
 > 单位: tok/s (MTP enabled). Decode 速率随 context 增长持续下降 — 两方面原因:  

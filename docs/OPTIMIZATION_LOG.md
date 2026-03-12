@@ -5009,4 +5009,50 @@ cuBLAS 首次调用特定 (M,N,K) 组合时执行内部 autotuning (搜索最优
 
 **文件**: `src/benchmark.cpp`
 
+---
+
+## MoE Prefill 优化: Sorted Expert GEMV + Batched MoE Final
+
+### 背景
+MoE 35B-A3B 模型 prefill 仅 ~150 tok/s (27B Dense 对比 ~1000+ tok/s), P=2048 TTFT=13.5s.
+瓶颈分析:
+1. 256 expert × top-8 → T×8=16384 个 GEMV assignment, 每个读不同 expert 权重
+2. 相邻 blockIdx.y 的 assignments 访问随机 expert → L2 (32MB) cache thrashing
+3. T>1 路径 sigmoid_gated_add 逐 token 循环 → 2048×40层=81,920 次 tiny kernel launch
+
+### 优化 1: batched_moe_final (T+2 launches → 1)
+
+将 `invoke_weighted_expert_reduce` + `invoke_sigmoid_gated_add`×T + `invoke_add`
+融合为单次 `invoke_batched_moe_final`, Grid=(ceil(hs/256), T).
+
+**效果**: ~0% prefill 提升 (launch overhead 非瓶颈), 但代码更干净.
+
+### 优化 2: Sorted Expert GEMV (+39.7% prefill)
+
+核心: `counting_sort_by_expert_kernel` (1 block, 256 threads) 对 T×top_k 个
+assignments 按 expert_id 排序, 产生 `sorted_indices` 排列.
+
+`grouped_expert_gemv_kernel` 和 `grouped_expert_gemv_swiglu_kernel` 使用
+`sorted_indices[blockIdx.y]` 替代 `blockIdx.y` 作为 assign_idx.
+
+**原理**: 排序后同一 expert 的 ~64 个 assignments (16384/256 avg) 连续执行,
+expert 权重 (~4MB gate_up + ~2MB down) 保持在 L2 cache 中, 避免 256 expert
+× 6MB = 1.5GB 的随机 DRAM 访问.
+
+### 结果 (35B-A3B MoE BF16, P=2048, d=5, 3 iterations)
+
+| 指标 | 优化前 | 优化后 | 变化 |
+|------|--------|--------|------|
+| Prefill tok/s | 151 | **212** | **+40.4%** |
+| TTFT | 13,553 ms | **9,682 ms** | **-28.6%** |
+| Decode tok/s | 15.4 | 15.8 | +2.6% |
+
+**P=4096**: 151→215 tok/s (+42.4%), TTFT 27.2→19.1s (-29.8%)
+
+27B Dense 无回退: P=17 decode 11.2 tok/s, P=512 decode 3.4 tok/s (与基线一致).
+
+**文件**: `src/engine/light_ops.cu`, `src/engine/dense_gemm_sm110.cu`,
+`src/engine/dense_gemm_fp4_sm110.cu`, `src/engine/layer.cu`,
+`src/engine/light_ops.h`, `src/engine/dense_gemm.h`, `src/engine/dense_gemm_fp4.h`
+
 **文件**: `src/engine/engine.cpp`, `src/engine/model.cpp`
