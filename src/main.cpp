@@ -20,6 +20,7 @@
 #include "plugins/asr/asr_plugin.h"
 #include "plugins/asr/asr_engine.h"
 #include "plugins/tts/tts_plugin.h"
+#include "plugins/tts/tts_engine.h"
 
 // SM110a hardware probe (Level 0)
 namespace sm110a_probe { void run_sm110a_probes(); }
@@ -70,6 +71,7 @@ static void print_usage() {
     printf("    chat        Start interactive TUI chat\n");
     printf("    bench       Run inference benchmarks\n");
     printf("    asr         Transcribe audio file (native Qwen3-ASR)\n");
+    printf("    tts         Synthesize speech (native Qwen3-TTS)\n");
     printf("    test        Run unit tests\n");
     printf("    probe       SM110a hardware primitives micro-benchmark\n");
     printf("    version     Print version information\n\n");
@@ -351,6 +353,79 @@ static int cmd_asr(int argc, char** argv) {
 }
 
 // ============================================================================
+// 命令: tts (原生 Qwen3-TTS 语音合成)
+// ============================================================================
+
+static int cmd_tts(int argc, char** argv) {
+    std::string model_dir;
+    std::string text;
+    std::string speaker = "serena";
+    std::string language = "auto";
+    int max_tokens = 4096;
+
+    // Parse args
+    for (int i = 2; i < argc; i++) {
+        std::string arg = argv[i];
+        if ((arg == "--model-dir" || arg == "--model") && i + 1 < argc)
+            model_dir = argv[++i];
+        else if (arg == "--speaker" && i + 1 < argc)
+            speaker = argv[++i];
+        else if (arg == "--language" && i + 1 < argc)
+            language = argv[++i];
+        else if (arg == "--max-tokens" && i + 1 < argc)
+            max_tokens = std::stoi(argv[++i]);
+        else if ((arg == "--text" || arg == "-t") && i + 1 < argc)
+            text = argv[++i];
+        else if (arg[0] != '-' && text.empty())
+            text = arg;
+    }
+
+    if (model_dir.empty()) {
+        const char* env = getenv("QWEN_TTS_MODEL_DIR");
+        if (env) model_dir = env;
+    }
+
+    if (model_dir.empty() || text.empty()) {
+        fprintf(stderr, "Usage: qwen35-thor tts --model-dir <path/to/Qwen3-TTS> \"text to speak\"\n");
+        fprintf(stderr, "Options:\n");
+        fprintf(stderr, "  --model-dir <path>    TTS model directory (or set QWEN_TTS_MODEL_DIR)\n");
+        fprintf(stderr, "  --text, -t <text>     Text to synthesize\n");
+        fprintf(stderr, "  --speaker <name>      Speaker name (default: serena)\n");
+        fprintf(stderr, "  --language <lang>     Language hint (default: auto)\n");
+        fprintf(stderr, "  --max-tokens <N>      Max codec tokens (default: 4096)\n");
+        return 1;
+    }
+
+    fprintf(stderr, "[TTS] Model: %s\n", model_dir.c_str());
+    fprintf(stderr, "[TTS] Text: %s\n", text.c_str());
+    fprintf(stderr, "[TTS] Speaker: %s, Language: %s\n", speaker.c_str(), language.c_str());
+
+    qwen_thor::tts::TTSEngine engine;
+    engine.load_model(model_dir);
+
+    if (!engine.is_loaded()) {
+        fprintf(stderr, "[TTS] ERROR: failed to load model\n");
+        return 1;
+    }
+
+    auto codes = engine.synthesize(text, speaker, language, max_tokens);
+
+    // Phase 1: Output codec tokens to stdout (JSON format)
+    printf("{\n  \"num_steps\": %d,\n  \"num_groups\": %d,\n  \"codes\": [\n",
+           (int)codes.size(), codes.empty() ? 0 : (int)codes[0].size());
+    for (size_t i = 0; i < codes.size(); i++) {
+        printf("    [");
+        for (size_t j = 0; j < codes[i].size(); j++) {
+            printf("%d%s", codes[i][j], j + 1 < codes[i].size() ? ", " : "");
+        }
+        printf("]%s\n", i + 1 < codes.size() ? "," : "");
+    }
+    printf("  ]\n}\n");
+
+    return 0;
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -377,6 +452,7 @@ int main(int argc, char** argv) {
     else if (cmd == "chat")    rc = cmd_chat(argc, argv);
     else if (cmd == "bench")   rc = cmd_bench(argc, argv);
     else if (cmd == "asr")     rc = cmd_asr(argc, argv);
+    else if (cmd == "tts")     rc = cmd_tts(argc, argv);
     else if (cmd == "test")    rc = cmd_test(argc, argv);
     else if (cmd == "probe")   { sm110a_probe::run_sm110a_probes(); }
     else if (cmd == "version" || cmd == "--version" || cmd == "-v") {

@@ -29,6 +29,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/engine
     ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/asr
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/tts
     ${CUDAToolkit_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/tools/util/include
