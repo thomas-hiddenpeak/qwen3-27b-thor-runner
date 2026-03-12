@@ -195,6 +195,12 @@ void invoke_moe_router_gemv_topk(
 void invoke_scale_add(__nv_bfloat16* out, const __nv_bfloat16* in, float scale,
                       int n, cudaStream_t stream = 0);
 
+// Counting sort: sort assignments by expert_id for L2-friendly GEMV scheduling
+void invoke_sort_by_expert(
+    const int* expert_indices, int* sorted_indices,
+    int num_assignments, int num_experts,
+    cudaStream_t stream = 0);
+
 // Sigmoid-gated accumulate: out[i] += sigmoid(gate[0]) * in[i]
 // gate is a single BF16 scalar on device, applied broadcast to all n elements
 void invoke_sigmoid_gated_add(__nv_bfloat16* out, const __nv_bfloat16* in,

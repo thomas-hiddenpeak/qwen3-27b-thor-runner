@@ -1886,6 +1886,58 @@ void invoke_scale_add(__nv_bfloat16* out, const __nv_bfloat16* in, float scale,
 // Sigmoid-gated accumulate: out[i] += sigmoid(gate[0]) * in[i]
 // gate_scalar is a single BF16 value on device
 // ============================================================================
+// Counting sort: sort assignment indices by expert_id for L2 cache-friendly
+// grouped GEMV execution order. Single block, 256 threads.
+// Input:  expert_indices [T*top_k] — expert_id per assignment
+// Output: sorted_indices [T*top_k] — sorted permutation (sorted[i] → original assign_idx)
+// ============================================================================
+__global__ void counting_sort_by_expert_kernel(
+    const int* __restrict__ expert_indices,
+    int* __restrict__ sorted_indices,
+    int num_assignments, int num_experts)
+{
+    PDL_WAIT();
+    __shared__ int s_counts[256];
+    __shared__ int s_offsets[256];
+
+    // Phase 1: Clear counts
+    for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
+        s_counts[e] = 0;
+    __syncthreads();
+
+    // Phase 2: Count histogram
+    for (int i = threadIdx.x; i < num_assignments; i += blockDim.x)
+        atomicAdd_block(&s_counts[expert_indices[i]], 1);
+    __syncthreads();
+
+    // Phase 3: Exclusive prefix sum (serial, ≤256 bins)
+    if (threadIdx.x == 0) {
+        int sum = 0;
+        for (int e = 0; e < num_experts; e++) {
+            s_offsets[e] = sum;
+            sum += s_counts[e];
+        }
+    }
+    __syncthreads();
+
+    // Phase 4: Scatter — each assignment gets a unique sorted position
+    for (int i = threadIdx.x; i < num_assignments; i += blockDim.x) {
+        int pos = atomicAdd_block(&s_offsets[expert_indices[i]], 1);
+        sorted_indices[pos] = i;
+    }
+    PDL_SIGNAL();
+}
+
+void invoke_sort_by_expert(
+    const int* expert_indices, int* sorted_indices,
+    int num_assignments, int num_experts,
+    cudaStream_t stream)
+{
+    PDL_LAUNCH(counting_sort_by_expert_kernel, 1, 256, 0, stream,
+        expert_indices, sorted_indices, num_assignments, num_experts);
+}
+
+// ============================================================================
 __global__ void sigmoid_gated_add_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ in,

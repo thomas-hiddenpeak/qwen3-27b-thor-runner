@@ -660,6 +660,7 @@ __global__ void fp4_grouped_expert_gemv_kernel(
     const float* __restrict__ inv_global_scales,     // [E] per-expert
     __nv_bfloat16* __restrict__ outputs,             // [T*top_k, N]
     const int* __restrict__ expert_indices,          // [T*top_k]
+    const int* __restrict__ sorted_indices,          // nullable: sorted order
     int N, int K,
     bool shared_input, int top_k)
 {
@@ -674,7 +675,7 @@ __global__ void fp4_grouped_expert_gemv_kernel(
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x & (WARP_SIZE - 1);
     int out_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
-    int assign_idx = blockIdx.y;  // 0..T*top_k-1
+    int assign_idx = sorted_indices ? sorted_indices[blockIdx.y] : (int)blockIdx.y;
 
     // Load FP4 LUT
     if (threadIdx.x < 16) s_lut[threadIdx.x] = c_fp4_lut[threadIdx.x];
@@ -750,7 +751,8 @@ void invoke_fp4_grouped_expert_gemv(
     int N, int K,
     int top_k, bool shared_input,
     cudaStream_t stream,
-    int num_tokens)
+    int num_tokens,
+    const int* sorted_indices)
 {
     constexpr int BLOCK = 256;
     constexpr int WARPS = BLOCK / 32;
@@ -759,7 +761,7 @@ void invoke_fp4_grouped_expert_gemv(
 
     PDL_LAUNCH(fp4_grouped_expert_gemv_kernel, grid, BLOCK, smem, stream,
         inputs, packed_weights, packed_scales, inv_global_scales,
-        outputs, expert_indices, N, K, shared_input, top_k);
+        outputs, expert_indices, sorted_indices, N, K, shared_input, top_k);
 }
 
 // ============================================================================
@@ -774,6 +776,7 @@ __global__ void fp4_grouped_expert_gemv_swiglu_kernel(
     const float* __restrict__ inv_global_scales,        // [E] per-expert
     __nv_bfloat16* __restrict__ outputs,                // [T*top_k, N]
     const int* __restrict__ expert_indices,
+    const int* __restrict__ sorted_indices,             // nullable: sorted order
     int N, int K, int top_k)
 {
     constexpr int WARP_SIZE = 32;
@@ -787,7 +790,7 @@ __global__ void fp4_grouped_expert_gemv_swiglu_kernel(
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x & (WARP_SIZE - 1);
     int out_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
-    int assign_idx = blockIdx.y;
+    int assign_idx = sorted_indices ? sorted_indices[blockIdx.y] : (int)blockIdx.y;
 
     if (threadIdx.x < 16) s_lut[threadIdx.x] = c_fp4_lut[threadIdx.x];
 
@@ -870,7 +873,8 @@ void invoke_fp4_grouped_expert_gemv_swiglu(
     int N, int K,
     int top_k,
     cudaStream_t stream,
-    int num_tokens)
+    int num_tokens,
+    const int* sorted_indices)
 {
     constexpr int BLOCK = 256;
     constexpr int WARPS = BLOCK / 32;
@@ -879,7 +883,7 @@ void invoke_fp4_grouped_expert_gemv_swiglu(
 
     PDL_LAUNCH(fp4_grouped_expert_gemv_swiglu_kernel, grid, BLOCK, smem, stream,
         gate_up_outputs, packed_weights, packed_scales, inv_global_scales,
-        outputs, expert_indices, N, K, top_k);
+        outputs, expert_indices, sorted_indices, N, K, top_k);
 }
 
 // FP4 Dual GEMV for shared expert — reuses existing fp4_dual_gemv_kernel

@@ -129,6 +129,7 @@ void invoke_dense_gemm_add(
 // Grouped Expert GEMV: 单次 launch 计算 num_tokens × top_k 个 expert 的 GEMV
 // shared_input=true: 每个 token 的 top_k experts 共享该 token 的 inputs (gate_up projection)
 // shared_input=false: per-assignment inputs at inputs[assign_idx*K] (down projection)
+// sorted_indices: nullable, when provided sorted[blockIdx.y]→assign_idx for L2-friendly order
 void invoke_grouped_expert_gemv(
     const __nv_bfloat16* inputs,         // [T, K] (shared) or [T*top_k, K] (per-assignment)
     const __nv_bfloat16* packed_weights, // [E, N, K] all experts packed contiguous
@@ -137,7 +138,8 @@ void invoke_grouped_expert_gemv(
     int N, int K, size_t expert_stride,  // stride between experts in bf16 elements
     int top_k, bool shared_input,
     cudaStream_t stream = nullptr,
-    int num_tokens = 1
+    int num_tokens = 1,
+    const int* sorted_indices = nullptr
 );
 
 // Fused SwiGLU + Grouped Expert Down GEMV
@@ -150,7 +152,8 @@ void invoke_grouped_expert_gemv_swiglu(
     int N, int K, size_t expert_stride,
     int top_k,
     cudaStream_t stream = nullptr,
-    int num_tokens = 1
+    int num_tokens = 1,
+    const int* sorted_indices = nullptr
 );
 
 // Fused SwiGLU + GEMV for shared expert down projection

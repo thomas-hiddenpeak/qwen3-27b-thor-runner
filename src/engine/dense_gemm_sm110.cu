@@ -1624,6 +1624,7 @@ __global__ void grouped_expert_gemv_kernel(
     const __nv_bfloat16* __restrict__ packed_weights,
     __nv_bfloat16* __restrict__ outputs,
     const int* __restrict__ expert_indices,
+    const int* __restrict__ sorted_indices,    // nullable: sorted[blockIdx.y] → assign_idx
     int N, int K, size_t expert_stride,
     bool shared_input, int top_k)
 {
@@ -1636,7 +1637,7 @@ __global__ void grouped_expert_gemv_kernel(
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x & (WARP_SIZE - 1);
     int out_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
-    int assign_idx = blockIdx.y;  // 0..num_tokens*top_k-1
+    int assign_idx = sorted_indices ? sorted_indices[blockIdx.y] : (int)blockIdx.y;
     int token_idx = assign_idx / top_k;
 
     // Load input to SMEM (shared across warps in this block)
@@ -1697,14 +1698,15 @@ void invoke_grouped_expert_gemv(
     int N, int K, size_t expert_stride,
     int top_k, bool shared_input,
     cudaStream_t stream,
-    int num_tokens)
+    int num_tokens,
+    const int* sorted_indices)
 {
     constexpr int BLOCK = 256;
     constexpr int WARPS = BLOCK / 32;
     dim3 grid((N + WARPS - 1) / WARPS, num_tokens * top_k);
     size_t smem = K * sizeof(__nv_bfloat16);
     PDL_LAUNCH(grouped_expert_gemv_kernel, grid, BLOCK, smem, stream,
-        inputs, packed_weights, outputs, expert_indices,
+        inputs, packed_weights, outputs, expert_indices, sorted_indices,
         N, K, expert_stride, shared_input, top_k);
 }
 
@@ -1719,6 +1721,7 @@ __global__ void grouped_expert_gemv_swiglu_kernel(
     const __nv_bfloat16* __restrict__ packed_weights,    // [E, N, K] expert down weights
     __nv_bfloat16* __restrict__ outputs,                 // [T*top_k, N]
     const int* __restrict__ expert_indices,
+    const int* __restrict__ sorted_indices,    // nullable: sorted[blockIdx.y] → assign_idx
     int N, int K, size_t expert_stride, int top_k)
 {
     constexpr int WARP_SIZE = 32;
@@ -1729,7 +1732,7 @@ __global__ void grouped_expert_gemv_swiglu_kernel(
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x & (WARP_SIZE - 1);
     int out_idx = blockIdx.x * 8 + warp_id;
-    int assign_idx = blockIdx.y;  // 0..T*top_k-1
+    int assign_idx = sorted_indices ? sorted_indices[blockIdx.y] : (int)blockIdx.y;
 
     // Load gate+up (2*K elements) into SMEM
     const __nv_bfloat16* input = gate_up_outputs + assign_idx * 2 * K;
@@ -1794,14 +1797,15 @@ void invoke_grouped_expert_gemv_swiglu(
     int N, int K, size_t expert_stride,
     int top_k,
     cudaStream_t stream,
-    int num_tokens)
+    int num_tokens,
+    const int* sorted_indices)
 {
     constexpr int BLOCK = 256;
     constexpr int WARPS = BLOCK / 32;
     dim3 grid((N + WARPS - 1) / WARPS, num_tokens * top_k);
     size_t smem = 2 * K * sizeof(__nv_bfloat16);
     PDL_LAUNCH(grouped_expert_gemv_swiglu_kernel, grid, BLOCK, smem, stream,
-        gate_up_outputs, packed_weights, outputs, expert_indices,
+        gate_up_outputs, packed_weights, outputs, expert_indices, sorted_indices,
         N, K, expert_stride, top_k);
 }
 

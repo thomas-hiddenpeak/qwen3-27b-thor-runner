@@ -180,8 +180,10 @@ static void run_moe_mlp(
     __nv_bfloat16* shared_up_out   = shared_gate_out + num_tokens * shared_is;
     __nv_bfloat16* shared_swiglu_buf = shared_up_out + num_tokens * shared_is;
     __nv_bfloat16* gate_scalar     = shared_swiglu_buf + num_tokens * shared_is;
+    // sorted_indices for L2-friendly expert GEMV scheduling (T>1 only, T*top_k ints)
+    int* sorted_indices = (int*)(gate_scalar + ((num_tokens + 7) & ~7));
     // Fixed scratch (不随 T 缩放), aligned to 8 bf16 for vectorized stores
-    __nv_bfloat16* expert_scratch  = gate_scalar + ((num_tokens + 7) & ~7);
+    __nv_bfloat16* expert_scratch  = ((__nv_bfloat16*)(sorted_indices + ((num_tokens * top_k + 3) & ~3)));
 
     // 3. Router: [T, hs] × [hs, E] → [T, E] + Top-K selection
     if (moe_timing && num_tokens == 1) cudaEventRecord(moe_ev0, stream);
@@ -274,38 +276,42 @@ static void run_moe_mlp(
             hidden_states, hs, hs, top_k, stream);
     } else {
         // ============================================================
-        // T>1 路径: Batched Grouped Expert GEMV (GPU-resident, 无 D2H/sync)
-        // 所有 token × top_k expert assignments 在单次 kernel launch 中完成
+        // T>1 路径: Sorted Batched Grouped Expert GEMV (GPU-resident, 无 D2H/sync)
+        // Step 1: Counting sort by expert_id → L2-friendly execution order
+        // Step 2: Gate_up + SwiGLU+Down GEMV using sorted order
         // ============================================================
+        const int num_assigns = num_tokens * top_k;
+        ops::invoke_sort_by_expert(expert_indices, sorted_indices, num_assigns, E, stream);
+
         __nv_bfloat16* expert_gu_all      = expert_scratch;                              // [T*top_k, 2*moe_is]
         __nv_bfloat16* expert_down_all    = expert_gu_all + (size_t)num_tokens * top_k * 2 * moe_is;  // [T*top_k, hs]
 
-        // 5a. Batched grouped gate_up GEMV: all T*top_k assignments
+        // 5a. Sorted batched grouped gate_up GEMV: all T*top_k assignments
         if (fp4) {
             ops::invoke_fp4_grouped_expert_gemv(
                 post_norm_out, moe.fp4_experts_gate_up_packed, moe.fp4_experts_gate_up_scale,
                 moe.fp4_experts_gate_up_inv_gs, expert_gu_all,
                 expert_indices, 2 * moe_is, hs,
-                top_k, /*shared_input=*/true, stream, num_tokens);
+                top_k, /*shared_input=*/true, stream, num_tokens, sorted_indices);
         } else {
             ops::invoke_grouped_expert_gemv(
                 post_norm_out, moe.experts_gate_up_w, expert_gu_all,
                 expert_indices, 2 * moe_is, hs, gu_stride,
-                top_k, /*shared_input=*/true, stream, num_tokens);
+                top_k, /*shared_input=*/true, stream, num_tokens, sorted_indices);
         }
 
-        // 5b+5c. Fused SwiGLU + Batched grouped down GEMV
+        // 5b+5c. Fused SwiGLU + Sorted batched grouped down GEMV
         if (fp4) {
             ops::invoke_fp4_grouped_expert_gemv_swiglu(
                 expert_gu_all, moe.fp4_experts_down_packed, moe.fp4_experts_down_scale,
                 moe.fp4_experts_down_inv_gs, expert_down_all,
                 expert_indices, hs, moe_is,
-                top_k, stream, num_tokens);
+                top_k, stream, num_tokens, sorted_indices);
         } else {
             ops::invoke_grouped_expert_gemv_swiglu(
                 expert_gu_all, moe.experts_down_w, expert_down_all,
                 expert_indices, hs, moe_is, dn_stride,
-                top_k, stream, num_tokens);
+                top_k, stream, num_tokens, sorted_indices);
         }
         // (weighted_reduce + sigmoid_gated_add + residual deferred to batched_moe_final below)
     }

@@ -83,6 +83,7 @@ void cleanup_fp4_cublaslt();
 // 对 T*top_k 个 assignment, 用 expert_indices 选择 expert
 // shared_input=true: post_norm[T, K] → 每个 token 共享输入
 // 输出: outputs[T*top_k, 2*moe_is]
+// sorted_indices: nullable, when provided sorted[blockIdx.y]→assign_idx for L2-friendly order
 void invoke_fp4_grouped_expert_gemv(
     const __nv_bfloat16* inputs,         // [T, K] (shared) or [T*top_k, K]
     const uint8_t* packed_weights,       // [E * N, K/2] all experts
@@ -93,7 +94,8 @@ void invoke_fp4_grouped_expert_gemv(
     int N, int K,                        // N = per-expert output dim, K = input dim
     int top_k, bool shared_input,
     cudaStream_t stream = nullptr,
-    int num_tokens = 1
+    int num_tokens = 1,
+    const int* sorted_indices = nullptr
 );
 
 // FP4 Grouped Expert SwiGLU + Down GEMV:
@@ -108,7 +110,8 @@ void invoke_fp4_grouped_expert_gemv_swiglu(
     int N, int K,                          // N = hs, K = moe_is
     int top_k,
     cudaStream_t stream = nullptr,
-    int num_tokens = 1
+    int num_tokens = 1,
+    const int* sorted_indices = nullptr
 );
 
 // FP4 Dual GEMV for shared expert: gate + up, shared input A
