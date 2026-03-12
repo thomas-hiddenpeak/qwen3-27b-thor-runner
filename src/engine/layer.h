@@ -221,15 +221,17 @@ struct Qwen35Config {
         // MoE workspace after post_norm_out (per T=1):
         //   router_logits[E] + indices[topk*2] + weights[topk*2]
         //   + moe_acc[hs] + shared_gate/up/swiglu[3*shared_is] + gate_scalar[1]
-        //   + (batched) expert_gu_all[topk*2*moe_is] + expert_swiglu_all[topk*moe_is]
-        //   + expert_down_all[topk*hs]
-        // Dense MLP (already counted): gate_buf_size+2*is + hs
-        // Extra = MoE_total - dense_total
+        //   + sorted_indices[topk] (int → 2 bf16) + expert_scratch
+        // Expert scratch = max(T=1 GEMV, T>1 GEMM):
+        //   T=1 GEMV: topk*(2*mis + mis + hs)
+        //   T>1 GEMM: topk*(hs + 2*mis + mis) + hs + topk*2  (shared_down + inv_sorted)
+        // GEMM path adds hs + topk*2 on top of same base
+        int expert_scratch = num_experts_per_tok * (2 * moe_intermediate_size
+                           + moe_intermediate_size + hidden_size)
+                           + hidden_size + num_experts_per_tok * 2;  // GEMM path extra
         int moe_total = num_experts + num_experts_per_tok * 4
                       + hidden_size + 3 * shared_expert_intermediate_size + 1
-                      + num_experts_per_tok * 2 * moe_intermediate_size
-                      + num_experts_per_tok * moe_intermediate_size
-                      + num_experts_per_tok * hidden_size;
+                      + expert_scratch;
         int dense_total = gate_buf_size() + intermediate_size * 2 + hidden_size;
         return moe_total - dense_total;
     }

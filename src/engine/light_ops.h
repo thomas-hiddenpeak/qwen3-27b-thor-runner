@@ -196,9 +196,25 @@ void invoke_scale_add(__nv_bfloat16* out, const __nv_bfloat16* in, float scale,
                       int n, cudaStream_t stream = 0);
 
 // Counting sort: sort assignments by expert_id for L2-friendly GEMV scheduling
+// expert_offsets: optional [num_experts+1] prefix sums for per-expert GEMM dispatch
 void invoke_sort_by_expert(
     const int* expert_indices, int* sorted_indices,
     int num_assignments, int num_experts,
+    cudaStream_t stream = 0,
+    int* expert_offsets = nullptr);
+
+// MoE Gather: gather hidden states by sorted assignment order
+// gathered[i, :] = hidden_states[sorted_indices[i] / top_k, :]
+void invoke_moe_gather_input(
+    const __nv_bfloat16* hidden_states, const int* sorted_indices,
+    __nv_bfloat16* gathered, int num_assigns, int hs, int top_k,
+    cudaStream_t stream = 0);
+
+// MoE Scatter: scatter expert outputs from sorted to original order
+// orig_output[sorted_indices[i], :] = sorted_output[i, :]
+void invoke_moe_scatter_output(
+    const __nv_bfloat16* sorted_output, const int* sorted_indices,
+    __nv_bfloat16* orig_output, int num_assigns, int hs,
     cudaStream_t stream = 0);
 
 // Sigmoid-gated accumulate: out[i] += sigmoid(gate[0]) * in[i]
@@ -227,6 +243,20 @@ void invoke_batched_moe_final(
     const float* expert_weights,                       // [T, top_k]
     const __nv_bfloat16* shared_down,                  // [T, hs]
     const __nv_bfloat16* gate_scalar,                  // [T] BF16
+    int hs, int top_k, cudaStream_t stream = 0, int num_tokens = 1);
+
+// Build inverse permutation: inv[sorted_indices[i]] = i
+void invoke_build_inverse_perm(
+    const int* sorted_indices, int* inv_sorted, int n,
+    cudaStream_t stream = 0);
+
+// Batched fused MoE final with sorted expert outputs (GEMM path):
+// Uses inv_sorted for indirect lookup into expert_outputs_sorted
+void invoke_batched_moe_final_sorted(
+    __nv_bfloat16* hidden_states,
+    const __nv_bfloat16* expert_outputs_sorted, const int* inv_sorted,
+    const float* expert_weights,
+    const __nv_bfloat16* shared_down, const __nv_bfloat16* gate_scalar,
     int hs, int top_k, cudaStream_t stream = 0, int num_tokens = 1);
 
 // ============================================================================

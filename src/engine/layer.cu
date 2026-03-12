@@ -276,58 +276,130 @@ static void run_moe_mlp(
             hidden_states, hs, hs, top_k, stream);
     } else {
         // ============================================================
-        // T>1 路径: Sorted Batched Grouped Expert GEMV (GPU-resident, 无 D2H/sync)
-        // Step 1: Counting sort by expert_id → L2-friendly execution order
-        // Step 2: Gate_up + SwiGLU+Down GEMV using sorted order
+        // T>1 路径: Per-Expert GEMM (BF16) 或 Sorted GEMV (FP4/小T)
         // ============================================================
         const int num_assigns = num_tokens * top_k;
-        ops::invoke_sort_by_expert(expert_indices, sorted_indices, num_assigns, E, stream);
 
-        __nv_bfloat16* expert_gu_all      = expert_scratch;                              // [T*top_k, 2*moe_is]
-        __nv_bfloat16* expert_down_all    = expert_gu_all + (size_t)num_tokens * top_k * 2 * moe_is;  // [T*top_k, hs]
+        // GEMM 阈值: avg assignments per expert >= 4 (即 T >= E*4/top_k = 128)
+        // 仅 BF16 路径; FP4 保持 GEMV
+        const bool use_expert_gemm = !fp4 && (num_assigns >= E * 4);
 
-        // 5a. Sorted batched grouped gate_up GEMV: all T*top_k assignments
-        if (fp4) {
-            ops::invoke_fp4_grouped_expert_gemv(
-                post_norm_out, moe.fp4_experts_gate_up_packed, moe.fp4_experts_gate_up_scale,
-                moe.fp4_experts_gate_up_inv_gs, expert_gu_all,
-                expert_indices, 2 * moe_is, hs,
-                top_k, /*shared_input=*/true, stream, num_tokens, sorted_indices);
+        // 两种路径共用的指针 — 由各路径设置
+        __nv_bfloat16* expert_down_buf = nullptr;   // down outputs (sorted or original order)
+        __nv_bfloat16* shared_down_ptr = nullptr;   // shared expert down output
+        int* inv_sorted_ptr = nullptr;               // non-null → GEMM path (sorted order)
+
+        if (use_expert_gemm) {
+            // ============================================================
+            // Per-Expert GEMM 路径: CUTLASS GEMM 替代 T*top_k 个 GEMV
+            // 每个 expert 的 assignments 合并为单次 GEMM (avg M≈64)
+            // Weight 一次读取 + tensor cores → 比 GEMV 10-50× 更快
+            // ============================================================
+            static int* d_expert_offsets = nullptr;
+            if (!d_expert_offsets) cudaMallocManaged(&d_expert_offsets, (E + 1) * sizeof(int));
+
+            ops::invoke_sort_by_expert(expert_indices, sorted_indices,
+                                        num_assigns, E, stream, d_expert_offsets);
+            // Sync to read expert_offsets on CPU for GEMM dispatch loop
+            cudaStreamSynchronize(stream);
+
+            // Workspace layout (all at expert_scratch):
+            //   [0..A*hs):                  gathered_input → reused as down_sorted
+            //   [A*hs..A*(hs+2*mis)):       expert_gu_all
+            //   [A*(hs+2*mis)..A*(hs+3*mis)): expert_swiglu
+            //   [A*(hs+3*mis)..A*(hs+3*mis)+T*hs): shared_down_buf (GEMM path only)
+            //   [+T*hs..+A*2 ints):         inv_sorted (A ints ≈ A*0.5 bf16 equiv)
+            __nv_bfloat16* gathered    = expert_scratch;
+            __nv_bfloat16* gu_all      = gathered + (size_t)num_assigns * hs;
+            __nv_bfloat16* swiglu_buf  = gu_all + (size_t)num_assigns * 2 * moe_is;
+            __nv_bfloat16* down_sorted = gathered;   // alias (consumed after gate_up GEMMs)
+            shared_down_ptr            = swiglu_buf + (size_t)num_assigns * moe_is;
+            int* inv_sorted_buf        = (int*)(shared_down_ptr + (size_t)num_tokens * hs);
+
+            // 1. Gather hidden states for sorted assignments
+            ops::invoke_moe_gather_input(post_norm_out, sorted_indices,
+                                          gathered, num_assigns, hs, top_k, stream);
+
+            // 2. Per-expert Gate+Up GEMM
+            for (int e = 0; e < E; e++) {
+                int start = d_expert_offsets[e];
+                int count = d_expert_offsets[e + 1] - start;
+                if (count == 0) continue;
+                ops::invoke_dense_gemm(
+                    gathered + (size_t)start * hs,
+                    moe.experts_gate_up_w + (size_t)e * gu_stride,
+                    gu_all + (size_t)start * 2 * moe_is,
+                    count, 2 * moe_is, hs, stream);
+            }
+
+            // 3. SwiGLU on merged gate+up output [A, 2*moe_is] → [A, moe_is]
+            ops::invoke_swiglu_merged(swiglu_buf, gu_all, num_assigns, moe_is, stream);
+
+            // 4. Per-expert Down GEMM → reuse gathered buffer as down_sorted
+            for (int e = 0; e < E; e++) {
+                int start = d_expert_offsets[e];
+                int count = d_expert_offsets[e + 1] - start;
+                if (count == 0) continue;
+                ops::invoke_dense_gemm(
+                    swiglu_buf + (size_t)start * moe_is,
+                    moe.experts_down_w + (size_t)e * dn_stride,
+                    down_sorted + (size_t)start * hs,
+                    count, hs, moe_is, stream);
+            }
+
+            // 5. Build inverse permutation for sorted→original lookup
+            ops::invoke_build_inverse_perm(sorted_indices, inv_sorted_buf, num_assigns, stream);
+
+            expert_down_buf = down_sorted;
+            inv_sorted_ptr = inv_sorted_buf;
+
         } else {
-            ops::invoke_grouped_expert_gemv(
-                post_norm_out, moe.experts_gate_up_w, expert_gu_all,
-                expert_indices, 2 * moe_is, hs, gu_stride,
-                top_k, /*shared_input=*/true, stream, num_tokens, sorted_indices);
-        }
+            // ============================================================
+            // Sorted GEMV 路径 (FP4 或小 T)
+            // ============================================================
+            ops::invoke_sort_by_expert(expert_indices, sorted_indices, num_assigns, E, stream);
 
-        // 5b+5c. Fused SwiGLU + Sorted batched grouped down GEMV
-        if (fp4) {
-            ops::invoke_fp4_grouped_expert_gemv_swiglu(
-                expert_gu_all, moe.fp4_experts_down_packed, moe.fp4_experts_down_scale,
-                moe.fp4_experts_down_inv_gs, expert_down_all,
-                expert_indices, hs, moe_is,
-                top_k, stream, num_tokens, sorted_indices);
-        } else {
-            ops::invoke_grouped_expert_gemv_swiglu(
-                expert_gu_all, moe.experts_down_w, expert_down_all,
-                expert_indices, hs, moe_is, dn_stride,
-                top_k, stream, num_tokens, sorted_indices);
-        }
-        // (weighted_reduce + sigmoid_gated_add + residual deferred to batched_moe_final below)
-    }
+            __nv_bfloat16* expert_gu_all   = expert_scratch;
+            __nv_bfloat16* expert_down_all = expert_gu_all + (size_t)num_assigns * 2 * moe_is;
 
-    // Shared expert MLP (T>1 only — T=1 handled above with fused_moe_final)
-    if (num_tokens > 1) {
+            if (fp4) {
+                ops::invoke_fp4_grouped_expert_gemv(
+                    post_norm_out, moe.fp4_experts_gate_up_packed, moe.fp4_experts_gate_up_scale,
+                    moe.fp4_experts_gate_up_inv_gs, expert_gu_all,
+                    expert_indices, 2 * moe_is, hs,
+                    top_k, /*shared_input=*/true, stream, num_tokens, sorted_indices);
+                ops::invoke_fp4_grouped_expert_gemv_swiglu(
+                    expert_gu_all, moe.fp4_experts_down_packed, moe.fp4_experts_down_scale,
+                    moe.fp4_experts_down_inv_gs, expert_down_all,
+                    expert_indices, hs, moe_is,
+                    top_k, stream, num_tokens, sorted_indices);
+            } else {
+                ops::invoke_grouped_expert_gemv(
+                    post_norm_out, moe.experts_gate_up_w, expert_gu_all,
+                    expert_indices, 2 * moe_is, hs, gu_stride,
+                    top_k, /*shared_input=*/true, stream, num_tokens, sorted_indices);
+                ops::invoke_grouped_expert_gemv_swiglu(
+                    expert_gu_all, moe.experts_down_w, expert_down_all,
+                    expert_indices, hs, moe_is, dn_stride,
+                    top_k, stream, num_tokens, sorted_indices);
+            }
+
+            expert_down_buf = expert_down_all;
+            shared_down_ptr = expert_scratch;  // shared_down_buf at scratch[0] (GEMV path)
+        }
+        // (weighted_reduce + sigmoid_gated_add + residual deferred to below)
+
+        // ============================================================
+        // Shared expert MLP (T>1 only — T=1 handled above with fused_moe_final)
+        // ============================================================
         if (fp4 && moe.shared_gate_qw.valid()) {
-            // FP4 shared expert: separate gate + up GEMM, SwiGLU, FP4 down GEMM
             ops::invoke_fp4_gemm(post_norm_out, moe.shared_gate_qw, shared_gate_out, num_tokens, stream);
             ops::invoke_fp4_gemm(post_norm_out, moe.shared_up_qw, shared_up_out, num_tokens, stream);
             ops::invoke_swiglu(shared_swiglu_buf, shared_gate_out, shared_up_out,
                                 num_tokens, shared_is, stream);
             ops::invoke_dense_gemm(post_norm_out, moe.shared_expert_gate_w,
                                     gate_scalar, num_tokens, 1, hs, stream);
-            __nv_bfloat16* shared_down_buf = expert_scratch;
-            ops::invoke_fp4_gemm(shared_swiglu_buf, moe.shared_down_qw, shared_down_buf, num_tokens, stream);
+            ops::invoke_fp4_gemm(shared_swiglu_buf, moe.shared_down_qw, shared_down_ptr, num_tokens, stream);
         } else {
             ops::invoke_dense_gemm(post_norm_out, moe.shared_gate_w, shared_gate_out,
                                     num_tokens, shared_is, hs, stream);
@@ -337,18 +409,22 @@ static void run_moe_mlp(
                                 num_tokens, shared_is, stream);
             ops::invoke_dense_gemm(post_norm_out, moe.shared_expert_gate_w,
                                     gate_scalar, num_tokens, 1, hs, stream);
-            __nv_bfloat16* shared_down_buf = expert_scratch;
-            ops::invoke_dense_gemm(shared_swiglu_buf, moe.shared_down_w, shared_down_buf,
+            ops::invoke_dense_gemm(shared_swiglu_buf, moe.shared_down_w, shared_down_ptr,
                                     num_tokens, hs, shared_is, stream);
         }
-        // shared_down_buf is at expert_scratch — same location for both paths
-        __nv_bfloat16* shared_down_buf = expert_scratch;
-        // expert_down_all starts after expert_gu_all [T*top_k, 2*moe_is]
-        __nv_bfloat16* expert_down_all = expert_scratch + (size_t)num_tokens * top_k * 2 * moe_is;
-        // Fused: weighted_reduce + sigmoid_gated_add + residual (T+2 launches → 1)
-        ops::invoke_batched_moe_final(
-            hidden_states, expert_down_all, expert_weights,
-            shared_down_buf, gate_scalar, hs, top_k, stream, num_tokens);
+
+        // Final: weighted_reduce + sigmoid_gated_add + residual
+        if (inv_sorted_ptr) {
+            // GEMM path: expert outputs in sorted order, use inv_sorted for lookup
+            ops::invoke_batched_moe_final_sorted(
+                hidden_states, expert_down_buf, inv_sorted_ptr, expert_weights,
+                shared_down_ptr, gate_scalar, hs, top_k, stream, num_tokens);
+        } else {
+            // GEMV path: expert outputs in original order
+            ops::invoke_batched_moe_final(
+                hidden_states, expert_down_buf, expert_weights,
+                shared_down_ptr, gate_scalar, hs, top_k, stream, num_tokens);
+        }
     }
 
     // MoE timing reporting

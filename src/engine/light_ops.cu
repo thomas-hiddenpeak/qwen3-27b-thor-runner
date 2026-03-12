@@ -1894,6 +1894,7 @@ void invoke_scale_add(__nv_bfloat16* out, const __nv_bfloat16* in, float scale,
 __global__ void counting_sort_by_expert_kernel(
     const int* __restrict__ expert_indices,
     int* __restrict__ sorted_indices,
+    int* __restrict__ expert_offsets,  // nullable: [num_experts+1] prefix sums
     int num_assignments, int num_experts)
 {
     PDL_WAIT();
@@ -1920,6 +1921,15 @@ __global__ void counting_sort_by_expert_kernel(
     }
     __syncthreads();
 
+    // Phase 3b: Write prefix sums to global memory (before Phase 4 modifies s_offsets)
+    if (expert_offsets) {
+        for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
+            expert_offsets[e] = s_offsets[e];
+        if (threadIdx.x == 0)
+            expert_offsets[num_experts] = num_assignments;
+        __syncthreads();
+    }
+
     // Phase 4: Scatter — each assignment gets a unique sorted position
     for (int i = threadIdx.x; i < num_assignments; i += blockDim.x) {
         int pos = atomicAdd_block(&s_offsets[expert_indices[i]], 1);
@@ -1931,10 +1941,88 @@ __global__ void counting_sort_by_expert_kernel(
 void invoke_sort_by_expert(
     const int* expert_indices, int* sorted_indices,
     int num_assignments, int num_experts,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    int* expert_offsets)
 {
     PDL_LAUNCH(counting_sort_by_expert_kernel, 1, 256, 0, stream,
-        expert_indices, sorted_indices, num_assignments, num_experts);
+        expert_indices, sorted_indices, expert_offsets,
+        num_assignments, num_experts);
+}
+
+// ============================================================================
+// MoE Gather: gather hidden states by sorted assignment order
+// For each sorted position i, copy hidden_states[token_idx, :] to gathered[i, :]
+// where token_idx = sorted_indices[i] / top_k
+// ============================================================================
+__global__ void moe_gather_input_kernel(
+    const __nv_bfloat16* __restrict__ hidden_states,  // [T, hs]
+    const int* __restrict__ sorted_indices,           // [num_assigns]
+    __nv_bfloat16* __restrict__ gathered,             // [num_assigns, hs]
+    int hs, int top_k)
+{
+    PDL_WAIT();
+    int assign_pos = blockIdx.x;
+    int orig_idx = sorted_indices[assign_pos];
+    int token_idx = orig_idx / top_k;
+
+    const __nv_bfloat16* src = hidden_states + (size_t)token_idx * hs;
+    __nv_bfloat16* dst = gathered + (size_t)assign_pos * hs;
+
+    // Vectorized copy (float4 = 8 bf16)
+    int hs8 = hs / 8;
+    const float4* src4 = reinterpret_cast<const float4*>(src);
+    float4* dst4 = reinterpret_cast<float4*>(dst);
+    for (int i = threadIdx.x; i < hs8; i += blockDim.x)
+        dst4[i] = src4[i];
+    // Tail
+    for (int i = hs8 * 8 + threadIdx.x; i < hs; i += blockDim.x)
+        dst[i] = src[i];
+    PDL_SIGNAL();
+}
+
+void invoke_moe_gather_input(
+    const __nv_bfloat16* hidden_states, const int* sorted_indices,
+    __nv_bfloat16* gathered, int num_assigns, int hs, int top_k,
+    cudaStream_t stream)
+{
+    PDL_LAUNCH(moe_gather_input_kernel, num_assigns, 256, 0, stream,
+        hidden_states, sorted_indices, gathered, hs, top_k);
+}
+
+// ============================================================================
+// MoE Scatter: scatter expert outputs from sorted order to original order
+// For each sorted position i, copy src[i, :] to dst[sorted_indices[i], :]
+// ============================================================================
+__global__ void moe_scatter_output_kernel(
+    const __nv_bfloat16* __restrict__ sorted_output,  // [num_assigns, hs]
+    const int* __restrict__ sorted_indices,           // [num_assigns]
+    __nv_bfloat16* __restrict__ orig_output,          // [num_assigns, hs]
+    int hs)
+{
+    PDL_WAIT();
+    int sorted_pos = blockIdx.x;
+    int orig_idx = sorted_indices[sorted_pos];
+
+    const __nv_bfloat16* src = sorted_output + (size_t)sorted_pos * hs;
+    __nv_bfloat16* dst = orig_output + (size_t)orig_idx * hs;
+
+    int hs8 = hs / 8;
+    const float4* src4 = reinterpret_cast<const float4*>(src);
+    float4* dst4 = reinterpret_cast<float4*>(dst);
+    for (int i = threadIdx.x; i < hs8; i += blockDim.x)
+        dst4[i] = src4[i];
+    for (int i = hs8 * 8 + threadIdx.x; i < hs; i += blockDim.x)
+        dst[i] = src[i];
+    PDL_SIGNAL();
+}
+
+void invoke_moe_scatter_output(
+    const __nv_bfloat16* sorted_output, const int* sorted_indices,
+    __nv_bfloat16* orig_output, int num_assigns, int hs,
+    cudaStream_t stream)
+{
+    PDL_LAUNCH(moe_scatter_output_kernel, num_assigns, 256, 0, stream,
+        sorted_output, sorted_indices, orig_output, hs);
 }
 
 // ============================================================================
@@ -2095,6 +2183,83 @@ void invoke_batched_moe_final(
     dim3 grid((hs + BLOCK - 1) / BLOCK, num_tokens);
     PDL_LAUNCH(batched_moe_final_kernel, grid, BLOCK, 0, stream,
         hidden_states, expert_outputs, expert_weights,
+        shared_down, gate_scalar, hs, top_k);
+}
+
+// ============================================================================
+// Build inverse permutation: inv[sorted_indices[i]] = i
+// Used by GEMM path to map original assignment → sorted position
+// ============================================================================
+__global__ void build_inverse_perm_kernel(
+    const int* __restrict__ sorted_indices,
+    int* __restrict__ inv_sorted,
+    int n)
+{
+    PDL_WAIT();
+    for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < n; i += gridDim.x * blockDim.x)
+        inv_sorted[sorted_indices[i]] = i;
+    PDL_SIGNAL();
+}
+
+void invoke_build_inverse_perm(
+    const int* sorted_indices, int* inv_sorted, int n,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK = 256;
+    int grid = (n + BLOCK - 1) / BLOCK;
+    PDL_LAUNCH(build_inverse_perm_kernel, grid, BLOCK, 0, stream,
+        sorted_indices, inv_sorted, n);
+}
+
+// ============================================================================
+// Batched MoE final with sorted expert outputs (GEMM path)
+// Expert outputs are in sorted order; uses inv_sorted for indirect lookup
+// ============================================================================
+__global__ void batched_moe_final_sorted_kernel(
+    __nv_bfloat16* __restrict__ hidden_states,
+    const __nv_bfloat16* __restrict__ expert_outputs_sorted,  // [T*top_k, hs] sorted order
+    const int* __restrict__ inv_sorted,                       // [T*top_k] orig→sorted mapping
+    const float* __restrict__ expert_weights,                 // [T, top_k]
+    const __nv_bfloat16* __restrict__ shared_down,            // [T, hs]
+    const __nv_bfloat16* __restrict__ gate_scalar,            // [T] BF16
+    int hs, int top_k)
+{
+    PDL_WAIT();
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y;
+    if (idx >= hs) { PDL_SIGNAL(); return; }
+
+    // Weighted expert reduce with indirect lookup
+    float val = 0.f;
+    for (int k = 0; k < top_k; k++) {
+        int sorted_pos = inv_sorted[t * top_k + k];
+        val += expert_weights[t * top_k + k]
+             * __bfloat162float(expert_outputs_sorted[sorted_pos * hs + idx]);
+    }
+
+    // Sigmoid-gated shared expert add
+    float gate = __bfloat162float(gate_scalar[t]);
+    float sig = 1.f / (1.f + exp2f(-gate * LOG2E));
+    val += sig * __bfloat162float(shared_down[t * hs + idx]);
+
+    // Residual add
+    hidden_states[t * hs + idx] = __float2bfloat16(
+        __bfloat162float(hidden_states[t * hs + idx]) + val);
+
+    PDL_SIGNAL();
+}
+
+void invoke_batched_moe_final_sorted(
+    __nv_bfloat16* hidden_states,
+    const __nv_bfloat16* expert_outputs_sorted, const int* inv_sorted,
+    const float* expert_weights,
+    const __nv_bfloat16* shared_down, const __nv_bfloat16* gate_scalar,
+    int hs, int top_k, cudaStream_t stream, int num_tokens)
+{
+    constexpr int BLOCK = 256;
+    dim3 grid((hs + BLOCK - 1) / BLOCK, num_tokens);
+    PDL_LAUNCH(batched_moe_final_sorted_kernel, grid, BLOCK, 0, stream,
+        hidden_states, expert_outputs_sorted, inv_sorted, expert_weights,
         shared_down, gate_scalar, hs, top_k);
 }
 
