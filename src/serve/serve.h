@@ -153,11 +153,15 @@ private:
 
     // ---- WebSocket 语音对话 ----
     void handle_websocket_voice(int client_fd, const HttpRequest& req);
-    void ws_voice_generate(int client_fd,
-                           const std::string& user_text,
-                           std::vector<std::pair<std::string, std::string>>& chat_history,
-                           const std::string& voice,
-                           bool tts_enabled);
+    void ws_voice_generate(
+        const std::string& user_text,
+        std::vector<std::pair<std::string, std::string>>& chat_history,
+        const std::string& voice,
+        bool tts_enabled,
+        const std::function<bool(const std::string&)>& send_text,
+        const std::function<bool(const uint8_t*, size_t)>& send_binary,
+        std::atomic<bool>& generating,
+        std::atomic<bool>& interrupted);
 
     // ---- WebSocket /v1/realtime — 持续双向语音通道 ----
     void handle_websocket_realtime(int client_fd, const HttpRequest& req);

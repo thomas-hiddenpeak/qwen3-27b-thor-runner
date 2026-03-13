@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Qwen3 Voice Chat — WebSocket 语音对话</title>
+<title>Qwen3 Voice — 语音对话 & TTS</title>
 <style>
 :root {
   --bg: #0f1117;
@@ -34,14 +34,17 @@ body {
   flex-direction: column;
 }
 
+/* ======== Header ======== */
 .header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 24px;
+  padding: 10px 24px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .header h1 {
@@ -50,12 +53,14 @@ body {
   background: linear-gradient(135deg, var(--primary), #a78bfa);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
+  flex-shrink: 0;
 }
 
 .header-controls {
   display: flex;
-  gap: 12px;
+  gap: 10px;
   align-items: center;
+  flex-wrap: wrap;
 }
 
 .header-controls label { font-size: 12px; color: var(--text2); }
@@ -70,6 +75,35 @@ body {
   outline: none;
 }
 
+/* ======== Tab bar ======== */
+.tab-bar {
+  display: flex;
+  gap: 0;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.tab-bar button {
+  padding: 10px 24px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text2);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-family: inherit;
+}
+
+.tab-bar button:hover { color: var(--text); }
+.tab-bar button.active { color: var(--primary); border-bottom-color: var(--primary); }
+
+.tab-content { display: none; flex: 1; overflow: hidden; flex-direction: column; }
+.tab-content.active { display: flex; }
+
+/* ======== Voice Chat Tab ======== */
 .chat-area {
   flex: 1;
   overflow-y: auto;
@@ -113,20 +147,13 @@ body {
   word-break: break-word;
 }
 
-.message audio {
-  display: block;
-  margin-top: 8px;
-  width: 100%;
-  height: 36px;
-  border-radius: 6px;
-}
-
 .message .meta {
   font-size: 11px;
   color: var(--text2);
   margin-top: 6px;
 }
 
+/* Input area */
 .input-area {
   padding: 16px 24px;
   background: var(--surface);
@@ -261,7 +288,7 @@ body {
 .toggle-switch input:checked + .toggle-slider { background: var(--primary); border-color: var(--primary); }
 .toggle-switch input:checked + .toggle-slider:before { transform: translateX(16px); background: #fff; }
 
-/* Connection status indicator */
+/* Connection status */
 .ws-status {
   display: inline-flex;
   align-items: center;
@@ -288,7 +315,6 @@ body {
   color: var(--text2);
 }
 
-/* Status bar */
 .status-bar {
   font-size: 12px;
   color: var(--text2);
@@ -300,7 +326,6 @@ body {
 .status-bar.visible { display: block; }
 .status-bar.error { color: var(--error); }
 
-/* Streaming cursor */
 .streaming-cursor::after {
   content: '▊';
   animation: blink 1s step-end infinite;
@@ -308,12 +333,270 @@ body {
 }
 
 @keyframes blink { 50% { opacity: 0; } }
+
+/* ======== TTS Tab ======== */
+.tts-container {
+  width: 100%;
+  max-width: 720px;
+  padding: 24px;
+  margin: 0 auto;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+  margin-bottom: 16px;
+}
+
+.form-group { margin-bottom: 16px; }
+
+.form-group label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text2);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+
+.tts-container textarea {
+  width: 100%;
+  min-height: 120px;
+  padding: 12px 16px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.6;
+  resize: vertical;
+  outline: none;
+  transition: border-color 0.2s;
+  font-family: inherit;
+}
+
+.tts-container textarea:focus { border-color: var(--primary); }
+
+.row { display: flex; gap: 12px; }
+.row > * { flex: 1; }
+
+.tts-container select, .tts-container input[type="text"] {
+  width: 100%;
+  padding: 10px 14px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s;
+  appearance: none;
+  font-family: inherit;
+}
+
+.tts-container select:focus, .tts-container input:focus { border-color: var(--primary); }
+
+.tts-container select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%239ca0ab'%3E%3Cpath d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 14px center;
+  padding-right: 36px;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 28px;
+  font-size: 15px;
+  font-weight: 600;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-family: inherit;
+}
+
+.btn-primary {
+  background: var(--primary);
+  color: #fff;
+  width: 100%;
+}
+
+.btn-primary:hover:not(:disabled) { background: var(--primary-hover); transform: translateY(-1px); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-secondary {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 8px 16px;
+  font-size: 13px;
+}
+
+.btn-secondary:hover { background: var(--border); }
+
+.tts-status {
+  text-align: center;
+  padding: 12px;
+  font-size: 14px;
+  color: var(--text2);
+  display: none;
+}
+
+.tts-status.visible { display: block; }
+.tts-status.error { color: var(--error); }
+.tts-status.success { color: var(--success); }
+
+.player { display: none; margin-top: 16px; }
+.player.visible { display: block; }
+
+.player audio {
+  width: 100%;
+  height: 48px;
+  border-radius: 8px;
+  outline: none;
+}
+
+.player-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--text2);
+}
+
+.presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.preset {
+  padding: 6px 12px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  font-size: 13px;
+  color: var(--text2);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.preset:hover { background: var(--border); color: var(--text); }
+
+.history-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text2);
+  margin-bottom: 12px;
+}
+
+.history-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--surface2);
+  border-radius: 8px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.history-item:hover { background: var(--border); }
+
+.history-item .text {
+  flex: 1;
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-item .item-meta {
+  font-size: 12px;
+  color: var(--text2);
+  white-space: nowrap;
+}
+
+.history-item .play-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.play-icon svg {
+  width: 14px;
+  height: 14px;
+  fill: white;
+  margin-left: 2px;
+}
+
+.spinner {
+  display: inline-block;
+  width: 16px; height: 16px;
+  border: 2px solid rgba(255,255,255,0.3);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* API docs */
+.api-section { margin-top: 24px; }
+
+.api-section summary {
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text2);
+  padding: 8px 0;
+}
+
+.api-section pre {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  font-size: 13px;
+  overflow-x: auto;
+  line-height: 1.5;
+  margin-top: 8px;
+  color: var(--text);
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+.api-section code { color: var(--primary); }
+
+footer {
+  padding: 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text2);
+  flex-shrink: 0;
+}
 </style>
 </head>
 <body>
 
+<!-- ========== Header ========== -->
 <div class="header">
-  <h1>🎙️ Qwen3 Voice Chat <span style="font-size:12px;font-weight:400;opacity:0.6">(WebSocket)</span></h1>
+  <h1>🎙️ Qwen3 Voice</h1>
   <div class="header-controls">
     <div class="ws-status">
       <span class="ws-dot" id="wsDot"></span>
@@ -373,71 +656,207 @@ body {
   </div>
 </div>
 
-<div class="chat-area" id="chatArea">
-  <div class="message assistant">
-    <div class="role-tag">Assistant</div>
-    <div class="content">你好！我是 Qwen 语音助手 (WebSocket 模式)。你可以用文字或语音和我对话。</div>
+<!-- ========== Tab Bar ========== -->
+<div class="tab-bar">
+  <button class="active" onclick="switchTab('voice', this)">💬 语音对话</button>
+  <button onclick="switchTab('tts', this)">🔊 TTS 合成</button>
+</div>
+
+<!-- ========== Voice Chat Tab ========== -->
+<div class="tab-content active" id="tab-voice">
+  <div class="chat-area" id="chatArea">
+    <div class="message assistant">
+      <div class="role-tag">Assistant</div>
+      <div class="content">你好！我是 Qwen 语音助手。你可以用文字或语音和我对话。</div>
+    </div>
+  </div>
+
+  <div class="status-bar" id="statusBar"></div>
+
+  <div class="input-area">
+    <div class="input-row">
+      <textarea id="inputText" placeholder="输入消息... (Ctrl+Enter 发送)" rows="1"
+                oninput="autoResize(this)"></textarea>
+      <button class="mic-btn" id="micBtn" onclick="toggleRecording()" title="按住说话">
+        <svg viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5z"/>
+          <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+        </svg>
+      </button>
+      <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="发送">
+        <svg viewBox="0 0 24 24" fill="currentColor">
+          <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+        </svg>
+      </button>
+    </div>
+    <div class="settings-row">
+      <span id="recordingStatus"></span>
+    </div>
   </div>
 </div>
 
-<div class="status-bar" id="statusBar"></div>
+<!-- ========== TTS Tab ========== -->
+<div class="tab-content" id="tab-tts">
+  <div class="tts-container">
+    <div class="card">
+      <div class="form-group">
+        <label>输入文本</label>
+        <textarea id="ttsInputText" placeholder="请输入要合成的文本...">你好，我是通义千问。很高兴为你服务！</textarea>
+        <div class="presets">
+          <span class="preset" data-text="你好，我是通义千问。很高兴为你服务！">中文问候</span>
+          <span class="preset" data-text="Hello, I'm Qwen. How can I help you today?">English</span>
+          <span class="preset" data-text="春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。">古诗</span>
+          <span class="preset" data-text="今天天气真好，我们一起出去散步吧。阳光明媚，微风轻拂，正是踏青的好时节。">长句</span>
+          <span class="preset" data-text="1加1等于2，圆周率约等于3.14159。">数字</span>
+        </div>
+      </div>
 
-<div class="input-area">
-  <div class="input-row">
-    <textarea id="inputText" placeholder="输入消息... (Ctrl+Enter 发送)" rows="1"
-              oninput="autoResize(this)"></textarea>
-    <button class="mic-btn" id="micBtn" onclick="toggleRecording()" title="按住说话">
-      <svg viewBox="0 0 24 24" fill="currentColor">
-        <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5z"/>
-        <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
-      </svg>
-    </button>
-    <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="发送">
-      <svg viewBox="0 0 24 24" fill="currentColor">
-        <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
-      </svg>
-    </button>
-  </div>
-  <div class="settings-row">
-    <span id="recordingStatus"></span>
+      <div class="row">
+        <div class="form-group">
+          <label>说话人</label>
+          <select id="ttsVoiceSelect">
+            <option value="serena">Serena</option>
+            <option value="vivian">Vivian</option>
+            <option value="sohee">Sohee</option>
+            <option value="ono_anna">Anna</option>
+            <option value="eric">Eric</option>
+            <option value="ryan">Ryan</option>
+            <option value="aiden">Aiden</option>
+            <option value="dylan">Dylan</option>
+            <option value="uncle_fu">Uncle Fu</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>输出格式</label>
+          <select id="formatSelect">
+            <option value="wav">WAV</option>
+            <option value="pcm">PCM (raw)</option>
+          </select>
+        </div>
+      </div>
+
+      <button class="btn btn-primary" id="synthesizeBtn" onclick="synthesizeTts()">
+        合成语音
+      </button>
+
+      <div class="tts-status" id="ttsStatus"></div>
+
+      <div class="player" id="ttsPlayer">
+        <audio id="ttsAudioPlayer" controls></audio>
+        <div class="player-info">
+          <span id="ttsAudioInfo"></span>
+          <div>
+            <button class="btn btn-secondary" onclick="downloadAudio()">⬇ 下载</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- History -->
+    <div class="card" id="ttsHistoryCard" style="display:none">
+      <div class="history-title">历史记录</div>
+      <div id="ttsHistoryList"></div>
+    </div>
+
+    <!-- API Reference -->
+    <details class="api-section card">
+      <summary>📖 API 参考</summary>
+      <h3 style="margin: 12px 0 8px; font-size: 15px;">POST /v1/audio/speech</h3>
+      <p style="font-size: 13px; color: var(--text2); margin-bottom: 12px;">
+        OpenAI 兼容的 TTS 端点。返回二进制音频数据。
+      </p>
+      <pre>{
+  "model": "qwen3-tts",
+  "input": "你好，世界！",
+  "voice": "serena",
+  "response_format": "wav",
+  "speed": 1.0
+}</pre>
+
+      <h3 style="margin: 16px 0 8px; font-size: 15px;">cURL 示例</h3>
+      <pre>curl -X POST http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"input":"你好世界","voice":"serena"}' \
+  --output speech.wav</pre>
+
+      <h3 style="margin: 16px 0 8px; font-size: 15px;">Python 示例</h3>
+      <pre>from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="none")
+response = client.audio.speech.create(
+    model="qwen3-tts",
+    voice="serena",
+    input="你好，我是通义千问！",
+    response_format="wav"
+)
+response.stream_to_file("output.wav")</pre>
+
+      <h3 style="margin: 16px 0 8px; font-size: 15px;">JavaScript Fetch</h3>
+      <pre>const response = await fetch('/v1/audio/speech', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    input: '你好世界',
+    voice: 'serena',
+    response_format: 'wav'
+  })
+});
+const blob = await response.blob();
+const url = URL.createObjectURL(blob);
+const audio = new Audio(url);
+audio.play();</pre>
+    </details>
   </div>
 </div>
+
+<footer>
+  Qwen3-TTS on Jetson AGX Thor &bull; SM110a Blackwell &bull; Native CUDA Inference
+</footer>
 
 <script>
 // ============================================================================
-// State
+// Tab Switching
+// ============================================================================
+function switchTab(tabId, btnEl) {
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-bar button').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + tabId).classList.add('active');
+  btnEl.classList.add('active');
+}
+
+// ============================================================================
+// Voice Chat State
 // ============================================================================
 let ws = null;
 let isRecording = false;
 let isProcessing = false;
 let currentMode = 'text';
-let streamingDiv = null;   // 当前正在流式输出的消息 div
-let streamingText = '';    // 累积的流式文本
-let responseT0 = 0;       // 响应开始时间
+let streamingDiv = null;
+let streamingText = '';
+let responseT0 = 0;
 
-// ---- 流式 ASR 状态 ----
+// Streaming ASR
 let audioContext = null;
 let audioWorkletNode = null;
 let mediaStream = null;
 const STREAM_SAMPLE_RATE = 16000;
 
-// ---- 流式 TTS 播放状态 ----
-let ttsPlayCtx = null;        // TTS 播放用 AudioContext
-let ttsNextTime = 0;          // 下一段应播放的时间点
-let ttsPreBuffer = [];        // 预缓冲: 累积初始 chunks 再开始播放
-let ttsSampleRate = 24000;    // 服务端 TTS 采样率
-let ttsStreamActive = false;  // 是否在流式 TTS 模式
-let wasRecording = false;     // 响应前是否在录音 (用于自动重启)
-let ttsPlayingAudio = false;  // TTS 音频是否正在播放
+// Streaming TTS playback
+let ttsPlayCtx = null;
+let ttsNextTime = 0;
+let ttsPreBuffer = [];
+let ttsSampleRate = 24000;
+let ttsStreamActive = false;
+let wasRecording = false;
+let ttsTotalSize = 0;
+let ttsDone = false;
 
 // ============================================================================
 // WebSocket 连接
 // ============================================================================
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  // 直接用 location.host (通过 8080 静态文件服务访问时端口一致)
   const url = proto + '//' + location.host + '/v1/voice';
-
   ws = new WebSocket(url);
 
   ws.onopen = () => {
@@ -449,7 +868,6 @@ function connectWS() {
   ws.onclose = () => {
     document.getElementById('wsDot').classList.remove('connected');
     document.getElementById('wsLabel').textContent = '已断开';
-    // 自动重连
     setTimeout(connectWS, 3000);
   };
 
@@ -459,7 +877,6 @@ function connectWS() {
 
   ws.onmessage = (e) => {
     if (e.data instanceof Blob) {
-      // Binary frame = TTS audio data (follows tts.meta text frame)
       handleTtsBinary(e.data);
       return;
     }
@@ -500,35 +917,28 @@ function resetTtsDefaults() {
 }
 
 // ============================================================================
-// 事件处理
+// TTS Binary Handling (Voice Chat)
 // ============================================================================
-let ttsTotalSize = 0;       // TTS 总字节数
-let ttsDone = false;        // tts.done 已收到
-
 function handleTtsBinary(blob) {
   ttsTotalSize += blob.size;
 
   if (ttsStreamActive) {
-    // 流式 PCM16 模式: 预缓冲 + 无缝播放
     blob.arrayBuffer().then(buf => {
       const pcm16 = new Int16Array(buf);
       if (pcm16.length === 0) return;
 
-      // PCM16 → Float32
       const float32 = new Float32Array(pcm16.length);
       for (let i = 0; i < pcm16.length; i++) {
         float32[i] = pcm16[i] / 32768.0;
       }
 
       if (!ttsPlayCtx) {
-        // 预缓冲阶段: 累积足够音频再开始播放, 避免断续
         ttsPreBuffer.push(float32);
         let totalSamples = 0;
         for (const c of ttsPreBuffer) totalSamples += c.length;
         const totalMs = (totalSamples / ttsSampleRate) * 1000;
-        if (totalMs < 600) return;  // 累积至少 600ms 再开始
+        if (totalMs < 600) return;
 
-        // 启动播放, 调度所有累积的 chunks
         ttsPlayCtx = new AudioContext({ sampleRate: ttsSampleRate });
         ttsNextTime = ttsPlayCtx.currentTime + 0.05;
         for (const chunk of ttsPreBuffer) {
@@ -544,7 +954,6 @@ function handleTtsBinary(blob) {
         return;
       }
 
-      // 后续 chunks: 无缝拼接调度
       const audioBuf = ttsPlayCtx.createBuffer(1, float32.length, ttsSampleRate);
       audioBuf.copyToChannel(float32, 0);
       const source = ttsPlayCtx.createBufferSource();
@@ -552,12 +961,11 @@ function handleTtsBinary(blob) {
       source.connect(ttsPlayCtx.destination);
 
       const now = ttsPlayCtx.currentTime;
-      if (ttsNextTime < now) ttsNextTime = now + 0.15;  // 150ms 恢复缓冲
+      if (ttsNextTime < now) ttsNextTime = now + 0.15;
       source.start(ttsNextTime);
       ttsNextTime += audioBuf.duration;
     });
   } else {
-    // 兼容旧 WAV 模式
     const audioUrl = URL.createObjectURL(blob);
     if (streamingDiv) {
       const audio = document.createElement('audio');
@@ -571,17 +979,18 @@ function handleTtsBinary(blob) {
   }
 }
 
-// 等待 TTS 音频播放完毕 (防止麦克风采集到 TTS 回声)
 function waitForTtsPlaybackEnd(callback) {
   if (!ttsPlayCtx || ttsNextTime <= ttsPlayCtx.currentTime) {
-    // 没有播放上下文或已播完
     callback();
     return;
   }
   const remaining = (ttsNextTime - ttsPlayCtx.currentTime) * 1000;
-  setTimeout(callback, remaining + 200);  // +200ms 安全余量
+  setTimeout(callback, remaining + 200);
 }
 
+// ============================================================================
+// Event Handling (Voice Chat)
+// ============================================================================
 function handleEvent(msg) {
   switch (msg.type) {
     case 'session.created':
@@ -601,14 +1010,12 @@ function handleEvent(msg) {
       break;
 
     case 'stream.vad':
-      // VAD 检测到语音结束, 服务端正在 ASR
       setStatus('语音结束，正在识别...');
-      wasRecording = true;   // 记住需要自动重启
-      stopStreaming(false);   // 停止采集但不发 stream.stop (服务端已处理)
+      wasRecording = true;
+      stopStreaming(false);
       break;
 
     case 'stream.stopped':
-      // 手动停止确认 — 如果没有触发 ASR, 解锁 UI
       if (isProcessing && !streamingDiv) {
         isProcessing = false;
         document.getElementById('sendBtn').disabled = false;
@@ -617,7 +1024,6 @@ function handleEvent(msg) {
       break;
 
     case 'audio.level':
-      // 更新音频电平 UI
       updateAudioLevel(msg.rms || 0);
       break;
 
@@ -626,12 +1032,10 @@ function handleEvent(msg) {
       break;
 
     case 'tts.stream_start':
-      // 流式 TTS PCM16 开始
       ttsStreamActive = true;
       ttsSampleRate = msg.sample_rate || 24000;
       ttsNextTime = 0;
       ttsPreBuffer = [];
-      // 关闭上一个播放上下文
       if (ttsPlayCtx) { ttsPlayCtx.close(); ttsPlayCtx = null; }
       break;
 
@@ -675,14 +1079,11 @@ function handleEvent(msg) {
       break;
 
     case 'tts.meta':
-      // 兼容旧协议 TTS 分段元数据
       break;
 
     case 'tts.done':
-      // 所有 TTS 分段发送完毕
       ttsDone = true;
       ttsStreamActive = false;
-      // 刷新预缓冲中的剩余音频 (短句可能不足 600ms)
       if (!ttsPlayCtx && ttsPreBuffer.length > 0) {
         ttsPlayCtx = new AudioContext({ sampleRate: ttsSampleRate });
         ttsNextTime = ttsPlayCtx.currentTime + 0.05;
@@ -707,7 +1108,6 @@ function handleEvent(msg) {
       }
       clearStatus();
       streamingDiv = null;
-      // 等 TTS 音频播放完毕后再解锁 UI + 重启麦克风 (防止麦克风采集到 TTS 回声)
       waitForTtsPlaybackEnd(() => {
         isProcessing = false;
         document.getElementById('sendBtn').disabled = false;
@@ -727,7 +1127,6 @@ function handleEvent(msg) {
         contentEl.classList.remove('streaming-cursor');
         streamingDiv = null;
       }
-      // 出错后也自动重启麦克风
       if (wasRecording) {
         wasRecording = false;
         setTimeout(() => startStreaming(), 500);
@@ -738,7 +1137,6 @@ function handleEvent(msg) {
       break;
   }
 
-  // llm.done 且 TTS 未启用 → 解锁 + 自动重启麦克风
   if (msg.type === 'llm.done' && !ttsStreamActive) {
     const ttsEnabled = document.getElementById('ttsToggle').checked;
     if (!ttsEnabled) {
@@ -754,7 +1152,7 @@ function handleEvent(msg) {
 }
 
 // ============================================================================
-// UI Helpers
+// UI Helpers (Voice Chat)
 // ============================================================================
 function setMode(mode) {
   currentMode = mode;
@@ -768,7 +1166,7 @@ function autoResize(el) {
   el.style.height = Math.min(el.scrollHeight, 120) + 'px';
 }
 
-function setStatus(msg, type = '') {
+function setStatus(msg, type) {
   const bar = document.getElementById('statusBar');
   bar.textContent = msg;
   bar.className = 'status-bar visible' + (type ? ' ' + type : '');
@@ -796,7 +1194,7 @@ function addMessage(role, content, audioUrl, meta) {
   let html = '<div class="role-tag">' + (role === 'user' ? 'You' : 'Assistant') + '</div>';
   html += '<div class="content">' + escapeHtml(content) + '</div>';
   if (audioUrl) {
-    html += '<audio controls src="' + audioUrl + '" style="display:block;margin-top:8px;width:100%;height:36px;border-radius:6px;"></audio>';
+    html += '<audio controls src="' + escapeHtml(audioUrl) + '" style="display:block;margin-top:8px;width:100%;height:36px;border-radius:6px;"></audio>';
   }
   if (meta) {
     html += '<div class="meta">' + escapeHtml(meta) + '</div>';
@@ -817,7 +1215,7 @@ function createStreamingMessage() {
 }
 
 // ============================================================================
-// 发送文字消息
+// Send Text Message (Voice Chat)
 // ============================================================================
 function sendMessage() {
   const input = document.getElementById('inputText');
@@ -835,12 +1233,12 @@ function sendMessage() {
 }
 
 // ============================================================================
-// 实时语音流 → ASR (AudioWorklet + PCM16 binary frames)
+// Streaming ASR (AudioWorklet + PCM16)
 // ============================================================================
 async function toggleRecording() {
   if (isProcessing) return;
   if (isRecording) {
-    stopStreaming(true);  // 手动停止 → 发 stream.stop
+    stopStreaming(true);
   } else {
     await startStreaming();
   }
@@ -861,7 +1259,6 @@ async function startStreaming() {
     audioContext = new AudioContext({ sampleRate: STREAM_SAMPLE_RATE });
     const source = audioContext.createMediaStreamSource(mediaStream);
 
-    // 构造 AudioWorklet processor (inline, via Blob URL)
     const workletCode = `
       class PcmProcessor extends AudioWorkletProcessor {
         process(inputs) {
@@ -882,7 +1279,6 @@ async function startStreaming() {
     audioWorkletNode = new AudioWorkletNode(audioContext, 'pcm-processor');
     audioWorkletNode.port.onmessage = (e) => {
       if (!isRecording || !ws || ws.readyState !== WebSocket.OPEN) return;
-      // Float32 → PCM16LE
       const float32 = e.data;
       const pcm16 = new Int16Array(float32.length);
       for (let i = 0; i < float32.length; i++) {
@@ -893,11 +1289,9 @@ async function startStreaming() {
     };
 
     source.connect(audioWorkletNode);
-    audioWorkletNode.connect(audioContext.destination);  // 需要连接才能持续 process
+    audioWorkletNode.connect(audioContext.destination);
 
-    // 通知服务端开始接收 (使用实际采样率, 浏览器可能忽略 16kHz 请求)
     const actualRate = audioContext.sampleRate;
-    console.log(`[Voice] AudioContext actual sampleRate: ${actualRate} (requested ${STREAM_SAMPLE_RATE})`);
     ws.send(JSON.stringify({ type: 'stream.start', sample_rate: actualRate }));
 
     isRecording = true;
@@ -918,28 +1312,16 @@ function stopStreaming(sendStop) {
   document.getElementById('micBtn').classList.remove('recording');
   document.getElementById('recordingStatus').textContent = '';
 
-  // 关闭音频采集
-  if (audioWorkletNode) {
-    audioWorkletNode.disconnect();
-    audioWorkletNode = null;
-  }
-  if (audioContext) {
-    audioContext.close();
-    audioContext = null;
-  }
-  if (mediaStream) {
-    mediaStream.getTracks().forEach(t => t.stop());
-    mediaStream = null;
-  }
+  if (audioWorkletNode) { audioWorkletNode.disconnect(); audioWorkletNode = null; }
+  if (audioContext) { audioContext.close(); audioContext = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
 
-  // 通知服务端停止 (手动停止时)
   if (sendStop && ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'stream.stop' }));
   }
 }
 
 function updateAudioLevel(rms) {
-  // 可扩展: 更新 UI 音频电平指示器
   const statusEl = document.getElementById('recordingStatus');
   if (isRecording) {
     const bars = Math.min(5, Math.floor(rms * 100));
@@ -948,25 +1330,8 @@ function updateAudioLevel(rms) {
   }
 }
 
-// 兼容旧模式: base64 音频 blob 发送 (保留, 供外部调用)
-async function sendAudio(blob) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    setStatus('WebSocket 未连接', 'error');
-    return;
-  }
-  isProcessing = true;
-  document.getElementById('sendBtn').disabled = true;
-  const reader = new FileReader();
-  reader.onload = () => {
-    const base64 = reader.result.split(',')[1];
-    const fmt = (blob.type || 'audio/webm').split('/').pop().split(';')[0];
-    ws.send(JSON.stringify({ type: 'audio', data: base64, format: fmt }));
-  };
-  reader.readAsDataURL(blob);
-}
-
 // ============================================================================
-// 键盘快捷键
+// Keyboard Shortcuts (Voice Chat)
 // ============================================================================
 document.getElementById('inputText').addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
@@ -984,7 +1349,168 @@ document.addEventListener('keydown', e => {
 });
 
 // ============================================================================
-// 启动
+// TTS Tab — REST API Synthesis
+// ============================================================================
+let ttsCurrentBlob = null;
+let ttsCurrentUrl = null;
+let ttsHistory = [];
+
+document.querySelectorAll('.preset').forEach(el => {
+  el.addEventListener('click', () => {
+    document.getElementById('ttsInputText').value = el.dataset.text;
+  });
+});
+
+function setTtsStatus(msg, type) {
+  const el = document.getElementById('ttsStatus');
+  el.textContent = msg;
+  el.className = 'tts-status visible' + (type ? ' ' + type : '');
+}
+
+function clearTtsStatus() {
+  document.getElementById('ttsStatus').className = 'tts-status';
+}
+
+async function synthesizeTts() {
+  const text = document.getElementById('ttsInputText').value.trim();
+  if (!text) { setTtsStatus('请输入要合成的文本', 'error'); return; }
+
+  const voice = document.getElementById('ttsVoiceSelect').value;
+  const format = document.getElementById('formatSelect').value;
+  const apiBase = window.location.origin;
+
+  const btn = document.getElementById('synthesizeBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> 合成中...';
+
+  document.getElementById('ttsPlayer').className = 'player';
+  setTtsStatus('正在合成语音，请稍候...');
+
+  const t0 = performance.now();
+
+  try {
+    const response = await fetch(apiBase + '/v1/audio/speech', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'qwen3-tts',
+        input: text,
+        voice: voice,
+        response_format: format,
+        speed: 1.0
+      })
+    });
+
+    if (!response.ok) {
+      let errMsg = 'HTTP ' + response.status;
+      try { const errJson = await response.json(); errMsg = errJson.error?.message || errMsg; } catch {}
+      throw new Error(errMsg);
+    }
+
+    const blob = await response.blob();
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+
+    if (ttsCurrentUrl) URL.revokeObjectURL(ttsCurrentUrl);
+
+    ttsCurrentBlob = blob;
+    if (format === 'pcm') {
+      ttsCurrentBlob = await wrapPcmAsWav(blob, 24000);
+    }
+
+    ttsCurrentUrl = URL.createObjectURL(ttsCurrentBlob);
+
+    const audioPlayer = document.getElementById('ttsAudioPlayer');
+    audioPlayer.src = ttsCurrentUrl;
+
+    document.getElementById('ttsPlayer').className = 'player visible';
+
+    const sizeKB = (blob.size / 1024).toFixed(1);
+    document.getElementById('ttsAudioInfo').textContent =
+      sizeKB + ' KB · ' + elapsed + 's · ' + (voice || 'default');
+
+    setTtsStatus('合成完成 (' + elapsed + 's)', 'success');
+    try { await audioPlayer.play(); } catch {}
+
+    addTtsHistory(text, voice, ttsCurrentUrl, elapsed, sizeKB);
+
+  } catch (err) {
+    setTtsStatus('合成失败: ' + err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '合成语音';
+  }
+}
+
+async function wrapPcmAsWav(blob, sampleRate) {
+  const pcmData = await blob.arrayBuffer();
+  const wavBuffer = new ArrayBuffer(44 + pcmData.byteLength);
+  const view = new DataView(wavBuffer);
+
+  function writeStr(offset, str) {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  }
+
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + pcmData.byteLength, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, pcmData.byteLength, true);
+
+  new Uint8Array(wavBuffer, 44).set(new Uint8Array(pcmData));
+  return new Blob([wavBuffer], { type: 'audio/wav' });
+}
+
+function downloadAudio() {
+  if (!ttsCurrentBlob) return;
+  const format = document.getElementById('formatSelect').value;
+  const a = document.createElement('a');
+  a.href = ttsCurrentUrl;
+  a.download = 'speech.' + (format === 'pcm' ? 'wav' : format);
+  a.click();
+}
+
+function addTtsHistory(text, voice, audioUrl, elapsed, sizeKB) {
+  ttsHistory.unshift({ text, voice, audioUrl, elapsed, sizeKB });
+  if (ttsHistory.length > 20) ttsHistory.pop();
+  renderTtsHistory();
+}
+
+function renderTtsHistory() {
+  const card = document.getElementById('ttsHistoryCard');
+  const list = document.getElementById('ttsHistoryList');
+
+  if (ttsHistory.length === 0) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+
+  list.innerHTML = ttsHistory.map((item, idx) =>
+    '<div class="history-item" onclick="playTtsHistory(' + idx + ')">' +
+    '<div class="play-icon"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></div>' +
+    '<div class="text">' + escapeHtml(item.text) + '</div>' +
+    '<div class="item-meta">' + (item.voice || 'default') + ' · ' + item.elapsed + 's</div></div>'
+  ).join('');
+}
+
+function playTtsHistory(idx) {
+  const item = ttsHistory[idx];
+  if (!item?.audioUrl) return;
+  const player = document.getElementById('ttsAudioPlayer');
+  player.src = item.audioUrl;
+  document.getElementById('ttsPlayer').className = 'player visible';
+  document.getElementById('ttsAudioInfo').textContent =
+    item.sizeKB + ' KB · ' + item.elapsed + 's · ' + (item.voice || 'default');
+  player.play();
+}
+
+// ============================================================================
+// Init
 // ============================================================================
 connectWS();
 </script>
