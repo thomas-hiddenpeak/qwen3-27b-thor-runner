@@ -74,6 +74,7 @@ Talker::Talker(const TTSConfig& config, int max_seq_len)
     , cp_v_cache_(config.code_predictor.num_hidden_layers, nullptr)
     , cp_lm_heads_(config.talker.num_code_groups - 1, nullptr)
     , cp_codec_embeddings_(config.talker.num_code_groups - 1, nullptr)
+    , cp_merged_embeddings_(config.talker.num_code_groups - 1, nullptr)
 {
     temperature_ = config.temperature;
     top_k_ = config.top_k;
@@ -328,6 +329,40 @@ void Talker::merge_weights(cudaStream_t stream) {
     cudaStreamSynchronize(stream);
     fprintf(stderr, "[TTS Talker] merged QKV+GateUp weights: %.1f MB (%d talker + %d CP layers)\n",
             merged_bytes / (1024.0f * 1024.0f), tc.num_hidden_layers, cp.num_hidden_layers);
+
+    // Merge CP codec embeddings with projection: embed[v] × proj^T + bias → merged[v]
+    // Eliminates projection GEMV + add_bias in the decode loop (saves 28 launches + 56MB reads/step)
+    if (cp_projection_w_ && cp_projection_b_) {
+        int talker_h = tc.hidden_size;       // 2048
+        int cp_h = cp.hidden_size;           // 1024
+        int vocab_size = cp.vocab_size;      // 2048
+        int num_embed = tc.num_code_groups - 1; // 15
+        size_t embed_merged_bytes = 0;
+
+        for (int g = 0; g < num_embed; g++) {
+            if (!cp_codec_embeddings_[g]) continue;
+
+            // Allocate merged: [vocab_size, cp_h]
+            __nv_bfloat16* merged = nullptr;
+            cudaMalloc(&merged, (size_t)vocab_size * cp_h * sizeof(__nv_bfloat16));
+            merged_weight_allocs_.push_back(merged);
+
+            // GEMM: merged[V, cp_h] = embedding[V, talker_h] × projection^T[talker_h, cp_h]
+            cublas_gemm(cublas_handle_, merged, cp_codec_embeddings_[g], cp_projection_w_,
+                        vocab_size, talker_h, cp_h, stream);
+
+            // Add bias to each row: merged[v][j] += bias[j]
+            invoke_add_bias(merged, cp_projection_b_, vocab_size, cp_h, stream);
+
+            cp_merged_embeddings_[g] = merged;
+            embed_merged_bytes += (size_t)vocab_size * cp_h * sizeof(__nv_bfloat16);
+        }
+
+        cp_embeddings_merged_ = true;
+        cudaStreamSynchronize(stream);
+        fprintf(stderr, "[TTS Talker] merged CP embeddings×projection: %.1f MB (%d groups)\n",
+                embed_merged_bytes / (1024.0f * 1024.0f), num_embed);
+    }
 }
 
 void Talker::reset() {
@@ -1039,28 +1074,41 @@ void Talker::run_code_predictor(
                                    codec_out_gpu_ + 1, cp_rng(), stream);
 
     // Decode groups 2-15 autoregressively — fully GPU-resident, zero intermediate syncs
-    for (int g = 1; g < num_groups; g++) {
-        // Lookup embedding from GPU-resident previous token (codec_out_gpu_[g])
-        audio_ops::invoke_embedding_lookup(cp_embed_buf_, codec_out_gpu_ + g,
-                                            cp_codec_embeddings_[g - 1], 1, talker_h, stream);
-
-        // Project to cp_h
-        if (cp_projection_w_) {
-            ops::invoke_dense_gemv(cp_embed_buf_, cp_projection_w_, cp_decode_hidden_, cp_h, talker_h, stream);
-            invoke_add_bias(cp_decode_hidden_, cp_projection_b_, 1, cp_h, stream);
-        } else {
-            cudaMemcpyAsync(cp_decode_hidden_, cp_embed_buf_,
-                            cp_h * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+    // Pre-compute all position IDs on GPU (1 bulk H2D instead of 14 per-step copies)
+    {
+        int num_decode = num_groups - 1;  // 14
+        int all_pos[3 * 14];
+        for (int i = 0; i < num_decode; i++) {
+            int pos = 2 + i;  // cp_cache_len_ starts at 2 after prefill
+            all_pos[i * 3 + 0] = pos;
+            all_pos[i * 3 + 1] = pos;
+            all_pos[i * 3 + 2] = pos;
         }
+        cudaMemcpyAsync(cp_pos_gpu_, all_pos, 3 * num_decode * sizeof(int),
+                        cudaMemcpyHostToDevice, stream);
+    }
 
-        // Set position IDs once per group step (not per layer)
-        int pos = cp_cache_len_;
-        int cp_pos[3] = {pos, pos, pos};
-        cudaMemcpyAsync(cp_pos_gpu_, cp_pos, 3 * sizeof(int), cudaMemcpyHostToDevice, stream);
+    for (int g = 1; g < num_groups; g++) {
+        if (cp_embeddings_merged_) {
+            // Merged path: direct lookup into pre-merged [vocab, cp_h] table (no projection needed)
+            audio_ops::invoke_embedding_lookup(cp_decode_hidden_, codec_out_gpu_ + g,
+                                                cp_merged_embeddings_[g - 1], 1, cp_h, stream);
+        } else {
+            // Original path: lookup [vocab, talker_h] + project + bias
+            audio_ops::invoke_embedding_lookup(cp_embed_buf_, codec_out_gpu_ + g,
+                                                cp_codec_embeddings_[g - 1], 1, talker_h, stream);
+            if (cp_projection_w_) {
+                ops::invoke_dense_gemv(cp_embed_buf_, cp_projection_w_, cp_decode_hidden_, cp_h, talker_h, stream);
+                invoke_add_bias(cp_decode_hidden_, cp_projection_b_, 1, cp_h, stream);
+            } else {
+                cudaMemcpyAsync(cp_decode_hidden_, cp_embed_buf_,
+                                cp_h * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+            }
+        }
 
         // Forward through CodePredictor layers (decode T=1)
         for (int layer = 0; layer < cp.num_hidden_layers; layer++) {
-            cp_layer_forward_decode(layer, cp_decode_hidden_, cp_pos_gpu_, workspace_, stream);
+            cp_layer_forward_decode(layer, cp_decode_hidden_, cp_pos_gpu_ + (g - 1) * 3, workspace_, stream);
         }
         cp_cache_len_++;
 

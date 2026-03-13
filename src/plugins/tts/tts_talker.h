@@ -164,6 +164,8 @@ private:
     std::vector<CodePredictorLayerWeights> cp_layer_weights_;
     std::vector<__nv_bfloat16*> cp_lm_heads_;      // [num_code_groups-1]
     std::vector<__nv_bfloat16*> cp_codec_embeddings_; // [num_code_groups-1]
+    std::vector<__nv_bfloat16*> cp_merged_embeddings_; // [num_code_groups-1] merged embed×proj for CP decode
+    bool cp_embeddings_merged_ = false;  // true after embed×proj merge
 
     // ===== Talker KV Cache =====
     std::vector<__nv_bfloat16*> talker_k_cache_;    // [num_layers], each [max_seq_len, kv_heads, head_dim]
