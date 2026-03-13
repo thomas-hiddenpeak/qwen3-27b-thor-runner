@@ -632,7 +632,7 @@ footer {
     <label id="instructLabel" style="display:none;color:var(--text2);width:100%">音色描述 (VoiceDesign):
       <input type="text" id="ttsInstruct" placeholder="例: 请用温柔甜美的女声朗读"
              style="width:100%;padding:4px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;margin-top:4px;"
-             onchange="sendConfig()">
+             onchange="syncInstruct(this); sendConfig()">
     </label>
     <label style="color:var(--text2)">Temperature:
       <input type="range" id="ttsTemp" min="0.1" max="1.5" step="0.05" value="0.9"
@@ -737,7 +737,8 @@ footer {
           <div id="ttsTabInstructDiv" style="display:none;margin-top:8px;">
             <label>音色描述 (VoiceDesign)</label>
             <input type="text" id="ttsTabInstruct" placeholder="例: 请用温柔甜美的女声朗读"
-                   style="width:100%;padding:6px 10px;margin-top:4px;">
+                   style="width:100%;padding:6px 10px;margin-top:4px;"
+                   onchange="syncInstruct(this)">
           </div>
         </div>
         <div class="form-group">
@@ -1053,6 +1054,14 @@ function connectWS() {
     const msg = JSON.parse(e.data);
     handleEvent(msg);
   };
+}
+
+// 同步两个 instruct 输入框 (聊天界面 ttsInstruct ↔ TTS Tab ttsTabInstruct)
+function syncInstruct(source) {
+  const a = document.getElementById('ttsInstruct');
+  const b = document.getElementById('ttsTabInstruct');
+  if (source === a && b) b.value = a.value;
+  else if (source === b && a) a.value = b.value;
 }
 
 function sendConfig() {
