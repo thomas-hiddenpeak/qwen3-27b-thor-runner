@@ -467,6 +467,7 @@ TtsPlugin::ModelInfo NativeTtsPlugin::model_info() const {
     // Sort for stable ordering
     std::sort(info.available_voices.begin(), info.available_voices.end());
     std::sort(info.available_languages.begin(), info.available_languages.end());
+    info.speaker_dialects = cfg.talker.spk_is_dialect;
     return info;
 }
 

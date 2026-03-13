@@ -210,6 +210,39 @@ bool TTSConfig::load_from_json(const std::string& config_path) {
         // Language IDs
         talker.codec_language_id = json_parse_string_int_map(tc_clean, "codec_language_id");
 
+        // Speaker-dialect mapping (values: false → "", "dialect_name" → stored as-is)
+        {
+            std::string obj = json_find_object(tc_clean, "spk_is_dialect");
+            if (!obj.empty()) {
+                size_t pos = 0;
+                while (true) {
+                    pos = obj.find('"', pos);
+                    if (pos == std::string::npos) break;
+                    pos++;
+                    auto end = obj.find('"', pos);
+                    if (end == std::string::npos) break;
+                    std::string k = obj.substr(pos, end - pos);
+                    pos = end + 1;
+                    auto colon = obj.find(':', pos);
+                    if (colon == std::string::npos) break;
+                    pos = colon + 1;
+                    while (pos < obj.size() && (obj[pos] == ' ' || obj[pos] == '\t')) pos++;
+                    if (pos < obj.size() && obj[pos] == '"') {
+                        // String value: dialect name
+                        pos++;
+                        auto vend = obj.find('"', pos);
+                        if (vend == std::string::npos) break;
+                        talker.spk_is_dialect[k] = obj.substr(pos, vend - pos);
+                        pos = vend + 1;
+                    } else {
+                        // false / true / other → standard speaker
+                        talker.spk_is_dialect[k] = "";
+                        while (pos < obj.size() && obj[pos] != ',' && obj[pos] != '}') pos++;
+                    }
+                }
+            }
+        }
+
         // Code Predictor config (nested inside talker_config, already extracted above)
         if (!cp.empty()) {
             code_predictor.hidden_size = json_get_int(cp, "hidden_size", code_predictor.hidden_size);

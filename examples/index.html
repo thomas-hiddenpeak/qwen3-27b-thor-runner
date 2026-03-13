@@ -607,7 +607,7 @@ footer {
       <button id="modeVoice" onclick="setMode('voice')">语音</button>
       <button id="modeAuto" onclick="setMode('auto')">自动</button>
     </div>
-    <select id="voiceSelect" onchange="sendConfig()">
+    <select id="voiceSelect" onchange="onVoiceChanged(); sendConfig()">
       <option value="serena">Serena</option>
     </select>
     <select id="langSelect" onchange="sendConfig()" title="TTS 语言/方言">
@@ -655,6 +655,16 @@ footer {
       <span id="ttsRepVal" style="color:var(--text);min-width:30px;display:inline-block">1.05</span>
     </label>
     <button onclick="resetTtsDefaults()" style="padding:4px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text2);font-size:12px;cursor:pointer;">重置默认</button>
+  </div>
+  <!-- System Prompt Editor -->
+  <div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+      <span style="color:var(--text2);font-weight:500;">系统提示词</span>
+      <button onclick="toggleSystemPrompt()" id="sysPromptToggleBtn" style="padding:2px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-size:11px;cursor:pointer;">展开</button>
+      <button onclick="applySystemPrompt()" style="padding:2px 8px;background:#27ae60;border:none;border-radius:4px;color:white;font-size:11px;cursor:pointer;">应用</button>
+      <button onclick="resetSystemPrompt()" style="padding:2px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-size:11px;cursor:pointer;">恢复默认</button>
+    </div>
+    <textarea id="systemPromptEditor" style="display:none;width:100%;min-height:120px;padding:8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;font-family:monospace;resize:vertical;line-height:1.5;" placeholder="输入系统提示词..."></textarea>
   </div>
 </div>
 
@@ -716,7 +726,7 @@ footer {
       <div class="row">
         <div class="form-group">
           <label>说话人</label>
-          <select id="ttsVoiceSelect">
+          <select id="ttsVoiceSelect" onchange="updateLangSelect()">
             <option value="serena">Serena</option>
           </select>
           <label style="margin-top:8px;">语言/方言</label>
@@ -859,6 +869,7 @@ let ttsDone = false;
 let ttsModelType = 'custom_voice';  // custom_voice, voice_design, voice_clone
 let ttsAvailableVoices = ['serena'];
 let ttsAvailableLanguages = [];
+let ttsSpeakerDialects = {}; // speaker → dialect ("" = standard)
 
 // ============================================================================
 // TTS Info — 获取模型类型和可用音色
@@ -876,12 +887,15 @@ async function fetchTtsInfo() {
     }
     if (info.available_languages && info.available_languages.length > 0) {
       ttsAvailableLanguages = info.available_languages;
-      updateLangSelect();
+    }
+    if (info.speaker_dialects) {
+      ttsSpeakerDialects = info.speaker_dialects;
     }
     if (info.sample_rate) ttsSampleRate = info.sample_rate;
 
     // 更新语音下拉框
     updateVoiceSelects();
+    updateLangSelect();
 
     // VoiceDesign 模式显示 instruct 输入
     const isDesign = ttsModelType === 'voice_design';
@@ -925,19 +939,45 @@ const langDisplayNames = {
   french: 'Français', russian: 'Русский', beijing_dialect: '北京话', sichuan_dialect: '四川话'
 };
 
+// 已知的方言语言名 (用于区分 standard vs dialect)
+const dialectLanguages = new Set(['beijing_dialect', 'sichuan_dialect']);
+
+function getFilteredLanguages(voice) {
+  const dialect = ttsSpeakerDialects[voice];
+  if (dialect) {
+    // 方言角色: 只显示其对应方言
+    return ttsAvailableLanguages.filter(l => l === dialect);
+  }
+  // 标准角色: 排除方言语言
+  return ttsAvailableLanguages.filter(l => !dialectLanguages.has(l));
+}
+
 function updateLangSelect() {
-  const selects = [document.getElementById('langSelect'), document.getElementById('ttsLangSelect')];
-  for (const sel of selects) {
+  const voice = document.getElementById('voiceSelect').value;
+  const selects = [
+    { sel: document.getElementById('langSelect'), voice: voice },
+    { sel: document.getElementById('ttsLangSelect'), voice: document.getElementById('ttsVoiceSelect').value }
+  ];
+  for (const { sel, voice: v } of selects) {
     const current = sel.value;
+    const langs = getFilteredLanguages(v);
     sel.innerHTML = '<option value="">自动</option>';
-    for (const lang of ttsAvailableLanguages) {
+    for (const lang of langs) {
       const opt = document.createElement('option');
       opt.value = lang;
       opt.textContent = langDisplayNames[lang] || lang;
       sel.appendChild(opt);
     }
-    if (current && ttsAvailableLanguages.includes(current)) sel.value = current;
+    if (current && langs.includes(current)) {
+      sel.value = current;
+    } else {
+      sel.value = '';  // 重置为"自动"
+    }
   }
+}
+
+function onVoiceChanged() {
+  updateLangSelect();
 }
 
 // ============================================================================
@@ -1026,6 +1066,31 @@ function resetTtsDefaults() {
   document.getElementById('ttsRepPenalty').value = 1.05;
   document.getElementById('ttsRepVal').textContent = '1.05';
   sendConfig();
+}
+
+let defaultSystemPrompt = '';
+
+function toggleSystemPrompt() {
+  const editor = document.getElementById('systemPromptEditor');
+  const btn = document.getElementById('sysPromptToggleBtn');
+  if (editor.style.display === 'none') {
+    editor.style.display = 'block';
+    btn.textContent = '收起';
+  } else {
+    editor.style.display = 'none';
+    btn.textContent = '展开';
+  }
+}
+
+function applySystemPrompt() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const text = document.getElementById('systemPromptEditor').value;
+  ws.send(JSON.stringify({ type: 'config', system_prompt: text }));
+}
+
+function resetSystemPrompt() {
+  document.getElementById('systemPromptEditor').value = defaultSystemPrompt;
+  applySystemPrompt();
 }
 
 // ============================================================================
@@ -1139,6 +1204,15 @@ function handleEvent(msg) {
       break;
 
     case 'config.updated':
+      if (msg.system_prompt !== undefined) {
+        const editor = document.getElementById('systemPromptEditor');
+        if (!editor.value) {
+          editor.value = msg.system_prompt;
+        }
+        if (!defaultSystemPrompt) {
+          defaultSystemPrompt = msg.system_prompt;
+        }
+      }
       break;
 
     case 'status':

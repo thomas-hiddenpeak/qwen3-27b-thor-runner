@@ -41,6 +41,9 @@ struct TalkerConfig {
 
     // Language IDs (codec embedding indices)
     std::unordered_map<std::string, int> codec_language_id;
+
+    // Speaker → dialect mapping (empty string = standard speaker)
+    std::unordered_map<std::string, std::string> spk_is_dialect;
 };
 
 // ============================================================

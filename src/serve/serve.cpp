@@ -148,11 +148,10 @@ static const char* DEFAULT_VOICE_SYSTEM_PROMPT =
     "\n"
     "【格式】每句话前用方括号标注贴合句意的情感，如：\n"
     "[温柔]你好啊。[开心]今天天气真不错！[认真]我来帮你看看。\n"
-    "可选：平静、温柔、开心、兴奋、惊讶、认真、俏皮、安慰、关切、鼓励、好奇、轻松、热情、自信\n"
+    "举例可选：平静、温柔、开心、兴奋、惊讶、认真、俏皮、安慰、关切、鼓励、好奇、轻松、热情、自信\n"
     "\n"
     "【规则】\n"
-    "1. 每次回答只说2到4句话，直接回答问题，说完就停\n"
-    "2. 不用 Markdown、特殊符号，数字用中文读法";
+    "1. 不用 Markdown、特殊符号，数字用中文读法";
 
 // 从 LLM 输出的文本中提取 [情感标注] 并返回 (clean_text, emotion)
 // 例: "[温柔]你好啊" → ("你好啊", "温柔")
@@ -3861,11 +3860,22 @@ void ServeApp::handle_tts_info(const HttpRequest& /*req*/, int client_fd) {
     }
     langs_json += "]";
 
+    // speaker_dialects: {"eric":"sichuan_dialect","dylan":"beijing_dialect",...}
+    std::string dialects_json = "{";
+    bool first_d = true;
+    for (const auto& [spk, dialect] : info.speaker_dialects) {
+        if (!first_d) dialects_json += ",";
+        first_d = false;
+        dialects_json += "\"" + json_escape(spk) + "\":\"" + json_escape(dialect) + "\"";
+    }
+    dialects_json += "}";
+
     resp.body = "{\"enabled\":true,"
                 "\"model_type\":\"" + json_escape(info.model_type) + "\","
                 "\"sample_rate\":" + std::to_string(info.sample_rate) + ","
                 "\"available_voices\":" + voices_json + ","
-                "\"available_languages\":" + langs_json + "}";
+                "\"available_languages\":" + langs_json + ","
+                "\"speaker_dialects\":" + dialects_json + "}";
     send_response(client_fd, resp);
     close(client_fd);
 }
@@ -4204,6 +4214,12 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             // VoiceDesign instruct
             std::string inst = json_get_string(msg, "tts_instruct");
             if (!inst.empty()) tts_instruct = inst;
+            // System prompt (per-session override)
+            if (msg.find("\"system_prompt\"") != std::string::npos) {
+                std::string sp = json_get_string(msg, "system_prompt");
+                config_.voice_system_prompt = sp;  // 空值 = 恢复默认
+                fprintf(stderr, "[WS] System prompt updated (%zu chars)\n", sp.size());
+            }
             // Language/dialect
             std::string lang = json_get_string(msg, "tts_language");
             if (msg.find("\"tts_language\"") != std::string::npos) tts_language = lang;
@@ -4214,7 +4230,12 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 float tts_rep = (float)json_get_number(msg, "tts_rep_penalty", 1.05);
                 tts_plugin_->set_sampling(tts_temp, tts_topk, tts_topp, tts_rep);
             }
-            safe_send_text("{\"type\":\"config.updated\"}");
+            // 返回当前系统提示词 (供 WebUI 初始化)
+            {
+                const std::string& sp = config_.voice_system_prompt.empty()
+                    ? std::string(DEFAULT_VOICE_SYSTEM_PROMPT) : config_.voice_system_prompt;
+                safe_send_text("{\"type\":\"config.updated\",\"system_prompt\":\"" + json_escape(sp) + "\"}");
+            }
 
         } else if (event_type == "chat") {
             if (generating) continue;

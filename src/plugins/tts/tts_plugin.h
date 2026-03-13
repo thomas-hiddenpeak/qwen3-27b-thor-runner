@@ -105,6 +105,7 @@ public:
         std::string model_type;                    // custom_voice, voice_design, voice_clone
         std::vector<std::string> available_voices; // speaker names
         std::vector<std::string> available_languages; // language/dialect names
+        std::unordered_map<std::string, std::string> speaker_dialects; // speaker → dialect (empty = standard)
         int sample_rate = 24000;
     };
     virtual ModelInfo model_info() const { return {}; }
