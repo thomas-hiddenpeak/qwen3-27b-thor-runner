@@ -861,8 +861,10 @@ async function startStreaming() {
     source.connect(audioWorkletNode);
     audioWorkletNode.connect(audioContext.destination);  // 需要连接才能持续 process
 
-    // 通知服务端开始接收
-    ws.send(JSON.stringify({ type: 'stream.start', sample_rate: STREAM_SAMPLE_RATE }));
+    // 通知服务端开始接收 (使用实际采样率, 浏览器可能忽略 16kHz 请求)
+    const actualRate = audioContext.sampleRate;
+    console.log(`[Voice] AudioContext actual sampleRate: ${actualRate} (requested ${STREAM_SAMPLE_RATE})`);
+    ws.send(JSON.stringify({ type: 'stream.start', sample_rate: actualRate }));
 
     isRecording = true;
     isProcessing = true;

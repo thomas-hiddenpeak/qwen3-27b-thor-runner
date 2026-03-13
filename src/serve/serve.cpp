@@ -3799,11 +3799,11 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
     std::vector<int16_t> pcm_buffer;             // 累积 PCM16 样本 (16kHz mono)
     int stream_sample_rate = 16000;
     // VAD (Voice Activity Detection) 参数
-    constexpr float VAD_ENERGY_THRESHOLD = 0.02f;  // RMS 能量阈值 (提高避免误识别非语音噪音)
+    constexpr float VAD_ENERGY_THRESHOLD = 0.01f;  // RMS 能量阈值 (per-chunk, 用于 speech_ratio 计算)
     constexpr int VAD_SILENCE_MS = 800;            // 静音持续 ms 后判定语音结束
     constexpr int VAD_MIN_SPEECH_MS = 500;         // 最短语音长度 (过滤短噪声)
     constexpr int VAD_MAX_DURATION_S = 30;         // 最长录音 30s
-    constexpr float VAD_MIN_SPEECH_ENERGY = 0.015f; // 整段音频最低平均 RMS (低于此认为无语音)
+    constexpr float VAD_MIN_SPEECH_ENERGY = 0.008f; // 整段音频最低平均 RMS
     int silence_samples = 0;                       // 连续静音样本计数
     bool speech_detected = false;                  // 是否检测到语音开始
     double total_energy_sum = 0;                   // 累计能量 (用于平均 RMS 检查)
@@ -3884,7 +3884,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                     : 0.0f;
                 float speech_ratio = (float)total_speech_samples / std::max(1, (int)pcm_buffer.size());
 
-                if (avg_rms < VAD_MIN_SPEECH_ENERGY || speech_ratio < 0.1f) {
+                if (avg_rms < VAD_MIN_SPEECH_ENERGY) {
                     fprintf(stderr, "[WS] Rejected audio: avg_rms=%.4f speech_ratio=%.1f%% (too quiet)\n",
                             avg_rms, speech_ratio * 100);
                     pcm_buffer.clear();
@@ -4260,9 +4260,10 @@ void ServeApp::ws_voice_generate(int client_fd,
                 last_start--;
             std::string last_ch = pending_sentence.substr(last_start);
 
-            bool is_clause_break = (pending_sentence.size() > 90 &&
+            bool is_clause_break = (pending_sentence.size() > 30 &&
                                     (last_ch == "，" || last_ch == "," ||
-                                     last_ch == "；" || last_ch == ";"));
+                                     last_ch == "；" || last_ch == ";" ||
+                                     last_ch == "：" || last_ch == ":"));
 
             if (is_sentence_end_punct(last_ch) || is_clause_break) {
                 std::string sentence = pending_sentence;

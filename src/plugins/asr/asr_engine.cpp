@@ -477,11 +477,16 @@ std::string ASREngine::transcribe(
             }
         }
 
-        if (text_start < output_tokens.size() && tokenizer_.is_loaded()) {
+        if (text_start > 0 && text_start < output_tokens.size() && tokenizer_.is_loaded()) {
+            // Decode only text tokens after <asr_text> marker
             std::vector<int> text_tokens(output_tokens.begin() + text_start,
                                           output_tokens.end());
             result = tokenizer_.decode(text_tokens);
+        } else if (text_start > 0) {
+            // <asr_text> found but no text tokens after it → no speech detected
+            result = "";
         } else if (tokenizer_.is_loaded()) {
+            // No <asr_text> marker at all → decode everything as fallback
             result = tokenizer_.decode(output_tokens);
         } else {
             result = "[" + std::to_string(output_tokens.size()) + " tokens]";
