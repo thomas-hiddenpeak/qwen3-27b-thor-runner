@@ -411,6 +411,116 @@ void invoke_mrope(__nv_bfloat16* q, __nv_bfloat16* k,
 }
 
 // ============================================================================
+// Fused QK RMSNorm + MRoPE (3 kernel launches → 1)
+//
+// Grid: (num_q_heads + num_kv_heads) × num_tokens
+// Block: head_dim threads (128 for TTS)
+// Each block: RMSNorm on one head → SMEM → RoPE half-rotation → write back
+// ============================================================================
+
+__global__ void fused_qk_norm_rope_kernel(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ q_norm_w,
+    const __nv_bfloat16* __restrict__ k_norm_w,
+    const int* __restrict__ pos_ids,
+    float eps,
+    int num_tokens,
+    int num_q_heads, int num_kv_heads,
+    int head_dim,
+    int s0, int s1, int s2,
+    float theta)
+{
+    int idx = blockIdx.x;   // head index (0..num_q_heads-1 = Q, then K)
+    int token = blockIdx.y;
+    int tid = threadIdx.x;
+
+    bool is_q = (idx < num_q_heads);
+    int head = is_q ? idx : (idx - num_q_heads);
+
+    __nv_bfloat16* data;
+    const __nv_bfloat16* norm_w;
+    if (is_q) {
+        data = q + ((size_t)token * num_q_heads + head) * head_dim;
+        norm_w = q_norm_w;
+    } else {
+        data = k + ((size_t)token * num_kv_heads + head) * head_dim;
+        norm_w = k_norm_w;
+    }
+
+    extern __shared__ float smem[];
+
+    // ---- RMSNorm ----
+    float val = (tid < head_dim) ? bf16_to_float(data[tid]) : 0.0f;
+    float sum_sq = val * val;
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+
+    __shared__ float s_shared[8];
+    int wid = tid / 32, lid = tid % 32;
+    if (lid == 0) s_shared[wid] = sum_sq;
+    __syncthreads();
+
+    if (wid == 0) {
+        sum_sq = (lid < (blockDim.x + 31) / 32) ? s_shared[lid] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+
+    __shared__ float s_rsqrt;
+    if (tid == 0) s_rsqrt = rsqrtf(sum_sq / head_dim + eps);
+    __syncthreads();
+
+    float normed = val * s_rsqrt * bf16_to_float(norm_w[tid]);
+    if (tid < head_dim) smem[tid] = normed;
+    __syncthreads();
+
+    // ---- RoPE (half rotation) ----
+    int half_dim = head_dim / 2;
+    if (tid < half_dim) {
+        int d = tid;
+        int d_hi = d + half_dim;
+
+        int dim_idx = 0;
+        if ((d % 3 == 1) && (d < s1 * 3)) dim_idx = 1;
+        if ((d % 3 == 2) && (d < s2 * 3)) dim_idx = 2;
+
+        int pos = pos_ids[dim_idx * num_tokens + token];
+        float freq = 1.0f / powf(theta, (float)(d * 2) / (float)head_dim);
+        float angle = (float)pos * freq;
+        float cos_a, sin_a;
+        sincosf(angle, &sin_a, &cos_a);
+
+        float x_lo = smem[d];
+        float x_hi = smem[d_hi];
+        data[d]    = float_to_bf16(x_lo * cos_a - x_hi * sin_a);
+        data[d_hi] = float_to_bf16(x_hi * cos_a + x_lo * sin_a);
+    }
+}
+
+void invoke_fused_qk_norm_rope(
+    __nv_bfloat16* q, __nv_bfloat16* k,
+    const __nv_bfloat16* q_norm_w,
+    const __nv_bfloat16* k_norm_w,
+    const int* pos_ids,
+    float eps,
+    int num_tokens,
+    int num_q_heads, int num_kv_heads,
+    int head_dim,
+    int s0, int s1, int s2,
+    float theta,
+    cudaStream_t stream) {
+    dim3 grid(num_q_heads + num_kv_heads, num_tokens);
+    int block = head_dim;
+    int smem_bytes = head_dim * sizeof(float);
+    fused_qk_norm_rope_kernel<<<grid, block, smem_bytes, stream>>>(
+        q, k, q_norm_w, k_norm_w, pos_ids, eps,
+        num_tokens, num_q_heads, num_kv_heads, head_dim,
+        s0, s1, s2, theta);
+}
+
+// ============================================================================
 // Standard 1D RoPE (half-rotation)
 // ============================================================================
 

@@ -43,6 +43,22 @@ void invoke_per_head_rmsnorm(__nv_bfloat16* out, const __nv_bfloat16* x,
                               float eps, int num_tokens, int num_heads, int head_dim,
                               cudaStream_t stream = 0);
 
+// Fused per-head QK RMSNorm + MRoPE (3 kernels → 1)
+// Combines: per_head_rmsnorm(Q) + per_head_rmsnorm(K) + mrope in single launch.
+// Grid: (num_q_heads + num_kv_heads) × num_tokens blocks.
+void invoke_fused_qk_norm_rope(
+    __nv_bfloat16* q, __nv_bfloat16* k,
+    const __nv_bfloat16* q_norm_w,     // [head_dim]
+    const __nv_bfloat16* k_norm_w,     // [head_dim]
+    const int* pos_ids,                // [3, num_tokens]
+    float eps,
+    int num_tokens,
+    int num_q_heads, int num_kv_heads,
+    int head_dim,
+    int s0, int s1, int s2,
+    float theta,
+    cudaStream_t stream = 0);
+
 // ============================================================================
 // 激活函数
 // ============================================================================

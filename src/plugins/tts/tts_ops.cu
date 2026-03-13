@@ -364,8 +364,9 @@ void invoke_suppress_tokens(__nv_bfloat16* logits, int start, int end,
 // ============================================================================
 // GPU-Resident Top-K/Top-P Sampling for Small Vocab (≤4096)
 //
-// Parallel softmax + cooperative top-k via per-thread local maxima +
-// single-thread selection from candidates. Improved RNG using SplitMix64.
+// Fully parallel: softmax + cooperative top-k using all 256 threads.
+// Old approach: thread-0 serial O(k×V) → new: parallel O(k×V/bdim)
+// For V=3072, k=50: old ~153K serial iters → new 50×12=600/thread (256× speedup)
 // ============================================================================
 
 __global__ void gpu_sample_top_k_top_p_kernel(
@@ -377,11 +378,20 @@ __global__ void gpu_sample_top_k_top_p_kernel(
     int* __restrict__ result,
     unsigned long long seed)
 {
-    extern __shared__ float smem[];
-    // Layout: smem[0..vocab_size-1] = probs, smem[vocab_size..] = candidates
-    float* probs = smem;
+    // SMEM layout: probs[V] | top_probs[128] | top_ids[128]
+    extern __shared__ char smem_raw[];
+    float* probs = (float*)smem_raw;
+    float* top_probs = probs + vocab_size;
+    int*   top_ids   = (int*)(top_probs + 128);
+
     const int tid = threadIdx.x;
     const int bdim = blockDim.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    const int num_warps = bdim / 32;
+
+    __shared__ float s_val[8];
+    __shared__ int   s_idx[8];
 
     // Phase 1: Load logits → SMEM with temperature scaling, find max
     float local_max = -FLT_MAX;
@@ -391,22 +401,18 @@ __global__ void gpu_sample_top_k_top_p_kernel(
         local_max = fmaxf(local_max, v);
     }
 
-    // Warp reduce max
+    // Block reduce max
     for (int offset = 16; offset > 0; offset >>= 1)
         local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
-
-    __shared__ float s_reduce[8];
-    int warp_id = tid / 32;
-    int lane_id = tid % 32;
-    if (lane_id == 0) s_reduce[warp_id] = local_max;
+    if (lane_id == 0) s_val[warp_id] = local_max;
     __syncthreads();
     if (tid == 0) {
-        float m = s_reduce[0];
-        for (int i = 1; i < (bdim + 31) / 32; i++) m = fmaxf(m, s_reduce[i]);
-        s_reduce[0] = m;
+        float m = s_val[0];
+        for (int i = 1; i < num_warps; i++) m = fmaxf(m, s_val[i]);
+        s_val[0] = m;
     }
     __syncthreads();
-    float block_max = s_reduce[0];
+    float block_max = s_val[0];
 
     // Phase 2: exp(x - max) and compute sum — use exp2f for speed
     float local_sum = 0.0f;
@@ -417,18 +423,18 @@ __global__ void gpu_sample_top_k_top_p_kernel(
         local_sum += v;
     }
 
-    // Warp reduce sum
+    // Block reduce sum
     for (int offset = 16; offset > 0; offset >>= 1)
         local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
-    if (lane_id == 0) s_reduce[warp_id] = local_sum;
+    if (lane_id == 0) s_val[warp_id] = local_sum;
     __syncthreads();
     if (tid == 0) {
         float s = 0.0f;
-        for (int i = 0; i < (bdim + 31) / 32; i++) s += s_reduce[i];
-        s_reduce[0] = s;
+        for (int i = 0; i < num_warps; i++) s += s_val[i];
+        s_val[0] = s;
     }
     __syncthreads();
-    float inv_sum = 1.0f / s_reduce[0];
+    float inv_sum = 1.0f / s_val[0];
 
     // Phase 3: Normalize to probabilities
     for (int i = tid; i < vocab_size; i += bdim) {
@@ -436,36 +442,57 @@ __global__ void gpu_sample_top_k_top_p_kernel(
     }
     __syncthreads();
 
-    // Phase 4: Cooperative top-k candidate gathering
-    // Each thread finds its local top candidates, thread 0 merges
+    // Phase 4: Cooperative parallel top-k — ALL threads participate
+    // Each iteration: parallel max reduction O(V/bdim), then mark used
     int k = top_k;
     if (k <= 0 || k > vocab_size) k = vocab_size;
     if (k > 128) k = 128;
 
-    // Each thread tracks its top-2 local maxima per pass
-    // Thread 0 collects from all threads' ranges
-    if (tid == 0) {
-        // Use a simple but correct approach: partial selection sort
-        // For k<=128, vocab<=4096: k*V/bdim iterations per thread
-        // With 256 threads and V=3072, each thread handles 12 elements
-        float top_probs[128];
-        int top_ids[128];
+    for (int j = 0; j < k; j++) {
+        // Each thread scans its chunk for local max
+        float my_max = -1.0f;
+        int my_idx = 0;
+        for (int i = tid; i < vocab_size; i += bdim) {
+            if (probs[i] > my_max) {
+                my_max = probs[i];
+                my_idx = i;
+            }
+        }
 
-        // Parallel-friendly: each iteration finds global max, marks it used
-        for (int j = 0; j < k; j++) {
-            float best = -1.0f;
-            int best_id = 0;
-            for (int i = 0; i < vocab_size; i++) {
-                if (probs[i] > best) {
-                    best = probs[i];
-                    best_id = i;
+        // Warp reduce (max with index)
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_max = __shfl_down_sync(0xffffffff, my_max, offset);
+            int   other_idx = __shfl_down_sync(0xffffffff, my_idx, offset);
+            if (other_max > my_max) {
+                my_max = other_max;
+                my_idx = other_idx;
+            }
+        }
+        if (lane_id == 0) {
+            s_val[warp_id] = my_max;
+            s_idx[warp_id] = my_idx;
+        }
+        __syncthreads();
+
+        // Thread 0: reduce across warps, store result, mark used
+        if (tid == 0) {
+            float best = s_val[0];
+            int best_id = s_idx[0];
+            for (int w = 1; w < num_warps; w++) {
+                if (s_val[w] > best) {
+                    best = s_val[w];
+                    best_id = s_idx[w];
                 }
             }
             top_probs[j] = best;
             top_ids[j] = best_id;
             probs[best_id] = -1.0f;  // mark used
         }
+        __syncthreads();
+    }
 
+    // Phase 5: Top-p filtering and sampling (thread 0, sequential O(k) — negligible)
+    if (tid == 0) {
         // Renormalize top-k
         float renorm_sum = 0.0f;
         for (int i = 0; i < k; i++) renorm_sum += top_probs[i];
@@ -480,7 +507,6 @@ __global__ void gpu_sample_top_k_top_p_kernel(
                 cum += top_probs[i];
                 if (cum >= top_p) { nucleus = i + 1; break; }
             }
-            // Renormalize nucleus
             renorm_sum = 0.0f;
             for (int i = 0; i < nucleus; i++) renorm_sum += top_probs[i];
             if (renorm_sum > 0.0f) {
@@ -489,13 +515,12 @@ __global__ void gpu_sample_top_k_top_p_kernel(
             }
         }
 
-        // SplitMix64 RNG — better distribution than xorshift
+        // SplitMix64 RNG
         unsigned long long s = seed;
         s += 0x9E3779B97F4A7C15ULL;
         s = (s ^ (s >> 30)) * 0xBF58476D1CE4E5B9ULL;
         s = (s ^ (s >> 27)) * 0x94D049BB133111EBULL;
         s = s ^ (s >> 31);
-        // Convert to [0, 1) using upper bits for better uniformity
         float r = (float)(s >> 40) / (float)(1ULL << 24);
 
         float cum = 0.0f;
@@ -515,7 +540,8 @@ void invoke_gpu_sample_top_k_top_p(const __nv_bfloat16* logits, int vocab_size,
     float inv_temp = (temperature > 0.0f && temperature != 1.0f)
                      ? (1.0f / temperature) : 1.0f;
     int threads = 256;
-    int smem_bytes = vocab_size * sizeof(float);
+    // SMEM: probs[V] + top_probs[128] + top_ids[128]
+    int smem_bytes = vocab_size * sizeof(float) + 128 * sizeof(float) + 128 * sizeof(int);
     gpu_sample_top_k_top_p_kernel<<<1, threads, smem_bytes, stream>>>(
         logits, vocab_size, top_k, top_p, inv_temp, result, seed);
 }

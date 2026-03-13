@@ -824,16 +824,12 @@ void Talker::talker_layer_forward_decode(
                                eps, 1, h, stream);
     ops::invoke_dense_gemv(norm_buf, lw.qkv_proj_w, qkv_buf, qkv_dim, h, stream);
 
-    // Per-head QK RMSNorm
-    audio_ops::invoke_per_head_rmsnorm(q_buf, q_buf, lw.q_norm_w, eps,
-                                        1, tc.num_attention_heads, tc.head_dim, stream);
-    audio_ops::invoke_per_head_rmsnorm(k_buf, k_buf, lw.k_norm_w, eps,
-                                        1, tc.num_kv_heads, tc.head_dim, stream);
-
-    audio_ops::invoke_mrope(q_buf, k_buf, pos_ids,
-                             1, tc.num_attention_heads, tc.num_kv_heads, tc.head_dim,
-                             tc.mrope_sections[0], tc.mrope_sections[1], tc.mrope_sections[2],
-                             tc.rope_theta, stream);
+    // Fused QK RMSNorm + MRoPE (3 kernels → 1)
+    audio_ops::invoke_fused_qk_norm_rope(
+        q_buf, k_buf, lw.q_norm_w, lw.k_norm_w, pos_ids, eps,
+        1, tc.num_attention_heads, tc.num_kv_heads, tc.head_dim,
+        tc.mrope_sections[0], tc.mrope_sections[1], tc.mrope_sections[2],
+        tc.rope_theta, stream);
 
     audio_ops::invoke_write_kv_cache(talker_k_cache_[layer_idx], talker_v_cache_[layer_idx],
                                       k_buf, v_buf, talker_cache_len_, 1,
@@ -959,16 +955,11 @@ void Talker::cp_layer_forward_decode(
     audio_ops::invoke_rmsnorm(norm_buf, hidden, lw.input_layernorm_w, eps, 1, h, stream);
     ops::invoke_dense_gemv(norm_buf, lw.qkv_proj_w, qkv_buf, qkv_dim, h, stream);
 
-    // Per-head QK RMSNorm
-    audio_ops::invoke_per_head_rmsnorm(q_buf, q_buf, lw.q_norm_w, eps,
-                                        1, cp.num_attention_heads, cp.head_dim, stream);
-    audio_ops::invoke_per_head_rmsnorm(k_buf, k_buf, lw.k_norm_w, eps,
-                                        1, cp.num_kv_heads, cp.head_dim, stream);
-
-    // 1D RoPE — position IDs passed in from caller (set once per group step)
-    audio_ops::invoke_mrope(q_buf, k_buf, pos_ids,
-                             1, cp.num_attention_heads, cp.num_kv_heads, cp.head_dim,
-                             64, 0, 0, cp.rope_theta, stream);
+    // Fused QK RMSNorm + 1D RoPE (3 kernels → 1)
+    audio_ops::invoke_fused_qk_norm_rope(
+        q_buf, k_buf, lw.q_norm_w, lw.k_norm_w, pos_ids, eps,
+        1, cp.num_attention_heads, cp.num_kv_heads, cp.head_dim,
+        64, 0, 0, cp.rope_theta, stream);
 
     audio_ops::invoke_write_kv_cache(cp_k_cache_[layer_idx], cp_v_cache_[layer_idx],
                                       k_buf, v_buf, cp_cache_len_, 1,
