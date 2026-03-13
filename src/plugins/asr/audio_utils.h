@@ -65,6 +65,21 @@ void compute_mel(const float* samples, int num_samples,
                  std::vector<float>& mel_out,
                  int& num_frames);
 
+// Compute mel spectrogram with pre-cached filterbank and window
+// (避免每次调用都重建 filterbank + Hann window)
+void compute_mel_cached(const float* samples, int num_samples,
+                        const MelConfig& config,
+                        const std::vector<float>& mel_fb,        // [n_mels * n_freqs]
+                        const std::vector<float>& hann_window,   // [n_fft]
+                        std::vector<float>& mel_out,
+                        int& num_frames);
+
+// Build mel filterbank matrix [n_mels, n_fft/2+1]
+std::vector<float> build_mel_filterbank(int n_mels, int n_fft, int sample_rate);
+
+// Build Hann window [n_fft]
+std::vector<float> build_hann_window(int n_fft);
+
 // ============================================================================
 // PCM 输出 (用于 TTS)
 // ============================================================================

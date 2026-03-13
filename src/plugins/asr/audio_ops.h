@@ -174,5 +174,14 @@ void invoke_write_kv_cache(__nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
                             int num_kv_heads, int head_dim,
                             cudaStream_t stream = 0);
 
+// GPU Argmax: 在 GPU 上计算 BF16 logits 的 argmax
+// 结果写到 result_idx (device 或 managed memory)
+void invoke_argmax(const __nv_bfloat16* logits, int* result_idx, int n,
+                   cudaStream_t stream = 0);
+
+// BF16 转换: float32 → BF16 (GPU kernel, 避免 CPU 逐元素转换 + H2D 拷贝)
+void invoke_f32_to_bf16(__nv_bfloat16* out, const float* in, int n,
+                        cudaStream_t stream = 0);
+
 } // namespace audio_ops
 } // namespace qwen_thor

@@ -2,6 +2,7 @@
 
 #include "asr_plugin.h"
 #include "asr_engine.h"
+#include "audio_utils.h"
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -252,6 +253,82 @@ AsrResult NativeAsrPlugin::transcribe(const std::string& audio_path,
     result.duration_s = elapsed_s;
 
     fprintf(stderr, "[ASR Native] Transcribed in %.2fs: \"%s\"\n",
+            elapsed_s, text.substr(0, 100).c_str());
+
+    return result;
+}
+
+// ============================================================================
+// AsrPlugin::transcribe_memory — 默认实现 (写临时文件)
+// ============================================================================
+
+AsrResult AsrPlugin::transcribe_memory(const uint8_t* data, size_t size,
+                                        const std::string& language) {
+    // 默认: 写临时文件, 调用 transcribe(path)
+    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    std::string tmp_path = "tmp/asr_mem_" + std::to_string(now) + "_" +
+                           std::to_string(getpid()) + ".wav";
+    {
+        std::ofstream af(tmp_path, std::ios::binary);
+        if (!af.is_open()) {
+            AsrResult r;
+            r.error_code = 10;
+            r.error_message = "Failed to create temp file for transcribe_memory";
+            return r;
+        }
+        af.write(reinterpret_cast<const char*>(data), size);
+    }
+    auto result = transcribe(tmp_path, language);
+    std::filesystem::remove(tmp_path);
+    return result;
+}
+
+// ============================================================================
+// NativeAsrPlugin::transcribe_memory — 零临时文件, 直接内存解析
+// ============================================================================
+
+AsrResult NativeAsrPlugin::transcribe_memory(const uint8_t* data, size_t size,
+                                              const std::string& language) {
+    AsrResult result;
+
+    if (!is_available()) {
+        result.error_code = 1;
+        result.error_message = "ASR engine not loaded";
+        return result;
+    }
+
+    // 在内存中解析 WAV — 零磁盘 I/O
+    audio::AudioData wav;
+    if (!audio::load_wav_from_memory(data, size, wav)) {
+        result.error_code = 2;
+        result.error_message = "Failed to parse audio data in memory (need PCM16 WAV)";
+        return result;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    std::string text = engine_->transcribe(wav.samples.data(), (int)wav.samples.size(),
+                                            wav.sample_rate);
+
+    auto t1 = std::chrono::steady_clock::now();
+    float elapsed_s = std::chrono::duration<float>(t1 - t0).count();
+
+    if (text.empty()) {
+        result.error_code = 3;
+        result.error_message = "ASR transcription produced no text";
+        return result;
+    }
+
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\n')) text.erase(text.begin());
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\n')) text.pop_back();
+
+    result.text = text;
+    result.language = language;
+    result.duration_s = elapsed_s;
+
+    fprintf(stderr, "[ASR Native] Transcribed (memory) in %.2fs: \"%s\"\n",
             elapsed_s, text.substr(0, 100).c_str());
 
     return result;

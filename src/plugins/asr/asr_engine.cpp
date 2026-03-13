@@ -11,6 +11,11 @@
 #include <cstring>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 namespace qwen_thor {
 namespace asr {
@@ -40,28 +45,16 @@ ASREngine::~ASREngine() {
     if (logits_) cudaFree(logits_);
     if (position_ids_) cudaFree(position_ids_);
     if (token_id_gpu_) cudaFree(token_id_gpu_);
+    if (prompt_tokens_gpu_) cudaFree(prompt_tokens_gpu_);
+    if (mel_staging_gpu_) cudaFree(mel_staging_gpu_);
 }
 
 // ============================================================================
-// Greedy argmax on CPU (for single-token logits)
+// Greedy argmax on GPU — single CTA reduction, result in managed memory
+// Replaces CPU version that copied 496KB per step
 // ============================================================================
 
-int ASREngine::greedy_decode(__nv_bfloat16* logits_gpu, int vocab_size) {
-    std::vector<__nv_bfloat16> logits_cpu(vocab_size);
-    cudaMemcpy(logits_cpu.data(), logits_gpu,
-               vocab_size * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-
-    int best_id = 0;
-    float best_val = __bfloat162float(logits_cpu[0]);
-    for (int i = 1; i < vocab_size; i++) {
-        float v = __bfloat162float(logits_cpu[i]);
-        if (v > best_val) {
-            best_val = v;
-            best_id = i;
-        }
-    }
-    return best_id;
-}
+// (greedy_decode removed — using audio_ops::invoke_argmax + token_id_gpu_)
 
 // ============================================================================
 // Build prompt token IDs
@@ -258,6 +251,9 @@ void ASREngine::load_model(const std::string& model_dir) {
     max_mel_frames_ = 12000;
     cudaMalloc(&mel_gpu_, (size_t)config_.num_mel_bins * max_mel_frames_ * sizeof(__nv_bfloat16));
 
+    // F32 staging buffer for GPU mel→BF16 conversion
+    cudaMalloc(&mel_staging_gpu_, (size_t)config_.num_mel_bins * max_mel_frames_ * sizeof(float));
+
     // Max encoder output tokens
     int max_enc_tokens = config_.max_source_positions;
     cudaMalloc(&encoder_out_, (size_t)max_enc_tokens * config_.output_dim * sizeof(__nv_bfloat16));
@@ -272,8 +268,14 @@ void ASREngine::load_model(const std::string& model_dir) {
     // Position IDs for MRoPE [3, max_seq]
     cudaMalloc(&position_ids_, 3 * max_decoder_seq * sizeof(int));
 
-    // Token ID for decode step
+    // Token ID for decode step (managed memory, GPU argmax writes here)
     cudaMallocManaged(&token_id_gpu_, sizeof(int));
+
+    // Pre-allocated prompt token buffer (avoids per-call cudaMalloc/Free)
+    cudaMalloc(&prompt_tokens_gpu_, max_prompt_len_ * sizeof(int));
+
+    // 7. Pre-compute mel filterbank and Hann window
+    init_mel_cache();
 
     auto t1 = std::chrono::steady_clock::now();
     float load_time = std::chrono::duration<float>(t1 - t0).count();
@@ -287,6 +289,20 @@ void ASREngine::load_model(const std::string& model_dir) {
                 return 3400.0;  // approximate
             }());
     loaded_ = true;
+}
+
+// ============================================================================
+// init_mel_cache: 预计算 mel filterbank + Hann window
+// ============================================================================
+
+void ASREngine::init_mel_cache() {
+    cached_n_fft_ = 400;
+    cached_n_mels_ = 128;
+    cached_sample_rate_ = 16000;
+    cached_mel_fb_ = audio::build_mel_filterbank(cached_n_mels_, cached_n_fft_, cached_sample_rate_);
+    cached_hann_window_ = audio::build_hann_window(cached_n_fft_);
+    fprintf(stderr, "[ASR] Mel filterbank cached: %d mels, %d FFT, %d Hz\n",
+            cached_n_mels_, cached_n_fft_, cached_sample_rate_);
 }
 
 // ============================================================================
@@ -315,7 +331,7 @@ std::string ASREngine::transcribe(
         audio_len = (int)audio_buf.size();
     }
 
-    // 2. Compute mel spectrogram (CPU)
+    // 2. Compute mel spectrogram (CPU, cached filterbank)
     audio::MelConfig mel_cfg;
     mel_cfg.n_fft = 400;
     mel_cfg.hop_length = 160;
@@ -324,7 +340,9 @@ std::string ASREngine::transcribe(
 
     int mel_frames = 0;
     std::vector<float> mel_f32;
-    audio::compute_mel(audio_16k, audio_len, mel_cfg, mel_f32, mel_frames);
+    audio::compute_mel_cached(audio_16k, audio_len, mel_cfg,
+                              cached_mel_fb_, cached_hann_window_,
+                              mel_f32, mel_frames);
 
     if (mel_frames > max_mel_frames_) {
         fprintf(stderr, "[ASR] WARNING: audio too long (%d frames > %d max), truncating\n",
@@ -332,13 +350,13 @@ std::string ASREngine::transcribe(
         mel_frames = max_mel_frames_;
     }
 
-    // 3. Convert mel to BF16 and copy to GPU
-    std::vector<__nv_bfloat16> mel_bf16(128 * mel_frames);
-    for (int i = 0; i < 128 * mel_frames; i++) {
-        mel_bf16[i] = __float2bfloat16(mel_f32[i]);
+    // 3. Convert mel to BF16 on GPU (avoids CPU loop + H2D copy of BF16 data)
+    {
+        int mel_count = 128 * mel_frames;
+        cudaMemcpyAsync(mel_staging_gpu_, mel_f32.data(),
+                        mel_count * sizeof(float), cudaMemcpyHostToDevice, stream_);
+        audio_ops::invoke_f32_to_bf16(mel_gpu_, mel_staging_gpu_, mel_count, stream_);
     }
-    cudaMemcpy(mel_gpu_, mel_bf16.data(),
-               128 * mel_frames * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
 
     // 4. Encode audio
     int encoder_out_len = 0;
@@ -364,18 +382,13 @@ std::string ASREngine::transcribe(
         return "";
     }
 
-    // Embed all prompt tokens
+    // Embed all prompt tokens (using pre-allocated GPU buffer)
     int h = config_.decoder_hidden_size;
-    {
-        int* tokens_gpu = nullptr;
-        cudaMalloc(&tokens_gpu, prompt_len * sizeof(int));
-        cudaMemcpy(tokens_gpu, prompt_tokens.data(),
-                   prompt_len * sizeof(int), cudaMemcpyHostToDevice);
-        audio_ops::invoke_embedding_lookup(
-            input_embeds_, tokens_gpu, embed_tokens_w_,
-            prompt_len, h, stream_);
-        cudaFree(tokens_gpu);
-    }
+    cudaMemcpyAsync(prompt_tokens_gpu_, prompt_tokens.data(),
+                    prompt_len * sizeof(int), cudaMemcpyHostToDevice, stream_);
+    audio_ops::invoke_embedding_lookup(
+        input_embeds_, prompt_tokens_gpu_, embed_tokens_w_,
+        prompt_len, h, stream_);
 
     // 6. Replace AUDIO_PAD embeddings with encoder output
     // Find the start index of audio_pad tokens in the prompt
@@ -413,9 +426,11 @@ std::string ASREngine::transcribe(
     float prefill_ms = std::chrono::duration<float, std::milli>(t_prefill - t_encode).count();
     fprintf(stderr, "[ASR] Prefill: %d tokens (%.1f ms)\n", prompt_len, prefill_ms);
 
-    // 9. Autoregressive decode
+    // 9. Autoregressive decode (GPU argmax — no D2H logits transfer)
     std::vector<int> output_tokens;
-    int next_token = greedy_decode(logits_, config_.vocab_size);
+    audio_ops::invoke_argmax(logits_, token_id_gpu_, config_.vocab_size, stream_);
+    cudaStreamSynchronize(stream_);
+    int next_token = *token_id_gpu_;
     int current_pos = prompt_len;
 
     while (next_token != IM_END && next_token != ENDOFTEXT
@@ -425,10 +440,13 @@ std::string ASREngine::transcribe(
 
         // Position IDs for decode step: [3, 1] all same position
         int step_pos[3] = {current_pos, current_pos, current_pos};
-        cudaMemcpy(position_ids_, step_pos, 3 * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(position_ids_, step_pos, 3 * sizeof(int),
+                        cudaMemcpyHostToDevice, stream_);
 
         decoder_->forward_decode(next_token, position_ids_, logits_, stream_);
-        next_token = greedy_decode(logits_, config_.vocab_size);
+        audio_ops::invoke_argmax(logits_, token_id_gpu_, config_.vocab_size, stream_);
+        cudaStreamSynchronize(stream_);
+        next_token = *token_id_gpu_;
         current_pos++;
     }
 

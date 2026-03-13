@@ -411,6 +411,11 @@ function connectWS() {
   };
 
   ws.onmessage = (e) => {
+    if (e.data instanceof Blob) {
+      // Binary frame = TTS audio data (follows tts.meta text frame)
+      handleTtsBinary(e.data);
+      return;
+    }
     const msg = JSON.parse(e.data);
     handleEvent(msg);
   };
@@ -426,6 +431,54 @@ function sendConfig() {
 // ============================================================================
 // 事件处理
 // ============================================================================
+let pendingTtsMeta = null;  // 等待 binary frame 的 tts.meta
+let ttsAudioQueue = [];     // 待播放的音频队列
+let ttsPlaying = false;     // 是否正在播放
+let ttsTotalSize = 0;       // TTS 总字节数
+let ttsDone = false;        // tts.done 已收到
+
+function handleTtsBinary(blob) {
+  // Binary frame = WAV audio, preceded by tts.meta text frame
+  const audioUrl = URL.createObjectURL(blob);
+  ttsAudioQueue.push({ url: audioUrl, size: blob.size });
+  ttsTotalSize += blob.size;
+
+  // 第一段立即播放, 后续排队
+  if (!ttsPlaying) playNextTts();
+}
+
+function playNextTts() {
+  if (ttsAudioQueue.length === 0) {
+    ttsPlaying = false;
+    // tts.done 已到达且播放完毕 → 解锁 UI
+    if (ttsDone) {
+      isProcessing = false;
+      document.getElementById('sendBtn').disabled = false;
+      streamingDiv = null;
+    }
+    return;
+  }
+  ttsPlaying = true;
+  const item = ttsAudioQueue.shift();
+
+  // 添加/复用 audio 元素
+  if (streamingDiv) {
+    let audio = streamingDiv.querySelector('audio.tts-audio');
+    if (!audio) {
+      audio = document.createElement('audio');
+      audio.className = 'tts-audio';
+      audio.controls = true;
+      audio.style.cssText = 'display:block;margin-top:8px;width:100%;height:36px;border-radius:6px;';
+      streamingDiv.appendChild(audio);
+    }
+    audio.src = item.url;
+    audio.onended = () => playNextTts();
+    audio.onerror = () => playNextTts();
+    audio.play().catch(() => playNextTts());
+    scrollToBottom();
+  }
+}
+
 function handleEvent(msg) {
   switch (msg.type) {
     case 'session.created':
@@ -441,20 +494,21 @@ function handleEvent(msg) {
       break;
 
     case 'asr':
-      // ASR 识别结果 — 显示为用户消息
       addMessage('user', msg.text, null, 'ASR 识别');
       break;
 
     case 'llm.start':
-      // 开始流式输出
       responseT0 = performance.now();
       streamingText = '';
       streamingDiv = createStreamingMessage();
+      ttsAudioQueue = [];
+      ttsPlaying = false;
+      ttsTotalSize = 0;
+      ttsDone = false;
       setStatus('正在生成回复...');
       break;
 
     case 'llm.delta':
-      // 增量文本
       if (streamingDiv) {
         streamingText += msg.delta;
         const contentEl = streamingDiv.querySelector('.content');
@@ -465,7 +519,6 @@ function handleEvent(msg) {
       break;
 
     case 'llm.done':
-      // LLM 完成
       if (streamingDiv) {
         const contentEl = streamingDiv.querySelector('.content');
         contentEl.classList.remove('streaming-cursor');
@@ -473,7 +526,6 @@ function handleEvent(msg) {
         let metaText = `LLM ${llmTime}s`;
         if (msg.prompt_tokens) metaText += ` · ${msg.prompt_tokens} prompt`;
         if (msg.completion_tokens) metaText += ` · ${msg.completion_tokens} gen`;
-        // meta 先设置, TTS 到达后会更新
         streamingDiv.dataset.llmMeta = metaText;
         let metaEl = streamingDiv.querySelector('.meta');
         if (!metaEl) {
@@ -486,32 +538,39 @@ function handleEvent(msg) {
       clearStatus();
       break;
 
+    case 'tts.meta':
+      // TTS 分段元数据 (binary frame follows)
+      pendingTtsMeta = msg;
+      break;
+
+    case 'tts.done':
+      // 所有 TTS 分段发送完毕
+      ttsDone = true;
+      if (streamingDiv) {
+        const metaEl = streamingDiv.querySelector('.meta');
+        if (metaEl) {
+          const sizeKB = (ttsTotalSize / 1024).toFixed(0);
+          metaEl.textContent = (streamingDiv.dataset.llmMeta || '') +
+            ` · TTS ${sizeKB}KB (${msg.segments || 1}段)`;
+        }
+      }
+      clearStatus();
+      // 等音频播放完才解锁 (如果有音频在播放)
+      if (!ttsPlaying) {
+        isProcessing = false;
+        document.getElementById('sendBtn').disabled = false;
+        streamingDiv = null;
+      }
+      break;
+
     case 'tts':
-      // TTS 音频 (base64 WAV)
+      // 兼容旧协议 (base64 WAV, 单段)
       if (msg.data && streamingDiv) {
         const binary = atob(msg.data);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
         const blob = new Blob([bytes], { type: 'audio/wav' });
-        const audioUrl = URL.createObjectURL(blob);
-
-        // 添加 audio 元素
-        const audio = document.createElement('audio');
-        audio.controls = true;
-        audio.src = audioUrl;
-        audio.style.cssText = 'display:block;margin-top:8px;width:100%;height:36px;border-radius:6px;';
-        streamingDiv.appendChild(audio);
-
-        // 更新 meta
-        const sizeKB = (bytes.length / 1024).toFixed(0);
-        const metaEl = streamingDiv.querySelector('.meta');
-        if (metaEl) {
-          metaEl.textContent = (streamingDiv.dataset.llmMeta || '') + ` · TTS ${sizeKB}KB`;
-        }
-
-        // 自动播放
-        audio.play().catch(() => {});
-        scrollToBottom();
+        handleTtsBinary(blob);
       }
       clearStatus();
       isProcessing = false;

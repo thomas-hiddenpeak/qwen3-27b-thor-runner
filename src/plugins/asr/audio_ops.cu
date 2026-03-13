@@ -854,5 +854,99 @@ void invoke_write_kv_cache(__nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
         start_pos, num_tokens, num_kv_heads, head_dim);
 }
 
+// ============================================================================
+// GPU Argmax (single-CTA warp reduction)
+// ============================================================================
+
+__global__ void argmax_kernel(
+    const __nv_bfloat16* __restrict__ logits,
+    int* __restrict__ result_idx,
+    int n)
+{
+    // 每个 warp 处理 n/num_warps 个元素, 然后 warp 间 reduce
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    float best_val = -1e30f;
+    int best_idx = 0;
+
+    for (int i = tid; i < n; i += stride) {
+        float v = __bfloat162float(logits[i]);
+        if (v > best_val) {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+
+    // Warp-level reduction
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other_val = __shfl_xor_sync(0xffffffff, best_val, offset);
+        int other_idx = __shfl_xor_sync(0xffffffff, best_idx, offset);
+        if (other_val > best_val) {
+            best_val = other_val;
+            best_idx = other_idx;
+        }
+    }
+
+    // Cross-warp reduction via shared memory
+    __shared__ float s_vals[32];
+    __shared__ int s_idxs[32];
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+
+    if (lane == 0) {
+        s_vals[warp_id] = best_val;
+        s_idxs[warp_id] = best_idx;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        int num_warps = blockDim.x / 32;
+        best_val = (lane < num_warps) ? s_vals[lane] : -1e30f;
+        best_idx = (lane < num_warps) ? s_idxs[lane] : 0;
+
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_val = __shfl_xor_sync(0xffffffff, best_val, offset);
+            int other_idx = __shfl_xor_sync(0xffffffff, best_idx, offset);
+            if (other_val > best_val) {
+                best_val = other_val;
+                best_idx = other_idx;
+            }
+        }
+
+        if (lane == 0) {
+            *result_idx = best_idx;
+        }
+    }
+}
+
+void invoke_argmax(const __nv_bfloat16* logits, int* result_idx, int n,
+                   cudaStream_t stream) {
+    // 单 block, 256 threads (8 warps)
+    argmax_kernel<<<1, 256, 0, stream>>>(logits, result_idx, n);
+}
+
+// ============================================================================
+// F32 → BF16 conversion kernel
+// ============================================================================
+
+__global__ void f32_to_bf16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const float* __restrict__ in,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = __float2bfloat16(in[idx]);
+    }
+}
+
+void invoke_f32_to_bf16(__nv_bfloat16* out, const float* in, int n,
+                        cudaStream_t stream) {
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    f32_to_bf16_kernel<<<grid, block, 0, stream>>>(out, in, n);
+}
+
 } // namespace audio_ops
 } // namespace qwen_thor

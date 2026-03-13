@@ -138,7 +138,27 @@ inline float mel_to_hz(float mel) {
     return 700.0f * (std::pow(10.0f, mel / 2595.0f) - 1.0f);
 }
 
-// 构建 Mel filterbank 矩阵 [n_mels, n_fft/2+1]
+// Real-valued DFT (slow reference, sufficient for audio preprocessing)
+void rdft(const float* x, int n, float* real_out, float* imag_out) {
+    int half = n / 2 + 1;
+    for (int k = 0; k < half; k++) {
+        float re = 0, im = 0;
+        for (int t = 0; t < n; t++) {
+            float angle = 2.0f * (float)M_PI * k * t / n;
+            re += x[t] * std::cos(angle);
+            im -= x[t] * std::sin(angle);
+        }
+        real_out[k] = re;
+        imag_out[k] = im;
+    }
+}
+
+} // anonymous namespace
+
+// ============================================================================
+// 公开的 filterbank/window 构建 (供外部缓存)
+// ============================================================================
+
 std::vector<float> build_mel_filterbank(int n_mels, int n_fft, int sample_rate) {
     int n_freqs = n_fft / 2 + 1;
     std::vector<float> fb(n_mels * n_freqs, 0.0f);
@@ -146,13 +166,11 @@ std::vector<float> build_mel_filterbank(int n_mels, int n_fft, int sample_rate) 
     float min_mel = hz_to_mel(0.0f);
     float max_mel = hz_to_mel((float)sample_rate / 2.0f);
 
-    // n_mels + 2 boundary points
     std::vector<float> mel_points(n_mels + 2);
     for (int i = 0; i < n_mels + 2; i++) {
         mel_points[i] = mel_to_hz(min_mel + (max_mel - min_mel) * i / (n_mels + 1));
     }
 
-    // Convert to FFT bin indices
     std::vector<float> fft_bins(n_mels + 2);
     for (int i = 0; i < n_mels + 2; i++) {
         fft_bins[i] = mel_points[i] * n_fft / sample_rate;
@@ -172,7 +190,6 @@ std::vector<float> build_mel_filterbank(int n_mels, int n_fft, int sample_rate) 
             }
         }
 
-        // Slaney 归一化: 除以滤波器带宽
         float enorm = 2.0f / (mel_points[m + 2] - mel_points[m]);
         for (int k = 0; k < n_freqs; k++) {
             fb[m * n_freqs + k] *= enorm;
@@ -182,7 +199,6 @@ std::vector<float> build_mel_filterbank(int n_mels, int n_fft, int sample_rate) 
     return fb;
 }
 
-// Hann window
 std::vector<float> build_hann_window(int size) {
     std::vector<float> w(size);
     for (int i = 0; i < size; i++) {
@@ -190,24 +206,6 @@ std::vector<float> build_hann_window(int size) {
     }
     return w;
 }
-
-// Real-valued DFT (slow reference, sufficient for audio preprocessing)
-// 输入: x[n_fft], 输出: real[n_fft/2+1], imag[n_fft/2+1]
-void rdft(const float* x, int n, float* real_out, float* imag_out) {
-    int half = n / 2 + 1;
-    for (int k = 0; k < half; k++) {
-        float re = 0, im = 0;
-        for (int t = 0; t < n; t++) {
-            float angle = 2.0f * (float)M_PI * k * t / n;
-            re += x[t] * std::cos(angle);
-            im -= x[t] * std::sin(angle);
-        }
-        real_out[k] = re;
-        imag_out[k] = im;
-    }
-}
-
-} // anonymous namespace
 
 // ============================================================================
 // Mel Spectrogram 计算
@@ -217,6 +215,17 @@ void compute_mel(const float* samples, int num_samples,
                  const MelConfig& config,
                  std::vector<float>& mel_out,
                  int& num_frames) {
+    auto mel_fb = build_mel_filterbank(config.n_mels, config.n_fft, config.sample_rate);
+    auto window = build_hann_window(config.n_fft);
+    compute_mel_cached(samples, num_samples, config, mel_fb, window, mel_out, num_frames);
+}
+
+void compute_mel_cached(const float* samples, int num_samples,
+                        const MelConfig& config,
+                        const std::vector<float>& mel_fb,
+                        const std::vector<float>& window,
+                        std::vector<float>& mel_out,
+                        int& num_frames) {
     int n_fft = config.n_fft;
     int hop = config.hop_length;
     int n_mels = config.n_mels;
@@ -228,10 +237,6 @@ void compute_mel(const float* samples, int num_samples,
     std::memcpy(padded.data(), samples, num_samples * sizeof(float));
 
     num_frames = (padded_len - n_fft) / hop + 1;
-
-    // Build filterbank and window (can be cached but <1ms for 128 bins)
-    auto mel_fb = build_mel_filterbank(n_mels, n_fft, config.sample_rate);
-    auto window = build_hann_window(n_fft);
 
     // Compute STFT → power spectrum → mel
     std::vector<float> mel_spec(n_mels * num_frames, 0.0f);

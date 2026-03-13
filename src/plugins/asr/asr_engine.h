@@ -64,6 +64,8 @@ private:
     __nv_bfloat16* logits_ = nullptr;         // [vocab_size]
     int* position_ids_ = nullptr;             // [3, max_seq_len]
     int* token_id_gpu_ = nullptr;             // [1]
+    int* prompt_tokens_gpu_ = nullptr;        // [max_prompt_len], pre-allocated
+    float* mel_staging_gpu_ = nullptr;        // [128, max_mel_frames] F32 staging for GPU conversion
 
     // Embed weight pointer (shared with decoder, not owned separately)
     __nv_bfloat16* embed_tokens_w_ = nullptr;
@@ -75,13 +77,20 @@ private:
     int max_mel_frames_ = 0;
     int max_prompt_len_ = 0;
 
+    // 缓存的 mel filterbank 和 Hann window
+    std::vector<float> cached_mel_fb_;     // [n_mels * n_freqs]
+    std::vector<float> cached_hann_window_; // [n_fft]
+    int cached_n_fft_ = 0;
+    int cached_n_mels_ = 0;
+    int cached_sample_rate_ = 0;
+
     cudaStream_t stream_ = 0;
     bool loaded_ = false;
 
     // 内部方法
     void load_weights(const std::string& model_dir);
     void build_prompt(int encoder_out_len, std::vector<int>& token_ids);
-    int greedy_decode(__nv_bfloat16* logits, int vocab_size);
+    void init_mel_cache();  // 预计算 mel filterbank + Hann window
 };
 
 } // namespace asr

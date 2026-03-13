@@ -3570,38 +3570,13 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
     std::string response_format = form.fields.count("response_format") ?
                                   form.fields["response_format"] : "json";
 
-    // 写入临时文件
-    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-    // 提取文件扩展名
-    std::string ext = ".wav";
-    auto dot = audio_filename.rfind('.');
-    if (dot != std::string::npos) ext = audio_filename.substr(dot);
-    std::string tmp_path = "tmp/asr_upload_" + std::to_string(now) + "_" +
-                           std::to_string(getpid()) + ext;
-
-    {
-        std::ofstream af(tmp_path, std::ios::binary);
-        if (!af.is_open()) {
-            HttpResponse resp;
-            resp.status_code = 500;
-            resp.status_text = "Internal Server Error";
-            resp.body = "{\"error\":{\"message\":\"Failed to save audio file\","
-                        "\"type\":\"server_error\"}}";
-            send_response(client_fd, resp);
-            close(client_fd);
-            return;
-        }
-        af.write(audio_data.data(), audio_data.size());
-    }
-
     fprintf(stderr, "[Serve] ASR: received %zu bytes audio (%s), language=%s\n",
             audio_data.size(), audio_filename.c_str(), language.c_str());
 
-    // 调用 ASR 插件
-    auto result = asr_plugin_->transcribe(tmp_path, language);
-
-    // 清理临时文件
-    std::filesystem::remove(tmp_path);
+    // 调用 ASR 插件 (直接内存解析, 无临时文件 I/O)
+    auto result = asr_plugin_->transcribe_memory(
+        reinterpret_cast<const uint8_t*>(audio_data.data()),
+        audio_data.size(), language);
 
     if (result.error_code != 0) {
         HttpResponse resp;
@@ -3875,26 +3850,11 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 continue;
             }
 
-            // 写入临时文件
-            std::string ext = ".webm";
-            if (format == "wav") ext = ".wav";
-            else if (format == "ogg") ext = ".ogg";
-            auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-            std::string tmp_path = "tmp/ws_asr_" + std::to_string(now) + "_" +
-                                   std::to_string(getpid()) + ext;
-            {
-                std::ofstream af(tmp_path, std::ios::binary);
-                if (!af.is_open()) {
-                    ws_send_text(client_fd, "{\"type\":\"error\",\"message\":\"Failed to save audio\"}");
-                    continue;
-                }
-                af.write((const char*)audio_bytes.data(), audio_bytes.size());
-            }
-
             ws_send_text(client_fd, "{\"type\":\"status\",\"stage\":\"asr\"}");
 
-            auto result = asr_plugin_->transcribe(tmp_path, "auto");
-            std::filesystem::remove(tmp_path);
+            // 直接内存转录 — 无临时文件 I/O
+            auto result = asr_plugin_->transcribe_memory(audio_bytes.data(),
+                                                          audio_bytes.size(), "auto");
 
             if (result.error_code != 0 || result.text.empty()) {
                 ws_send_text(client_fd, "{\"type\":\"error\",\"message\":\"ASR failed: " +
@@ -3993,19 +3953,70 @@ void ServeApp::ws_voice_generate(int client_fd,
 
     chat_history.push_back({"assistant", full_response});
 
-    // TTS
+    // TTS: 按句分段合成, 边生成边发送
     if (tts_enabled && tts_plugin_ && tts_plugin_->is_available() && !full_response.empty()) {
         ws_send_text(client_fd, "{\"type\":\"status\",\"stage\":\"tts\"}");
 
-        auto tts_result = tts_plugin_->synthesize(full_response, voice, 1.0f, "wav");
-        if (tts_result.error_code == 0 && !tts_result.audio_data.empty()) {
-            // 发送音频数据 (base64 编码)
-            std::string audio_b64 = base64_encode(tts_result.audio_data.data(),
-                                                   tts_result.audio_data.size());
-            ws_send_text(client_fd, "{\"type\":\"tts\",\"format\":\"wav\",\"data\":\"" + audio_b64 + "\"}");
-        } else {
-            ws_send_text(client_fd, "{\"type\":\"error\",\"message\":\"TTS failed\"}");
+        // 按句子边界分割 (。！？.!? + 换行 + 逗号后的长句)
+        std::vector<std::string> sentences;
+        std::string current;
+        for (size_t i = 0; i < full_response.size(); ) {
+            unsigned char c = full_response[i];
+            // UTF-8 字符长度检测
+            int char_len = 1;
+            if ((c & 0xE0) == 0xC0) char_len = 2;
+            else if ((c & 0xF0) == 0xE0) char_len = 3;
+            else if ((c & 0xF8) == 0xF0) char_len = 4;
+
+            std::string ch = full_response.substr(i, char_len);
+            current += ch;
+            i += char_len;
+
+            // 中文/英文句末标点
+            bool is_sentence_end = (ch == "。" || ch == "！" || ch == "？" ||
+                                    ch == "." || ch == "!" || ch == "?" ||
+                                    ch == "\n");
+            // 逗号/分号后的长句界 (>20 chars)
+            bool is_clause_break = (current.size() > 60 &&
+                                    (ch == "，" || ch == "," || ch == "；" || ch == ";"));
+
+            if (is_sentence_end || is_clause_break) {
+                // Trim
+                while (!current.empty() && (current.back() == ' ' || current.back() == '\n'))
+                    current.pop_back();
+                if (!current.empty()) {
+                    sentences.push_back(std::move(current));
+                    current.clear();
+                }
+            }
         }
+        if (!current.empty()) {
+            while (!current.empty() && (current.back() == ' ' || current.back() == '\n'))
+                current.pop_back();
+            if (!current.empty())
+                sentences.push_back(std::move(current));
+        }
+
+        // 逐句合成并发送 (binary WS frames, 无 base64 开销)
+        int sent_idx = 0;
+        for (auto& sentence : sentences) {
+            auto tts_result = tts_plugin_->synthesize(sentence, voice, 1.0f, "wav");
+            if (tts_result.error_code == 0 && !tts_result.audio_data.empty()) {
+                // 先发元数据 (text frame)
+                ws_send_text(client_fd, "{\"type\":\"tts.meta\",\"index\":" +
+                             std::to_string(sent_idx) + ",\"total\":" +
+                             std::to_string((int)sentences.size()) +
+                             ",\"format\":\"wav\",\"size\":" +
+                             std::to_string(tts_result.audio_data.size()) + "}");
+                // 再发音频数据 (binary frame, 无 base64 编码)
+                ws_send_binary(client_fd, tts_result.audio_data.data(),
+                               tts_result.audio_data.size());
+            }
+            sent_idx++;
+        }
+
+        ws_send_text(client_fd, "{\"type\":\"tts.done\",\"segments\":" +
+                     std::to_string(sent_idx) + "}");
     }
 }
 
