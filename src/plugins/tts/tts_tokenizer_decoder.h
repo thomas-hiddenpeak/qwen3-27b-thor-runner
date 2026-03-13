@@ -68,11 +68,13 @@ struct TokenizerTransformerLayerWeights {
     float* q_proj_w = nullptr;              // [1024, 512] (16 heads × 64)
     float* k_proj_w = nullptr;              // [1024, 512]
     float* v_proj_w = nullptr;              // [1024, 512]
+    float* qkv_proj_w = nullptr;            // [3072, 512] merged Q+K+V
     float* o_proj_w = nullptr;              // [512, 1024]
     float* attn_layer_scale = nullptr;      // [512]
     float* post_attention_layernorm_w = nullptr; // [512]
     float* gate_proj_w = nullptr;           // [1024, 512]
     float* up_proj_w = nullptr;             // [1024, 512]
+    float* gate_up_proj_w = nullptr;        // [2048, 512] merged gate+up
     float* down_proj_w = nullptr;           // [512, 1024]
     float* mlp_layer_scale = nullptr;       // [512]
 };

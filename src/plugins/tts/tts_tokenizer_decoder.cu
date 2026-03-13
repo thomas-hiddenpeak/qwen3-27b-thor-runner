@@ -52,7 +52,8 @@ __global__ void causal_conv1d_kernel(
     const float* __restrict__ weight,     // [out_channels, in_channels, kernel_size]
     const float* __restrict__ bias,       // [out_channels] or nullptr
     int in_channels, int out_channels, int kernel_size,
-    int T_in, int T_out, int dilation, int stride)
+    int T_in, int T_out, int dilation, int stride,
+    const float* __restrict__ residual = nullptr)  // optional residual add
 {
     extern __shared__ float w_smem[];
     int oc = blockIdx.x;
@@ -82,6 +83,9 @@ __global__ void causal_conv1d_kernel(
             }
         }
     }
+    if (residual) {
+        sum += residual[oc * T_out + t_out];
+    }
     output[oc * T_out + t_out] = sum;
 }
 
@@ -108,38 +112,62 @@ __global__ void depthwise_causal_conv1d_kernel(
     output[ch * T_out + t] = sum;
 }
 
-// ---------- Causal Transposed Conv1d with stride-skip + SMEM weight ----------
+// ---------- Causal Transposed Conv1d with stride-skip + tiled SMEM weight ----------
 // ConvTranspose1d with right-side cropping (causal):
 // Full output T = (T_in - 1) * stride + kernel, then crop right (kernel - stride)
 // Result: T_out = T_in * stride
-// Optimization: only iterate k values where (t_out - k) % stride == 0,
-// reducing iterations from kernel_size to kernel_size/stride.
+// Uses tiled SMEM loading: process TILE_IC input channels at a time to keep SMEM bounded.
+// Each block processes one output channel, loads weights for TILE_IC input channels per tile.
 __global__ void causal_transconv1d_kernel(
     float* __restrict__ output,           // [out_channels, T_out]
     const float* __restrict__ input,      // [in_channels, T_in]
     const float* __restrict__ weight,     // [in_channels, out_channels, kernel_size]
     const float* __restrict__ bias,       // [out_channels] or nullptr
     int in_channels, int out_channels, int kernel_size, int stride,
-    int T_in, int T_out)
+    int T_in, int T_out, int tile_ic)
 {
+    extern __shared__ float tc_smem[];
     int oc = blockIdx.x;
     int t_out = blockIdx.y * blockDim.x + threadIdx.x;
-    if (oc >= out_channels || t_out >= T_out) return;
+    if (oc >= out_channels) return;
 
-    float sum = bias ? bias[oc] : 0.0f;
+    float sum = (t_out < T_out && bias) ? bias[oc] : 0.0f;
 
-    // Only k values where (t_out - k) % stride == 0 contribute
-    int r = t_out % stride;
-    for (int ic = 0; ic < in_channels; ic++) {
-        for (int k = r; k < kernel_size; k += stride) {
-            int t_in = (t_out - k) / stride;
-            if (t_in >= 0 && t_in < T_in) {
-                sum += weight[(ic * out_channels + oc) * kernel_size + k] *
-                       input[ic * T_in + t_in];
+    int r = (t_out < T_out) ? (t_out % stride) : 0;
+
+    // Tile over input channels
+    for (int ic_base = 0; ic_base < in_channels; ic_base += tile_ic) {
+        int ic_end = min(ic_base + tile_ic, in_channels);
+        int ic_count = ic_end - ic_base;
+        int smem_size = ic_count * kernel_size;
+
+        // Cooperatively load weights for this tile
+        for (int i = threadIdx.x; i < smem_size; i += blockDim.x) {
+            int ic_local = i / kernel_size;
+            int k = i % kernel_size;
+            int ic = ic_base + ic_local;
+            tc_smem[i] = weight[(ic * out_channels + oc) * kernel_size + k];
+        }
+        __syncthreads();
+
+        if (t_out < T_out) {
+            for (int ic_local = 0; ic_local < ic_count; ic_local++) {
+                const float* w = tc_smem + ic_local * kernel_size;
+                int ic = ic_base + ic_local;
+                for (int k = r; k < kernel_size; k += stride) {
+                    int t_in = (t_out - k) / stride;
+                    if (t_in >= 0 && t_in < T_in) {
+                        sum += w[k] * input[ic * T_in + t_in];
+                    }
+                }
             }
         }
+        __syncthreads();
     }
-    output[oc * T_out + t_out] = sum;
+
+    if (t_out < T_out) {
+        output[oc * T_out + t_out] = sum;
+    }
 }
 
 // ---------- SnakeBeta activation (fast math) ----------
@@ -161,6 +189,26 @@ __global__ void snake_beta_kernel(
     float val = x[ch * T + t];
     float s = __sinf(val * a);
     x[ch * T + t] = val + (1.0f / (b + 1e-9f)) * s * s;
+}
+
+// Out-of-place SnakeBeta: reads from input, writes to output
+__global__ void snake_beta_oop_kernel(
+    float* __restrict__ output,           // [channels, T]
+    const float* __restrict__ input,      // [channels, T]
+    const float* __restrict__ alpha,      // [channels]
+    const float* __restrict__ beta,       // [channels]
+    int channels, int T)
+{
+    int ch = blockIdx.x;
+    int t = blockIdx.y * blockDim.x + threadIdx.x;
+    if (ch >= channels || t >= T) return;
+
+    constexpr float LOG2E = 1.4426950408889634f;
+    float a = exp2f(alpha[ch] * LOG2E);
+    float b = exp2f(beta[ch] * LOG2E);
+    float val = input[ch * T + t];
+    float s = __sinf(val * a);
+    output[ch * T + t] = val + (1.0f / (b + 1e-9f)) * s * s;
 }
 
 // ---------- RMSNorm (F32) ----------
@@ -559,6 +607,25 @@ bool SpeechTokenizerDecoder::load_weights(
         lw.up_proj_w = load_f32(p + "mlp.up_proj.weight");
         lw.down_proj_w = load_f32(p + "mlp.down_proj.weight");
         lw.mlp_layer_scale = load_f32(p + "mlp_layer_scale.scale");
+
+        // Merge QKV: [q(1024,512); k(1024,512); v(1024,512)] → [3072, 512]
+        int qkv_dim = config_.num_attention_heads * config_.head_dim;  // 1024
+        int h = config_.hidden_size;  // 512
+        cudaMalloc(&lw.qkv_proj_w, 3 * qkv_dim * h * sizeof(float));
+        cudaMemcpy(lw.qkv_proj_w, lw.q_proj_w, qkv_dim * h * sizeof(float), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(lw.qkv_proj_w + qkv_dim * h, lw.k_proj_w, qkv_dim * h * sizeof(float), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(lw.qkv_proj_w + 2 * qkv_dim * h, lw.v_proj_w, qkv_dim * h * sizeof(float), cudaMemcpyDeviceToDevice);
+        cudaFree(lw.q_proj_w); lw.q_proj_w = nullptr;
+        cudaFree(lw.k_proj_w); lw.k_proj_w = nullptr;
+        cudaFree(lw.v_proj_w); lw.v_proj_w = nullptr;
+
+        // Merge GateUp: [gate(1024,512); up(1024,512)] → [2048, 512]
+        int inter = config_.intermediate_size;  // 1024
+        cudaMalloc(&lw.gate_up_proj_w, 2 * inter * h * sizeof(float));
+        cudaMemcpy(lw.gate_up_proj_w, lw.gate_proj_w, inter * h * sizeof(float), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(lw.gate_up_proj_w + inter * h, lw.up_proj_w, inter * h * sizeof(float), cudaMemcpyDeviceToDevice);
+        cudaFree(lw.gate_proj_w); lw.gate_proj_w = nullptr;
+        cudaFree(lw.up_proj_w); lw.up_proj_w = nullptr;
     }
 
     // ===== Upsample =====
@@ -784,16 +851,16 @@ void SpeechTokenizerDecoder::transformer_layer_forward(
     rms_norm_f32_kernel<<<T, block_dim, block_dim * sizeof(float), s>>>(
         norm_out, hidden, w.input_layernorm_w, h, config_.rms_norm_eps);
 
-    // 2. QKV projections: [T, h] → [T, total_qkv_dim]
-    cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                total_qkv_dim, T, h, &alpha,
-                w.q_proj_w, h, norm_out, h, &beta_val, q, total_qkv_dim);
-    cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                total_qkv_dim, T, h, &alpha,
-                w.k_proj_w, h, norm_out, h, &beta_val, k, total_qkv_dim);
-    cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                total_qkv_dim, T, h, &alpha,
-                w.v_proj_w, h, norm_out, h, &beta_val, v, total_qkv_dim);
+    // 2. Merged QKV projection: 3× [T, h] → [T, total_qkv_dim] via single batched GEMM
+    cublasSgemmStridedBatched(cublas_,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        total_qkv_dim, T, h,
+        &alpha,
+        w.qkv_proj_w, h, (long long)total_qkv_dim * h,  // Q/K/V weight blocks
+        norm_out, h, 0,                                   // same input
+        &beta_val,
+        q, total_qkv_dim, (long long)T * total_qkv_dim,  // output to q, k, v contiguously
+        3);
 
     // 3. Apply RoPE (standard half-rotation with theta=10000)
     int num_pairs = total_qkv_dim / 2;
@@ -873,13 +940,16 @@ void SpeechTokenizerDecoder::transformer_layer_forward(
     rms_norm_f32_kernel<<<T, block_dim, block_dim * sizeof(float), s>>>(
         norm_out, hidden, w.post_attention_layernorm_w, h, config_.rms_norm_eps);
 
-    // 10. SwiGLU MLP: gate = norm @ gate_proj, up = norm @ up_proj
-    cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                inter, T, h, &alpha,
-                w.gate_proj_w, h, norm_out, h, &beta_val, gate_out, inter);
-    cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                inter, T, h, &alpha,
-                w.up_proj_w, h, norm_out, h, &beta_val, up_out, inter);
+    // 10. SwiGLU MLP: merged gate+up projection via single batched GEMM
+    cublasSgemmStridedBatched(cublas_,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        inter, T, h,
+        &alpha,
+        w.gate_up_proj_w, h, (long long)inter * h,       // gate/up weight blocks
+        norm_out, h, 0,                                    // same input
+        &beta_val,
+        gate_out, inter, (long long)T * inter,             // output to gate, up contiguously
+        2);
 
     // SiLU-gate
     silu_gate_kernel<<<(T * inter + 255) / 256, 256, 0, s>>>(
@@ -974,10 +1044,11 @@ void SpeechTokenizerDecoder::run_upsample(
 
         // ConvTranspose1d: [dim, T] → [dim, T_new], no padding (kernel=stride)
         dim3 grid(dim, (T_new + 255) / 256);
-        causal_transconv1d_kernel<<<grid, 256, 0, s>>>(
+        int tc_smem = dim * factor * sizeof(float);
+        causal_transconv1d_kernel<<<grid, 256, tc_smem, s>>>(
             stage_out, stage_in, upsample_[stage].transconv_w,
             upsample_[stage].transconv_b,
-            dim, dim, factor, factor, T, T_new);
+            dim, dim, factor, factor, T, T_new, dim);
 
         // ConvNeXt block: residual around the whole block
         auto& cn = upsample_[stage].convnext;
@@ -1078,6 +1149,11 @@ void SpeechTokenizerDecoder::run_bigvgan(
     float* buf_a = conv_out;
     int in_dim = dec_dim;
 
+    // Per-stage timing
+    cudaEvent_t ev_stage[5];
+    for (int i = 0; i < 5; i++) cudaEventCreate(&ev_stage[i]);
+    cudaEventRecord(ev_stage[0], s);
+
     // 4 decoder stages
     for (int stage = 0; stage < 4; stage++) {
         int upsample_rate = config_.upsample_rates[stage];  // [8, 5, 4, 3]
@@ -1096,11 +1172,14 @@ void SpeechTokenizerDecoder::run_bigvgan(
         float* buf_b = (float*)decode_pool_.alloc(out_size);
 
         // ConvTranspose1d: [in_dim, T] → [out_dim, T_new] (right-crop = kernel - stride)
+        // Tile input channels to fit SMEM (48KB max per block)
+        int tc_tile_ic = std::min(in_dim, (int)(48 * 1024 / (kernel * sizeof(float))));
+        int tc_smem = tc_tile_ic * kernel * sizeof(float);
         dim3 tc_grid(out_dim, (T_new + 255) / 256);
-        causal_transconv1d_kernel<<<tc_grid, 256, 0, s>>>(
+        causal_transconv1d_kernel<<<tc_grid, 256, tc_smem, s>>>(
             buf_b, buf_a, decoder_stages_[stage].transconv_w,
             decoder_stages_[stage].transconv_b,
-            in_dim, out_dim, kernel, upsample_rate, T, T_new);
+            in_dim, out_dim, kernel, upsample_rate, T, T_new, tc_tile_ic);
 
         // Free input buffer (no longer needed after transconv reads it)
         decode_pool_.free(buf_a);
@@ -1110,39 +1189,33 @@ void SpeechTokenizerDecoder::run_bigvgan(
         float* temp_buf = (float*)decode_pool_.alloc(out_size);
 
         // 3 ResBlocks with dilations [1, 3, 9]
+        // Uses out-of-place SnakeBeta1 to preserve buf_b as residual (no memcpy needed)
         for (int r = 0; r < 3; r++) {
             auto& rb = decoder_stages_[stage].res_blocks[r];
             int dil = dilations[r];
-
-            // Save residual
-            cudaMemcpyAsync(res_buf, buf_b, out_size, cudaMemcpyDeviceToDevice, s);
-
-            // SnakeBeta1 (in-place on buf_b)
             dim3 sb1(out_dim, (T_new + 255) / 256);
-            snake_beta_kernel<<<sb1, 256, 0, s>>>(
-                buf_b, rb.act1_alpha, rb.act1_beta, out_dim, T_new);
+
+            // SnakeBeta1 (out-of-place: buf_b → temp_buf, buf_b preserved as residual)
+            snake_beta_oop_kernel<<<sb1, 256, 0, s>>>(
+                temp_buf, buf_b, rb.act1_alpha, rb.act1_beta, out_dim, T_new);
 
             // Conv1 (dilated): [out_dim, T_new] → [out_dim, T_new]
             dim3 c1_grid(out_dim, (T_new + 255) / 256);
             int smem_c1 = out_dim * 7 * sizeof(float);
             causal_conv1d_kernel<<<c1_grid, 256, smem_c1, s>>>(
-                temp_buf, buf_b, rb.conv1_w, rb.conv1_b,
+                res_buf, temp_buf, rb.conv1_w, rb.conv1_b,
                 out_dim, out_dim, 7, T_new, T_new, dil, 1);
 
-            // SnakeBeta2 (in-place on temp_buf)
+            // SnakeBeta2 (in-place on res_buf)
             snake_beta_kernel<<<sb1, 256, 0, s>>>(
-                temp_buf, rb.act2_alpha, rb.act2_beta, out_dim, T_new);
+                res_buf, rb.act2_alpha, rb.act2_beta, out_dim, T_new);
 
-            // Conv2 (k=1): [out_dim, T_new] → [out_dim, T_new]
+            // Conv2 (k=1) + fused residual add: buf_b = conv2(res_buf) + buf_b
             dim3 c2_grid(out_dim, (T_new + 255) / 256);
             int smem_c2 = out_dim * 1 * sizeof(float);
             causal_conv1d_kernel<<<c2_grid, 256, smem_c2, s>>>(
-                buf_b, temp_buf, rb.conv2_w, rb.conv2_b,
-                out_dim, out_dim, 1, T_new, T_new, 1, 1);
-
-            // Residual add
-            int total = out_dim * T_new;
-            add_kernel<<<(total + 255) / 256, 256, 0, s>>>(buf_b, res_buf, total);
+                buf_b, res_buf, rb.conv2_w, rb.conv2_b,
+                out_dim, out_dim, 1, T_new, T_new, 1, 1, buf_b);
         }
 
         // Free ResBlock temp buffers
@@ -1153,6 +1226,7 @@ void SpeechTokenizerDecoder::run_bigvgan(
         buf_a = buf_b;
         in_dim = out_dim;
         T = T_new;
+        cudaEventRecord(ev_stage[stage + 1], s);
     }
 
     // Final: SnakeBeta(96) + Conv1d(96→1, k=7)
@@ -1172,6 +1246,17 @@ void SpeechTokenizerDecoder::run_bigvgan(
 
     // Clamp to [-1, 1]
     clamp_kernel<<<(T + 255) / 256, 256, 0, s>>>(output, T, -1.0f, 1.0f);
+
+    // Print stage timing
+    cudaStreamSynchronize(s);
+    float stage_ms[4];
+    for (int i = 0; i < 4; i++) {
+        cudaEventElapsedTime(&stage_ms[i], ev_stage[i], ev_stage[i+1]);
+    }
+    fprintf(stderr, "[BigVGAN Profile] Stage0(1536→768,×8)=%.1fms Stage1(768→384,×5)=%.1fms "
+            "Stage2(384→192,×4)=%.1fms Stage3(192→96,×3)=%.1fms\n",
+            stage_ms[0], stage_ms[1], stage_ms[2], stage_ms[3]);
+    for (int i = 0; i < 5; i++) cudaEventDestroy(ev_stage[i]);
 
     T_out = T;
 }
@@ -1286,33 +1371,57 @@ std::vector<float> SpeechTokenizerDecoder::decode(
     std::vector<float> pcm;
     if (num_frames <= config_.chunk_size + config_.left_context_size) {
         // Small enough to decode in one shot
+        cudaEvent_t ev_start, ev_rvq, ev_preconv, ev_pt, ev_up, ev_bvg;
+        cudaEventCreate(&ev_start); cudaEventCreate(&ev_rvq);
+        cudaEventCreate(&ev_preconv); cudaEventCreate(&ev_pt);
+        cudaEventCreate(&ev_up); cudaEventCreate(&ev_bvg);
+        cudaEventRecord(ev_start, s);
+
         float* latent = (float*)decode_pool_.alloc(config_.codebook_dim * num_frames * sizeof(float));
         rvq_dequant(d_codes, num_frames, latent, s);
+        cudaEventRecord(ev_rvq, s);
         debug_tensor("rvq_dequant", latent, std::min(config_.codebook_dim * num_frames, 1000), s);
 
         float* pre_conv_out = (float*)decode_pool_.alloc(config_.latent_dim * num_frames * sizeof(float));
         run_pre_conv(latent, num_frames, pre_conv_out, s);
+        cudaEventRecord(ev_preconv, s);
         debug_tensor("pre_conv", pre_conv_out, std::min(config_.latent_dim * num_frames, 1000), s);
 
         float* pt_out = (float*)decode_pool_.alloc(config_.latent_dim * num_frames * sizeof(float));
         run_pre_transformer(pre_conv_out, num_frames, pt_out, s);
+        cudaEventRecord(ev_pt, s);
         debug_tensor("pre_transformer", pt_out, std::min(config_.latent_dim * num_frames, 1000), s);
 
         int T_up;
         int T_after_up = num_frames * 4;
         float* up_out = (float*)decode_pool_.alloc((size_t)config_.latent_dim * T_after_up * sizeof(float));
         run_upsample(pt_out, num_frames, up_out, T_up, s);
+        cudaEventRecord(ev_up, s);
         debug_tensor("upsample", up_out, std::min(config_.latent_dim * T_up, 1000), s);
 
         int T_pcm;
         int expected_pcm = num_frames * config_.decode_upsample_rate;
         float* pcm_out = (float*)decode_pool_.alloc((size_t)expected_pcm * sizeof(float));
         run_bigvgan(up_out, T_up, pcm_out, T_pcm, s);
+        cudaEventRecord(ev_bvg, s);
         debug_tensor("bigvgan_pcm", pcm_out, std::min(T_pcm, 1000), s);
 
         pcm.resize(T_pcm);
         cudaMemcpyAsync(pcm.data(), pcm_out, T_pcm * sizeof(float), cudaMemcpyDeviceToHost, s);
         cudaStreamSynchronize(s);
+
+        float ms_rvq, ms_preconv, ms_pt, ms_up, ms_bvg;
+        cudaEventElapsedTime(&ms_rvq, ev_start, ev_rvq);
+        cudaEventElapsedTime(&ms_preconv, ev_rvq, ev_preconv);
+        cudaEventElapsedTime(&ms_pt, ev_preconv, ev_pt);
+        cudaEventElapsedTime(&ms_up, ev_pt, ev_up);
+        cudaEventElapsedTime(&ms_bvg, ev_up, ev_bvg);
+        fprintf(stderr, "[Decoder Profile] T=%d: RVQ=%.1fms PreConv=%.1fms PreTransformer=%.1fms Upsample=%.1fms BigVGAN=%.1fms Total=%.1fms\n",
+                num_frames, ms_rvq, ms_preconv, ms_pt, ms_up, ms_bvg,
+                ms_rvq + ms_preconv + ms_pt + ms_up + ms_bvg);
+        cudaEventDestroy(ev_start); cudaEventDestroy(ev_rvq);
+        cudaEventDestroy(ev_preconv); cudaEventDestroy(ev_pt);
+        cudaEventDestroy(ev_up); cudaEventDestroy(ev_bvg);
 
         decode_pool_.free(latent);
         decode_pool_.free(pre_conv_out);
