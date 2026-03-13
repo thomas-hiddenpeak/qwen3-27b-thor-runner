@@ -206,6 +206,7 @@ static int cmd_serve(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--asr-enabled")       asr_config.enabled = true;
+        else if (arg == "--asr-mode"       && i + 1 < argc) asr_config.mode       = argv[++i];
         else if (arg == "--asr-executable" && i + 1 < argc) asr_config.executable = argv[++i];
         else if (arg == "--asr-model"      && i + 1 < argc) asr_config.model_path = argv[++i];
         else if (arg == "--asr-language"   && i + 1 < argc) asr_config.language   = argv[++i];

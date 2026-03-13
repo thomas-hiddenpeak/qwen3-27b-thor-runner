@@ -441,13 +441,31 @@ std::string ASREngine::transcribe(
     fprintf(stderr, "[ASR] Total: %.1f ms (encode %.0f + prefill %.0f + decode %.0f)\n",
             total_ms, encode_ms, prefill_ms, decode_ms);
 
-    // 10. Decode tokens to text
+    // 10. Decode tokens to text — skip "language XXX <asr_text>" header
     std::string result;
     if (!output_tokens.empty()) {
-        if (tokenizer_.is_loaded()) {
+        // Debug: print token IDs
+        fprintf(stderr, "[ASR] Token IDs (%zu):", output_tokens.size());
+        for (auto id : output_tokens) fprintf(stderr, " %d", id);
+        fprintf(stderr, "\n");
+
+        // Find <asr_text> marker (token 151704) and only decode tokens after it
+        static constexpr int ASR_TEXT_TOKEN = 151704;
+        size_t text_start = 0;
+        for (size_t i = 0; i < output_tokens.size(); i++) {
+            if (output_tokens[i] == ASR_TEXT_TOKEN) {
+                text_start = i + 1;
+                break;
+            }
+        }
+
+        if (text_start < output_tokens.size() && tokenizer_.is_loaded()) {
+            std::vector<int> text_tokens(output_tokens.begin() + text_start,
+                                          output_tokens.end());
+            result = tokenizer_.decode(text_tokens);
+        } else if (tokenizer_.is_loaded()) {
             result = tokenizer_.decode(output_tokens);
         } else {
-            // Fallback: return token IDs as string
             result = "[" + std::to_string(output_tokens.size()) + " tokens]";
         }
     }

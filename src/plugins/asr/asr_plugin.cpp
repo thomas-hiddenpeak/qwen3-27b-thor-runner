@@ -1,6 +1,7 @@
 // asr_plugin.cpp — ASR 插件实现
 
 #include "asr_plugin.h"
+#include "asr_engine.h"
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -36,6 +37,7 @@ AsrConfig AsrConfig::from_file(const std::string& path) {
         while (!key.empty() && key.front() == ' ') key.erase(key.begin());
 
         if (key == "asr_enabled")     config.enabled    = (val == "true" || val == "1");
+        else if (key == "asr_mode")       config.mode       = val;
         else if (key == "asr_executable") config.executable = val;
         else if (key == "asr_model")      config.model_path = val;
         else if (key == "asr_language")   config.language   = val;
@@ -49,6 +51,7 @@ AsrConfig AsrConfig::from_file(const std::string& path) {
 void AsrConfig::print() const {
     fprintf(stderr, "[ASR Config]\n");
     fprintf(stderr, "  enabled:    %s\n", enabled ? "true" : "false");
+    fprintf(stderr, "  mode:       %s\n", mode.c_str());
     fprintf(stderr, "  executable: %s\n", executable.c_str());
     fprintf(stderr, "  model:      %s\n", model_path.c_str());
     fprintf(stderr, "  language:   %s\n", language.c_str());
@@ -190,11 +193,79 @@ AsrResult SubprocessAsrPlugin::transcribe(const std::string& audio_path,
 }
 
 // ============================================================================
+// NativeAsrPlugin — 使用内置 Qwen3-ASR 引擎
+// ============================================================================
+
+NativeAsrPlugin::NativeAsrPlugin(const AsrConfig& config)
+    : config_(config) {
+    engine_ = std::make_unique<asr::ASREngine>();
+    fprintf(stderr, "[ASR Native] Loading model from %s...\n", config.model_path.c_str());
+    engine_->load_model(config.model_path);
+    fprintf(stderr, "[ASR Native] Model loaded\n");
+}
+
+NativeAsrPlugin::~NativeAsrPlugin() = default;
+
+bool NativeAsrPlugin::is_available() const {
+    return engine_ && engine_->is_loaded();
+}
+
+AsrResult NativeAsrPlugin::transcribe(const std::string& audio_path,
+                                       const std::string& language) {
+    AsrResult result;
+
+    if (!is_available()) {
+        result.error_code = 1;
+        result.error_message = "ASR engine not loaded";
+        return result;
+    }
+
+    if (!std::filesystem::exists(audio_path)) {
+        result.error_code = 2;
+        result.error_message = "Audio file not found: " + audio_path;
+        return result;
+    }
+
+    // Serialize access — ASR engine is not thread-safe (single GPU stream)
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    std::string text = engine_->transcribe_file(audio_path);
+
+    auto t1 = std::chrono::steady_clock::now();
+    float elapsed_s = std::chrono::duration<float>(t1 - t0).count();
+
+    if (text.empty()) {
+        result.error_code = 3;
+        result.error_message = "ASR transcription produced no text";
+        return result;
+    }
+
+    // Engine already does token-level extraction (only decodes tokens after <asr_text> marker).
+    // Just trim whitespace.
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\n')) text.erase(text.begin());
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\n')) text.pop_back();
+
+    result.text = text;
+    result.language = language;
+    result.duration_s = elapsed_s;
+
+    fprintf(stderr, "[ASR Native] Transcribed in %.2fs: \"%s\"\n",
+            elapsed_s, text.substr(0, 100).c_str());
+
+    return result;
+}
+
+// ============================================================================
 // 工厂
 // ============================================================================
 
 std::unique_ptr<AsrPlugin> create_asr_plugin(const AsrConfig& config) {
     if (!config.enabled) return nullptr;
+    if (config.mode == "native" && !config.model_path.empty()) {
+        return std::make_unique<NativeAsrPlugin>(config);
+    }
     return std::make_unique<SubprocessAsrPlugin>(config);
 }
 

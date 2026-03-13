@@ -258,17 +258,18 @@ void compute_mel(const float* samples, int num_samples,
         }
     }
 
-    // Log-mel + Whisper 归一化
+    // Log-mel + Whisper normalization (matching WhisperFeatureExtractor)
     float max_val = -1e20f;
     for (auto& v : mel_spec) {
         v = std::log10(std::max(v, 1e-10f));
         max_val = std::max(max_val, v);
     }
 
-    float clamp_max = std::max(max_val, -8.0f);
+    // Clamp floor to max_val - 8 (80 dB dynamic range), then normalize
+    float floor_val = max_val - 8.0f;
     for (auto& v : mel_spec) {
-        v = (v - clamp_max) / (clamp_max > 0 ? clamp_max : -clamp_max + 1e-10f);
-        v = std::max(v + 4.0f, 0.0f);
+        v = std::max(v, floor_val);
+        v = (v + 4.0f) / 4.0f;
     }
 
     mel_out = std::move(mel_spec);

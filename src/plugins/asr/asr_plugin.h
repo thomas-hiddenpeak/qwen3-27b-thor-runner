@@ -18,6 +18,10 @@
 #include <vector>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+
+// Forward declarations
+namespace qwen_thor { namespace asr { class ASREngine; } }
 
 namespace qwen_thor {
 namespace plugins {
@@ -27,8 +31,9 @@ namespace plugins {
 // ============================================================================
 struct AsrConfig {
     bool        enabled     = false;
-    std::string executable;           // ASR 可执行文件路径
-    std::string model_path;           // ASR 模型路径
+    std::string mode        = "subprocess"; // "native" 或 "subprocess"
+    std::string executable;           // ASR 可执行文件路径 (subprocess only)
+    std::string model_path;           // ASR 模型目录 (native) 或模型文件 (subprocess)
     std::string language    = "auto"; // 默认语言 ("auto", "zh", "en", "ja", ...)
     int         threads     = 4;      // CPU 线程数
     std::string extra_args;           // 额外 CLI 参数 (直接追加到命令行)
@@ -83,6 +88,25 @@ public:
 
 private:
     AsrConfig config_;
+};
+
+// ============================================================================
+// 原生 ASR 实现 — 使用内置 Qwen3-ASR 引擎
+// ============================================================================
+class NativeAsrPlugin : public AsrPlugin {
+public:
+    explicit NativeAsrPlugin(const AsrConfig& config);
+    ~NativeAsrPlugin() override;
+
+    AsrResult transcribe(const std::string& audio_path,
+                         const std::string& language = "auto") override;
+    bool is_available() const override;
+    std::string name() const override { return "native-asr"; }
+
+private:
+    AsrConfig config_;
+    std::unique_ptr<asr::ASREngine> engine_;
+    std::mutex mutex_;
 };
 
 // 工厂: 根据配置创建 ASR 插件
