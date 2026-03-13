@@ -1426,8 +1426,22 @@ ServeConfig ServeConfig::from_file(const std::string& path) {
         else if (key == "model_name") cfg.model_name = val;
         else if (key == "timeout")    cfg.timeout_s = std::stoi(val);
         else if (key == "max_output_tokens") cfg.max_output_tokens_cap = std::stoi(val);
-        else if (key == "voice_system_prompt") cfg.voice_system_prompt = val;
+        else if (key == "voice_system_prompt") {
+            // Support \n escape for multi-line prompts in config
+            std::string parsed;
+            for (size_t i = 0; i < val.size(); i++) {
+                if (val[i] == '\\' && i + 1 < val.size() && val[i + 1] == 'n') {
+                    parsed += '\n';
+                    i++;
+                } else {
+                    parsed += val[i];
+                }
+            }
+            cfg.voice_system_prompt = parsed;
+        }
     }
+    // 保存 config 文件中的初始值作为 reset 基准
+    cfg.voice_system_prompt_default = cfg.voice_system_prompt;
     return cfg;
 }
 
@@ -4217,8 +4231,14 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             // System prompt (per-session override)
             if (msg.find("\"system_prompt\"") != std::string::npos) {
                 std::string sp = json_get_string(msg, "system_prompt");
-                config_.voice_system_prompt = sp;  // 空值 = 恢复默认
-                fprintf(stderr, "[WS] System prompt updated (%zu chars)\n", sp.size());
+                if (sp.empty()) {
+                    // 恢复到 config 文件中的默认值
+                    config_.voice_system_prompt = config_.voice_system_prompt_default;
+                } else {
+                    config_.voice_system_prompt = sp;
+                }
+                fprintf(stderr, "[WS] System prompt updated (%zu chars)\n",
+                        config_.voice_system_prompt.size());
             }
             // Language/dialect
             std::string lang = json_get_string(msg, "tts_language");
