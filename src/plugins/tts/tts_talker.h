@@ -208,6 +208,7 @@ private:
     int* decode_token_gpu_ = nullptr;                  // [1] for embedding lookup
     int* decode_pos_gpu_ = nullptr;                    // [3] for position IDs
     int* rep_ids_gpu_ = nullptr;                       // [max_new_tokens] for repetition penalty
+    int* codec_out_gpu_ = nullptr;                     // [16] GPU-resident codec tokens (eliminates CP sync overhead)
     // CodePredictor pre-allocated buffers
     __nv_bfloat16* cp_input_buf_ = nullptr;            // [2, talker_hidden_size]
     __nv_bfloat16* cp_hidden_buf_ = nullptr;           // [2, cp_hidden_size]

@@ -397,6 +397,22 @@ TtsResult NativeTtsPlugin::synthesize_continue(const std::string& text,
     return result;
 }
 
+int NativeTtsPlugin::synthesize_streaming(const std::string& text,
+                                           const std::string& voice,
+                                           PcmCallback callback,
+                                           int chunk_frames) {
+    if (!is_available() || !callback) return 0;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    std::string speaker = voice;
+    std::string language = "auto";
+
+    return engine_->synthesize_streaming(text, speaker, language,
+                                          config_.max_new_tokens,
+                                          chunk_frames, callback);
+}
+
 // ============================================================================
 // 工厂
 // ============================================================================

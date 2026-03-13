@@ -67,5 +67,15 @@ void invoke_sum_embeddings(__nv_bfloat16* output,
                            int num_embeddings, int hidden_size,
                            cudaStream_t stream = 0);
 
+// GPU-resident Top-K + Top-P sampling for small vocab (≤4096)
+// Performs temperature scaling, softmax, top-k, top-p, and sampling entirely on GPU.
+// Result is written to device memory — no CPU sync needed.
+// logits: [vocab_size] BF16 (NOT modified)
+// result: [1] int (device memory)
+void invoke_gpu_sample_top_k_top_p(const __nv_bfloat16* logits, int vocab_size,
+                                    int top_k, float top_p, float temperature,
+                                    int* result, unsigned long long seed,
+                                    cudaStream_t stream = 0);
+
 } // namespace tts
 } // namespace qwen_thor

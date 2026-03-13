@@ -456,6 +456,91 @@ std::vector<float> TTSEngine::synthesize_to_pcm(
 }
 
 // ============================================================================
+// Streaming synthesis: generate codec tokens and decode in chunks
+// First audio chunk arrives after chunk_frames * step_time + decode_time
+// instead of waiting for full generation + decode
+// ============================================================================
+
+int TTSEngine::synthesize_streaming(
+    const std::string& text,
+    const std::string& speaker,
+    const std::string& language,
+    int max_new_tokens,
+    int chunk_frames,
+    PcmCallback pcm_callback)
+{
+    if (!loaded_ || !st_decoder_ || !st_decoder_->is_loaded()) {
+        fprintf(stderr, "[TTS] ERROR: model not loaded\n");
+        return 0;
+    }
+    if (!pcm_callback) return 0;
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // 1. Tokenize text
+    auto text_tokens = build_text_tokens(text);
+    if (text_tokens.empty()) return 0;
+
+    // 2. Prefill
+    talker_->reset();
+    talker_->set_max_new_tokens(max_new_tokens);
+    talker_->build_prefill(text_tokens.data(), (int)text_tokens.size(),
+                           speaker, language, stream_);
+    talker_->forward_prefill(stream_);
+
+    int num_groups = config_.talker.num_code_groups;
+    std::vector<std::vector<int>> chunk_codes;
+    std::vector<int> codec_step(num_groups);
+    int total_steps = 0;
+    int total_pcm_samples = 0;
+    bool aborted = false;
+
+    // 3. Generate + decode in chunks
+    while (total_steps < max_new_tokens && !aborted) {
+        chunk_codes.clear();
+
+        // Generate chunk_frames codec frames
+        for (int f = 0; f < chunk_frames && total_steps < max_new_tokens; f++) {
+            int ret = talker_->forward_decode_step(codec_step.data(), stream_);
+            if (ret < 0) goto done;  // EOS
+            chunk_codes.push_back(codec_step);
+            total_steps++;
+        }
+
+        if (chunk_codes.empty()) break;
+
+        // Reshape chunk codes to [num_groups, T]
+        int T = (int)chunk_codes.size();
+        std::vector<int> codes_flat(num_groups * T);
+        for (int t = 0; t < T; t++) {
+            for (int g = 0; g < num_groups; g++) {
+                codes_flat[g * T + t] = chunk_codes[t][g];
+            }
+        }
+
+        // Decode chunk to PCM
+        auto pcm = st_decoder_->decode(codes_flat.data(), num_groups, T, stream_);
+
+        if (!pcm.empty()) {
+            total_pcm_samples += (int)pcm.size();
+            if (!pcm_callback(pcm.data(), (int)pcm.size())) {
+                aborted = true;
+            }
+        }
+    }
+
+done:
+    auto t_end = std::chrono::steady_clock::now();
+    float total_ms = std::chrono::duration<float, std::milli>(t_end - t0).count();
+    float audio_s = total_pcm_samples / (float)config_.tokenizer_decoder.output_sample_rate;
+    float rtf = audio_s > 0.0f ? audio_s / (total_ms / 1000.0f) : 0.0f;
+    fprintf(stderr, "[TTS] Streaming done: %d steps, %d samples (%.1fs audio), %.1f ms total (%.1fx realtime)\n",
+            total_steps, total_pcm_samples, audio_s, total_ms, rtf);
+
+    return total_pcm_samples;
+}
+
+// ============================================================================
 // Continue synthesis (preserve talker KV cache for voice consistency)
 // ============================================================================
 

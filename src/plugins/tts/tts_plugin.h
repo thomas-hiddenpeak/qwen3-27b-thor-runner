@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <functional>
 
 // Forward declarations
 namespace qwen_thor { namespace tts { class TTSEngine; } }
@@ -70,6 +71,14 @@ public:
     virtual TtsResult synthesize_continue(const std::string& text,
                                           const std::string& format = "pcm") = 0;
 
+    // Streaming synthesis: calls pcm_callback with PCM chunks as they become available
+    // Returns total PCM samples, 0 on failure. callback returns true to continue, false to abort.
+    using PcmCallback = std::function<bool(const float* data, int num_samples)>;
+    virtual int synthesize_streaming(const std::string& text,
+                                     const std::string& voice,
+                                     PcmCallback callback,
+                                     int chunk_frames = 24) { return 0; }
+
     virtual bool is_available() const = 0;
     virtual std::string name() const = 0;
 
@@ -91,6 +100,10 @@ public:
                          const std::string& format = "wav") override;
     TtsResult synthesize_continue(const std::string& text,
                                   const std::string& format = "pcm") override;
+    int synthesize_streaming(const std::string& text,
+                              const std::string& voice,
+                              PcmCallback callback,
+                              int chunk_frames = 24) override;
     bool is_available() const override;
     std::string name() const override { return "native-qwen3-tts"; }
     void set_sampling(float temperature, int top_k, float top_p, float rep_penalty) override;

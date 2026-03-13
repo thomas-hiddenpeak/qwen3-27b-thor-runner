@@ -93,6 +93,7 @@ Talker::~Talker() {
     if (decode_token_gpu_) cudaFree(decode_token_gpu_);
     if (decode_pos_gpu_) cudaFree(decode_pos_gpu_);
     if (rep_ids_gpu_) cudaFree(rep_ids_gpu_);
+    if (codec_out_gpu_) cudaFree(codec_out_gpu_);
     if (cp_input_buf_) cudaFree(cp_input_buf_);
     if (cp_hidden_buf_) cudaFree(cp_hidden_buf_);
     if (cp_embed_buf_) cudaFree(cp_embed_buf_);
@@ -212,6 +213,7 @@ void Talker::initialize(cudaStream_t stream) {
     cudaMalloc(&decode_token_gpu_, sizeof(int));
     cudaMalloc(&decode_pos_gpu_, 3 * sizeof(int));
     cudaMalloc(&rep_ids_gpu_, max_seq_len_ * sizeof(int));  // max tokens
+    cudaMalloc(&codec_out_gpu_, num_groups * sizeof(int));  // GPU-resident codec tokens
     // CodePredictor
     int talker_h = tc.hidden_size;
     int cp_h_sz = cp.hidden_size;
@@ -928,25 +930,20 @@ void Talker::run_code_predictor(
     cp_cache_len_ = 0;
 
     // Build CodePredictor prefill: [past_hidden, codec_embedding(group_0)]
-    // Shape: [2, talker_hidden_size] → projection → [2, cp_hidden_size]
-
     // Copy past_hidden (talker's last hidden state)
     cudaMemcpyAsync(cp_input_buf_, talker_hidden,
                     talker_h * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
 
-    // Lookup group_0 embedding from talker's codec_embedding
-    cudaMemcpyAsync(decode_token_gpu_, &group_0_id, sizeof(int), cudaMemcpyHostToDevice, stream);
-    audio_ops::invoke_embedding_lookup(cp_input_buf_ + talker_h, decode_token_gpu_,
+    // Lookup group_0 embedding — use GPU-resident token from codec_out_gpu_[0]
+    audio_ops::invoke_embedding_lookup(cp_input_buf_ + talker_h, codec_out_gpu_,
                                         codec_embedding_w_, 1, talker_h, stream);
 
-    // Project: [2, talker_h] → [2, cp_h] via small_to_mtp_projection
-    // For 0.6B: talker_h == cp_h, no projection needed
+    // Project: [2, talker_h] → [2, cp_h]
     if (cp_projection_w_) {
         cublas_gemm(cublas_handle_, cp_hidden_buf_, cp_input_buf_, cp_projection_w_,
                     2, talker_h, cp_h, stream);
         invoke_add_bias(cp_hidden_buf_, cp_projection_b_, 2, cp_h, stream);
     } else {
-        // No projection needed (0.6B: talker_h == cp_h == 1024)
         cudaMemcpyAsync(cp_hidden_buf_, cp_input_buf_,
                         2 * cp_h * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
     }
@@ -958,28 +955,23 @@ void Talker::run_code_predictor(
     cp_cache_len_ = 2;
 
     // RMSNorm + lm_head[0] on last token → logits for group 1
-    __nv_bfloat16* last_hidden = cp_hidden_buf_ + cp_h;  // last token
+    __nv_bfloat16* last_hidden = cp_hidden_buf_ + cp_h;
     __nv_bfloat16* cp_norm_out = workspace_;
     audio_ops::invoke_rmsnorm(cp_norm_out, last_hidden, cp_final_norm_w_,
                                cp.rms_norm_eps, 1, cp_h, stream);
     cublas_gemm(cublas_handle_, cp_logits_, cp_norm_out, cp_lm_heads_[0],
                 1, cp_h, cp.vocab_size, stream);
 
-    // Sample group 1
+    // Sample group 1 — GPU-resident, no sync (result → codec_out_gpu_[1])
     static std::mt19937_64 cp_rng(42);
-    invoke_sample_top_k_top_p(cp_logits_, cp.vocab_size,
-                               sub_top_k_, sub_top_p_, sub_temperature_,
-                               sampled_token_, cp_rng(), stream);
-    cudaStreamSynchronize(stream);
-    codec_out[0] = sampled_token_[0];
+    invoke_gpu_sample_top_k_top_p(cp_logits_, cp.vocab_size,
+                                   sub_top_k_, sub_top_p_, sub_temperature_,
+                                   codec_out_gpu_ + 1, cp_rng(), stream);
 
-    // Decode groups 2-15 autoregressively
+    // Decode groups 2-15 autoregressively — fully GPU-resident, zero intermediate syncs
     for (int g = 1; g < num_groups; g++) {
-        int prev_token = codec_out[g - 1];
-        cudaMemcpyAsync(decode_token_gpu_, &prev_token, sizeof(int), cudaMemcpyHostToDevice, stream);
-
-        // Lookup from cp_codec_embeddings_[g-1] (embedding in talker_h space)
-        audio_ops::invoke_embedding_lookup(cp_embed_buf_, decode_token_gpu_,
+        // Lookup embedding from GPU-resident previous token (codec_out_gpu_[g])
+        audio_ops::invoke_embedding_lookup(cp_embed_buf_, codec_out_gpu_ + g,
                                             cp_codec_embeddings_[g - 1], 1, talker_h, stream);
 
         // Project to cp_h
@@ -998,19 +990,21 @@ void Talker::run_code_predictor(
         }
         cp_cache_len_++;
 
-        // RMSNorm + lm_head[g] → logits for group g+1
+        // RMSNorm + lm_head[g]
         audio_ops::invoke_rmsnorm(cp_norm_out, cp_decode_hidden_, cp_final_norm_w_,
                                    cp.rms_norm_eps, 1, cp_h, stream);
         cublas_gemm(cublas_handle_, cp_logits_, cp_norm_out, cp_lm_heads_[g],
                     1, cp_h, cp.vocab_size, stream);
 
-        // Sample
-        invoke_sample_top_k_top_p(cp_logits_, cp.vocab_size,
-                                   sub_top_k_, sub_top_p_, sub_temperature_,
-                                   sampled_token_, cp_rng(), stream);
-        cudaStreamSynchronize(stream);
-        codec_out[g] = sampled_token_[0];
+        // GPU-resident sampling — result → codec_out_gpu_[g+1]
+        invoke_gpu_sample_top_k_top_p(cp_logits_, cp.vocab_size,
+                                       sub_top_k_, sub_top_p_, sub_temperature_,
+                                       codec_out_gpu_ + g + 1, cp_rng(), stream);
     }
+
+    // Single sync + batch copy all 15 codec tokens to CPU
+    cudaStreamSynchronize(stream);
+    cudaMemcpy(codec_out, codec_out_gpu_ + 1, num_groups * sizeof(int), cudaMemcpyDeviceToHost);
 }
 
 // ============================================================================
@@ -1087,15 +1081,18 @@ int Talker::forward_decode_step(int* codec_out, cudaStream_t stream) {
                                    rep_penalty_, stream);
     }
 
-    // Step 2: Sample group 0
+    // Step 2: Sample group 0 (needs CPU sync for EOS check + rep_penalty tracking)
     static std::mt19937_64 talker_rng(12345);
     invoke_sample_top_k_top_p(logits_, tc.vocab_size,
                                top_k_, top_p_, temperature_,
                                sampled_token_, talker_rng(), stream);
-    cudaStreamSynchronize(stream);
+    // invoke_sample_top_k_top_p already syncs internally
 
     int group_0_id = sampled_token_[0];
     codec_out[0] = group_0_id;
+
+    // Store group_0 on GPU for CodePredictor embedding lookup
+    cudaMemcpyAsync(codec_out_gpu_, &group_0_id, sizeof(int), cudaMemcpyHostToDevice, stream);
 
     // Check EOS
     if (group_0_id == tc.codec_eos_token_id) {
@@ -1105,20 +1102,18 @@ int Talker::forward_decode_step(int* codec_out, cudaStream_t stream) {
     // Track for repetition penalty
     generated_tokens_.push_back(group_0_id);
 
-    // Step 3: Run CodePredictor to generate groups 1-15
+    // Step 3: Run CodePredictor to generate groups 1-15 (GPU-resident, single sync)
     run_code_predictor(past_hidden_, group_0_id, codec_out + 1, stream);
 
-    // Step 4: Combine all 16 group embeddings
-    // Group 0: codec_embedding(group_0_id)
-    cudaMemcpyAsync(decode_token_gpu_, &group_0_id, sizeof(int), cudaMemcpyHostToDevice, stream);
-    audio_ops::invoke_embedding_lookup(decode_all_embeds_, decode_token_gpu_,
+    // Step 4: Combine all 16 group embeddings using GPU-resident tokens
+    // Group 0: use codec_out_gpu_[0]
+    audio_ops::invoke_embedding_lookup(decode_all_embeds_, codec_out_gpu_,
                                         codec_embedding_w_, 1, h, stream);
 
-    // Groups 1-15: cp_codec_embeddings_[g]
+    // Groups 1-15: use codec_out_gpu_[1..15] — no H2D roundtrips
     for (int g = 0; g < num_groups - 1; g++) {
-        int token = codec_out[g + 1];
-        cudaMemcpyAsync(decode_token_gpu_, &token, sizeof(int), cudaMemcpyHostToDevice, stream);
-        audio_ops::invoke_embedding_lookup(decode_all_embeds_ + (g + 1) * h, decode_token_gpu_,
+        audio_ops::invoke_embedding_lookup(decode_all_embeds_ + (g + 1) * h,
+                                            codec_out_gpu_ + g + 1,
                                             cp_codec_embeddings_[g], 1, h, stream);
     }
 

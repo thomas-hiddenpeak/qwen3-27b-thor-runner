@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <functional>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
@@ -63,6 +64,19 @@ public:
         const std::string& language = "auto",
         const std::string& instruct = "",
         int max_new_tokens = 4096);
+
+    // Streaming synthesis: generate and decode audio in chunks
+    // Calls pcm_callback with PCM chunks as they become available
+    // Returns total number of PCM samples generated, 0 on failure
+    // pcm_callback receives (data, num_samples) and returns true to continue, false to abort
+    using PcmCallback = std::function<bool(const float* data, int num_samples)>;
+    int synthesize_streaming(
+        const std::string& text,
+        const std::string& speaker = "serena",
+        const std::string& language = "auto",
+        int max_new_tokens = 4096,
+        int chunk_frames = 24,
+        PcmCallback pcm_callback = nullptr);
 
     // Continue synthesis: inject new text and continue decoding without resetting
     // Preserves talker KV cache for voice consistency across segments

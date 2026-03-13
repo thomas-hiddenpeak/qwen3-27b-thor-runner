@@ -4234,12 +4234,19 @@ void ServeApp::ws_voice_generate(int client_fd,
                     tts_queue.pop();
                 }
 
-                auto result = tts_raw->synthesize(sentence, voice, 1.0f, "pcm");
-
-                if (result.error_code == 0 && !result.audio_data.empty()) {
-                    safe_send_binary(result.audio_data.data(), result.audio_data.size());
-                    tts_segment_idx++;
-                }
+                tts_raw->synthesize_streaming(sentence, voice,
+                    [&](const float* data, int num_samples) -> bool {
+                        // Convert float PCM to PCM16LE
+                        std::vector<int16_t> pcm16(num_samples);
+                        for (int i = 0; i < num_samples; i++) {
+                            float v = std::max(-1.0f, std::min(1.0f, data[i]));
+                            pcm16[i] = (int16_t)(v * 32767.0f);
+                        }
+                        safe_send_binary(reinterpret_cast<const uint8_t*>(pcm16.data()),
+                                         pcm16.size() * sizeof(int16_t));
+                        return true;
+                    }, 24);
+                tts_segment_idx++;
             }
         });
     }
@@ -4706,22 +4713,26 @@ void ServeApp::process_text_input(
                 }
                 if (interrupted) break;
 
-                auto result = tts_raw->synthesize(sentence, voice, 1.0f, "pcm");
-
-                if (interrupted) break;
-                if (result.error_code != 0 || result.audio_data.empty()) continue;
-
-                // 分块发送音频 (200ms 一帧, 而不是一次性全发)
-                const uint8_t* ptr = result.audio_data.data();
-                size_t remaining = result.audio_data.size();
-                const size_t chunk_bytes = AUDIO_CHUNK_SAMPLES * 2;  // PCM16 = 2 bytes/sample
-
-                while (remaining > 0 && !interrupted) {
-                    size_t send_size = std::min(remaining, chunk_bytes);
-                    send_audio(ptr, send_size);
-                    ptr += send_size;
-                    remaining -= send_size;
-                }
+                tts_raw->synthesize_streaming(sentence, voice,
+                    [&](const float* data, int num_samples) -> bool {
+                        if (interrupted) return false;
+                        // Convert float PCM to PCM16LE, send in 200ms chunks
+                        std::vector<int16_t> pcm16(num_samples);
+                        for (int i = 0; i < num_samples; i++) {
+                            float v = std::max(-1.0f, std::min(1.0f, data[i]));
+                            pcm16[i] = (int16_t)(v * 32767.0f);
+                        }
+                        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(pcm16.data());
+                        size_t remaining = pcm16.size() * sizeof(int16_t);
+                        const size_t chunk_bytes = AUDIO_CHUNK_SAMPLES * 2;
+                        while (remaining > 0 && !interrupted) {
+                            size_t send_size = std::min(remaining, chunk_bytes);
+                            send_audio(ptr, send_size);
+                            ptr += send_size;
+                            remaining -= send_size;
+                        }
+                        return !interrupted;
+                    }, 24);
             }
         });
     }

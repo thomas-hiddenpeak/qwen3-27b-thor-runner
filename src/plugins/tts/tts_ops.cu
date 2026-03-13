@@ -353,5 +353,154 @@ void invoke_suppress_tokens(__nv_bfloat16* logits, int start, int end,
         logits, start, end, keep_id);
 }
 
+// ============================================================================
+// GPU-Resident Top-K/Top-P Sampling for Small Vocab (≤4096)
+//
+// Performs temperature scaling, softmax, top-k selection, top-p filtering,
+// and random sampling entirely on GPU — no CPU sync required.
+// Result is written to device memory for direct use by subsequent kernels.
+// ============================================================================
+
+__global__ void gpu_sample_top_k_top_p_kernel(
+    const __nv_bfloat16* __restrict__ logits,
+    int vocab_size,
+    int top_k,
+    float top_p,
+    float inv_temperature,
+    int* __restrict__ result,
+    unsigned long long seed)
+{
+    extern __shared__ float smem[];
+    const int tid = threadIdx.x;
+    const int bdim = blockDim.x;
+
+    // Phase 1: Load logits → SMEM with temperature scaling, find max
+    float local_max = -FLT_MAX;
+    for (int i = tid; i < vocab_size; i += bdim) {
+        float v = __bfloat162float(logits[i]) * inv_temperature;
+        smem[i] = v;
+        local_max = fmaxf(local_max, v);
+    }
+
+    // Warp reduce max
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+
+    __shared__ float s_reduce[8];
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    if (lane_id == 0) s_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float m = s_reduce[0];
+        for (int i = 1; i < (bdim + 31) / 32; i++) m = fmaxf(m, s_reduce[i]);
+        s_reduce[0] = m;
+    }
+    __syncthreads();
+    float block_max = s_reduce[0];
+
+    // Phase 2: exp(x - max) and compute sum
+    float local_sum = 0.0f;
+    for (int i = tid; i < vocab_size; i += bdim) {
+        float v = expf(smem[i] - block_max);
+        smem[i] = v;
+        local_sum += v;
+    }
+
+    // Warp reduce sum
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    if (lane_id == 0) s_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float s = 0.0f;
+        for (int i = 0; i < (bdim + 31) / 32; i++) s += s_reduce[i];
+        s_reduce[0] = s;
+    }
+    __syncthreads();
+    float block_sum = s_reduce[0];
+
+    // Phase 3: Normalize to probabilities
+    for (int i = tid; i < vocab_size; i += bdim) {
+        smem[i] /= block_sum;
+    }
+    __syncthreads();
+
+    // Phase 4: Thread 0 does top-k selection, top-p filtering, and sampling
+    if (tid == 0) {
+        int k = top_k;
+        if (k <= 0 || k > vocab_size) k = vocab_size;
+        if (k > 64) k = 64;
+
+        float top_probs[64];
+        int top_ids[64];
+
+        // Iterative top-k selection: find k largest probabilities
+        for (int j = 0; j < k; j++) {
+            float best = -1.0f;
+            int best_id = 0;
+            for (int i = 0; i < vocab_size; i++) {
+                if (smem[i] > best) {
+                    best = smem[i];
+                    best_id = i;
+                }
+            }
+            top_probs[j] = best;
+            top_ids[j] = best_id;
+            smem[best_id] = -1.0f;
+        }
+
+        // Renormalize top-k
+        float renorm_sum = 0.0f;
+        for (int i = 0; i < k; i++) renorm_sum += top_probs[i];
+        if (renorm_sum > 0.0f) {
+            for (int i = 0; i < k; i++) top_probs[i] /= renorm_sum;
+        }
+
+        // Top-P nucleus filtering
+        int nucleus = k;
+        if (top_p < 1.0f && top_p > 0.0f) {
+            float cum = 0.0f;
+            for (int i = 0; i < k; i++) {
+                cum += top_probs[i];
+                if (cum >= top_p) { nucleus = i + 1; break; }
+            }
+            // Renormalize nucleus
+            renorm_sum = 0.0f;
+            for (int i = 0; i < nucleus; i++) renorm_sum += top_probs[i];
+            if (renorm_sum > 0.0f) {
+                for (int i = 0; i < nucleus; i++) top_probs[i] /= renorm_sum;
+            }
+        }
+
+        // Random sample using xorshift64
+        unsigned long long s = seed;
+        s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
+        float r = (float)(s * 0x2545F4914F6CDD1DULL) / (float)UINT64_MAX;
+        if (r < 0.0f) r = -r;
+        if (r >= 1.0f) r = 0.999f;
+
+        float cum = 0.0f;
+        int sampled = top_ids[0];
+        for (int i = 0; i < nucleus; i++) {
+            cum += top_probs[i];
+            if (r < cum) { sampled = top_ids[i]; break; }
+        }
+        result[0] = sampled;
+    }
+}
+
+void invoke_gpu_sample_top_k_top_p(const __nv_bfloat16* logits, int vocab_size,
+                                    int top_k, float top_p, float temperature,
+                                    int* result, unsigned long long seed,
+                                    cudaStream_t stream) {
+    float inv_temp = (temperature > 0.0f && temperature != 1.0f)
+                     ? (1.0f / temperature) : 1.0f;
+    int threads = 256;
+    int smem_bytes = vocab_size * sizeof(float);
+    gpu_sample_top_k_top_p_kernel<<<1, threads, smem_bytes, stream>>>(
+        logits, vocab_size, top_k, top_p, inv_temp, result, seed);
+}
+
 } // namespace tts
 } // namespace qwen_thor

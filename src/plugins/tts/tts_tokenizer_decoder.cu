@@ -579,6 +579,8 @@ void SpeechTokenizerDecoder::initialize(cudaStream_t stream) {
 }
 
 // Debug: print tensor stats (min, max, mean, first few values)
+// Disabled in release builds — each call adds ~1ms from cudaStreamSynchronize + D2H copy
+#ifdef TTS_DEBUG_TENSORS
 static void debug_tensor(const char* name, const float* d_ptr, int n, cudaStream_t s) {
     std::vector<float> h(std::min(n, 10));
     cudaMemcpyAsync(h.data(), d_ptr, h.size() * sizeof(float), cudaMemcpyDeviceToHost, s);
@@ -599,6 +601,9 @@ static void debug_tensor(const char* name, const float* d_ptr, int n, cudaStream
     for (int i = 0; i < (int)h.size(); i++) fprintf(stderr, "%.4f%s", h[i], i < (int)h.size()-1 ? "," : "");
     fprintf(stderr, "]\n");
 }
+#else
+static inline void debug_tensor(const char*, const float*, int, cudaStream_t) {}
+#endif
 
 // ============================================================================
 // RVQ Dequantization
