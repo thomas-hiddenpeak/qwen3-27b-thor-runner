@@ -1,16 +1,12 @@
 // tts_plugin.h — TTS (Text-to-Speech) 插件
 //
 // 提供语音合成功能, 将文本转换为音频。
-// 默认实现基于子进程调用外部 TTS 工具 (如 piper, sherpa-onnx, espeak-ng 等)。
+// 两种实现:
+//   1. NativeTtsPlugin — 使用内置 Qwen3-TTS 引擎 (GPU 推理)
+//   2. SubprocessTtsPlugin — 调用外部 TTS 可执行文件
 //
 // API 端点 (OpenAI 兼容):
 //   POST /v1/audio/speech  — 文本转语音
-//
-// 配置:
-//   tts_enabled=true
-//   tts_executable=/path/to/piper
-//   tts_model=/path/to/tts-model
-//   tts_voice=default
 
 #pragma once
 
@@ -18,6 +14,10 @@
 #include <vector>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+
+// Forward declarations
+namespace qwen_thor { namespace tts { class TTSEngine; } }
 
 namespace qwen_thor {
 namespace plugins {
@@ -27,13 +27,16 @@ namespace plugins {
 // ============================================================================
 struct TtsConfig {
     bool        enabled      = false;
-    std::string executable;             // TTS 可执行文件路径
-    std::string model_path;             // TTS 模型路径
-    std::string voice        = "default"; // 默认语音
-    float       speed        = 1.0f;    // 语速 (0.5-2.0)
-    std::string format       = "wav";   // 输出格式 (wav/mp3/opus/pcm)
-    std::string extra_args;             // 额外 CLI 参数
-    std::string tmp_dir      = "tmp";   // 临时文件目录
+    std::string mode         = "native";    // "native" 或 "subprocess"
+    std::string model_path;                 // TTS 模型目录 (native) 或模型文件 (subprocess)
+    std::string executable;                 // TTS 可执行文件路径 (subprocess only)
+    std::string voice        = "serena";    // 默认语音
+    std::string language     = "auto";      // 默认语言
+    float       speed        = 1.0f;        // 语速 (0.5-2.0)
+    std::string format       = "wav";       // 输出格式 (wav/pcm)
+    std::string extra_args;                 // 额外 CLI 参数 (subprocess)
+    std::string tmp_dir      = "tmp";       // 临时文件目录
+    int         max_new_tokens = 4096;      // 最大生成 token 数
 
     static TtsConfig from_file(const std::string& path);
     void print() const;
@@ -44,8 +47,9 @@ struct TtsConfig {
 // ============================================================================
 struct TtsResult {
     std::vector<uint8_t> audio_data;   // 音频二进制数据
-    std::string          format;        // 音频格式 (wav/mp3/opus)
+    std::string          format;        // 音频格式 (wav/pcm)
     float                duration_s = 0; // 音频时长 (秒)
+    int                  sample_rate = 24000;
     int                  error_code = 0;
     std::string          error_message;
 };
@@ -57,21 +61,34 @@ class TtsPlugin {
 public:
     virtual ~TtsPlugin() = default;
 
-    // 合成语音
-    // text: 要合成的文本
-    // voice: 语音名称 (空字符串使用默认)
-    // speed: 语速倍率
-    // format: 输出格式 (wav/mp3/opus/pcm)
     virtual TtsResult synthesize(const std::string& text,
                                  const std::string& voice = "",
                                  float speed = 1.0f,
                                  const std::string& format = "wav") = 0;
 
-    // 检查插件是否可用
     virtual bool is_available() const = 0;
-
-    // 获取插件名称
     virtual std::string name() const = 0;
+};
+
+// ============================================================================
+// 原生 TTS 实现 — 使用内置 Qwen3-TTS 引擎
+// ============================================================================
+class NativeTtsPlugin : public TtsPlugin {
+public:
+    explicit NativeTtsPlugin(const TtsConfig& config);
+    ~NativeTtsPlugin() override;
+
+    TtsResult synthesize(const std::string& text,
+                         const std::string& voice = "",
+                         float speed = 1.0f,
+                         const std::string& format = "wav") override;
+    bool is_available() const override;
+    std::string name() const override { return "native-qwen3-tts"; }
+
+private:
+    TtsConfig config_;
+    std::unique_ptr<tts::TTSEngine> engine_;
+    std::mutex mutex_;  // TTS engine is not thread-safe
 };
 
 // ============================================================================

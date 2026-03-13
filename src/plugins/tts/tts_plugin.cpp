@@ -1,12 +1,15 @@
 // tts_plugin.cpp — TTS 插件实现
 
 #include "tts_plugin.h"
+#include "tts_engine.h"
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <filesystem>
 #include <chrono>
+#include <algorithm>
+#include <cmath>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -33,14 +36,17 @@ TtsConfig TtsConfig::from_file(const std::string& path) {
         while (!key.empty() && key.back() == ' ') key.pop_back();
         while (!key.empty() && key.front() == ' ') key.erase(key.begin());
 
-        if (key == "tts_enabled")     config.enabled    = (val == "true" || val == "1");
+        if (key == "tts_enabled")         config.enabled    = (val == "true" || val == "1");
+        else if (key == "tts_mode")       config.mode       = val;
         else if (key == "tts_executable") config.executable = val;
         else if (key == "tts_model")      config.model_path = val;
         else if (key == "tts_voice")      config.voice      = val;
+        else if (key == "tts_language")   config.language    = val;
         else if (key == "tts_speed")      config.speed      = std::stof(val);
         else if (key == "tts_format")     config.format     = val;
         else if (key == "tts_extra_args") config.extra_args = val;
         else if (key == "tts_tmp_dir")    config.tmp_dir    = val;
+        else if (key == "tts_max_tokens") config.max_new_tokens = std::stoi(val);
     }
     return config;
 }
@@ -48,9 +54,10 @@ TtsConfig TtsConfig::from_file(const std::string& path) {
 void TtsConfig::print() const {
     fprintf(stderr, "[TTS Config]\n");
     fprintf(stderr, "  enabled:    %s\n", enabled ? "true" : "false");
-    fprintf(stderr, "  executable: %s\n", executable.c_str());
+    fprintf(stderr, "  mode:       %s\n", mode.c_str());
     fprintf(stderr, "  model:      %s\n", model_path.c_str());
     fprintf(stderr, "  voice:      %s\n", voice.c_str());
+    fprintf(stderr, "  language:   %s\n", language.c_str());
     fprintf(stderr, "  speed:      %.1f\n", speed);
     fprintf(stderr, "  format:     %s\n", format.c_str());
     if (!extra_args.empty())
@@ -201,11 +208,136 @@ TtsResult SubprocessTtsPlugin::synthesize(const std::string& text,
 }
 
 // ============================================================================
+// NativeTtsPlugin — 使用内置 Qwen3-TTS 引擎
+// ============================================================================
+
+NativeTtsPlugin::NativeTtsPlugin(const TtsConfig& config)
+    : config_(config) {
+    engine_ = std::make_unique<tts::TTSEngine>();
+    fprintf(stderr, "[TTS Native] Loading model from %s...\n", config.model_path.c_str());
+    engine_->load_model(config.model_path);
+    fprintf(stderr, "[TTS Native] Model loaded, sample_rate=%d\n", engine_->sample_rate());
+}
+
+NativeTtsPlugin::~NativeTtsPlugin() = default;
+
+bool NativeTtsPlugin::is_available() const {
+    return engine_ && engine_->is_loaded();
+}
+
+// Build WAV header in memory
+static std::vector<uint8_t> build_wav_header_and_data(
+    const std::vector<float>& pcm, int sample_rate)
+{
+    int num_samples = (int)pcm.size();
+    int bytes_per_sample = 2;
+    int data_size = num_samples * bytes_per_sample;
+    int file_size = 36 + data_size;
+
+    std::vector<uint8_t> wav(44 + data_size);
+    auto w32 = [&](size_t off, uint32_t v) { memcpy(&wav[off], &v, 4); };
+    auto w16 = [&](size_t off, uint16_t v) { memcpy(&wav[off], &v, 2); };
+
+    // RIFF header
+    memcpy(&wav[0], "RIFF", 4);
+    w32(4, file_size);
+    memcpy(&wav[8], "WAVE", 4);
+
+    // fmt chunk
+    memcpy(&wav[12], "fmt ", 4);
+    w32(16, 16);                    // chunk size
+    w16(20, 1);                     // PCM format
+    w16(22, 1);                     // mono
+    w32(24, sample_rate);
+    w32(28, sample_rate * bytes_per_sample);  // byte rate
+    w16(32, bytes_per_sample);      // block align
+    w16(34, 16);                    // bits per sample
+
+    // data chunk
+    memcpy(&wav[36], "data", 4);
+    w32(40, data_size);
+
+    // Convert float → int16
+    int16_t* samples = reinterpret_cast<int16_t*>(&wav[44]);
+    for (int i = 0; i < num_samples; i++) {
+        float v = std::max(-1.0f, std::min(1.0f, pcm[i]));
+        samples[i] = (int16_t)(v * 32767.0f);
+    }
+
+    return wav;
+}
+
+TtsResult NativeTtsPlugin::synthesize(const std::string& text,
+                                       const std::string& voice,
+                                       float speed,
+                                       const std::string& format) {
+    TtsResult result;
+    result.format = (format.empty() || format == "wav") ? "wav" : "pcm";
+
+    if (!is_available()) {
+        result.error_code = 1;
+        result.error_message = "TTS engine not loaded";
+        return result;
+    }
+
+    if (text.empty()) {
+        result.error_code = 2;
+        result.error_message = "Empty text input";
+        return result;
+    }
+
+    std::string use_voice = voice.empty() ? config_.voice : voice;
+
+    // Serialize access — TTS engine is not thread-safe (single GPU stream)
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    auto pcm = engine_->synthesize_to_pcm(text, use_voice, config_.language, "",
+                                           config_.max_new_tokens);
+
+    if (pcm.empty()) {
+        result.error_code = 3;
+        result.error_message = "TTS synthesis produced no audio";
+        return result;
+    }
+
+    int sr = engine_->sample_rate();
+    result.sample_rate = sr;
+    result.duration_s = (float)pcm.size() / sr;
+
+    if (result.format == "pcm") {
+        // Raw PCM16 LE, mono
+        result.audio_data.resize(pcm.size() * 2);
+        int16_t* out = reinterpret_cast<int16_t*>(result.audio_data.data());
+        for (size_t i = 0; i < pcm.size(); i++) {
+            float v = std::max(-1.0f, std::min(1.0f, pcm[i]));
+            out[i] = (int16_t)(v * 32767.0f);
+        }
+    } else {
+        // WAV format
+        result.audio_data = build_wav_header_and_data(pcm, sr);
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    float elapsed_s = std::chrono::duration<float>(t1 - t0).count();
+    fprintf(stderr, "[TTS Native] Synthesized %.1fs audio in %.1fs (%.1fx realtime), %zu bytes\n",
+            result.duration_s, elapsed_s,
+            result.duration_s / std::max(elapsed_s, 0.001f),
+            result.audio_data.size());
+
+    return result;
+}
+
+// ============================================================================
 // 工厂
 // ============================================================================
 
 std::unique_ptr<TtsPlugin> create_tts_plugin(const TtsConfig& config) {
     if (!config.enabled) return nullptr;
+    if (config.mode == "native" && !config.model_path.empty()) {
+        return std::make_unique<NativeTtsPlugin>(config);
+    }
     return std::make_unique<SubprocessTtsPlugin>(config);
 }
 

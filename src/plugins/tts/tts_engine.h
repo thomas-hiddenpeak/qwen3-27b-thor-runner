@@ -55,6 +55,16 @@ public:
         const std::string& instruct = "",
         int max_new_tokens = 4096);
 
+    // Synthesize: text → raw PCM float samples (24kHz, mono)
+    // Returns empty vector on failure
+    std::vector<float> synthesize_to_pcm(
+        const std::string& text,
+        const std::string& speaker = "serena",
+        const std::string& language = "auto",
+        const std::string& instruct = "",
+        int max_new_tokens = 4096);
+
+    int sample_rate() const { return loaded_ ? config_.tokenizer_decoder.output_sample_rate : 24000; }
     bool is_loaded() const { return loaded_; }
     const TTSConfig& config() const { return config_; }
 

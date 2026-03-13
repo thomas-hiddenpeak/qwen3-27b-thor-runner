@@ -1412,7 +1412,7 @@ void ServeApp::handle_connection(int client_fd, int protocol) {
             send_response(client_fd, resp);
         }
     } else {
-        // OpenAI 端口: 只接受 /v1/* 路由
+        // OpenAI 端口: /v1/* API + 静态文件
         if (req.path == "/v1/models" && req.method == "GET") {
             handle_models(req, client_fd);
         } else if (req.path.rfind("/v1/models/", 0) == 0 && req.method == "GET") {
@@ -1428,6 +1428,8 @@ void ServeApp::handle_connection(int client_fd, int protocol) {
             handle_audio_transcriptions(req, client_fd);
         } else if (req.path == "/v1/audio/speech" && req.method == "POST") {
             handle_audio_speech(req, client_fd);
+        } else if (req.method == "GET" && (req.path == "/" || req.path.rfind("/examples/", 0) == 0)) {
+            handle_static_file(req, client_fd);
         } else {
             HttpResponse resp;
             resp.status_code = 404;
@@ -3541,16 +3543,66 @@ void ServeApp::handle_audio_speech(const HttpRequest& req, int client_fd) {
     // MIME type
     std::string content_type = "application/octet-stream";
     if (result.format == "wav")  content_type = "audio/wav";
-    else if (result.format == "mp3")  content_type = "audio/mpeg";
-    else if (result.format == "opus") content_type = "audio/opus";
-    else if (result.format == "ogg")  content_type = "audio/ogg";
-    else if (result.format == "flac") content_type = "audio/flac";
-    else if (result.format == "aac")  content_type = "audio/aac";
     else if (result.format == "pcm")  content_type = "audio/pcm";
 
     // 返回二进制音频数据
     send_binary_response(client_fd, 200, content_type,
                          result.audio_data.data(), result.audio_data.size());
+    close(client_fd);
+}
+
+// ============================================================================
+// 静态文件服务 (examples/ 目录)
+// ============================================================================
+
+void ServeApp::handle_static_file(const HttpRequest& req, int client_fd) {
+    // Map "/" → "examples/tts.html"
+    // Map "/examples/..." → "examples/..."
+    std::string file_path;
+    if (req.path == "/") {
+        file_path = "examples/tts.html";
+    } else {
+        // Strip leading slash, sanitize
+        file_path = req.path.substr(1);
+    }
+
+    // Security: reject path traversal
+    if (file_path.find("..") != std::string::npos) {
+        HttpResponse resp;
+        resp.status_code = 403;
+        resp.status_text = "Forbidden";
+        resp.body = "Forbidden";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    std::ifstream f(file_path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) {
+        HttpResponse resp;
+        resp.status_code = 404;
+        resp.status_text = "Not Found";
+        resp.body = "File not found";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    auto size = f.tellg();
+    f.seekg(0, std::ios::beg);
+    std::vector<uint8_t> content(static_cast<size_t>(size));
+    f.read(reinterpret_cast<char*>(content.data()), size);
+
+    // Determine content type from extension
+    std::string ct = "application/octet-stream";
+    if (file_path.size() > 5 && file_path.substr(file_path.size() - 5) == ".html") ct = "text/html; charset=utf-8";
+    else if (file_path.size() > 4 && file_path.substr(file_path.size() - 4) == ".css") ct = "text/css; charset=utf-8";
+    else if (file_path.size() > 3 && file_path.substr(file_path.size() - 3) == ".js") ct = "application/javascript; charset=utf-8";
+    else if (file_path.size() > 4 && file_path.substr(file_path.size() - 4) == ".svg") ct = "image/svg+xml";
+    else if (file_path.size() > 4 && file_path.substr(file_path.size() - 4) == ".png") ct = "image/png";
+    else if (file_path.size() > 5 && file_path.substr(file_path.size() - 5) == ".json") ct = "application/json";
+
+    send_binary_response(client_fd, 200, ct, content.data(), content.size());
     close(client_fd);
 }
 

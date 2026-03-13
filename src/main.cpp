@@ -210,9 +210,11 @@ static int cmd_serve(int argc, char** argv) {
         else if (arg == "--asr-model"      && i + 1 < argc) asr_config.model_path = argv[++i];
         else if (arg == "--asr-language"   && i + 1 < argc) asr_config.language   = argv[++i];
         else if (arg == "--tts-enabled")       tts_config.enabled = true;
+        else if (arg == "--tts-mode"       && i + 1 < argc) tts_config.mode       = argv[++i];
         else if (arg == "--tts-executable" && i + 1 < argc) tts_config.executable = argv[++i];
         else if (arg == "--tts-model"      && i + 1 < argc) tts_config.model_path = argv[++i];
         else if (arg == "--tts-voice"      && i + 1 < argc) tts_config.voice      = argv[++i];
+        else if (arg == "--tts-language"   && i + 1 < argc) tts_config.language   = argv[++i];
     }
 
     auto asr_plugin = plugins::create_asr_plugin(asr_config);

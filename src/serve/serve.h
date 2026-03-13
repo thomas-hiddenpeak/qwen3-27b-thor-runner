@@ -150,6 +150,9 @@ private:
     void handle_audio_transcriptions(const HttpRequest& req, int client_fd);
     void handle_audio_speech(const HttpRequest& req, int client_fd);
 
+    // ---- 静态文件 (examples/) ----
+    void handle_static_file(const HttpRequest& req, int client_fd);
+
     // 发送二进制响应 (音频数据)
     void send_binary_response(int client_fd, int status_code,
                               const std::string& content_type,

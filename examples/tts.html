@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen3 TTS — 语音合成测试</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #242836;
+  --primary: #6c8aff;
+  --primary-hover: #8da4ff;
+  --text: #e4e6eb;
+  --text2: #9ca0ab;
+  --border: #2e3345;
+  --success: #4ade80;
+  --error: #f87171;
+  --radius: 12px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+               'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.container {
+  width: 100%;
+  max-width: 720px;
+  padding: 24px;
+}
+
+header {
+  text-align: center;
+  padding: 40px 0 24px;
+}
+
+header h1 {
+  font-size: 28px;
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--primary), #a78bfa);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+header p {
+  color: var(--text2);
+  margin-top: 8px;
+  font-size: 14px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+  margin-bottom: 16px;
+}
+
+.form-group {
+  margin-bottom: 16px;
+}
+
+.form-group label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text2);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+
+textarea {
+  width: 100%;
+  min-height: 120px;
+  padding: 12px 16px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.6;
+  resize: vertical;
+  outline: none;
+  transition: border-color 0.2s;
+  font-family: inherit;
+}
+
+textarea:focus {
+  border-color: var(--primary);
+}
+
+.row {
+  display: flex;
+  gap: 12px;
+}
+
+.row > * {
+  flex: 1;
+}
+
+select, input[type="text"] {
+  width: 100%;
+  padding: 10px 14px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s;
+  appearance: none;
+  font-family: inherit;
+}
+
+select:focus, input:focus {
+  border-color: var(--primary);
+}
+
+select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%239ca0ab'%3E%3Cpath d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 14px center;
+  padding-right: 36px;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 28px;
+  font-size: 15px;
+  font-weight: 600;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-family: inherit;
+}
+
+.btn-primary {
+  background: var(--primary);
+  color: #fff;
+  width: 100%;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--primary-hover);
+  transform: translateY(-1px);
+}
+
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 8px 16px;
+  font-size: 13px;
+}
+
+.btn-secondary:hover {
+  background: var(--border);
+}
+
+.status {
+  text-align: center;
+  padding: 12px;
+  font-size: 14px;
+  color: var(--text2);
+  display: none;
+}
+
+.status.visible {
+  display: block;
+}
+
+.status.error {
+  color: var(--error);
+}
+
+.status.success {
+  color: var(--success);
+}
+
+/* Audio player */
+.player {
+  display: none;
+  margin-top: 16px;
+}
+
+.player.visible {
+  display: block;
+}
+
+.player audio {
+  width: 100%;
+  height: 48px;
+  border-radius: 8px;
+  outline: none;
+}
+
+.player-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--text2);
+}
+
+.player-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* History */
+.history-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text2);
+  margin-bottom: 12px;
+}
+
+.history-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--surface2);
+  border-radius: 8px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.history-item:hover {
+  background: var(--border);
+}
+
+.history-item .text {
+  flex: 1;
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-item .meta {
+  font-size: 12px;
+  color: var(--text2);
+  white-space: nowrap;
+}
+
+.history-item .play-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.play-icon svg {
+  width: 14px;
+  height: 14px;
+  fill: white;
+  margin-left: 2px;
+}
+
+/* Spinner */
+.spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(255,255,255,0.3);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Preset examples */
+.presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.preset {
+  padding: 6px 12px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  font-size: 13px;
+  color: var(--text2);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.preset:hover {
+  background: var(--border);
+  color: var(--text);
+}
+
+footer {
+  padding: 24px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text2);
+}
+
+/* API Info */
+.api-section {
+  margin-top: 24px;
+}
+
+.api-section summary {
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text2);
+  padding: 8px 0;
+}
+
+.api-section pre {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  font-size: 13px;
+  overflow-x: auto;
+  line-height: 1.5;
+  margin-top: 8px;
+  color: var(--text);
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+.api-section code {
+  color: var(--primary);
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🔊 Qwen3 TTS</h1>
+  <p>Qwen3-TTS 语音合成 &mdash; OpenAI 兼容 API</p>
+</header>
+
+<div class="container">
+
+  <!-- Input Card -->
+  <div class="card">
+    <div class="form-group">
+      <label>输入文本</label>
+      <textarea id="inputText" placeholder="请输入要合成的文本...">你好，我是通义千问。很高兴为你服务！</textarea>
+      <div class="presets">
+        <span class="preset" data-text="你好，我是通义千问。很高兴为你服务！">中文问候</span>
+        <span class="preset" data-text="Hello, I'm Qwen. How can I help you today?">English</span>
+        <span class="preset" data-text="春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。">古诗</span>
+        <span class="preset" data-text="今天天气真好，我们一起出去散步吧。阳光明媚，微风轻拂，正是踏青的好时节。">长句</span>
+        <span class="preset" data-text="1加1等于2，圆周率约等于3.14159。">数字</span>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="form-group">
+        <label>说话人</label>
+        <select id="voiceSelect">
+          <option value="serena">Serena</option>
+          <option value="Vivian">Vivian</option>
+          <option value="Ethan">Ethan</option>
+          <option value="Chelsie">Chelsie</option>
+          <option value="">默认</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>输出格式</label>
+        <select id="formatSelect">
+          <option value="wav">WAV</option>
+          <option value="pcm">PCM (raw)</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>API 地址</label>
+      <input type="text" id="apiUrl" placeholder="http://localhost:8080">
+    </div>
+
+    <button class="btn btn-primary" id="synthesizeBtn" onclick="synthesize()">
+      合成语音
+    </button>
+
+    <div class="status" id="status"></div>
+
+    <!-- Player -->
+    <div class="player" id="player">
+      <audio id="audioPlayer" controls></audio>
+      <div class="player-info">
+        <span id="audioInfo"></span>
+        <div class="player-actions">
+          <button class="btn btn-secondary" onclick="downloadAudio()">⬇ 下载</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- History Card -->
+  <div class="card" id="historyCard" style="display:none">
+    <div class="history-title">历史记录</div>
+    <div id="historyList"></div>
+  </div>
+
+  <!-- API Reference -->
+  <details class="api-section card">
+    <summary>📖 API 参考</summary>
+    <h3 style="margin: 12px 0 8px; font-size: 15px;">POST /v1/audio/speech</h3>
+    <p style="font-size: 13px; color: var(--text2); margin-bottom: 12px;">
+      OpenAI 兼容的 TTS 端点。返回二进制音频数据。
+    </p>
+    <pre>{
+  "model": "qwen3-tts",
+  "input": "你好，世界！",
+  "voice": "serena",
+  "response_format": "wav",
+  "speed": 1.0
+}</pre>
+
+    <h3 style="margin: 16px 0 8px; font-size: 15px;">cURL 示例</h3>
+    <pre>curl -X POST http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"input":"你好世界","voice":"serena"}' \
+  --output speech.wav</pre>
+
+    <h3 style="margin: 16px 0 8px; font-size: 15px;">Python 示例</h3>
+    <pre>from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="none")
+response = client.audio.speech.create(
+    model="qwen3-tts",
+    voice="serena",
+    input="你好，我是通义千问！",
+    response_format="wav"
+)
+response.stream_to_file("output.wav")</pre>
+
+    <h3 style="margin: 16px 0 8px; font-size: 15px;">JavaScript Fetch</h3>
+    <pre>const response = await fetch('/v1/audio/speech', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    input: '你好世界',
+    voice: 'serena',
+    response_format: 'wav'
+  })
+});
+const blob = await response.blob();
+const url = URL.createObjectURL(blob);
+const audio = new Audio(url);
+audio.play();</pre>
+  </details>
+
+</div>
+
+<footer>
+  Qwen3-TTS on Jetson AGX Thor &bull; SM110a Blackwell &bull; Native CUDA Inference
+</footer>
+
+<script>
+// State
+let currentAudioBlob = null;
+let currentAudioUrl = null;
+let history = [];
+
+// Auto-detect API URL
+const apiUrlInput = document.getElementById('apiUrl');
+apiUrlInput.value = window.location.origin;
+
+// Preset click handlers
+document.querySelectorAll('.preset').forEach(el => {
+  el.addEventListener('click', () => {
+    document.getElementById('inputText').value = el.dataset.text;
+  });
+});
+
+function setStatus(msg, type = '') {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = 'status visible' + (type ? ' ' + type : '');
+}
+
+function clearStatus() {
+  document.getElementById('status').className = 'status';
+}
+
+async function synthesize() {
+  const text = document.getElementById('inputText').value.trim();
+  if (!text) {
+    setStatus('请输入要合成的文本', 'error');
+    return;
+  }
+
+  const voice = document.getElementById('voiceSelect').value;
+  const format = document.getElementById('formatSelect').value;
+  const apiBase = apiUrlInput.value.replace(/\/$/, '');
+
+  const btn = document.getElementById('synthesizeBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> 合成中...';
+
+  // Hide player
+  document.getElementById('player').className = 'player';
+  setStatus('正在合成语音，请稍候...');
+
+  const t0 = performance.now();
+
+  try {
+    const response = await fetch(apiBase + '/v1/audio/speech', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'qwen3-tts',
+        input: text,
+        voice: voice,
+        response_format: format,
+        speed: 1.0
+      })
+    });
+
+    if (!response.ok) {
+      let errMsg = `HTTP ${response.status}`;
+      try {
+        const errJson = await response.json();
+        errMsg = errJson.error?.message || errMsg;
+      } catch {}
+      throw new Error(errMsg);
+    }
+
+    const blob = await response.blob();
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+
+    // Release previous URL
+    if (currentAudioUrl) URL.revokeObjectURL(currentAudioUrl);
+
+    currentAudioBlob = blob;
+    let audioType = format === 'pcm' ? 'audio/wav' : 'audio/wav';
+
+    // For PCM, wrap in WAV header for browser playback
+    if (format === 'pcm') {
+      currentAudioBlob = await wrapPcmAsWav(blob, 24000);
+    }
+
+    currentAudioUrl = URL.createObjectURL(currentAudioBlob);
+
+    const audioPlayer = document.getElementById('audioPlayer');
+    audioPlayer.src = currentAudioUrl;
+
+    // Show player
+    document.getElementById('player').className = 'player visible';
+
+    // Calculate duration
+    const sizeKB = (blob.size / 1024).toFixed(1);
+    document.getElementById('audioInfo').textContent =
+      `${sizeKB} KB · ${elapsed}s · ${voice || 'default'}`;
+
+    setStatus(`合成完成 (${elapsed}s)`, 'success');
+
+    // Auto play
+    try { await audioPlayer.play(); } catch {}
+
+    // Add to history
+    addHistory(text, voice, currentAudioUrl, elapsed, sizeKB);
+
+  } catch (err) {
+    setStatus('合成失败: ' + err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '合成语音';
+  }
+}
+
+// Wrap raw PCM16 LE data in a WAV container for browser playback
+async function wrapPcmAsWav(blob, sampleRate) {
+  const pcmData = await blob.arrayBuffer();
+  const numSamples = pcmData.byteLength / 2;
+  const wavBuffer = new ArrayBuffer(44 + pcmData.byteLength);
+  const view = new DataView(wavBuffer);
+
+  // RIFF header
+  writeString(view, 0, 'RIFF');
+  view.setUint32(4, 36 + pcmData.byteLength, true);
+  writeString(view, 8, 'WAVE');
+  writeString(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);     // PCM
+  view.setUint16(22, 1, true);     // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(view, 36, 'data');
+  view.setUint32(40, pcmData.byteLength, true);
+
+  new Uint8Array(wavBuffer, 44).set(new Uint8Array(pcmData));
+  return new Blob([wavBuffer], { type: 'audio/wav' });
+}
+
+function writeString(view, offset, str) {
+  for (let i = 0; i < str.length; i++) {
+    view.setUint8(offset + i, str.charCodeAt(i));
+  }
+}
+
+function downloadAudio() {
+  if (!currentAudioBlob) return;
+  const format = document.getElementById('formatSelect').value;
+  const a = document.createElement('a');
+  a.href = currentAudioUrl;
+  a.download = 'speech.' + (format === 'pcm' ? 'wav' : format);
+  a.click();
+}
+
+function addHistory(text, voice, audioUrl, elapsed, sizeKB) {
+  history.unshift({ text, voice, audioUrl, elapsed, sizeKB });
+  if (history.length > 20) history.pop();
+  renderHistory();
+}
+
+function renderHistory() {
+  const card = document.getElementById('historyCard');
+  const list = document.getElementById('historyList');
+
+  if (history.length === 0) {
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = 'block';
+
+  list.innerHTML = history.map((item, idx) => `
+    <div class="history-item" onclick="playHistory(${idx})">
+      <div class="play-icon">
+        <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+      </div>
+      <div class="text">${escapeHtml(item.text)}</div>
+      <div class="meta">${item.voice || 'default'} · ${item.elapsed}s</div>
+    </div>
+  `).join('');
+}
+
+function playHistory(idx) {
+  const item = history[idx];
+  if (!item?.audioUrl) return;
+  const player = document.getElementById('audioPlayer');
+  player.src = item.audioUrl;
+  document.getElementById('player').className = 'player visible';
+  document.getElementById('audioInfo').textContent =
+    `${item.sizeKB} KB · ${item.elapsed}s · ${item.voice || 'default'}`;
+  player.play();
+}
+
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+// Keyboard shortcut: Ctrl+Enter to synthesize
+document.getElementById('inputText').addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    e.preventDefault();
+    synthesize();
+  }
+});
+</script>
+</body>
+</html>

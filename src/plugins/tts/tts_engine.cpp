@@ -374,9 +374,8 @@ std::vector<int> TTSEngine::build_instruct_text_tokens(
 // Synthesize to WAV (end-to-end)
 // ============================================================================
 
-bool TTSEngine::synthesize_to_wav(
+std::vector<float> TTSEngine::synthesize_to_pcm(
     const std::string& text,
-    const std::string& output_path,
     const std::string& speaker,
     const std::string& language,
     const std::string& instruct,
@@ -384,17 +383,17 @@ bool TTSEngine::synthesize_to_wav(
 {
     if (!loaded_) {
         fprintf(stderr, "[TTS] ERROR: model not loaded\n");
-        return false;
+        return {};
     }
 
     if (!st_decoder_ || !st_decoder_->is_loaded()) {
         fprintf(stderr, "[TTS] ERROR: speech tokenizer decoder not loaded\n");
-        return false;
+        return {};
     }
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // 1. Tokenize text (choose template based on model type)
+    // 1. Tokenize text
     std::vector<int> text_tokens;
     if (!instruct.empty() || config_.tts_model_type == "voice_design") {
         text_tokens = build_instruct_text_tokens(text, instruct);
@@ -403,19 +402,18 @@ bool TTSEngine::synthesize_to_wav(
     }
     if (text_tokens.empty()) {
         fprintf(stderr, "[TTS] ERROR: empty text tokens\n");
-        return false;
+        return {};
     }
 
     // 2. Build prefill + decode → codec tokens
     talker_->reset();
     talker_->set_max_new_tokens(max_new_tokens);
-    int prefill_len = talker_->build_prefill(
-        text_tokens.data(), (int)text_tokens.size(),
-        speaker, language, stream_);
+    talker_->build_prefill(text_tokens.data(), (int)text_tokens.size(),
+                           speaker, language, stream_);
     talker_->forward_prefill(stream_);
 
-    std::vector<std::vector<int>> all_codes;
     int num_groups = config_.talker.num_code_groups;
+    std::vector<std::vector<int>> all_codes;
     std::vector<int> codec_step(num_groups);
     int step = 0;
     while (step < max_new_tokens) {
@@ -423,11 +421,6 @@ bool TTSEngine::synthesize_to_wav(
         if (ret < 0) break;
         all_codes.push_back(codec_step);
         step++;
-        if (step % 100 == 0) {
-            auto tn = std::chrono::steady_clock::now();
-            float ms = std::chrono::duration<float, std::milli>(tn - t0).count();
-            fprintf(stderr, "[TTS] Talker: %d steps (%.1f ms)\n", step, ms);
-        }
     }
 
     auto t_talker = std::chrono::steady_clock::now();
@@ -437,10 +430,10 @@ bool TTSEngine::synthesize_to_wav(
 
     if (all_codes.empty()) {
         fprintf(stderr, "[TTS] ERROR: no codec tokens generated\n");
-        return false;
+        return {};
     }
 
-    // 3. Reshape codes to [num_groups, num_frames] for decoder
+    // 3. Reshape codes to [num_groups, num_frames]
     int T = (int)all_codes.size();
     std::vector<int> codes_flat(num_groups * T);
     for (int t = 0; t < T; t++) {
@@ -451,44 +444,40 @@ bool TTSEngine::synthesize_to_wav(
 
     // 4. Decode codec tokens → PCM
     fprintf(stderr, "[TTS] Decoding %d frames → PCM...\n", T);
-
-    // Debug: dump codes to file for Python comparison
-    {
-        std::string codes_path = output_path + ".codes.bin";
-        FILE* cf = fopen(codes_path.c_str(), "wb");
-        if (cf) {
-            int32_t header[2] = {num_groups, T};
-            fwrite(header, sizeof(int32_t), 2, cf);
-            fwrite(codes_flat.data(), sizeof(int32_t), codes_flat.size(), cf);
-            fclose(cf);
-            fprintf(stderr, "[TTS] Codes dumped to %s (%d groups × %d frames)\n",
-                    codes_path.c_str(), num_groups, T);
-        }
-    }
-
     auto pcm = st_decoder_->decode(codes_flat.data(), num_groups, T, stream_);
 
     auto t_decode = std::chrono::steady_clock::now();
     float decode_ms = std::chrono::duration<float, std::milli>(t_decode - t_talker).count();
-    fprintf(stderr, "[TTS] Decoder done: %zu samples (%.1f ms)\n", pcm.size(), decode_ms);
+    float total_ms = std::chrono::duration<float, std::milli>(t_decode - t0).count();
+    fprintf(stderr, "[TTS] Decoder done: %zu samples (%.1f ms, total %.1f ms)\n",
+            pcm.size(), decode_ms, total_ms);
 
-    if (pcm.empty()) {
-        fprintf(stderr, "[TTS] ERROR: decoder produced empty PCM\n");
-        return false;
-    }
+    return pcm;
+}
 
-    // 5. Write WAV
+// ============================================================================
+// Synthesize to WAV (end-to-end)
+// ============================================================================
+
+bool TTSEngine::synthesize_to_wav(
+    const std::string& text,
+    const std::string& output_path,
+    const std::string& speaker,
+    const std::string& language,
+    const std::string& instruct,
+    int max_new_tokens)
+{
+    auto pcm = synthesize_to_pcm(text, speaker, language, instruct, max_new_tokens);
+    if (pcm.empty()) return false;
+
     bool ok = SpeechTokenizerDecoder::write_wav(
         output_path, pcm, config_.tokenizer_decoder.output_sample_rate);
 
     if (ok) {
         float duration_s = (float)pcm.size() / config_.tokenizer_decoder.output_sample_rate;
-        float total_ms = std::chrono::duration<float, std::milli>(
-            std::chrono::steady_clock::now() - t0).count();
-        fprintf(stderr, "[TTS] WAV written: %s (%.1fs audio, %.1f ms total)\n",
-                output_path.c_str(), duration_s, total_ms);
+        fprintf(stderr, "[TTS] WAV written: %s (%.1fs audio)\n",
+                output_path.c_str(), duration_s);
     }
-
     return ok;
 }
 
