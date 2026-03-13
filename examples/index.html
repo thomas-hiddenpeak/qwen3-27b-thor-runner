@@ -1006,7 +1006,7 @@ function onVoiceChanged() {
 // WebSocket 连接
 // ============================================================================
 function connectWS() {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
   const url = proto + '//' + location.host + '/v1/voice';
   ws = new WebSocket(url);
 
@@ -1621,8 +1621,6 @@ async function synthesizeTts() {
   // VoiceDesign 模式不发送 voice (无预设音色), 音色完全由 instruct 决定
   const voice = (ttsModelType === 'voice_design') ? '' : document.getElementById('ttsVoiceSelect').value;
   const format = document.getElementById('formatSelect').value;
-  const apiBase = window.location.origin;
-
   const instruct = document.getElementById('ttsTabInstruct')?.value.trim() || undefined;
   if (ttsModelType === 'voice_design') {
     console.log('[TTS Tab] VoiceDesign synthesis, instruct:', instruct || '(use default)');
@@ -1638,7 +1636,7 @@ async function synthesizeTts() {
   const t0 = performance.now();
 
   try {
-    const response = await fetch(apiBase + '/v1/audio/speech', {
+    const response = await fetch('/v1/audio/speech', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
