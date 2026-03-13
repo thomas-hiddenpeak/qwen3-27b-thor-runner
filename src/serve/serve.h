@@ -1,4 +1,4 @@
-// serve.h — HTTP API 服务 (Ollama / OpenAI 兼容接口)
+// serve.h — HTTP/WebSocket API 服务 (Ollama / OpenAI 兼容接口)
 //
 // 提供 RESTful API 端点:
 //   POST /v1/chat/completions     — OpenAI Chat Completions (streaming/non-streaming)
@@ -8,8 +8,9 @@
 //   GET  /v1/models               — 模型列表
 //   GET  /api/tags                — Ollama 模型列表
 //   GET  /health                  — 健康检查
+//   WS   /v1/voice                — WebSocket 语音对话 (ASR+LLM+TTS)
 //
-// 使用 POSIX socket 实现轻量级 HTTP 服务, 无外部依赖。
+// 使用 POSIX socket 实现轻量级 HTTP + WebSocket 服务, 无外部依赖。
 
 #pragma once
 
@@ -149,6 +150,14 @@ private:
     // ---- 音频 API (ASR / TTS 插件) ----
     void handle_audio_transcriptions(const HttpRequest& req, int client_fd);
     void handle_audio_speech(const HttpRequest& req, int client_fd);
+
+    // ---- WebSocket 语音对话 ----
+    void handle_websocket_voice(int client_fd, const HttpRequest& req);
+    void ws_voice_generate(int client_fd,
+                           const std::string& user_text,
+                           std::vector<std::pair<std::string, std::string>>& chat_history,
+                           const std::string& voice,
+                           bool tts_enabled);
 
     // ---- 静态文件 (examples/) ----
     void handle_static_file(const HttpRequest& req, int client_fd);

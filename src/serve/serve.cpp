@@ -2,6 +2,7 @@
 //
 // 轻量级 POSIX socket HTTP 服务, 无外部依赖。
 // 支持 OpenAI / Ollama 兼容 API 端点。
+// WebSocket 支持: RFC 6455 帧协议, /v1/voice 语音对话端点。
 
 #include "serve.h"
 #include "../engine/vision.h"
@@ -380,6 +381,176 @@ static std::vector<uint8_t> base64_decode_from(const std::string& input, size_t 
         }
     }
     return out;
+}
+
+// ============================================================================
+// Base64 encode (for WebSocket handshake)
+// ============================================================================
+static const char b64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string base64_encode(const uint8_t* data, size_t len) {
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t n = ((uint32_t)data[i]) << 16;
+        if (i + 1 < len) n |= ((uint32_t)data[i+1]) << 8;
+        if (i + 2 < len) n |= ((uint32_t)data[i+2]);
+        out += b64_chars[(n >> 18) & 63];
+        out += b64_chars[(n >> 12) & 63];
+        out += (i + 1 < len) ? b64_chars[(n >> 6) & 63] : '=';
+        out += (i + 2 < len) ? b64_chars[n & 63] : '=';
+    }
+    return out;
+}
+
+// ============================================================================
+// Minimal SHA-1 (RFC 3174) — WebSocket 握手专用
+// ============================================================================
+static void sha1_compute(const uint8_t* data, size_t len, uint8_t hash[20]) {
+    uint32_t h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE, h3 = 0x10325476, h4 = 0xC3D2E1F0;
+    // Pre-processing: pad message
+    size_t msg_len = len + 1 + 8;  // original + 0x80 + 8 bytes length
+    size_t padded_len = ((msg_len + 63) / 64) * 64;
+    std::vector<uint8_t> msg(padded_len, 0);
+    memcpy(msg.data(), data, len);
+    msg[len] = 0x80;
+    uint64_t bit_len = (uint64_t)len * 8;
+    for (int i = 0; i < 8; i++) msg[padded_len - 1 - i] = (uint8_t)(bit_len >> (i * 8));
+
+    auto left_rotate = [](uint32_t v, int n) -> uint32_t { return (v << n) | (v >> (32 - n)); };
+
+    for (size_t chunk = 0; chunk < padded_len; chunk += 64) {
+        uint32_t w[80];
+        for (int i = 0; i < 16; i++)
+            w[i] = ((uint32_t)msg[chunk + i*4] << 24) | ((uint32_t)msg[chunk + i*4+1] << 16) |
+                   ((uint32_t)msg[chunk + i*4+2] << 8) | (uint32_t)msg[chunk + i*4+3];
+        for (int i = 16; i < 80; i++)
+            w[i] = left_rotate(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+
+        uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
+        for (int i = 0; i < 80; i++) {
+            uint32_t f, k;
+            if (i < 20)      { f = (b & c) | ((~b) & d); k = 0x5A827999; }
+            else if (i < 40) { f = b ^ c ^ d;             k = 0x6ED9EBA1; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+            else              { f = b ^ c ^ d;             k = 0xCA62C1D6; }
+            uint32_t temp = left_rotate(a, 5) + f + e + k + w[i];
+            e = d; d = c; c = left_rotate(b, 30); b = a; a = temp;
+        }
+        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
+    }
+    auto store32 = [&](uint8_t* p, uint32_t v) { p[0]=v>>24; p[1]=v>>16; p[2]=v>>8; p[3]=v; };
+    store32(hash, h0); store32(hash+4, h1); store32(hash+8, h2); store32(hash+12, h3); store32(hash+16, h4);
+}
+
+// ============================================================================
+// WebSocket 帧编解码 (RFC 6455)
+// ============================================================================
+
+// WebSocket opcodes
+static constexpr uint8_t WS_OP_TEXT   = 0x01;
+static constexpr uint8_t WS_OP_BINARY = 0x02;
+static constexpr uint8_t WS_OP_CLOSE  = 0x08;
+static constexpr uint8_t WS_OP_PING   = 0x09;
+static constexpr uint8_t WS_OP_PONG   = 0x0A;
+
+// 发送 WebSocket 帧 (服务端→客户端, 无 mask)
+static bool ws_send_frame(int fd, uint8_t opcode, const uint8_t* data, size_t len) {
+    uint8_t header[10];
+    size_t hlen = 2;
+    header[0] = 0x80 | opcode;  // FIN + opcode
+    if (len < 126) {
+        header[1] = (uint8_t)len;
+    } else if (len < 65536) {
+        header[1] = 126;
+        header[2] = (uint8_t)(len >> 8);
+        header[3] = (uint8_t)(len & 0xFF);
+        hlen = 4;
+    } else {
+        header[1] = 127;
+        for (int i = 0; i < 8; i++)
+            header[2 + i] = (uint8_t)(len >> ((7 - i) * 8));
+        hlen = 10;
+    }
+    if (::send(fd, header, hlen, MSG_NOSIGNAL) < 0) return false;
+    if (len > 0 && ::send(fd, data, len, MSG_NOSIGNAL) < 0) return false;
+    return true;
+}
+
+static bool ws_send_text(int fd, const std::string& text) {
+    return ws_send_frame(fd, WS_OP_TEXT, (const uint8_t*)text.data(), text.size());
+}
+
+static bool ws_send_binary(int fd, const uint8_t* data, size_t len) {
+    return ws_send_frame(fd, WS_OP_BINARY, data, len);
+}
+
+// 接收 WebSocket 帧 (客户端→服务端, 带 mask)
+// 返回 false = 连接关闭或错误
+static bool ws_recv_frame(int fd, uint8_t& opcode, std::vector<uint8_t>& payload) {
+    payload.clear();
+    uint8_t hdr[2];
+    if (recv(fd, hdr, 2, MSG_WAITALL) != 2) return false;
+
+    opcode = hdr[0] & 0x0F;
+    bool masked = (hdr[1] & 0x80) != 0;
+    uint64_t plen = hdr[1] & 0x7F;
+
+    if (plen == 126) {
+        uint8_t ext[2];
+        if (recv(fd, ext, 2, MSG_WAITALL) != 2) return false;
+        plen = ((uint64_t)ext[0] << 8) | ext[1];
+    } else if (plen == 127) {
+        uint8_t ext[8];
+        if (recv(fd, ext, 8, MSG_WAITALL) != 8) return false;
+        plen = 0;
+        for (int i = 0; i < 8; i++) plen = (plen << 8) | ext[i];
+    }
+
+    // 安全限制: 最大 64 MB
+    if (plen > 64 * 1024 * 1024) return false;
+
+    uint8_t mask_key[4] = {};
+    if (masked) {
+        if (recv(fd, mask_key, 4, MSG_WAITALL) != 4) return false;
+    }
+
+    payload.resize((size_t)plen);
+    if (plen > 0) {
+        size_t received = 0;
+        while (received < plen) {
+            ssize_t n = recv(fd, payload.data() + received, plen - received, 0);
+            if (n <= 0) return false;
+            received += n;
+        }
+        if (masked) {
+            for (size_t i = 0; i < plen; i++)
+                payload[i] ^= mask_key[i % 4];
+        }
+    }
+    return true;
+}
+
+// WebSocket 握手: 验证并完成 HTTP 101 Upgrade
+static bool ws_handshake(int fd, const HttpRequest& req) {
+    auto it = req.headers.find("sec-websocket-key");
+    if (it == req.headers.end()) return false;
+
+    // Compute accept key: SHA-1(key + magic GUID), base64 encode
+    static const char* WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    std::string concat = it->second + WS_GUID;
+    uint8_t hash[20];
+    sha1_compute((const uint8_t*)concat.data(), concat.size(), hash);
+    std::string accept = base64_encode(hash, 20);
+
+    std::string response =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: " + accept + "\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "\r\n";
+    return ::send(fd, response.data(), response.size(), MSG_NOSIGNAL) > 0;
 }
 
 static ImageData decode_image_base64(const std::string& data_uri) {
@@ -1381,6 +1552,30 @@ void ServeApp::handle_connection(int client_fd, int protocol) {
         handle_cors_preflight(req, client_fd);
         close(client_fd);
         return;
+    }
+
+    // WebSocket Upgrade 检测 (OpenAI 端口)
+    {
+        auto upgrade_it = req.headers.find("upgrade");
+        if (upgrade_it != req.headers.end()) {
+            std::string val = upgrade_it->second;
+            std::transform(val.begin(), val.end(), val.begin(), ::tolower);
+            if (val == "websocket") {
+                if (protocol == 1 && req.path == "/v1/voice") {
+                    handle_websocket_voice(client_fd, req);
+                    close(client_fd);
+                    return;
+                }
+                // 不支持的 WebSocket 路径
+                HttpResponse resp;
+                resp.status_code = 404;
+                resp.status_text = "Not Found";
+                resp.body = "{\"error\":\"WebSocket endpoint not found\"}";
+                send_response(client_fd, resp);
+                close(client_fd);
+                return;
+            }
+        }
     }
 
     // /health 两个端口都可用
@@ -3604,6 +3799,214 @@ void ServeApp::handle_static_file(const HttpRequest& req, int client_fd) {
 
     send_binary_response(client_fd, 200, ct, content.data(), content.size());
     close(client_fd);
+}
+
+// ============================================================================
+// WebSocket /v1/voice — 语音对话 (ASR + LLM streaming + TTS)
+// ============================================================================
+
+void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
+    // WebSocket 握手
+    if (!ws_handshake(client_fd, req)) {
+        fprintf(stderr, "[WS] Handshake failed fd=%d\n", client_fd);
+        return;
+    }
+    fprintf(stderr, "[WS] Voice session started fd=%d\n", client_fd);
+
+    // 会话状态
+    std::vector<std::pair<std::string, std::string>> chat_history;
+    std::string voice = "Chelsie";
+    bool tts_enabled = true;
+
+    // 发送 session.created
+    ws_send_text(client_fd, "{\"type\":\"session.created\"}");
+
+    // 主循环: 读取客户端帧
+    while (running_) {
+        uint8_t opcode;
+        std::vector<uint8_t> payload;
+        if (!ws_recv_frame(client_fd, opcode, payload)) break;
+
+        if (opcode == WS_OP_CLOSE) {
+            ws_send_frame(client_fd, WS_OP_CLOSE, nullptr, 0);
+            break;
+        }
+        if (opcode == WS_OP_PING) {
+            ws_send_frame(client_fd, WS_OP_PONG, payload.data(), payload.size());
+            continue;
+        }
+        if (opcode != WS_OP_TEXT) continue;
+
+        // 解析 JSON 事件
+        std::string msg(payload.begin(), payload.end());
+        std::string event_type = json_get_string(msg, "type");
+
+        if (event_type == "config") {
+            // 更新会话配置
+            std::string v = json_get_string(msg, "voice");
+            if (!v.empty()) voice = v;
+            auto tts_pos = msg.find("\"tts\"");
+            if (tts_pos != std::string::npos) {
+                tts_enabled = json_get_bool(msg, "tts", true);
+            }
+            ws_send_text(client_fd, "{\"type\":\"config.updated\"}");
+
+        } else if (event_type == "chat") {
+            // 文本对话
+            std::string text = json_get_string(msg, "text");
+            if (text.empty()) continue;
+            ws_voice_generate(client_fd, text, chat_history, voice, tts_enabled);
+
+        } else if (event_type == "audio") {
+            // 语音输入: ASR → LLM → TTS
+            std::string audio_b64 = json_get_string(msg, "data");
+            std::string format = json_get_string(msg, "format");
+            if (audio_b64.empty()) continue;
+
+            if (!asr_plugin_ || !asr_plugin_->is_available()) {
+                ws_send_text(client_fd, "{\"type\":\"error\",\"message\":\"ASR not available\"}");
+                continue;
+            }
+
+            // Decode audio from base64
+            auto audio_bytes = base64_decode(audio_b64);
+            if (audio_bytes.empty()) {
+                ws_send_text(client_fd, "{\"type\":\"error\",\"message\":\"Invalid audio data\"}");
+                continue;
+            }
+
+            // 写入临时文件
+            std::string ext = ".webm";
+            if (format == "wav") ext = ".wav";
+            else if (format == "ogg") ext = ".ogg";
+            auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+            std::string tmp_path = "tmp/ws_asr_" + std::to_string(now) + "_" +
+                                   std::to_string(getpid()) + ext;
+            {
+                std::ofstream af(tmp_path, std::ios::binary);
+                if (!af.is_open()) {
+                    ws_send_text(client_fd, "{\"type\":\"error\",\"message\":\"Failed to save audio\"}");
+                    continue;
+                }
+                af.write((const char*)audio_bytes.data(), audio_bytes.size());
+            }
+
+            ws_send_text(client_fd, "{\"type\":\"status\",\"stage\":\"asr\"}");
+
+            auto result = asr_plugin_->transcribe(tmp_path, "auto");
+            std::filesystem::remove(tmp_path);
+
+            if (result.error_code != 0 || result.text.empty()) {
+                ws_send_text(client_fd, "{\"type\":\"error\",\"message\":\"ASR failed: " +
+                             json_escape(result.error_message) + "\"}");
+                continue;
+            }
+
+            // 发送 ASR 结果
+            ws_send_text(client_fd, "{\"type\":\"asr\",\"text\":\"" + json_escape(result.text) + "\"}");
+
+            // 继续 LLM + TTS
+            ws_voice_generate(client_fd, result.text, chat_history, voice, tts_enabled);
+
+        } else if (event_type == "clear") {
+            chat_history.clear();
+            ws_send_text(client_fd, "{\"type\":\"history.cleared\"}");
+        }
+    }
+
+    fprintf(stderr, "[WS] Voice session ended fd=%d\n", client_fd);
+}
+
+void ServeApp::ws_voice_generate(int client_fd,
+                                  const std::string& user_text,
+                                  std::vector<std::pair<std::string, std::string>>& chat_history,
+                                  const std::string& voice,
+                                  bool tts_enabled) {
+    const auto& tok = backend_.tokenizer();
+    if (!tok.is_loaded()) {
+        ws_send_text(client_fd, "{\"type\":\"error\",\"message\":\"Tokenizer not loaded\"}");
+        return;
+    }
+
+    chat_history.push_back({"user", user_text});
+
+    // 保留最近 10 轮
+    while (chat_history.size() > 20) {
+        chat_history.erase(chat_history.begin());
+    }
+
+    // 构建 messages
+    std::vector<std::pair<std::string, std::string>> messages;
+    messages.push_back({"system", "你是通义千问，一个有帮助的AI助手。请简洁、自然地回答问题。"});
+    for (auto& [role, content] : chat_history) {
+        messages.push_back({role, content});
+    }
+
+    auto prompt_tokens = tok.apply_chat_template(messages, true, false);
+    int prompt_count = (int)prompt_tokens.size();
+
+    // Submit inference
+    InferRequest infer_req;
+    infer_req.request_id     = next_request_id();
+    infer_req.prompt_tokens  = std::move(prompt_tokens);
+    infer_req.max_new_tokens = 512;
+    infer_req.temperature    = 0.7f;
+    infer_req.top_p          = 0.8f;
+    infer_req.top_k          = 20;
+    infer_req.presence_penalty = 1.5f;
+    infer_req.stream         = true;
+
+    register_request(infer_req.request_id);
+
+    if (!backend_.submit(infer_req)) {
+        unregister_request(infer_req.request_id);
+        ws_send_text(client_fd, "{\"type\":\"error\",\"message\":\"Request queue full\"}");
+        return;
+    }
+
+    ws_send_text(client_fd, "{\"type\":\"llm.start\"}");
+
+    // Stream LLM tokens
+    std::string full_response;
+    int comp_toks = poll_tokens(infer_req.request_id,
+        [&](const std::string& piece) {
+            full_response += piece;
+            // 发送增量
+            ws_send_text(client_fd, "{\"type\":\"llm.delta\",\"delta\":\"" + json_escape(piece) + "\"}");
+        },
+        config_.timeout_s,
+        false,   // enable_thinking = false
+        {},      // stop_seqs
+        {},      // on_reasoning
+        {},      // on_tool_call
+        nullptr, // finish_reason
+        nullptr, // abort_flag
+        nullptr  // cached_tokens
+    );
+
+    unregister_request(infer_req.request_id);
+
+    // 发送完成
+    ws_send_text(client_fd, "{\"type\":\"llm.done\",\"text\":\"" + json_escape(full_response) +
+                 "\",\"prompt_tokens\":" + std::to_string(prompt_count) +
+                 ",\"completion_tokens\":" + std::to_string(comp_toks) + "}");
+
+    chat_history.push_back({"assistant", full_response});
+
+    // TTS
+    if (tts_enabled && tts_plugin_ && tts_plugin_->is_available() && !full_response.empty()) {
+        ws_send_text(client_fd, "{\"type\":\"status\",\"stage\":\"tts\"}");
+
+        auto tts_result = tts_plugin_->synthesize(full_response, voice, 1.0f, "wav");
+        if (tts_result.error_code == 0 && !tts_result.audio_data.empty()) {
+            // 发送音频数据 (base64 编码)
+            std::string audio_b64 = base64_encode(tts_result.audio_data.data(),
+                                                   tts_result.audio_data.size());
+            ws_send_text(client_fd, "{\"type\":\"tts\",\"format\":\"wav\",\"data\":\"" + audio_b64 + "\"}");
+        } else {
+            ws_send_text(client_fd, "{\"type\":\"error\",\"message\":\"TTS failed\"}");
+        }
+    }
 }
 
 } // namespace serve

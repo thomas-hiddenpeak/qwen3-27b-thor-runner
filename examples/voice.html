@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Qwen3 Voice Chat — 语音对话</title>
+<title>Qwen3 Voice Chat — WebSocket 语音对话</title>
 <style>
 :root {
   --bg: #0f1117;
@@ -34,7 +34,6 @@ body {
   flex-direction: column;
 }
 
-/* Header */
 .header {
   display: flex;
   align-items: center;
@@ -59,10 +58,7 @@ body {
   align-items: center;
 }
 
-.header-controls label {
-  font-size: 12px;
-  color: var(--text2);
-}
+.header-controls label { font-size: 12px; color: var(--text2); }
 
 .header-controls select {
   padding: 6px 10px;
@@ -74,7 +70,6 @@ body {
   outline: none;
 }
 
-/* Chat area */
 .chat-area {
   flex: 1;
   overflow-y: auto;
@@ -90,7 +85,6 @@ body {
   border-radius: var(--radius);
   line-height: 1.6;
   font-size: 15px;
-  position: relative;
 }
 
 .message.user {
@@ -133,33 +127,6 @@ body {
   margin-top: 6px;
 }
 
-/* Thinking indicator */
-.thinking {
-  align-self: flex-start;
-  padding: 14px 18px;
-  background: var(--assistant-bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  color: var(--text2);
-  font-size: 14px;
-  display: none;
-}
-
-.thinking.visible { display: block; }
-
-.thinking .dots::after {
-  content: '';
-  animation: dots 1.5s steps(4, end) infinite;
-}
-
-@keyframes dots {
-  0%, 20% { content: ''; }
-  40% { content: '.'; }
-  60% { content: '..'; }
-  80%, 100% { content: '...'; }
-}
-
-/* Input area */
 .input-area {
   padding: 16px 24px;
   background: var(--surface);
@@ -191,18 +158,11 @@ body {
   min-height: 44px;
 }
 
-.input-row textarea:focus {
-  border-color: var(--primary);
-}
+.input-row textarea:focus { border-color: var(--primary); }
+.input-row textarea::placeholder { color: var(--text2); }
 
-.input-row textarea::placeholder {
-  color: var(--text2);
-}
-
-/* Mic button */
 .mic-btn {
-  width: 48px;
-  height: 48px;
+  width: 48px; height: 48px;
   border-radius: 50%;
   border: 2px solid var(--border);
   background: var(--surface2);
@@ -215,10 +175,7 @@ body {
   flex-shrink: 0;
 }
 
-.mic-btn:hover {
-  border-color: var(--primary);
-  background: rgba(108, 138, 255, 0.1);
-}
+.mic-btn:hover { border-color: var(--primary); background: rgba(108, 138, 255, 0.1); }
 
 .mic-btn.recording {
   border-color: var(--recording);
@@ -226,20 +183,15 @@ body {
   animation: pulse 1.5s ease infinite;
 }
 
-.mic-btn svg {
-  width: 22px;
-  height: 22px;
-}
+.mic-btn svg { width: 22px; height: 22px; }
 
 @keyframes pulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
   50% { box-shadow: 0 0 0 12px rgba(239, 68, 68, 0); }
 }
 
-/* Send button */
 .send-btn {
-  width: 48px;
-  height: 48px;
+  width: 48px; height: 48px;
   border-radius: 50%;
   border: none;
   background: var(--primary);
@@ -252,21 +204,10 @@ body {
   flex-shrink: 0;
 }
 
-.send-btn:hover:not(:disabled) {
-  background: var(--primary-hover);
-}
+.send-btn:hover:not(:disabled) { background: var(--primary-hover); }
+.send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.send-btn svg { width: 20px; height: 20px; }
 
-.send-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.send-btn svg {
-  width: 20px;
-  height: 20px;
-}
-
-/* Mode toggle */
 .mode-toggle {
   display: flex;
   gap: 4px;
@@ -287,44 +228,15 @@ body {
   font-family: inherit;
 }
 
-.mode-toggle button.active {
-  background: var(--primary);
-  color: #fff;
-}
-
-/* Settings */
-.settings-row {
-  display: flex;
-  gap: 16px;
-  align-items: center;
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--text2);
-}
-
-.settings-row input[type="text"] {
-  padding: 4px 8px;
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  color: var(--text);
-  font-size: 12px;
-  width: 200px;
-  outline: none;
-}
+.mode-toggle button.active { background: var(--primary); color: #fff; }
 
 .toggle-switch {
   position: relative;
   display: inline-block;
-  width: 36px;
-  height: 20px;
+  width: 36px; height: 20px;
 }
 
-.toggle-switch input {
-  opacity: 0;
-  width: 0;
-  height: 0;
-}
+.toggle-switch input { opacity: 0; width: 0; height: 0; }
 
 .toggle-slider {
   position: absolute;
@@ -339,37 +251,42 @@ body {
 .toggle-slider:before {
   content: '';
   position: absolute;
-  height: 14px;
-  width: 14px;
-  left: 2px;
-  bottom: 2px;
+  height: 14px; width: 14px;
+  left: 2px; bottom: 2px;
   background: var(--text2);
   border-radius: 50%;
   transition: 0.3s;
 }
 
-.toggle-switch input:checked + .toggle-slider {
-  background: var(--primary);
-  border-color: var(--primary);
+.toggle-switch input:checked + .toggle-slider { background: var(--primary); border-color: var(--primary); }
+.toggle-switch input:checked + .toggle-slider:before { transform: translateX(16px); background: #fff; }
+
+/* Connection status indicator */
+.ws-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text2);
 }
 
-.toggle-switch input:checked + .toggle-slider:before {
-  transform: translateX(16px);
-  background: #fff;
-}
-
-/* Spinner */
-.spinner {
-  display: inline-block;
-  width: 14px;
-  height: 14px;
-  border: 2px solid rgba(255,255,255,0.3);
-  border-top-color: #fff;
+.ws-dot {
+  width: 8px; height: 8px;
   border-radius: 50%;
-  animation: spin 0.6s linear infinite;
+  background: var(--error);
+  transition: background 0.3s;
 }
 
-@keyframes spin { to { transform: rotate(360deg); } }
+.ws-dot.connected { background: var(--success); }
+
+.settings-row {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text2);
+}
 
 /* Status bar */
 .status-bar {
@@ -382,52 +299,56 @@ body {
 
 .status-bar.visible { display: block; }
 .status-bar.error { color: var(--error); }
+
+/* Streaming cursor */
+.streaming-cursor::after {
+  content: '▊';
+  animation: blink 1s step-end infinite;
+  color: var(--primary);
+}
+
+@keyframes blink { 50% { opacity: 0; } }
 </style>
 </head>
 <body>
 
-<!-- Header -->
 <div class="header">
-  <h1>🎙️ Qwen3 Voice Chat</h1>
+  <h1>🎙️ Qwen3 Voice Chat <span style="font-size:12px;font-weight:400;opacity:0.6">(WebSocket)</span></h1>
   <div class="header-controls">
+    <div class="ws-status">
+      <span class="ws-dot" id="wsDot"></span>
+      <span id="wsLabel">未连接</span>
+    </div>
     <div class="mode-toggle">
       <button id="modeText" class="active" onclick="setMode('text')">文字</button>
       <button id="modeVoice" onclick="setMode('voice')">语音</button>
       <button id="modeAuto" onclick="setMode('auto')">自动</button>
     </div>
-    <select id="voiceSelect">
+    <select id="voiceSelect" onchange="sendConfig()">
+      <option value="Chelsie">Chelsie</option>
       <option value="serena">Serena</option>
       <option value="Vivian">Vivian</option>
       <option value="Ethan">Ethan</option>
-      <option value="Chelsie">Chelsie</option>
     </select>
     <label>
       <span>TTS</span>
       <label class="toggle-switch">
-        <input type="checkbox" id="ttsToggle" checked>
+        <input type="checkbox" id="ttsToggle" checked onchange="sendConfig()">
         <span class="toggle-slider"></span>
       </label>
     </label>
   </div>
 </div>
 
-<!-- Chat Messages -->
 <div class="chat-area" id="chatArea">
   <div class="message assistant">
     <div class="role-tag">Assistant</div>
-    <div class="content">你好！我是 Qwen 语音助手。你可以用文字或语音和我对话。点击麦克风按钮开始录音，或直接输入文字。</div>
+    <div class="content">你好！我是 Qwen 语音助手 (WebSocket 模式)。你可以用文字或语音和我对话。</div>
   </div>
 </div>
 
-<!-- Thinking Indicator -->
-<div class="thinking" id="thinking">
-  <span class="dots">思考中</span>
-</div>
-
-<!-- Status Bar -->
 <div class="status-bar" id="statusBar"></div>
 
-<!-- Input Area -->
 <div class="input-area">
   <div class="input-row">
     <textarea id="inputText" placeholder="输入消息... (Ctrl+Enter 发送)" rows="1"
@@ -445,7 +366,6 @@ body {
     </button>
   </div>
   <div class="settings-row">
-    <span>API: <input type="text" id="apiUrl"></span>
     <span id="recordingStatus"></span>
   </div>
 </div>
@@ -454,36 +374,193 @@ body {
 // ============================================================================
 // State
 // ============================================================================
-let chatHistory = [];  // {role, content}
+let ws = null;
 let isRecording = false;
 let mediaRecorder = null;
 let audioChunks = [];
 let isProcessing = false;
-let currentMode = 'text';  // 'text', 'voice', 'auto'
-
-// Auto-detect API URL
-document.getElementById('apiUrl').value = window.location.origin;
+let currentMode = 'text';
+let streamingDiv = null;   // 当前正在流式输出的消息 div
+let streamingText = '';    // 累积的流式文本
+let responseT0 = 0;       // 响应开始时间
 
 // ============================================================================
-// Mode
+// WebSocket 连接
+// ============================================================================
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = proto + '//' + location.host + '/v1/voice';
+
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    document.getElementById('wsDot').classList.add('connected');
+    document.getElementById('wsLabel').textContent = '已连接';
+    sendConfig();
+  };
+
+  ws.onclose = () => {
+    document.getElementById('wsDot').classList.remove('connected');
+    document.getElementById('wsLabel').textContent = '已断开';
+    // 自动重连
+    setTimeout(connectWS, 3000);
+  };
+
+  ws.onerror = () => {
+    setStatus('WebSocket 连接失败', 'error');
+  };
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    handleEvent(msg);
+  };
+}
+
+function sendConfig() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const voice = document.getElementById('voiceSelect').value;
+  const tts = document.getElementById('ttsToggle').checked;
+  ws.send(JSON.stringify({ type: 'config', voice, tts }));
+}
+
+// ============================================================================
+// 事件处理
+// ============================================================================
+function handleEvent(msg) {
+  switch (msg.type) {
+    case 'session.created':
+      clearStatus();
+      break;
+
+    case 'config.updated':
+      break;
+
+    case 'status':
+      if (msg.stage === 'asr') setStatus('正在转录语音...');
+      else if (msg.stage === 'tts') setStatus('正在合成语音...');
+      break;
+
+    case 'asr':
+      // ASR 识别结果 — 显示为用户消息
+      addMessage('user', msg.text, null, 'ASR 识别');
+      break;
+
+    case 'llm.start':
+      // 开始流式输出
+      responseT0 = performance.now();
+      streamingText = '';
+      streamingDiv = createStreamingMessage();
+      setStatus('正在生成回复...');
+      break;
+
+    case 'llm.delta':
+      // 增量文本
+      if (streamingDiv) {
+        streamingText += msg.delta;
+        const contentEl = streamingDiv.querySelector('.content');
+        contentEl.textContent = streamingText;
+        contentEl.classList.add('streaming-cursor');
+        scrollToBottom();
+      }
+      break;
+
+    case 'llm.done':
+      // LLM 完成
+      if (streamingDiv) {
+        const contentEl = streamingDiv.querySelector('.content');
+        contentEl.classList.remove('streaming-cursor');
+        const llmTime = ((performance.now() - responseT0) / 1000).toFixed(1);
+        let metaText = `LLM ${llmTime}s`;
+        if (msg.prompt_tokens) metaText += ` · ${msg.prompt_tokens} prompt`;
+        if (msg.completion_tokens) metaText += ` · ${msg.completion_tokens} gen`;
+        // meta 先设置, TTS 到达后会更新
+        streamingDiv.dataset.llmMeta = metaText;
+        let metaEl = streamingDiv.querySelector('.meta');
+        if (!metaEl) {
+          metaEl = document.createElement('div');
+          metaEl.className = 'meta';
+          streamingDiv.appendChild(metaEl);
+        }
+        metaEl.textContent = metaText;
+      }
+      clearStatus();
+      break;
+
+    case 'tts':
+      // TTS 音频 (base64 WAV)
+      if (msg.data && streamingDiv) {
+        const binary = atob(msg.data);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const blob = new Blob([bytes], { type: 'audio/wav' });
+        const audioUrl = URL.createObjectURL(blob);
+
+        // 添加 audio 元素
+        const audio = document.createElement('audio');
+        audio.controls = true;
+        audio.src = audioUrl;
+        audio.style.cssText = 'display:block;margin-top:8px;width:100%;height:36px;border-radius:6px;';
+        streamingDiv.appendChild(audio);
+
+        // 更新 meta
+        const sizeKB = (bytes.length / 1024).toFixed(0);
+        const metaEl = streamingDiv.querySelector('.meta');
+        if (metaEl) {
+          metaEl.textContent = (streamingDiv.dataset.llmMeta || '') + ` · TTS ${sizeKB}KB`;
+        }
+
+        // 自动播放
+        audio.play().catch(() => {});
+        scrollToBottom();
+      }
+      clearStatus();
+      isProcessing = false;
+      document.getElementById('sendBtn').disabled = false;
+      streamingDiv = null;
+      break;
+
+    case 'error':
+      setStatus(msg.message || '发生错误', 'error');
+      isProcessing = false;
+      document.getElementById('sendBtn').disabled = false;
+      if (streamingDiv) {
+        const contentEl = streamingDiv.querySelector('.content');
+        contentEl.classList.remove('streaming-cursor');
+        streamingDiv = null;
+      }
+      break;
+
+    case 'history.cleared':
+      break;
+  }
+
+  // llm.done 且 TTS 未启用 → 解锁
+  if (msg.type === 'llm.done') {
+    const ttsEnabled = document.getElementById('ttsToggle').checked;
+    const shouldTTS = ttsEnabled && (currentMode === 'voice' || currentMode === 'auto');
+    if (!shouldTTS) {
+      isProcessing = false;
+      document.getElementById('sendBtn').disabled = false;
+      streamingDiv = null;
+    }
+  }
+}
+
+// ============================================================================
+// UI Helpers
 // ============================================================================
 function setMode(mode) {
   currentMode = mode;
   document.querySelectorAll('.mode-toggle button').forEach(b => b.classList.remove('active'));
   document.getElementById('mode' + mode.charAt(0).toUpperCase() + mode.slice(1)).classList.add('active');
+  sendConfig();
 }
 
-// ============================================================================
-// Auto resize textarea
-// ============================================================================
 function autoResize(el) {
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, 120) + 'px';
 }
 
-// ============================================================================
-// Status
-// ============================================================================
 function setStatus(msg, type = '') {
   const bar = document.getElementById('statusBar');
   bar.textContent = msg;
@@ -494,24 +571,8 @@ function clearStatus() {
   document.getElementById('statusBar').className = 'status-bar';
 }
 
-// ============================================================================
-// Add message to chat
-// ============================================================================
-function addMessage(role, content, audioUrl = null, meta = '') {
+function scrollToBottom() {
   const chatArea = document.getElementById('chatArea');
-  const div = document.createElement('div');
-  div.className = 'message ' + role;
-
-  let html = '<div class="role-tag">' + (role === 'user' ? 'You' : 'Assistant') + '</div>';
-  html += '<div class="content">' + escapeHtml(content) + '</div>';
-  if (audioUrl) {
-    html += '<audio controls src="' + audioUrl + '"></audio>';
-  }
-  if (meta) {
-    html += '<div class="meta">' + escapeHtml(meta) + '</div>';
-  }
-  div.innerHTML = html;
-  chatArea.appendChild(div);
   chatArea.scrollTop = chatArea.scrollHeight;
 }
 
@@ -521,12 +582,56 @@ function escapeHtml(s) {
   return div.innerHTML;
 }
 
+function addMessage(role, content, audioUrl, meta) {
+  const chatArea = document.getElementById('chatArea');
+  const div = document.createElement('div');
+  div.className = 'message ' + role;
+  let html = '<div class="role-tag">' + (role === 'user' ? 'You' : 'Assistant') + '</div>';
+  html += '<div class="content">' + escapeHtml(content) + '</div>';
+  if (audioUrl) {
+    html += '<audio controls src="' + audioUrl + '" style="display:block;margin-top:8px;width:100%;height:36px;border-radius:6px;"></audio>';
+  }
+  if (meta) {
+    html += '<div class="meta">' + escapeHtml(meta) + '</div>';
+  }
+  div.innerHTML = html;
+  chatArea.appendChild(div);
+  scrollToBottom();
+}
+
+function createStreamingMessage() {
+  const chatArea = document.getElementById('chatArea');
+  const div = document.createElement('div');
+  div.className = 'message assistant';
+  div.innerHTML = '<div class="role-tag">Assistant</div><div class="content streaming-cursor"></div>';
+  chatArea.appendChild(div);
+  scrollToBottom();
+  return div;
+}
+
 // ============================================================================
-// Recording
+// 发送文字消息
+// ============================================================================
+function sendMessage() {
+  const input = document.getElementById('inputText');
+  const text = input.value.trim();
+  if (!text || isProcessing || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+  input.value = '';
+  autoResize(input);
+
+  addMessage('user', text);
+  isProcessing = true;
+  document.getElementById('sendBtn').disabled = true;
+
+  ws.send(JSON.stringify({ type: 'chat', text }));
+}
+
+// ============================================================================
+// 录音 → ASR
 // ============================================================================
 async function toggleRecording() {
   if (isProcessing) return;
-
   if (isRecording) {
     stopRecording();
   } else {
@@ -538,26 +643,20 @@ async function startRecording() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     audioChunks = [];
-
-    // Use webm/opus for broader browser support
     const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-      ? 'audio/webm;codecs=opus'
-      : 'audio/webm';
+      ? 'audio/webm;codecs=opus' : 'audio/webm';
 
     mediaRecorder = new MediaRecorder(stream, { mimeType });
-
     mediaRecorder.ondataavailable = (e) => {
       if (e.data.size > 0) audioChunks.push(e.data);
     };
-
     mediaRecorder.onstop = async () => {
       stream.getTracks().forEach(t => t.stop());
       if (audioChunks.length > 0) {
         const blob = new Blob(audioChunks, { type: mimeType });
-        await processAudioInput(blob);
+        await sendAudio(blob);
       }
     };
-
     mediaRecorder.start(100);
     isRecording = true;
     document.getElementById('micBtn').classList.add('recording');
@@ -568,207 +667,36 @@ async function startRecording() {
 }
 
 function stopRecording() {
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    mediaRecorder.stop();
-  }
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
   isRecording = false;
   document.getElementById('micBtn').classList.remove('recording');
   document.getElementById('recordingStatus').textContent = '';
 }
 
-// ============================================================================
-// Process audio input (ASR → LLM → TTS)
-// ============================================================================
-async function processAudioInput(audioBlob) {
-  if (isProcessing) return;
-  isProcessing = true;
-  const sendBtn = document.getElementById('sendBtn');
-  sendBtn.disabled = true;
-
-  const apiBase = document.getElementById('apiUrl').value.replace(/\/$/, '');
-
-  try {
-    // Step 1: ASR — transcribe audio
-    setStatus('正在转录语音...');
-    document.getElementById('thinking').className = 'thinking visible';
-    document.getElementById('thinking').innerHTML = '<span class="dots">转录中</span>';
-
-    const formData = new FormData();
-    formData.append('file', audioBlob, 'recording.webm');
-    formData.append('language', 'auto');
-    formData.append('response_format', 'json');
-
-    const asrResp = await fetch(apiBase + '/v1/audio/transcriptions', {
-      method: 'POST',
-      body: formData
-    });
-
-    if (!asrResp.ok) {
-      let errMsg = 'ASR 服务不可用';
-      try { const j = await asrResp.json(); errMsg = j.error?.message || errMsg; } catch {}
-      throw new Error(errMsg);
-    }
-
-    const asrResult = await asrResp.json();
-    const userText = asrResult.text;
-
-    if (!userText || !userText.trim()) {
-      throw new Error('未能识别语音内容');
-    }
-
-    // Show user message
-    const userAudioUrl = URL.createObjectURL(audioBlob);
-    addMessage('user', userText, userAudioUrl, 'ASR 识别');
-
-    // Step 2: LLM — generate response
-    await generateResponse(userText, apiBase);
-
-  } catch (err) {
-    setStatus('处理失败: ' + err.message, 'error');
-  } finally {
-    isProcessing = false;
-    sendBtn.disabled = false;
-    document.getElementById('thinking').className = 'thinking';
+async function sendAudio(blob) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    setStatus('WebSocket 未连接', 'error');
+    return;
   }
-}
 
-// ============================================================================
-// Send text message
-// ============================================================================
-async function sendMessage() {
-  const input = document.getElementById('inputText');
-  const text = input.value.trim();
-  if (!text || isProcessing) return;
-
-  input.value = '';
-  autoResize(input);
-
-  addMessage('user', text);
-
-  const apiBase = document.getElementById('apiUrl').value.replace(/\/$/, '');
   isProcessing = true;
   document.getElementById('sendBtn').disabled = true;
 
-  try {
-    await generateResponse(text, apiBase);
-  } catch (err) {
-    setStatus('处理失败: ' + err.message, 'error');
-  } finally {
-    isProcessing = false;
-    document.getElementById('sendBtn').disabled = false;
-  }
+  // 将音频 blob 转为 base64 发送
+  const reader = new FileReader();
+  reader.onload = () => {
+    const base64 = reader.result.split(',')[1]; // strip data:...;base64,
+    ws.send(JSON.stringify({
+      type: 'audio',
+      data: base64,
+      format: 'webm'
+    }));
+  };
+  reader.readAsDataURL(blob);
 }
 
 // ============================================================================
-// Generate LLM response + optional TTS
-// ============================================================================
-async function generateResponse(userText, apiBase) {
-  // Add to chat history
-  chatHistory.push({ role: 'user', content: userText });
-
-  // Show thinking
-  document.getElementById('thinking').className = 'thinking visible';
-  document.getElementById('thinking').innerHTML = '<span class="dots">思考中</span>';
-  setStatus('正在生成回复...');
-
-  const t0 = performance.now();
-
-  // LLM call
-  const messages = [
-    { role: 'system', content: '你是通义千问，一个有帮助的AI助手。请简洁、自然地回答问题。' },
-    ...chatHistory.slice(-10)  // Keep last 10 messages for context
-  ];
-
-  const llmResp = await fetch(apiBase + '/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'qwen3.5',
-      messages: messages,
-      temperature: 0.7,
-      max_tokens: 512,
-      chat_template_kwargs: { enable_thinking: false }
-    })
-  });
-
-  if (!llmResp.ok) {
-    let errMsg = 'LLM 服务错误';
-    try { const j = await llmResp.json(); errMsg = j.error?.message || errMsg; } catch {}
-    throw new Error(errMsg);
-  }
-
-  const llmResult = await llmResp.json();
-  const assistantText = llmResult.choices?.[0]?.message?.content || '';
-  const llmTime = ((performance.now() - t0) / 1000).toFixed(1);
-
-  chatHistory.push({ role: 'assistant', content: assistantText });
-
-  // Hide thinking
-  document.getElementById('thinking').className = 'thinking';
-
-  // Should we do TTS?
-  const ttsEnabled = document.getElementById('ttsToggle').checked;
-  const shouldTTS = ttsEnabled && (currentMode === 'voice' || currentMode === 'auto');
-
-  if (shouldTTS && assistantText.trim()) {
-    // Generate TTS
-    setStatus('正在合成语音...');
-    document.getElementById('thinking').className = 'thinking visible';
-    document.getElementById('thinking').innerHTML = '<span class="dots">合成语音中</span>';
-
-    try {
-      const ttsT0 = performance.now();
-      const voice = document.getElementById('voiceSelect').value;
-
-      const ttsResp = await fetch(apiBase + '/v1/audio/speech', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'qwen3-tts',
-          input: assistantText,
-          voice: voice,
-          response_format: 'wav'
-        })
-      });
-
-      if (ttsResp.ok) {
-        const audioBlob = await ttsResp.blob();
-        const audioUrl = URL.createObjectURL(audioBlob);
-        const ttsTime = ((performance.now() - ttsT0) / 1000).toFixed(1);
-        const sizeKB = (audioBlob.size / 1024).toFixed(0);
-
-        addMessage('assistant', assistantText, audioUrl,
-          `LLM ${llmTime}s · TTS ${ttsTime}s · ${sizeKB}KB`);
-
-        // Auto play
-        const audio = new Audio(audioUrl);
-        audio.play().catch(() => {});
-
-        clearStatus();
-      } else {
-        // TTS failed, show text only
-        addMessage('assistant', assistantText, null, `LLM ${llmTime}s · TTS 失败`);
-        setStatus('TTS 合成失败，仅显示文字', 'error');
-      }
-    } catch (ttsErr) {
-      addMessage('assistant', assistantText, null, `LLM ${llmTime}s`);
-      setStatus('TTS 异常: ' + ttsErr.message, 'error');
-    }
-  } else {
-    // Text only
-    addMessage('assistant', assistantText, null, `LLM ${llmTime}s`);
-    clearStatus();
-  }
-
-  document.getElementById('thinking').className = 'thinking';
-
-  // Scroll to bottom
-  const chatArea = document.getElementById('chatArea');
-  chatArea.scrollTop = chatArea.scrollHeight;
-}
-
-// ============================================================================
-// Keyboard shortcuts
+// 键盘快捷键
 // ============================================================================
 document.getElementById('inputText').addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
@@ -777,7 +705,6 @@ document.getElementById('inputText').addEventListener('keydown', e => {
   }
 });
 
-// Space to toggle recording when input is empty
 document.addEventListener('keydown', e => {
   if (e.code === 'Space' && document.activeElement.tagName !== 'TEXTAREA'
       && document.activeElement.tagName !== 'INPUT') {
@@ -785,6 +712,11 @@ document.addEventListener('keydown', e => {
     toggleRecording();
   }
 });
+
+// ============================================================================
+// 启动
+// ============================================================================
+connectWS();
 </script>
 </body>
 </html>
