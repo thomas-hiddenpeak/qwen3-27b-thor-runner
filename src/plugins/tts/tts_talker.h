@@ -108,13 +108,17 @@ public:
 
     // ===== Generation =====
 
-    // Build prefill embeddings for CustomVoice mode
-    // text_ids: tokenized text including <|im_start|>assistant\n...text...<|im_end|>...
+    // Build prefill embeddings for CustomVoice/VoiceDesign mode
+    // text_ids: tokenized text: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
     // text_len: number of text tokens
+    // instruct_ids: optional instruct tokens: <|im_start|>user\n{instruct}<|im_end|>\n
+    //   Embedded as pure text-track (no codec), placed before role tokens in prefill
+    // instruct_len: number of instruct tokens (0 = no instruct)
     // speaker: speaker name (looked up in config), empty = no speaker
     // language: language name (looked up in config), "auto" = no language
     // Returns prefill embedding length
     int build_prefill(const int* text_ids_cpu, int text_len,
+                      const int* instruct_ids_cpu, int instruct_len,
                       const std::string& speaker,
                       const std::string& language,
                       cudaStream_t stream = 0);

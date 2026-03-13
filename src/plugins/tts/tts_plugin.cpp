@@ -42,11 +42,16 @@ TtsConfig TtsConfig::from_file(const std::string& path) {
         else if (key == "tts_model")      config.model_path = val;
         else if (key == "tts_voice")      config.voice      = val;
         else if (key == "tts_language")   config.language    = val;
+        else if (key == "tts_instruct")   config.instruct   = val;
         else if (key == "tts_speed")      config.speed      = std::stof(val);
         else if (key == "tts_format")     config.format     = val;
         else if (key == "tts_extra_args") config.extra_args = val;
         else if (key == "tts_tmp_dir")    config.tmp_dir    = val;
         else if (key == "tts_max_tokens") config.max_new_tokens = std::stoi(val);
+        else if (key == "tts_temperature")   config.tts_temperature = std::stof(val);
+        else if (key == "tts_top_k")         config.tts_top_k = std::stoi(val);
+        else if (key == "tts_top_p")         config.tts_top_p = std::stof(val);
+        else if (key == "tts_rep_penalty")   config.tts_rep_penalty = std::stof(val);
     }
     return config;
 }
@@ -60,8 +65,12 @@ void TtsConfig::print() const {
     fprintf(stderr, "  language:   %s\n", language.c_str());
     fprintf(stderr, "  speed:      %.1f\n", speed);
     fprintf(stderr, "  format:     %s\n", format.c_str());
+    if (!instruct.empty())
+        fprintf(stderr, "  instruct:   %s\n", instruct.c_str());
     if (!extra_args.empty())
         fprintf(stderr, "  extra_args: %s\n", extra_args.c_str());
+    fprintf(stderr, "  sampling:   temp=%.2f top_k=%d top_p=%.2f rep=%.2f\n",
+            tts_temperature, tts_top_k, tts_top_p, tts_rep_penalty);
 }
 
 // ============================================================================
@@ -93,7 +102,8 @@ static std::string format_to_content_type(const std::string& fmt) {
 TtsResult SubprocessTtsPlugin::synthesize(const std::string& text,
                                            const std::string& voice,
                                            float speed,
-                                           const std::string& format) {
+                                           const std::string& format,
+                                           const std::string& instruct) {
     TtsResult result;
     result.format = format.empty() ? config_.format : format;
 
@@ -222,7 +232,11 @@ NativeTtsPlugin::NativeTtsPlugin(const TtsConfig& config)
     engine_ = std::make_unique<tts::TTSEngine>();
     fprintf(stderr, "[TTS Native] Loading model from %s...\n", config.model_path.c_str());
     engine_->load_model(config.model_path);
-    fprintf(stderr, "[TTS Native] Model loaded, sample_rate=%d\n", engine_->sample_rate());
+    fprintf(stderr, "[TTS Native] Model loaded, sample_rate=%d, model_type=%s\n",
+            engine_->sample_rate(), engine_->config().tts_model_type.c_str());
+    // Apply initial sampling parameters from config
+    engine_->set_sampling(config.tts_temperature, config.tts_top_k,
+                          config.tts_top_p, config.tts_rep_penalty);
 }
 
 NativeTtsPlugin::~NativeTtsPlugin() = default;
@@ -285,7 +299,8 @@ static std::vector<uint8_t> build_wav_header_and_data(
 TtsResult NativeTtsPlugin::synthesize(const std::string& text,
                                        const std::string& voice,
                                        float speed,
-                                       const std::string& format) {
+                                       const std::string& format,
+                                       const std::string& instruct) {
     TtsResult result;
     result.format = (format.empty() || format == "wav") ? "wav" : "pcm";
 
@@ -302,13 +317,14 @@ TtsResult NativeTtsPlugin::synthesize(const std::string& text,
     }
 
     std::string use_voice = voice.empty() ? config_.voice : voice;
+    std::string use_instruct = instruct.empty() ? config_.instruct : instruct;
 
     // Serialize access — TTS engine is not thread-safe (single GPU stream)
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto t0 = std::chrono::steady_clock::now();
 
-    auto pcm = engine_->synthesize_to_pcm(text, use_voice, config_.language, "",
+    auto pcm = engine_->synthesize_to_pcm(text, use_voice, config_.language, use_instruct,
                                            config_.max_new_tokens);
 
     if (pcm.empty()) {
@@ -399,6 +415,7 @@ TtsResult NativeTtsPlugin::synthesize_continue(const std::string& text,
 
 int NativeTtsPlugin::synthesize_streaming(const std::string& text,
                                            const std::string& voice,
+                                           const std::string& instruct,
                                            PcmCallback callback,
                                            int chunk_frames) {
     if (!is_available() || !callback) return 0;
@@ -407,8 +424,10 @@ int NativeTtsPlugin::synthesize_streaming(const std::string& text,
 
     std::string speaker = voice;
     std::string language = "auto";
+    // Use instruct from call parameter, fall back to config default
+    std::string use_instruct = instruct.empty() ? config_.instruct : instruct;
 
-    return engine_->synthesize_streaming(text, speaker, language,
+    return engine_->synthesize_streaming(text, speaker, language, use_instruct,
                                           config_.max_new_tokens,
                                           chunk_frames, callback);
 }
@@ -423,6 +442,24 @@ int NativeTtsPlugin::continue_streaming(const std::string& text,
     return engine_->continue_streaming(text,
                                         config_.max_new_tokens,
                                         chunk_frames, callback);
+}
+
+// ============================================================================
+// NativeTtsPlugin::model_info — 返回模型类型和可用音色
+// ============================================================================
+
+TtsPlugin::ModelInfo NativeTtsPlugin::model_info() const {
+    ModelInfo info;
+    if (!engine_ || !engine_->is_loaded()) return info;
+    const auto& cfg = engine_->config();
+    info.model_type = cfg.tts_model_type;
+    info.sample_rate = cfg.tokenizer_decoder.output_sample_rate;
+    for (const auto& [name, id] : cfg.talker.spk_id) {
+        info.available_voices.push_back(name);
+    }
+    // Sort for stable ordering
+    std::sort(info.available_voices.begin(), info.available_voices.end());
+    return info;
 }
 
 // ============================================================================

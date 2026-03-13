@@ -74,6 +74,7 @@ public:
         const std::string& text,
         const std::string& speaker = "serena",
         const std::string& language = "auto",
+        const std::string& instruct = "",
         int max_new_tokens = 4096,
         int chunk_frames = 24,
         PcmCallback pcm_callback = nullptr);
@@ -125,10 +126,9 @@ private:
     // Output: token IDs including <|im_start|>assistant\n...text...<|im_end|>\n<|im_start|>assistant\n
     std::vector<int> build_text_tokens(const std::string& text);
 
-    // Build instruct text tokens for VoiceDesign mode
-    // <|im_start|>user\n{instruct}<|im_end|>\n<|im_start|>assistant\n...text...<|im_end|>\n<|im_start|>assistant\n
-    std::vector<int> build_instruct_text_tokens(const std::string& text,
-                                                 const std::string& instruct);
+    // Build instruct-only tokens: <|im_start|>user\n{instruct}<|im_end|>\n
+    // These are embedded as pure text-track in prefill (no codec counterpart)
+    std::vector<int> build_instruct_tokens(const std::string& instruct);
 };
 
 } // namespace tts

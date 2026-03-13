@@ -106,7 +106,8 @@ static void print_usage() {
     printf("    --tts-enabled         Enable TTS (text-to-speech) plugin\n");
     printf("    --tts-executable <p>  Path to TTS executable (e.g., piper)\n");
     printf("    --tts-model <path>    TTS model path\n");
-    printf("    --tts-voice <name>    Default TTS voice name\n\n");
+    printf("    --tts-voice <name>    Default TTS voice name\n");
+    printf("    --tts-instruct <text> VoiceDesign instruct prompt\n\n");
     printf("  Chat Options:\n");
     printf("    --max-tokens <N>      Max new tokens per response (default: 2048)\n");
     printf("    --temperature <F>     Sampling temperature (default: 1.0)\n");
@@ -216,6 +217,7 @@ static int cmd_serve(int argc, char** argv) {
         else if (arg == "--tts-model"      && i + 1 < argc) tts_config.model_path = argv[++i];
         else if (arg == "--tts-voice"      && i + 1 < argc) tts_config.voice      = argv[++i];
         else if (arg == "--tts-language"   && i + 1 < argc) tts_config.language   = argv[++i];
+        else if (arg == "--tts-instruct"   && i + 1 < argc) tts_config.instruct   = argv[++i];
     }
 
     auto asr_plugin = plugins::create_asr_plugin(asr_config);

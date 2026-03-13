@@ -509,6 +509,7 @@ void Talker::gemm_bf16_bias(__nv_bfloat16* C, const __nv_bfloat16* A, const __nv
 
 int Talker::build_prefill(
     const int* text_ids_cpu, int text_len,
+    const int* instruct_ids_cpu, int instruct_len,
     const std::string& speaker,
     const std::string& language,
     cudaStream_t stream)
@@ -654,8 +655,30 @@ int Talker::build_prefill(
     __nv_bfloat16* tts_bos_embed = tts_special_embed + h;
     __nv_bfloat16* tts_eos_embed = tts_special_embed + 2 * h;
 
+    // ======= Build Instruct Embedding (pure text track, no codec) =======
+    // Official model: instruct_ids are embedded via text_embedding → text_projection
+    // and placed BEFORE role tokens in the prefill sequence.
+    // instruct_ids format: <|im_start|>user\n{instruct}<|im_end|>\n
+    __nv_bfloat16* instruct_embed = nullptr;
+    int instruct_embed_len = 0;
+    if (instruct_ids_cpu && instruct_len > 0) {
+        instruct_embed_len = instruct_len;
+        int* instruct_ids_gpu;
+        cudaMalloc(&instruct_ids_gpu, instruct_len * sizeof(int));
+        cudaMemcpyAsync(instruct_ids_gpu, instruct_ids_cpu, instruct_len * sizeof(int),
+                        cudaMemcpyHostToDevice, stream);
+        __nv_bfloat16* instruct_text_embed;
+        cudaMalloc(&instruct_text_embed, instruct_len * h * sizeof(__nv_bfloat16));
+        audio_ops::invoke_embedding_lookup(instruct_text_embed, instruct_ids_gpu,
+                                            text_embedding_w_, instruct_len, h, stream);
+        cudaMalloc(&instruct_embed, instruct_len * h * sizeof(__nv_bfloat16));
+        text_projection_forward(instruct_embed, instruct_text_embed, instruct_len, workspace_, stream);
+        cudaFree(instruct_ids_gpu);
+        cudaFree(instruct_text_embed);
+    }
+
     // ======= Construct Prefill Embedding (streaming mode) =======
-    // Layout: [role_embed(3)] + [_talker_input_embed(codec_total-1)] + [first_text_token(1)]
+    // Layout: [instruct_embed(N)] + [role_embed(3)] + [_talker_input_embed(codec_total-1)] + [first_text_token(1)]
     //
     // _talker_input_embed = tts_pad * (codec_total-2) + tts_bos
     //                       + codec_embed_all[0:codec_total-1]  (additive)
@@ -663,17 +686,26 @@ int Talker::build_prefill(
     // first_text_token = text_projection(text_embedding(text_ids[3]))
     //                    + codec_embed_all[codec_total-1]  (additive)
 
-    int prefill_total = role_len + (codec_total - 1) + 1;  // role + codec_aligned + first_text
+    int prefill_total = instruct_embed_len + role_len + (codec_total - 1) + 1;
     prefill_len_ = prefill_total;
 
-    // Copy role embed to prefill buffer
-    cudaMemcpyAsync(prefill_embeds_, role_embed,
+    // Copy instruct embed first (pure text track, no codec counterpart)
+    int pf_offset = 0;
+    if (instruct_embed && instruct_embed_len > 0) {
+        cudaMemcpyAsync(prefill_embeds_, instruct_embed,
+                        instruct_embed_len * h * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToDevice, stream);
+        pf_offset = instruct_embed_len;
+    }
+
+    // Copy role embed after instruct
+    cudaMemcpyAsync(prefill_embeds_ + pf_offset * h, role_embed,
                     role_len * h * sizeof(__nv_bfloat16),
                     cudaMemcpyDeviceToDevice, stream);
 
     // Build _talker_input_embed (dual-track additive)
     // Text track: tts_pad repeated (codec_total-2) times, then tts_bos
-    __nv_bfloat16* dual_start = prefill_embeds_ + role_len * h;
+    __nv_bfloat16* dual_start = prefill_embeds_ + (pf_offset + role_len) * h;
     for (int i = 0; i < codec_total - 2; i++) {
         cudaMemcpyAsync(dual_start + i * h, tts_pad_embed_,
                         h * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
@@ -686,7 +718,7 @@ int Talker::build_prefill(
                (codec_total - 1) * h, stream);
 
     // First text token (additive with last codec embed)
-    __nv_bfloat16* first_text_pos = prefill_embeds_ + (role_len + codec_total - 1) * h;
+    __nv_bfloat16* first_text_pos = prefill_embeds_ + (pf_offset + role_len + codec_total - 1) * h;
     // text_projection(text_embedding(text_ids[3]))
     __nv_bfloat16* first_text_raw;
     cudaMalloc(&first_text_raw, h * sizeof(__nv_bfloat16));
@@ -745,9 +777,10 @@ int Talker::build_prefill(
     cudaFree(tts_special_text_embed);
     cudaFree(tts_special_embed);
     cudaFree(first_text_raw);
+    if (instruct_embed) cudaFree(instruct_embed);
 
-    fprintf(stderr, "[TTS Talker] prefill built: %d tokens, trailing_text=%d tokens\n",
-            prefill_len_, trailing_text_len_);
+    fprintf(stderr, "[TTS Talker] prefill built: %d tokens (instruct=%d), trailing_text=%d tokens\n",
+            prefill_len_, instruct_embed_len, trailing_text_len_);
     return prefill_len_;
 }
 

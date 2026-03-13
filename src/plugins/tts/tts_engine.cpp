@@ -259,6 +259,7 @@ std::vector<std::vector<int>> TTSEngine::synthesize(
     talker_->set_max_new_tokens(max_new_tokens);
     int prefill_len = talker_->build_prefill(
         text_tokens.data(), (int)text_tokens.size(),
+        nullptr, 0,
         speaker, language, stream_);
 
     auto t_build = std::chrono::steady_clock::now();
@@ -326,46 +327,28 @@ void TTSEngine::set_sub_sampling(float temperature, int top_k, float top_p) {
 }
 
 // ============================================================================
-// Build instruct text tokens (for VoiceDesign mode)
+// Build instruct-only token IDs
+// Format: <|im_start|>user\n{instruct}<|im_end|>\n
+// These tokens are embedded as pure text-track in build_prefill
 // ============================================================================
 
-std::vector<int> TTSEngine::build_instruct_text_tokens(
-    const std::string& text, const std::string& instruct)
+std::vector<int> TTSEngine::build_instruct_tokens(const std::string& instruct)
 {
-    // VoiceDesign chat template (Python: _build_instruct_text + _build_assistant_text):
-    //   <|im_start|>user\n{instruct}<|im_end|>\n<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
-
     std::vector<int> tokens;
 
     // <|im_start|>user\n
     tokens.push_back(config_.im_start_token_id);   // 151644
-    // "user" token - use tokenizer to encode "user"
     auto user_tokens = tokenizer_.encode("user");
     tokens.insert(tokens.end(), user_tokens.begin(), user_tokens.end());
     tokens.push_back(198);    // "\n"
 
     // instruct text
-    auto instruct_tokens = tokenizer_.encode(instruct);
-    tokens.insert(tokens.end(), instruct_tokens.begin(), instruct_tokens.end());
+    auto instruct_toks = tokenizer_.encode(instruct);
+    tokens.insert(tokens.end(), instruct_toks.begin(), instruct_toks.end());
 
     // <|im_end|>\n
-    tokens.push_back(config_.im_end_token_id);
-    tokens.push_back(198);
-
-    // <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
-    tokens.push_back(config_.im_start_token_id);
-    tokens.push_back(config_.assistant_token_id);
-    tokens.push_back(198);
-
-    auto text_tokens = tokenizer_.encode(text);
-    tokens.insert(tokens.end(), text_tokens.begin(), text_tokens.end());
-
-    tokens.push_back(config_.im_end_token_id);
-    tokens.push_back(198);
-
-    tokens.push_back(config_.im_start_token_id);
-    tokens.push_back(config_.assistant_token_id);
-    tokens.push_back(198);
+    tokens.push_back(config_.im_end_token_id);     // 151645
+    tokens.push_back(198);    // "\n"
 
     return tokens;
 }
@@ -393,13 +376,15 @@ std::vector<float> TTSEngine::synthesize_to_pcm(
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // 1. Tokenize text
-    std::vector<int> text_tokens;
+    // 1. Tokenize text (always use build_text_tokens for the spoken text)
+    std::vector<int> text_tokens = build_text_tokens(text);
+
+    // Build instruct tokens separately (for CustomVoice emotion or VoiceDesign style)
+    std::vector<int> instruct_tokens;
     if (!instruct.empty() || config_.tts_model_type == "voice_design") {
-        text_tokens = build_instruct_text_tokens(text, instruct);
-    } else {
-        text_tokens = build_text_tokens(text);
+        instruct_tokens = build_instruct_tokens(instruct);
     }
+
     if (text_tokens.empty()) {
         fprintf(stderr, "[TTS] ERROR: empty text tokens\n");
         return {};
@@ -409,6 +394,8 @@ std::vector<float> TTSEngine::synthesize_to_pcm(
     talker_->reset();
     talker_->set_max_new_tokens(max_new_tokens);
     talker_->build_prefill(text_tokens.data(), (int)text_tokens.size(),
+                           instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
+                           (int)instruct_tokens.size(),
                            speaker, language, stream_);
     talker_->forward_prefill(stream_);
 
@@ -465,6 +452,7 @@ int TTSEngine::synthesize_streaming(
     const std::string& text,
     const std::string& speaker,
     const std::string& language,
+    const std::string& instruct,
     int max_new_tokens,
     int chunk_frames,
     PcmCallback pcm_callback)
@@ -477,14 +465,22 @@ int TTSEngine::synthesize_streaming(
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // 1. Tokenize text
-    auto text_tokens = build_text_tokens(text);
+    // 1. Tokenize text (always use build_text_tokens for the spoken text)
+    std::vector<int> text_tokens = build_text_tokens(text);
+
+    // Build instruct tokens separately (for CustomVoice emotion or VoiceDesign style)
+    std::vector<int> instruct_tokens;
+    if (!instruct.empty() || config_.tts_model_type == "voice_design") {
+        instruct_tokens = build_instruct_tokens(instruct);
+    }
     if (text_tokens.empty()) return 0;
 
     // 2. Prefill
     talker_->reset();
     talker_->set_max_new_tokens(max_new_tokens);
     talker_->build_prefill(text_tokens.data(), (int)text_tokens.size(),
+                           instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
+                           (int)instruct_tokens.size(),
                            speaker, language, stream_);
     talker_->forward_prefill(stream_);
 

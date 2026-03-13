@@ -609,14 +609,6 @@ footer {
     </div>
     <select id="voiceSelect" onchange="sendConfig()">
       <option value="serena">Serena</option>
-      <option value="vivian">Vivian</option>
-      <option value="sohee">Sohee</option>
-      <option value="ono_anna">Anna</option>
-      <option value="eric">Eric</option>
-      <option value="ryan">Ryan</option>
-      <option value="aiden">Aiden</option>
-      <option value="dylan">Dylan</option>
-      <option value="uncle_fu">Uncle Fu</option>
     </select>
     <label>
       <span>TTS</span>
@@ -625,6 +617,7 @@ footer {
         <span class="toggle-slider"></span>
       </label>
     </label>
+    <button id="stopTtsBtn" onclick="stopTts()" style="display:none;padding:5px 10px;background:#e74c3c;border:none;border-radius:6px;color:white;font-size:12px;cursor:pointer;" title="停止语音播放">⏹ 停止</button>
     <button onclick="toggleTtsSettings()" style="padding:5px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;cursor:pointer;" title="TTS 采样参数">⚙️</button>
   </div>
 </div>
@@ -632,6 +625,12 @@ footer {
 <!-- TTS Settings Panel -->
 <div id="ttsSettings" style="display:none;padding:10px 24px;background:var(--surface);border-bottom:1px solid var(--border);font-size:13px;">
   <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap;">
+    <!-- VoiceDesign instruct input (hidden for custom_voice) -->
+    <label id="instructLabel" style="display:none;color:var(--text2);width:100%">音色描述 (VoiceDesign):
+      <input type="text" id="ttsInstruct" placeholder="例: 请用温柔甜美的女声朗读"
+             style="width:100%;padding:4px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;margin-top:4px;"
+             onchange="sendConfig()">
+    </label>
     <label style="color:var(--text2)">Temperature:
       <input type="range" id="ttsTemp" min="0.1" max="1.5" step="0.05" value="0.9"
              oninput="document.getElementById('ttsTempVal').textContent=this.value" onchange="sendConfig()">
@@ -716,15 +715,13 @@ footer {
           <label>说话人</label>
           <select id="ttsVoiceSelect">
             <option value="serena">Serena</option>
-            <option value="vivian">Vivian</option>
-            <option value="sohee">Sohee</option>
-            <option value="ono_anna">Anna</option>
-            <option value="eric">Eric</option>
-            <option value="ryan">Ryan</option>
-            <option value="aiden">Aiden</option>
-            <option value="dylan">Dylan</option>
-            <option value="uncle_fu">Uncle Fu</option>
           </select>
+          <!-- VoiceDesign instruct for TTS tab -->
+          <div id="ttsTabInstructDiv" style="display:none;margin-top:8px;">
+            <label>音色描述 (VoiceDesign)</label>
+            <input type="text" id="ttsTabInstruct" placeholder="例: 请用温柔甜美的女声朗读"
+                   style="width:100%;padding:6px 10px;margin-top:4px;">
+          </div>
         </div>
         <div class="form-group">
           <label>输出格式</label>
@@ -851,6 +848,65 @@ let wasRecording = false;
 let ttsTotalSize = 0;
 let ttsDone = false;
 
+// TTS model info
+let ttsModelType = 'custom_voice';  // custom_voice, voice_design, voice_clone
+let ttsAvailableVoices = ['serena'];
+
+// ============================================================================
+// TTS Info — 获取模型类型和可用音色
+// ============================================================================
+async function fetchTtsInfo() {
+  try {
+    const resp = await fetch('/v1/tts/info');
+    if (!resp.ok) return;
+    const info = await resp.json();
+    if (!info.enabled) return;
+
+    ttsModelType = info.model_type || 'custom_voice';
+    if (info.available_voices && info.available_voices.length > 0) {
+      ttsAvailableVoices = info.available_voices;
+    }
+    if (info.sample_rate) ttsSampleRate = info.sample_rate;
+
+    // 更新语音下拉框
+    updateVoiceSelects();
+
+    // VoiceDesign 模式显示 instruct 输入
+    const isDesign = ttsModelType === 'voice_design';
+    const isClone = ttsModelType === 'voice_clone';
+    document.getElementById('instructLabel').style.display = isDesign ? 'block' : 'none';
+    document.getElementById('ttsTabInstructDiv').style.display = isDesign ? 'block' : 'none';
+
+    // voice_design 模式隐藏 voice 选择
+    document.getElementById('voiceSelect').style.display = (isDesign || isClone) ? 'none' : '';
+    document.getElementById('ttsVoiceSelect').parentElement.style.display = (isDesign || isClone) ? 'none' : '';
+
+    // voice_clone 提示
+    if (isClone) {
+      setStatus('当前加载的是复制音色模型 (voice_clone), 需要参考音频功能尚未支持');
+    }
+  } catch (e) {
+    console.warn('Failed to fetch TTS info:', e);
+  }
+}
+
+function updateVoiceSelects() {
+  const selects = [document.getElementById('voiceSelect'), document.getElementById('ttsVoiceSelect')];
+  for (const sel of selects) {
+    const current = sel.value;
+    sel.innerHTML = '';
+    for (const v of ttsAvailableVoices) {
+      const opt = document.createElement('option');
+      opt.value = v;
+      opt.textContent = v.charAt(0).toUpperCase() + v.slice(1).replace(/_/g, ' ');
+      sel.appendChild(opt);
+    }
+    if (ttsAvailableVoices.includes(current)) {
+      sel.value = current;
+    }
+  }
+}
+
 // ============================================================================
 // WebSocket 连接
 // ============================================================================
@@ -862,6 +918,7 @@ function connectWS() {
   ws.onopen = () => {
     document.getElementById('wsDot').classList.add('connected');
     document.getElementById('wsLabel').textContent = '已连接';
+    fetchTtsInfo();
     sendConfig();
     // 断线前在录音，重连后自动恢复
     if (wasRecording) {
@@ -914,6 +971,9 @@ function sendConfig() {
     tts_top_p: parseFloat(document.getElementById('ttsTopP').value),
     tts_rep_penalty: parseFloat(document.getElementById('ttsRepPenalty').value)
   };
+  // VoiceDesign instruct
+  const instruct = document.getElementById('ttsInstruct').value.trim();
+  if (instruct) msg.tts_instruct = instruct;
   ws.send(JSON.stringify(msg));
 }
 
@@ -1007,6 +1067,35 @@ function waitForTtsPlaybackEnd(callback) {
 }
 
 // ============================================================================
+// TTS Stop — 停止语音播放和生成
+// ============================================================================
+function stopTts() {
+  // 1. 通知服务端中断
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'interrupt' }));
+  }
+  // 2. 停止本地音频播放
+  ttsStreamActive = false;
+  ttsPreBuffer = [];
+  if (ttsPlayCtx) {
+    ttsPlayCtx.close().catch(() => {});
+    ttsPlayCtx = null;
+  }
+  ttsNextTime = 0;
+  // 3. 隐藏停止按钮
+  document.getElementById('stopTtsBtn').style.display = 'none';
+  // 4. 恢复 UI 状态
+  isProcessing = false;
+  document.getElementById('sendBtn').disabled = false;
+  if (streamingDiv) {
+    const contentEl = streamingDiv.querySelector('.content');
+    if (contentEl) contentEl.classList.remove('streaming-cursor');
+    streamingDiv = null;
+  }
+  clearStatus();
+}
+
+// ============================================================================
 // Event Handling (Voice Chat)
 // ============================================================================
 function handleEvent(msg) {
@@ -1055,6 +1144,7 @@ function handleEvent(msg) {
       ttsNextTime = 0;
       ttsPreBuffer = [];
       if (ttsPlayCtx) { ttsPlayCtx.close(); ttsPlayCtx = null; }
+      document.getElementById('stopTtsBtn').style.display = 'inline-block';
       break;
 
     case 'llm.start':
@@ -1064,6 +1154,7 @@ function handleEvent(msg) {
       ttsTotalSize = 0;
       ttsDone = false;
       setStatus('正在生成回复...');
+      document.getElementById('stopTtsBtn').style.display = 'inline-block';
       break;
 
     case 'llm.delta':
@@ -1102,6 +1193,7 @@ function handleEvent(msg) {
     case 'tts.done':
       ttsDone = true;
       ttsStreamActive = false;
+      document.getElementById('stopTtsBtn').style.display = 'none';
       if (!ttsPlayCtx && ttsPreBuffer.length > 0) {
         ttsPlayCtx = new AudioContext({ sampleRate: ttsSampleRate });
         ttsNextTime = ttsPlayCtx.currentTime + 0.05;
@@ -1140,6 +1232,7 @@ function handleEvent(msg) {
       setStatus(msg.message || '发生错误', 'error');
       isProcessing = false;
       document.getElementById('sendBtn').disabled = false;
+      document.getElementById('stopTtsBtn').style.display = 'none';
       if (streamingDiv) {
         const contentEl = streamingDiv.querySelector('.content');
         contentEl.classList.remove('streaming-cursor');
@@ -1160,6 +1253,7 @@ function handleEvent(msg) {
     if (!ttsEnabled) {
       isProcessing = false;
       document.getElementById('sendBtn').disabled = false;
+      document.getElementById('stopTtsBtn').style.display = 'none';
       streamingDiv = null;
       if (wasRecording) {
         wasRecording = false;

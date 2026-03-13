@@ -142,6 +142,98 @@ static int clamp_max_output_tokens(int requested, int cap) {
 static const char* DEFAULT_SYSTEM_PROMPT =
     "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
 
+// 语音对话默认 system prompt — 引导 LLM 输出适合 TTS 的文本 + 每句情感标注
+static const char* DEFAULT_VOICE_SYSTEM_PROMPT =
+    "你是一个语音助手，你的回答将通过语音合成（TTS）播放给用户。\n"
+    "\n"
+    "【输出格式】\n"
+    "每句话前面用方括号标注该句的语气或情感，格式为 [情感描述]句子内容。\n"
+    "情感描述要简洁具体，例如：\n"
+    "- [温柔关切]你今天看起来有点累，要不要休息一下？\n"
+    "- [兴奋]太棒了，这个消息真让人开心！\n"
+    "- [平静]好的，我来帮你查一下。\n"
+    "- [俏皮]嘿嘿，猜猜看是什么？\n"
+    "- [认真]这个问题需要仔细分析一下。\n"
+    "- [惊讶]哇，这也太巧了吧！\n"
+    "- [安慰]别担心，一切都会好起来的。\n"
+    "\n"
+    "常用情感词：平静、温柔、开心、兴奋、惊讶、认真、"
+    "俏皮、感慨、安慰、关切、鼓励、幽默、好奇、"
+    "遗憾、无奈、轻松、热情、自信、神秘、思考\n"
+    "也可以组合或自由描述，如：温柔且感慨、用讲故事的语气、轻声细语。\n"
+    "\n"
+    "【文本规则】\n"
+    "1. 使用口语化、自然的表达，就像在和朋友聊天\n"
+    "2. 回答简洁明了，避免冗长的段落\n"
+    "3. 不要使用 Markdown 格式（加粗、标题、列表标记、代码块等）\n"
+    "4. 不要使用特殊符号（星号、井号、反引号等）和表格\n"
+    "5. 数字用中文读法表示（如一百二十三），除非是专有名词\n"
+    "6. 适当使用语气词让对话更自然\n"
+    "7. 避免输出网址、链接或代码";
+
+// 从 LLM 输出的文本中提取 [情感标注] 并返回 (clean_text, emotion)
+// 例: "[温柔]你好啊" → ("你好啊", "温柔")
+// 例: "你好啊" → ("你好啊", "")
+static std::pair<std::string, std::string> extract_tts_instruct(const std::string& text) {
+    if (text.empty()) return {"", ""};
+
+    // 查找开头的 [xxx] 标注 (跳过前导空白)
+    size_t start = 0;
+    while (start < text.size() && (text[start] == ' ' || text[start] == '\n')) start++;
+
+    // 检查是否以 [ 开头 (UTF-8: '[' = 0x5B, 中文'[' = E3 80 90)
+    bool found = false;
+    size_t tag_start = start;
+    size_t tag_end = std::string::npos;
+
+    // ASCII [ ]
+    if (start < text.size() && text[start] == '[') {
+        tag_end = text.find(']', start + 1);
+        if (tag_end != std::string::npos && tag_end - start < 100) {
+            found = true;
+        }
+    }
+    // 中文【】
+    else if (start + 2 < text.size() &&
+             (unsigned char)text[start] == 0xE3 &&
+             (unsigned char)text[start+1] == 0x80 &&
+             (unsigned char)text[start+2] == 0x90) {
+        // 搜索 】(E3 80 91)
+        for (size_t i = start + 3; i + 2 < text.size() && i < start + 100; i++) {
+            if ((unsigned char)text[i] == 0xE3 &&
+                (unsigned char)text[i+1] == 0x80 &&
+                (unsigned char)text[i+2] == 0x91) {
+                tag_end = i + 2;  // 指向 】 的最后一个字节
+                found = true;
+                break;
+            }
+        }
+        if (found) {
+            // 提取标注内容 (去掉【】)
+            std::string emotion = text.substr(start + 3, tag_end - 2 - (start + 3));
+            std::string clean = text.substr(tag_end + 1);
+            // 去掉 clean 前导空格
+            size_t cs = 0;
+            while (cs < clean.size() && clean[cs] == ' ') cs++;
+            if (cs > 0) clean = clean.substr(cs);
+            if (emotion.empty()) return {clean, ""};
+            return {clean, emotion};
+        }
+    }
+
+    if (!found) return {text, ""};
+
+    // ASCII [] 情况: 提取标注内容
+    std::string emotion = text.substr(tag_start + 1, tag_end - tag_start - 1);
+    std::string clean = text.substr(tag_end + 1);
+    // 去掉 clean 前导空格
+    size_t cs = 0;
+    while (cs < clean.size() && clean[cs] == ' ') cs++;
+    if (cs > 0) clean = clean.substr(cs);
+    if (emotion.empty()) return {clean, ""};
+    return {clean, emotion};
+}
+
 // Unescape JSON string value (handles \", \\, \n, \t, \r, \/)
 static std::string json_unescape(const std::string& s) {
     std::string out;
@@ -1323,6 +1415,7 @@ ServeConfig ServeConfig::merge_args(const ServeConfig& base, int argc, char** ar
         else if (arg == "--model-name" && i + 1 < argc) cfg.model_name = argv[++i];
         else if (arg == "--timeout" && i + 1 < argc) cfg.timeout_s = std::stoi(argv[++i]);
         else if (arg == "--max-output-tokens" && i + 1 < argc) cfg.max_output_tokens_cap = std::stoi(argv[++i]);
+        else if (arg == "--voice-system-prompt" && i + 1 < argc) cfg.voice_system_prompt = argv[++i];
     }
     return cfg;
 }
@@ -1351,6 +1444,7 @@ ServeConfig ServeConfig::from_file(const std::string& path) {
         else if (key == "model_name") cfg.model_name = val;
         else if (key == "timeout")    cfg.timeout_s = std::stoi(val);
         else if (key == "max_output_tokens") cfg.max_output_tokens_cap = std::stoi(val);
+        else if (key == "voice_system_prompt") cfg.voice_system_prompt = val;
     }
     return cfg;
 }
@@ -1366,6 +1460,8 @@ void ServeConfig::print() const {
     printf("│  Model Name:    %-26s │\n", model_name.c_str());
     printf("│  Timeout:       %-6d s                     │\n", timeout_s);
     printf("│  Max Output:    %-6d tok                   │\n", max_output_tokens_cap);
+    if (!voice_system_prompt.empty())
+        printf("│  Voice Prompt:  %.38s │\n", voice_system_prompt.c_str());
     printf("└─────────────────────────────────────────────┘\n");
 }
 
@@ -1646,6 +1742,8 @@ void ServeApp::handle_connection(int client_fd, int protocol) {
             handle_audio_transcriptions(req, client_fd);
         } else if (req.path == "/v1/audio/speech" && req.method == "POST") {
             handle_audio_speech(req, client_fd);
+        } else if (req.path == "/v1/tts/info" && req.method == "GET") {
+            handle_tts_info(req, client_fd);
         } else if (req.method == "GET" && (req.path == "/" || req.path.rfind("/examples/", 0) == 0)) {
             handle_static_file(req, client_fd);
         } else {
@@ -3512,13 +3610,15 @@ ServeApp::MultipartForm ServeApp::parse_multipart(const HttpRequest& req) {
 
 void ServeApp::send_binary_response(int client_fd, int status_code,
                                      const std::string& content_type,
-                                     const uint8_t* data, size_t size) {
+                                     const uint8_t* data, size_t size,
+                                     const std::string& extra_headers) {
     std::string status_text = (status_code == 200) ? "OK" : "Error";
     std::ostringstream oss;
     oss << "HTTP/1.1 " << status_code << " " << status_text << "\r\n";
     oss << "Content-Type: " << content_type << "\r\n";
     oss << "Content-Length: " << size << "\r\n";
     oss << "Access-Control-Allow-Origin: *\r\n";
+    if (!extra_headers.empty()) oss << extra_headers;
     oss << "\r\n";
 
     auto header_str = oss.str();
@@ -3704,6 +3804,7 @@ void ServeApp::handle_audio_speech(const HttpRequest& req, int client_fd) {
     voice = get_str("voice");
     format = get_str("response_format");
     speed = get_num("speed", 1.0f);
+    std::string instruct = get_str("instruct");
 
     if (input_text.empty()) {
         HttpResponse resp;
@@ -3716,11 +3817,12 @@ void ServeApp::handle_audio_speech(const HttpRequest& req, int client_fd) {
         return;
     }
 
-    fprintf(stderr, "[Serve] TTS: text=%zu chars, voice=%s, speed=%.1f, format=%s\n",
-            input_text.size(), voice.c_str(), speed, format.c_str());
+    fprintf(stderr, "[Serve] TTS: text=%zu chars, voice=%s, speed=%.1f, format=%s, instruct=%s\n",
+            input_text.size(), voice.c_str(), speed, format.c_str(),
+            instruct.empty() ? "(none)" : instruct.c_str());
 
     // 调用 TTS 插件
-    auto result = tts_plugin_->synthesize(input_text, voice, speed, format);
+    auto result = tts_plugin_->synthesize(input_text, voice, speed, format, instruct);
 
     if (result.error_code != 0) {
         HttpResponse resp;
@@ -3741,6 +3843,37 @@ void ServeApp::handle_audio_speech(const HttpRequest& req, int client_fd) {
     // 返回二进制音频数据
     send_binary_response(client_fd, 200, content_type,
                          result.audio_data.data(), result.audio_data.size());
+    close(client_fd);
+}
+
+// ============================================================================
+// GET /v1/tts/info — 返回 TTS 模型信息 (模型类型, 可用音色, 采样率)
+// ============================================================================
+
+void ServeApp::handle_tts_info(const HttpRequest& /*req*/, int client_fd) {
+    HttpResponse resp;
+
+    if (!tts_plugin_ || !tts_plugin_->is_available()) {
+        resp.body = "{\"enabled\":false}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    auto info = tts_plugin_->model_info();
+
+    std::string voices_json = "[";
+    for (size_t i = 0; i < info.available_voices.size(); i++) {
+        if (i > 0) voices_json += ",";
+        voices_json += "\"" + json_escape(info.available_voices[i]) + "\"";
+    }
+    voices_json += "]";
+
+    resp.body = "{\"enabled\":true,"
+                "\"model_type\":\"" + json_escape(info.model_type) + "\","
+                "\"sample_rate\":" + std::to_string(info.sample_rate) + ","
+                "\"available_voices\":" + voices_json + "}";
+    send_response(client_fd, resp);
     close(client_fd);
 }
 
@@ -3795,7 +3928,13 @@ void ServeApp::handle_static_file(const HttpRequest& req, int client_fd) {
     else if (file_path.size() > 4 && file_path.substr(file_path.size() - 4) == ".png") ct = "image/png";
     else if (file_path.size() > 5 && file_path.substr(file_path.size() - 5) == ".json") ct = "application/json";
 
-    send_binary_response(client_fd, 200, ct, content.data(), content.size());
+    // HTML 文件禁止缓存，确保前端更新及时可见
+    std::string extra_headers;
+    if (ct.find("text/html") != std::string::npos) {
+        extra_headers = "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+                        "Pragma: no-cache\r\n";
+    }
+    send_binary_response(client_fd, 200, ct, content.data(), content.size(), extra_headers);
     close(client_fd);
 }
 
@@ -3821,6 +3960,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
     // 会话状态
     std::vector<std::pair<std::string, std::string>> chat_history;
     std::string voice = "serena";
+    std::string tts_instruct;  // VoiceDesign 模式的音色描述指令
     bool tts_enabled = true;
 
     // ---- 连接活跃性 + 生成控制 ----
@@ -3868,27 +4008,31 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
     std::thread worker_thread;
 
     // 启动生成 (worker thread)
-    auto start_generate = [&](std::string text, std::string voice_copy, bool tts_copy) {
+    auto start_generate = [&](std::string text, std::string voice_copy,
+                               std::string instruct_copy, bool tts_copy) {
         if (generating || !conn_alive) return;
         if (worker_thread.joinable()) worker_thread.join();
         generating = true;
         interrupted = false;
         worker_thread = std::thread([&, text = std::move(text),
-                                     voice_copy = std::move(voice_copy), tts_copy]() {
-            ws_voice_generate(text, chat_history, voice_copy, tts_copy,
+                                     voice_copy = std::move(voice_copy),
+                                     instruct_copy = std::move(instruct_copy), tts_copy]() {
+            ws_voice_generate(text, chat_history, voice_copy, instruct_copy, tts_copy,
                               safe_send_text, safe_send_binary, generating, interrupted);
         });
     };
 
     // 启动语音输入 (ASR → LLM → TTS, 在 worker thread)
     auto start_voice_input = [&](std::vector<int16_t> audio, int sr,
-                                  std::string voice_copy, bool tts_copy) {
+                                  std::string voice_copy, std::string instruct_copy,
+                                  bool tts_copy) {
         if (generating || !conn_alive) return;
         if (worker_thread.joinable()) worker_thread.join();
         generating = true;
         interrupted = false;
         worker_thread = std::thread([&, audio = std::move(audio), sr,
-                                     voice_copy = std::move(voice_copy), tts_copy]() {
+                                     voice_copy = std::move(voice_copy),
+                                     instruct_copy = std::move(instruct_copy), tts_copy]() {
             if (interrupted) { generating = false; return; }
 
             // ASR
@@ -3926,7 +4070,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             safe_send_text("{\"type\":\"asr\",\"text\":\"" + json_escape(asr_text) + "\"}");
             if (interrupted) { generating = false; return; }
 
-            ws_voice_generate(asr_text, chat_history, voice_copy, tts_copy,
+            ws_voice_generate(asr_text, chat_history, voice_copy, instruct_copy, tts_copy,
                               safe_send_text, safe_send_binary, generating, interrupted);
         });
     };
@@ -4042,7 +4186,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 speech_detected = false;
                 total_energy_sum = 0;
                 total_speech_samples = 0;
-                start_voice_input(std::move(audio_copy), stream_sample_rate, voice, tts_enabled);
+                start_voice_input(std::move(audio_copy), stream_sample_rate, voice, tts_instruct, tts_enabled);
             }
             continue;
         }
@@ -4060,6 +4204,9 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             if (tts_pos != std::string::npos) {
                 tts_enabled = json_get_bool(msg, "tts", true);
             }
+            // VoiceDesign instruct
+            std::string inst = json_get_string(msg, "tts_instruct");
+            if (!inst.empty()) tts_instruct = inst;
             if (tts_plugin_ && msg.find("\"tts_temperature\"") != std::string::npos) {
                 float tts_temp = (float)json_get_number(msg, "tts_temperature", 0.9);
                 int tts_topk = json_get_int(msg, "tts_top_k", 50);
@@ -4073,7 +4220,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             if (generating) continue;
             std::string text = json_get_string(msg, "text");
             if (!text.empty()) {
-                start_generate(std::move(text), voice, tts_enabled);
+                start_generate(std::move(text), voice, tts_instruct, tts_enabled);
             }
 
         } else if (event_type == "stream.start") {
@@ -4121,7 +4268,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                     speech_detected = false;
                     total_energy_sum = 0;
                     total_speech_samples = 0;
-                    start_voice_input(std::move(audio_copy), stream_sample_rate, voice, tts_enabled);
+                    start_voice_input(std::move(audio_copy), stream_sample_rate, voice, tts_instruct, tts_enabled);
                 } else {
                     fprintf(stderr, "[WS] Stream stopped, too short (%.1fs)\n", audio_dur);
                     safe_send_text("{\"type\":\"error\",\"message\":\"录音太短\"}");
@@ -4150,7 +4297,9 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             generating = true;
             interrupted = false;
             worker_thread = std::thread([&, audio_b64 = std::move(audio_b64),
-                                         voice_copy = voice, tts_copy = tts_enabled]() {
+                                         voice_copy = voice,
+                                         instruct_copy = tts_instruct,
+                                         tts_copy = tts_enabled]() {
                 auto audio_bytes = base64_decode(audio_b64);
                 if (audio_bytes.empty()) {
                     safe_send_text("{\"type\":\"error\",\"message\":\"Invalid audio data\"}");
@@ -4172,9 +4321,15 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 safe_send_text("{\"type\":\"asr\",\"text\":\"" + json_escape(result.text) + "\"}");
                 if (interrupted) { generating = false; return; }
 
-                ws_voice_generate(result.text, chat_history, voice_copy, tts_copy,
+                ws_voice_generate(result.text, chat_history, voice_copy, instruct_copy, tts_copy,
                                   safe_send_text, safe_send_binary, generating, interrupted);
             });
+
+        } else if (event_type == "interrupt" || event_type == "tts.stop") {
+            if (generating) {
+                interrupted = true;
+                fprintf(stderr, "[WS] Client interrupt fd=%d\n", client_fd);
+            }
 
         } else if (event_type == "clear") {
             if (!generating) {
@@ -4201,6 +4356,7 @@ static bool is_sentence_end_punct(const std::string& ch) {
 void ServeApp::ws_voice_generate(const std::string& user_text,
                                   std::vector<std::pair<std::string, std::string>>& chat_history,
                                   const std::string& voice,
+                                  const std::string& instruct,
                                   bool tts_enabled,
                                   const std::function<bool(const std::string&)>& send_text,
                                   const std::function<bool(const uint8_t*, size_t)>& send_binary,
@@ -4222,7 +4378,9 @@ void ServeApp::ws_voice_generate(const std::string& user_text,
 
     // 构建 messages
     std::vector<std::pair<std::string, std::string>> messages;
-    messages.push_back({"system", "你是通义千问，一个有帮助的AI助手。请简洁、自然地回答问题。"});
+    const std::string& voice_prompt = config_.voice_system_prompt.empty()
+        ? std::string(DEFAULT_VOICE_SYSTEM_PROMPT) : config_.voice_system_prompt;
+    messages.push_back({"system", voice_prompt});
     for (auto& [role, content] : chat_history) {
         messages.push_back({role, content});
     }
@@ -4255,7 +4413,8 @@ void ServeApp::ws_voice_generate(const std::string& user_text,
     send_text("{\"type\":\"llm.start\"}");
 
     // ---- TTS 生产者-消费者: LLM 和 TTS 并行执行 ----
-    std::queue<std::string> tts_queue;
+    // 队列元素: (sentence_text, per_sentence_instruct)
+    std::queue<std::pair<std::string, std::string>> tts_queue;
     std::mutex tts_mutex;
     std::condition_variable tts_cv;
     bool tts_done_flag = false;
@@ -4266,27 +4425,34 @@ void ServeApp::ws_voice_generate(const std::string& user_text,
         send_text("{\"type\":\"tts.stream_start\",\"sample_rate\":24000,\"format\":\"pcm16\"}");
     }
 
-    // TTS 消费者线程: 每句独立 synthesize_streaming()
+    // TTS 消费者线程: 每句独立 synthesize_streaming(), 使用 per-sentence instruct
     auto* tts_raw = tts_plugin_.get();
     std::thread tts_thread;
     if (do_stream_tts) {
         tts_thread = std::thread([&, tts_raw]() {
             while (true) {
                 std::string sentence;
+                std::string sent_instruct;
                 {
                     std::unique_lock<std::mutex> lock(tts_mutex);
                     tts_cv.wait(lock, [&]{ return !tts_queue.empty() || tts_done_flag; });
                     if (tts_queue.empty() && tts_done_flag) break;
                     if (tts_queue.empty()) continue;
-                    sentence = std::move(tts_queue.front());
+                    auto& front = tts_queue.front();
+                    sentence = std::move(front.first);
+                    sent_instruct = std::move(front.second);
                     tts_queue.pop();
                 }
 
                 if (interrupted) break;
 
-                fprintf(stderr, "[TTS] Synthesize sentence #%d: %.60s...\n",
-                        tts_segment_idx.load() + 1, sentence.c_str());
-                tts_raw->synthesize_streaming(sentence, voice,
+                // per-sentence instruct → 回退到全局 instruct
+                const std::string& use_instruct = sent_instruct.empty() ? instruct : sent_instruct;
+                fprintf(stderr, "[TTS] Synthesize #%d [%s]: %.60s...\n",
+                        tts_segment_idx.load() + 1,
+                        use_instruct.empty() ? "default" : use_instruct.c_str(),
+                        sentence.c_str());
+                tts_raw->synthesize_streaming(sentence, voice, use_instruct,
                     [&](const float* data, int num_samples) -> bool {
                         if (interrupted) return false;
                         std::vector<int16_t> pcm16(num_samples);
@@ -4302,12 +4468,19 @@ void ServeApp::ws_voice_generate(const std::string& user_text,
         });
     }
 
-    // 推送句子到 TTS 队列
+    // 推送句子到 TTS 队列 (自动解析 [情感标注] → TTS instruct)
     auto push_tts = [&](const std::string& sentence) {
         if (!do_stream_tts || sentence.empty()) return;
+        auto [clean_text, emotion] = extract_tts_instruct(sentence);
+        if (clean_text.empty()) return;
+        // Format emotion as proper TTS instruct (e.g., "温柔" → "用温柔的语气说")
+        std::string formatted_instruct;
+        if (!emotion.empty()) {
+            formatted_instruct = "用" + emotion + "的语气说";
+        }
         {
             std::lock_guard<std::mutex> lock(tts_mutex);
-            tts_queue.push(sentence);
+            tts_queue.push({std::move(clean_text), std::move(formatted_instruct)});
         }
         tts_cv.notify_one();
     };
@@ -4716,7 +4889,9 @@ void ServeApp::process_text_input(
     while (chat_history.size() > 20) chat_history.erase(chat_history.begin());
 
     std::vector<std::pair<std::string, std::string>> messages;
-    messages.push_back({"system", "你是通义千问，一个有帮助的AI助手。请简洁、自然地回答问题。"});
+    const std::string& voice_prompt = config_.voice_system_prompt.empty()
+        ? std::string(DEFAULT_VOICE_SYSTEM_PROMPT) : config_.voice_system_prompt;
+    messages.push_back({"system", voice_prompt});
     for (auto& [role, content] : chat_history) messages.push_back({role, content});
 
     auto prompt_tokens = tok.apply_chat_template(messages, true, false);
@@ -4745,7 +4920,8 @@ void ServeApp::process_text_input(
     send_json("{\"type\":\"response.started\"}");
 
     // ---- TTS 生产者-消费者 ----
-    std::queue<std::string> tts_queue;
+    // 队列元素: (sentence_text, per_sentence_instruct)
+    std::queue<std::pair<std::string, std::string>> tts_queue;
     std::mutex tts_mutex;
     std::condition_variable tts_cv;
     bool tts_done_flag = false;
@@ -4761,20 +4937,25 @@ void ServeApp::process_text_input(
             while (true) {
                 if (interrupted) break;
                 std::string sentence;
+                std::string sent_instruct;
                 {
                     std::unique_lock<std::mutex> lock(tts_mutex);
                     tts_cv.wait(lock, [&]{ return !tts_queue.empty() || tts_done_flag; });
                     if (tts_queue.empty() && tts_done_flag) break;
                     if (tts_queue.empty()) continue;
-                    sentence = std::move(tts_queue.front());
+                    auto& front = tts_queue.front();
+                    sentence = std::move(front.first);
+                    sent_instruct = std::move(front.second);
                     tts_queue.pop();
                 }
                 if (interrupted) break;
 
                 tts_sentence_count++;
-                fprintf(stderr, "[TTS] Synthesize sentence #%d: %.60s...\n",
-                        tts_sentence_count, sentence.c_str());
-                tts_raw->synthesize_streaming(sentence, voice,
+                fprintf(stderr, "[TTS] Synthesize #%d [%s]: %.60s...\n",
+                        tts_sentence_count,
+                        sent_instruct.empty() ? "default" : sent_instruct.c_str(),
+                        sentence.c_str());
+                tts_raw->synthesize_streaming(sentence, voice, sent_instruct,
                     [&](const float* data, int num_samples) -> bool {
                         if (interrupted) return false;
                         std::vector<int16_t> pcm16(num_samples);
@@ -4820,9 +5001,17 @@ void ServeApp::process_text_input(
             clean.pop_back();
         // Skip if too short (< 2 Chinese chars or < 6 bytes)
         if (clean.size() < 6) return;
+        // 提取 [情感标注] → TTS instruct
+        auto [text_part, emotion] = extract_tts_instruct(clean);
+        if (text_part.size() < 6) return;
+        // Format emotion as proper TTS instruct (e.g., "温柔" → "用温柔的语气说")
+        std::string formatted_instruct;
+        if (!emotion.empty()) {
+            formatted_instruct = "用" + emotion + "的语气说";
+        }
         {
             std::lock_guard<std::mutex> lock(tts_mutex);
-            tts_queue.push(clean);
+            tts_queue.push({std::move(text_part), std::move(formatted_instruct)});
             fprintf(stderr, "[TTS] push_tts: queue_size=%zu, text=%.40s...\n",
                     tts_queue.size(), clean.c_str());
         }

@@ -41,6 +41,7 @@ struct ServeConfig {
     std::string model_name = "qwen3.5-27b"; // 模型显示名称
     int         timeout_s  = 300;           // 请求超时 (秒)
     int         max_output_tokens_cap = 512; // 单请求最大生成 token 上限 (稳定性护栏)
+    std::string voice_system_prompt;         // 语音对话系统提示词 (空=使用默认)
 
     // 从 CLI 参数解析 (全新配置)
     static ServeConfig from_args(int argc, char** argv);
@@ -150,6 +151,7 @@ private:
     // ---- 音频 API (ASR / TTS 插件) ----
     void handle_audio_transcriptions(const HttpRequest& req, int client_fd);
     void handle_audio_speech(const HttpRequest& req, int client_fd);
+    void handle_tts_info(const HttpRequest& req, int client_fd);
 
     // ---- WebSocket 语音对话 ----
     void handle_websocket_voice(int client_fd, const HttpRequest& req);
@@ -157,6 +159,7 @@ private:
         const std::string& user_text,
         std::vector<std::pair<std::string, std::string>>& chat_history,
         const std::string& voice,
+        const std::string& instruct,
         bool tts_enabled,
         const std::function<bool(const std::string&)>& send_text,
         const std::function<bool(const uint8_t*, size_t)>& send_binary,
@@ -180,7 +183,8 @@ private:
     // 发送二进制响应 (音频数据)
     void send_binary_response(int client_fd, int status_code,
                               const std::string& content_type,
-                              const uint8_t* data, size_t size);
+                              const uint8_t* data, size_t size,
+                              const std::string& extra_headers = "");
 
     // 解析 multipart/form-data
     struct MultipartFile {

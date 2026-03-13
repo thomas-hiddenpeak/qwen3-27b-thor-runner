@@ -33,11 +33,17 @@ struct TtsConfig {
     std::string executable;                 // TTS 可执行文件路径 (subprocess only)
     std::string voice        = "serena";    // 默认语音
     std::string language     = "auto";      // 默认语言
+    std::string instruct;                   // VoiceDesign 模式的音色描述指令
     float       speed        = 1.0f;        // 语速 (0.5-2.0)
     std::string format       = "wav";       // 输出格式 (wav/pcm)
     std::string extra_args;                 // 额外 CLI 参数 (subprocess)
     std::string tmp_dir      = "tmp";       // 临时文件目录
     int         max_new_tokens = 4096;      // 最大生成 token 数
+    // TTS 采样参数
+    float       tts_temperature   = 0.9f;
+    int         tts_top_k         = 50;
+    float       tts_top_p         = 1.0f;
+    float       tts_rep_penalty   = 1.05f;
 
     static TtsConfig from_file(const std::string& path);
     void print() const;
@@ -65,7 +71,8 @@ public:
     virtual TtsResult synthesize(const std::string& text,
                                  const std::string& voice = "",
                                  float speed = 1.0f,
-                                 const std::string& format = "wav") = 0;
+                                 const std::string& format = "wav",
+                                 const std::string& instruct = "") = 0;
 
     // Continue synthesis without resetting talker state (voice consistency)
     virtual TtsResult synthesize_continue(const std::string& text,
@@ -76,6 +83,7 @@ public:
     using PcmCallback = std::function<bool(const float* data, int num_samples)>;
     virtual int synthesize_streaming(const std::string& text,
                                      const std::string& voice,
+                                     const std::string& instruct,
                                      PcmCallback callback,
                                      int chunk_frames = 24) { return 0; }
 
@@ -89,6 +97,14 @@ public:
 
     // Set TTS sampling parameters (temperature, top_k, top_p, repetition_penalty)
     virtual void set_sampling(float temperature, int top_k, float top_p, float rep_penalty) {}
+
+    // Model info: type, available voices, sample rate
+    struct ModelInfo {
+        std::string model_type;                    // custom_voice, voice_design, voice_clone
+        std::vector<std::string> available_voices; // speaker names
+        int sample_rate = 24000;
+    };
+    virtual ModelInfo model_info() const { return {}; }
 };
 
 // ============================================================================
@@ -102,11 +118,13 @@ public:
     TtsResult synthesize(const std::string& text,
                          const std::string& voice = "",
                          float speed = 1.0f,
-                         const std::string& format = "wav") override;
+                         const std::string& format = "wav",
+                         const std::string& instruct = "") override;
     TtsResult synthesize_continue(const std::string& text,
                                   const std::string& format = "pcm") override;
     int synthesize_streaming(const std::string& text,
                               const std::string& voice,
+                              const std::string& instruct,
                               PcmCallback callback,
                               int chunk_frames = 24) override;
     int continue_streaming(const std::string& text,
@@ -115,6 +133,7 @@ public:
     bool is_available() const override;
     std::string name() const override { return "native-qwen3-tts"; }
     void set_sampling(float temperature, int top_k, float top_p, float rep_penalty) override;
+    ModelInfo model_info() const override;
 
 private:
     TtsConfig config_;
@@ -132,7 +151,8 @@ public:
     TtsResult synthesize(const std::string& text,
                          const std::string& voice = "",
                          float speed = 1.0f,
-                         const std::string& format = "wav") override;
+                         const std::string& format = "wav",
+                         const std::string& instruct = "") override;
     TtsResult synthesize_continue(const std::string& text,
                                   const std::string& format = "pcm") override;
     bool is_available() const override;
