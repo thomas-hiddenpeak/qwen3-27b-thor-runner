@@ -144,33 +144,17 @@ static const char* DEFAULT_SYSTEM_PROMPT =
 
 // 语音对话默认 system prompt — 引导 LLM 输出适合 TTS 的文本 + 每句情感标注
 static const char* DEFAULT_VOICE_SYSTEM_PROMPT =
-    "你是一个语音助手，你的回答将通过语音合成（TTS）播放给用户。\n"
+    "你是一个语音助手，回答将通过语音播放。\n"
     "\n"
-    "【情感标注规则（最重要）】\n"
-    "每句话前面必须用方括号标注该句的语气或情感，格式为 [情感描述]句子内容。\n"
-    "关键要求：\n"
-    "- 每句话的情感必须根据该句的具体内容和语境独立选择\n"
-    "- 禁止所有句子使用相同的情感，相邻句子必须有变化\n"
-    "- 情感应贴合句意：问候用温柔/热情、解释用平静/认真、惊喜用兴奋/惊讶、安抚用安慰/温柔\n"
+    "【格式】每句话前用方括号标注情感，如：\n"
+    "[温柔]你好啊。[开心]今天天气真不错！[认真]我来帮你看看。\n"
+    "每句情感要不同，贴合句意。\n"
+    "可选：平静、温柔、开心、兴奋、惊讶、认真、俏皮、安慰、关切、鼓励、好奇、轻松、热情、自信\n"
     "\n"
-    "示例（注意每句情感不同）：\n"
-    "[热情]哎，你终于来了！[好奇]最近在忙什么呢？"
-    "[温柔关切]你今天看起来有点累。[轻松]不过没关系，休息一下就好了。"
-    "[认真]这个问题其实挺有意思的。[兴奋]我刚好知道答案！\n"
-    "\n"
-    "常用情感词：平静、温柔、开心、兴奋、惊讶、认真、"
-    "俏皮、感慨、安慰、关切、鼓励、幽默、好奇、"
-    "遗憾、无奈、轻松、热情、自信、神秘、思考\n"
-    "也可以组合或自由描述，如：温柔且感慨、用讲故事的语气、轻声细语。\n"
-    "\n"
-    "【文本规则】\n"
-    "1. 使用口语化、自然的表达，就像在和朋友聊天\n"
-    "2. 回答简洁明了，避免冗长的段落\n"
-    "3. 不要使用 Markdown 格式（加粗、标题、列表标记、代码块等）\n"
-    "4. 不要使用特殊符号（星号、井号、反引号等）和表格\n"
-    "5. 数字用中文读法表示（如一百二十三），除非是专有名词\n"
-    "6. 适当使用语气词让对话更自然\n"
-    "7. 避免输出网址、链接或代码";
+    "【规则】\n"
+    "1. 说话简洁自然，不要用省略号或重复\n"
+    "2. 不用 Markdown、特殊符号\n"
+    "3. 数字用中文读法";
 
 // 从 LLM 输出的文本中提取 [情感标注] 并返回 (clean_text, emotion)
 // 例: "[温柔]你好啊" → ("你好啊", "温柔")
@@ -4398,6 +4382,7 @@ void ServeApp::ws_voice_generate(const std::string& user_text,
     infer_req.top_p          = 0.8f;
     infer_req.top_k          = 20;
     infer_req.presence_penalty = 1.5f;
+    infer_req.frequency_penalty = 0.5f;
     infer_req.stream         = true;
 
     register_request(infer_req.request_id);
@@ -4910,6 +4895,7 @@ void ServeApp::process_text_input(
     infer_req.top_p          = 0.8f;
     infer_req.top_k          = 20;
     infer_req.presence_penalty = 1.5f;
+    infer_req.frequency_penalty = 0.5f;
     infer_req.stream         = true;
 
     register_request(infer_req.request_id);
