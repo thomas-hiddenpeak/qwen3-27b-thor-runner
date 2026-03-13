@@ -863,11 +863,29 @@ function connectWS() {
     document.getElementById('wsDot').classList.add('connected');
     document.getElementById('wsLabel').textContent = '已连接';
     sendConfig();
+    // 断线前在录音，重连后自动恢复
+    if (wasRecording) {
+      wasRecording = false;
+      setTimeout(() => startStreaming(), 500);
+    }
   };
 
   ws.onclose = () => {
     document.getElementById('wsDot').classList.remove('connected');
     document.getElementById('wsLabel').textContent = '已断开';
+    // 重置所有会话状态，防止重连后交互被阻塞
+    isProcessing = false;
+    document.getElementById('sendBtn').disabled = false;
+    if (streamingDiv) {
+      const contentEl = streamingDiv.querySelector('.content');
+      if (contentEl) contentEl.classList.remove('streaming-cursor');
+      streamingDiv = null;
+    }
+    ttsStreamActive = false;
+    if (ttsPlayCtx) { ttsPlayCtx.close(); ttsPlayCtx = null; }
+    ttsPreBuffer = [];
+    wasRecording = isRecording; // 记住断线前是否在录音，重连后自动恢复
+    stopStreaming(false);
     setTimeout(connectWS, 3000);
   };
 

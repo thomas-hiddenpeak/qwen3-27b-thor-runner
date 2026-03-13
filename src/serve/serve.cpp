@@ -3811,6 +3811,13 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
     }
     fprintf(stderr, "[WS] Voice session started fd=%d\n", client_fd);
 
+    // 设置 socket 超时，防止在死连接上阻塞
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     // 会话状态
     std::vector<std::pair<std::string, std::string>> chat_history;
     std::string voice = "serena";
