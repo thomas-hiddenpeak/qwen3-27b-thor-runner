@@ -945,10 +945,10 @@ const dialectLanguages = new Set(['beijing_dialect', 'sichuan_dialect']);
 function getFilteredLanguages(voice) {
   const dialect = ttsSpeakerDialects[voice];
   if (dialect) {
-    // 方言角色: 只显示其对应方言
-    return ttsAvailableLanguages.filter(l => l === dialect);
+    // 方言角色: 显示其对应方言 + 所有标准语言
+    return ttsAvailableLanguages.filter(l => l === dialect || !dialectLanguages.has(l));
   }
-  // 标准角色: 排除方言语言
+  // 标准角色: 只显示标准语言
   return ttsAvailableLanguages.filter(l => !dialectLanguages.has(l));
 }
 
