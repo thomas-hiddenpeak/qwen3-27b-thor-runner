@@ -424,6 +424,7 @@ const STREAM_SAMPLE_RATE = 16000;
 // ---- 流式 TTS 播放状态 ----
 let ttsPlayCtx = null;        // TTS 播放用 AudioContext
 let ttsNextTime = 0;          // 下一段应播放的时间点
+let ttsPreBuffer = [];        // 预缓冲: 累积初始 chunks 再开始播放
 let ttsSampleRate = 24000;    // 服务端 TTS 采样率
 let ttsStreamActive = false;  // 是否在流式 TTS 模式
 let wasRecording = false;     // 响应前是否在录音 (用于自动重启)
@@ -508,16 +509,10 @@ function handleTtsBinary(blob) {
   ttsTotalSize += blob.size;
 
   if (ttsStreamActive) {
-    // 流式 PCM16 模式: 直接通过 AudioContext 无缝播放
+    // 流式 PCM16 模式: 预缓冲 + 无缝播放
     blob.arrayBuffer().then(buf => {
       const pcm16 = new Int16Array(buf);
       if (pcm16.length === 0) return;
-
-      // 初始化播放上下文
-      if (!ttsPlayCtx) {
-        ttsPlayCtx = new AudioContext({ sampleRate: ttsSampleRate });
-        ttsNextTime = ttsPlayCtx.currentTime + 0.05;  // 50ms 缓冲
-      }
 
       // PCM16 → Float32
       const float32 = new Float32Array(pcm16.length);
@@ -525,16 +520,39 @@ function handleTtsBinary(blob) {
         float32[i] = pcm16[i] / 32768.0;
       }
 
-      // 创建 AudioBuffer 并播放
+      if (!ttsPlayCtx) {
+        // 预缓冲阶段: 累积足够音频再开始播放, 避免断续
+        ttsPreBuffer.push(float32);
+        let totalSamples = 0;
+        for (const c of ttsPreBuffer) totalSamples += c.length;
+        const totalMs = (totalSamples / ttsSampleRate) * 1000;
+        if (totalMs < 600) return;  // 累积至少 600ms 再开始
+
+        // 启动播放, 调度所有累积的 chunks
+        ttsPlayCtx = new AudioContext({ sampleRate: ttsSampleRate });
+        ttsNextTime = ttsPlayCtx.currentTime + 0.05;
+        for (const chunk of ttsPreBuffer) {
+          const ab = ttsPlayCtx.createBuffer(1, chunk.length, ttsSampleRate);
+          ab.copyToChannel(chunk, 0);
+          const src = ttsPlayCtx.createBufferSource();
+          src.buffer = ab;
+          src.connect(ttsPlayCtx.destination);
+          src.start(ttsNextTime);
+          ttsNextTime += ab.duration;
+        }
+        ttsPreBuffer = [];
+        return;
+      }
+
+      // 后续 chunks: 无缝拼接调度
       const audioBuf = ttsPlayCtx.createBuffer(1, float32.length, ttsSampleRate);
       audioBuf.copyToChannel(float32, 0);
       const source = ttsPlayCtx.createBufferSource();
       source.buffer = audioBuf;
       source.connect(ttsPlayCtx.destination);
 
-      // 无缝拼接: 从 ttsNextTime 开始播放
       const now = ttsPlayCtx.currentTime;
-      if (ttsNextTime < now) ttsNextTime = now + 0.02;
+      if (ttsNextTime < now) ttsNextTime = now + 0.15;  // 150ms 恢复缓冲
       source.start(ttsNextTime);
       ttsNextTime += audioBuf.duration;
     });
@@ -612,6 +630,7 @@ function handleEvent(msg) {
       ttsStreamActive = true;
       ttsSampleRate = msg.sample_rate || 24000;
       ttsNextTime = 0;
+      ttsPreBuffer = [];
       // 关闭上一个播放上下文
       if (ttsPlayCtx) { ttsPlayCtx.close(); ttsPlayCtx = null; }
       break;
@@ -663,6 +682,21 @@ function handleEvent(msg) {
       // 所有 TTS 分段发送完毕
       ttsDone = true;
       ttsStreamActive = false;
+      // 刷新预缓冲中的剩余音频 (短句可能不足 600ms)
+      if (!ttsPlayCtx && ttsPreBuffer.length > 0) {
+        ttsPlayCtx = new AudioContext({ sampleRate: ttsSampleRate });
+        ttsNextTime = ttsPlayCtx.currentTime + 0.05;
+        for (const chunk of ttsPreBuffer) {
+          const ab = ttsPlayCtx.createBuffer(1, chunk.length, ttsSampleRate);
+          ab.copyToChannel(chunk, 0);
+          const src = ttsPlayCtx.createBufferSource();
+          src.buffer = ab;
+          src.connect(ttsPlayCtx.destination);
+          src.start(ttsNextTime);
+          ttsNextTime += ab.duration;
+        }
+        ttsPreBuffer = [];
+      }
       if (streamingDiv) {
         const metaEl = streamingDiv.querySelector('.meta');
         if (metaEl) {

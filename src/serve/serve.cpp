@@ -4245,7 +4245,7 @@ void ServeApp::ws_voice_generate(int client_fd,
                         safe_send_binary(reinterpret_cast<const uint8_t*>(pcm16.data()),
                                          pcm16.size() * sizeof(int16_t));
                         return true;
-                    }, 24);
+                    }, 8);
                 tts_segment_idx++;
             }
         });
@@ -4732,7 +4732,7 @@ void ServeApp::process_text_input(
                             remaining -= send_size;
                         }
                         return !interrupted;
-                    }, 24);
+                    }, 8);
             }
         });
     }

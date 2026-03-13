@@ -78,6 +78,7 @@ Talker::~Talker() {
     for (auto p : talker_v_cache_) if (p) cudaFree(p);
     for (auto p : cp_k_cache_) if (p) cudaFree(p);
     for (auto p : cp_v_cache_) if (p) cudaFree(p);
+    for (auto p : merged_weight_allocs_) if (p) cudaFree(p);
     if (workspace_) cudaFree(workspace_);
     if (prefill_embeds_) cudaFree(prefill_embeds_);
     if (position_ids_) cudaFree(position_ids_);
@@ -234,6 +235,88 @@ void Talker::initialize(cudaStream_t stream) {
             num_talker_layers, num_cp_layers);
     fprintf(stderr, "  talker KV cache: %.1f MB, CP KV: %.1f MB, workspace: %.1f MB\n",
             talker_kv_mb, cp_kv_mb, ws_mb);
+
+    // Merge QKV and GateUp weights for both Talker and CodePredictor
+    merge_weights(stream);
+}
+
+// ============================================================================
+// Merge QKV and GateUp projections for reduced kernel launch overhead
+// ============================================================================
+
+void Talker::merge_weights(cudaStream_t stream) {
+    const auto& tc = config_.talker;
+    const auto& cp = config_.code_predictor;
+
+    // Helper: allocate merged weight, copy sub-weights into it
+    auto merge_row_major = [&](const __nv_bfloat16* w1, size_t rows1,
+                               const __nv_bfloat16* w2, size_t rows2,
+                               const __nv_bfloat16* w3, size_t rows3,
+                               size_t cols) -> __nv_bfloat16* {
+        size_t total_rows = rows1 + rows2 + rows3;
+        size_t total_bytes = total_rows * cols * sizeof(__nv_bfloat16);
+        void* merged = nullptr;
+        cudaMalloc(&merged, total_bytes);
+        merged_weight_allocs_.push_back(merged);
+        auto* dst = reinterpret_cast<__nv_bfloat16*>(merged);
+        cudaMemcpyAsync(dst, w1, rows1 * cols * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(dst + rows1 * cols, w2, rows2 * cols * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToDevice, stream);
+        if (rows3 > 0) {
+            cudaMemcpyAsync(dst + (rows1 + rows2) * cols, w3, rows3 * cols * sizeof(__nv_bfloat16),
+                            cudaMemcpyDeviceToDevice, stream);
+        }
+        return dst;
+    };
+    auto merge2_row_major = [&](const __nv_bfloat16* w1, size_t rows1,
+                                const __nv_bfloat16* w2, size_t rows2,
+                                size_t cols) -> __nv_bfloat16* {
+        return merge_row_major(w1, rows1, w2, rows2, nullptr, 0, cols);
+    };
+
+    int talker_q_dim  = tc.num_attention_heads * tc.head_dim;
+    int talker_kv_dim = tc.num_kv_heads * tc.head_dim;
+    int cp_q_dim  = cp.num_attention_heads * cp.head_dim;
+    int cp_kv_dim = cp.num_kv_heads * cp.head_dim;
+
+    size_t merged_bytes = 0;
+
+    // Merge Talker layer weights
+    for (int i = 0; i < tc.num_hidden_layers; i++) {
+        auto& lw = talker_layer_weights_[i];
+        // QKV: [q_dim, h] + [kv_dim, h] + [kv_dim, h] → [q_dim+2*kv_dim, h]
+        lw.qkv_proj_w = merge_row_major(lw.q_proj_w, talker_q_dim,
+                                         lw.k_proj_w, talker_kv_dim,
+                                         lw.v_proj_w, talker_kv_dim,
+                                         tc.hidden_size);
+        merged_bytes += (size_t)(talker_q_dim + 2 * talker_kv_dim) * tc.hidden_size * sizeof(__nv_bfloat16);
+
+        // GateUp: [inter, h] + [inter, h] → [2*inter, h]
+        lw.gate_up_proj_w = merge2_row_major(lw.gate_proj_w, tc.intermediate_size,
+                                              lw.up_proj_w, tc.intermediate_size,
+                                              tc.hidden_size);
+        merged_bytes += (size_t)(2 * tc.intermediate_size) * tc.hidden_size * sizeof(__nv_bfloat16);
+    }
+
+    // Merge CodePredictor layer weights
+    for (int i = 0; i < cp.num_hidden_layers; i++) {
+        auto& cw = cp_layer_weights_[i];
+        cw.qkv_proj_w = merge_row_major(cw.q_proj_w, cp_q_dim,
+                                         cw.k_proj_w, cp_kv_dim,
+                                         cw.v_proj_w, cp_kv_dim,
+                                         cp.hidden_size);
+        merged_bytes += (size_t)(cp_q_dim + 2 * cp_kv_dim) * cp.hidden_size * sizeof(__nv_bfloat16);
+
+        cw.gate_up_proj_w = merge2_row_major(cw.gate_proj_w, cp.intermediate_size,
+                                              cw.up_proj_w, cp.intermediate_size,
+                                              cp.hidden_size);
+        merged_bytes += (size_t)(2 * cp.intermediate_size) * cp.hidden_size * sizeof(__nv_bfloat16);
+    }
+
+    cudaStreamSynchronize(stream);
+    fprintf(stderr, "[TTS Talker] merged QKV+GateUp weights: %.1f MB (%d talker + %d CP layers)\n",
+            merged_bytes / (1024.0f * 1024.0f), tc.num_hidden_layers, cp.num_hidden_layers);
 }
 
 void Talker::reset() {
@@ -650,10 +733,9 @@ void Talker::talker_layer_forward_prefill(
     __nv_bfloat16* gate_buf = attn_out + (size_t)seq_len * h;
     __nv_bfloat16* up_buf   = gate_buf + (size_t)seq_len * tc.intermediate_size;
 
-    // Self-Attention
+    // Self-Attention (separate QKV for prefill — merged output is interleaved for T>1)
     audio_ops::invoke_rmsnorm(norm_buf, hidden, lw.input_layernorm_w,
                                eps, seq_len, h, stream);
-
     cublas_gemm(cublas_handle_, q_buf, norm_buf, lw.q_proj_w, seq_len, h, q_dim, stream);
     cublas_gemm(cublas_handle_, k_buf, norm_buf, lw.k_proj_w, seq_len, h, kv_dim, stream);
     cublas_gemm(cublas_handle_, v_buf, norm_buf, lw.v_proj_w, seq_len, h, kv_dim, stream);
@@ -685,7 +767,7 @@ void Talker::talker_layer_forward_prefill(
     cublas_gemm(cublas_handle_, norm_buf, attn_out, lw.o_proj_w, seq_len, q_dim, h, stream);
     audio_ops::invoke_add_residual(hidden, norm_buf, seq_len * h, stream);
 
-    // MLP (SwiGLU)
+    // MLP (SwiGLU) — separate gate/up for prefill (merged output interleaved for T>1)
     audio_ops::invoke_rmsnorm(norm_buf, hidden, lw.post_attention_layernorm_w,
                                eps, seq_len, h, stream);
     cublas_gemm(cublas_handle_, gate_buf, norm_buf, lw.gate_proj_w,
@@ -714,22 +796,23 @@ void Talker::talker_layer_forward_decode(
     int h = tc.hidden_size;
     int q_dim = tc.num_attention_heads * tc.head_dim;
     int kv_dim = tc.num_kv_heads * tc.head_dim;
+    int qkv_dim = q_dim + 2 * kv_dim;
     float eps = tc.rms_norm_eps;
 
     __nv_bfloat16* norm_buf = ws;
-    __nv_bfloat16* q_buf    = norm_buf + h;
-    __nv_bfloat16* k_buf    = q_buf    + q_dim;
-    __nv_bfloat16* v_buf    = k_buf    + kv_dim;
-    __nv_bfloat16* attn_out = v_buf    + kv_dim;
-    __nv_bfloat16* gate_buf = attn_out + h;
-    __nv_bfloat16* up_buf   = gate_buf + tc.intermediate_size;
+    __nv_bfloat16* qkv_buf  = norm_buf + h;      // merged QKV output
+    __nv_bfloat16* q_buf    = qkv_buf;            // alias into merged output
+    __nv_bfloat16* k_buf    = qkv_buf + q_dim;
+    __nv_bfloat16* v_buf    = qkv_buf + q_dim + kv_dim;
+    __nv_bfloat16* attn_out = qkv_buf + qkv_dim;
+    __nv_bfloat16* gateup_buf = attn_out + h;     // merged GateUp output
+    __nv_bfloat16* gate_buf = gateup_buf;          // alias
+    __nv_bfloat16* up_buf   = gateup_buf + tc.intermediate_size;
 
-    // Self-Attention
+    // Self-Attention: fused QKV projection (3 GEMV → 1)
     audio_ops::invoke_rmsnorm(norm_buf, hidden, lw.input_layernorm_w,
                                eps, 1, h, stream);
-    cublas_gemm(cublas_handle_, q_buf, norm_buf, lw.q_proj_w, 1, h, q_dim, stream);
-    cublas_gemm(cublas_handle_, k_buf, norm_buf, lw.k_proj_w, 1, h, kv_dim, stream);
-    cublas_gemm(cublas_handle_, v_buf, norm_buf, lw.v_proj_w, 1, h, kv_dim, stream);
+    cublas_gemm(cublas_handle_, qkv_buf, norm_buf, lw.qkv_proj_w, 1, h, qkv_dim, stream);
 
     // Per-head QK RMSNorm
     audio_ops::invoke_per_head_rmsnorm(q_buf, q_buf, lw.q_norm_w, eps,
@@ -755,20 +838,15 @@ void Talker::talker_layer_forward_decode(
     cublas_gemm(cublas_handle_, norm_buf, attn_out, lw.o_proj_w, 1, q_dim, h, stream);
     audio_ops::invoke_add_residual(hidden, norm_buf, h, stream);
 
-    // MLP
+    // MLP: fused GateUp projection (2 GEMV → 1)
     audio_ops::invoke_rmsnorm(norm_buf, hidden, lw.post_attention_layernorm_w,
                                eps, 1, h, stream);
-    cublas_gemm(cublas_handle_, gate_buf, norm_buf, lw.gate_proj_w,
-                1, h, tc.intermediate_size, stream);
-    cublas_gemm(cublas_handle_, up_buf, norm_buf, lw.up_proj_w,
-                1, h, tc.intermediate_size, stream);
+    cublas_gemm(cublas_handle_, gateup_buf, norm_buf, lw.gate_up_proj_w,
+                1, h, 2 * tc.intermediate_size, stream);
     audio_ops::invoke_swiglu(gate_buf, gate_buf, up_buf, 1, tc.intermediate_size, stream);
     cublas_gemm(cublas_handle_, norm_buf, gate_buf, lw.down_proj_w,
                 1, tc.intermediate_size, h, stream);
     audio_ops::invoke_add_residual(hidden, norm_buf, h, stream);
-
-    // No per-layer sync needed: all ops enqueued on same stream,
-    // ordering guaranteed. Final sync at end of forward_decode_step.
 }
 
 // ============================================================================
@@ -847,6 +925,7 @@ void Talker::cp_layer_forward_prefill(
 void Talker::cp_layer_forward_decode(
     int layer_idx,
     __nv_bfloat16* hidden,
+    const int* pos_ids,
     __nv_bfloat16* ws,
     cudaStream_t stream)
 {
@@ -855,20 +934,22 @@ void Talker::cp_layer_forward_decode(
     int h = cp.hidden_size;
     int q_dim = cp.num_attention_heads * cp.head_dim;
     int kv_dim = cp.num_kv_heads * cp.head_dim;
+    int qkv_dim = q_dim + 2 * kv_dim;
     float eps = cp.rms_norm_eps;
 
     __nv_bfloat16* norm_buf = ws;
-    __nv_bfloat16* q_buf    = norm_buf + h;
-    __nv_bfloat16* k_buf    = q_buf + q_dim;
-    __nv_bfloat16* v_buf    = k_buf + kv_dim;
-    __nv_bfloat16* attn_out = v_buf + kv_dim;
-    __nv_bfloat16* gate_buf = attn_out + h;
-    __nv_bfloat16* up_buf   = gate_buf + cp.intermediate_size;
+    __nv_bfloat16* qkv_buf  = norm_buf + h;      // merged QKV output
+    __nv_bfloat16* q_buf    = qkv_buf;            // alias
+    __nv_bfloat16* k_buf    = qkv_buf + q_dim;
+    __nv_bfloat16* v_buf    = qkv_buf + q_dim + kv_dim;
+    __nv_bfloat16* attn_out = qkv_buf + qkv_dim;
+    __nv_bfloat16* gateup_buf = attn_out + h;     // merged GateUp output
+    __nv_bfloat16* gate_buf = gateup_buf;
+    __nv_bfloat16* up_buf   = gateup_buf + cp.intermediate_size;
 
+    // Fused QKV projection (3 GEMV → 1)
     audio_ops::invoke_rmsnorm(norm_buf, hidden, lw.input_layernorm_w, eps, 1, h, stream);
-    cublas_gemm(cublas_handle_, q_buf, norm_buf, lw.q_proj_w, 1, h, q_dim, stream);
-    cublas_gemm(cublas_handle_, k_buf, norm_buf, lw.k_proj_w, 1, h, kv_dim, stream);
-    cublas_gemm(cublas_handle_, v_buf, norm_buf, lw.v_proj_w, 1, h, kv_dim, stream);
+    cublas_gemm(cublas_handle_, qkv_buf, norm_buf, lw.qkv_proj_w, 1, h, qkv_dim, stream);
 
     // Per-head QK RMSNorm
     audio_ops::invoke_per_head_rmsnorm(q_buf, q_buf, lw.q_norm_w, eps,
@@ -876,12 +957,8 @@ void Talker::cp_layer_forward_decode(
     audio_ops::invoke_per_head_rmsnorm(k_buf, k_buf, lw.k_norm_w, eps,
                                         1, cp.num_kv_heads, cp.head_dim, stream);
 
-    // 1D RoPE position
-    int pos = cp_cache_len_;
-    int cp_pos[3] = {pos, pos, pos};
-    cudaMemcpyAsync(cp_pos_gpu_, cp_pos, 3 * sizeof(int), cudaMemcpyHostToDevice, stream);
-
-    audio_ops::invoke_mrope(q_buf, k_buf, cp_pos_gpu_,
+    // 1D RoPE — position IDs passed in from caller (set once per group step)
+    audio_ops::invoke_mrope(q_buf, k_buf, pos_ids,
                              1, cp.num_attention_heads, cp.num_kv_heads, cp.head_dim,
                              64, 0, 0, cp.rope_theta, stream);
 
@@ -897,14 +974,12 @@ void Talker::cp_layer_forward_decode(
     cublas_gemm(cublas_handle_, norm_buf, attn_out, lw.o_proj_w, 1, q_dim, h, stream);
     audio_ops::invoke_add_residual(hidden, norm_buf, h, stream);
 
+    // Fused GateUp projection (2 GEMV → 1)
     audio_ops::invoke_rmsnorm(norm_buf, hidden, lw.post_attention_layernorm_w, eps, 1, h, stream);
-    cublas_gemm(cublas_handle_, gate_buf, norm_buf, lw.gate_proj_w, 1, h, cp.intermediate_size, stream);
-    cublas_gemm(cublas_handle_, up_buf, norm_buf, lw.up_proj_w, 1, h, cp.intermediate_size, stream);
+    cublas_gemm(cublas_handle_, gateup_buf, norm_buf, lw.gate_up_proj_w, 1, h, 2 * cp.intermediate_size, stream);
     audio_ops::invoke_swiglu(gate_buf, gate_buf, up_buf, 1, cp.intermediate_size, stream);
     cublas_gemm(cublas_handle_, norm_buf, gate_buf, lw.down_proj_w, 1, cp.intermediate_size, h, stream);
     audio_ops::invoke_add_residual(hidden, norm_buf, h, stream);
-
-    // No per-layer sync needed: all ops on same stream.
 }
 
 // ============================================================================
@@ -981,9 +1056,14 @@ void Talker::run_code_predictor(
                             cp_h * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
         }
 
+        // Set position IDs once per group step (not per layer)
+        int pos = cp_cache_len_;
+        int cp_pos[3] = {pos, pos, pos};
+        cudaMemcpyAsync(cp_pos_gpu_, cp_pos, 3 * sizeof(int), cudaMemcpyHostToDevice, stream);
+
         // Forward through CodePredictor layers (decode T=1)
         for (int layer = 0; layer < cp.num_hidden_layers; layer++) {
-            cp_layer_forward_decode(layer, cp_decode_hidden_, workspace_, stream);
+            cp_layer_forward_decode(layer, cp_decode_hidden_, cp_pos_gpu_, workspace_, stream);
         }
         cp_cache_len_++;
 
@@ -999,9 +1079,9 @@ void Talker::run_code_predictor(
                                        codec_out_gpu_ + g + 1, cp_rng(), stream);
     }
 
-    // Single sync + batch copy all 15 codec tokens to CPU
-    cudaStreamSynchronize(stream);
-    cudaMemcpy(codec_out, codec_out_gpu_ + 1, num_groups * sizeof(int), cudaMemcpyDeviceToHost);
+    // Async copy — let caller's sync handle completion
+    cudaMemcpyAsync(codec_out, codec_out_gpu_ + 1, num_groups * sizeof(int),
+                    cudaMemcpyDeviceToHost, stream);
 }
 
 // ============================================================================

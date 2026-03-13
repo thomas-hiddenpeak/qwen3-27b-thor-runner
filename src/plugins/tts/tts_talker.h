@@ -44,6 +44,9 @@ struct TalkerLayerWeights {
     __nv_bfloat16* gate_proj_w = nullptr;                // [intermediate, hidden]
     __nv_bfloat16* up_proj_w = nullptr;                  // [intermediate, hidden]
     __nv_bfloat16* down_proj_w = nullptr;                // [hidden, intermediate]
+    // Merged weights (allocated at init, filled from individual weights)
+    __nv_bfloat16* qkv_proj_w = nullptr;                 // [q_dim+2*kv_dim, hidden_size]
+    __nv_bfloat16* gate_up_proj_w = nullptr;             // [2*intermediate, hidden_size]
 };
 
 // ============================================================
@@ -61,6 +64,9 @@ struct CodePredictorLayerWeights {
     __nv_bfloat16* gate_proj_w = nullptr;                // [intermediate=3072, hidden=1024]
     __nv_bfloat16* up_proj_w = nullptr;                  // [intermediate=3072, hidden=1024]
     __nv_bfloat16* down_proj_w = nullptr;                // [hidden=1024, intermediate=3072]
+    // Merged weights (allocated at init, filled from individual weights)
+    __nv_bfloat16* qkv_proj_w = nullptr;                 // [q_dim+2*kv_dim, hidden]
+    __nv_bfloat16* gate_up_proj_w = nullptr;             // [2*intermediate, hidden]
 };
 
 class Talker {
@@ -238,6 +244,7 @@ private:
     void cp_layer_forward_prefill(int layer_idx, __nv_bfloat16* hidden,
                                   int seq_len, __nv_bfloat16* ws, cudaStream_t stream);
     void cp_layer_forward_decode(int layer_idx, __nv_bfloat16* hidden,
+                                  const int* pos_ids,
                                   __nv_bfloat16* ws, cudaStream_t stream);
 
     // Run CodePredictor to generate 15 codec groups
@@ -252,6 +259,12 @@ private:
                                  int num_tokens,
                                  __nv_bfloat16* ws,
                                  cudaStream_t stream);
+
+    // Weight merging (called from initialize)
+    void merge_weights(cudaStream_t stream);
+
+    // Merged weight allocations (freed in destructor)
+    std::vector<void*> merged_weight_allocs_;
 
     // cuBLAS GEMM helper
     void gemm_bf16(__nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B,

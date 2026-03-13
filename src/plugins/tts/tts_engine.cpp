@@ -496,20 +496,9 @@ int TTSEngine::synthesize_streaming(
     bool aborted = false;
 
     // 3. Generate + decode in chunks
-    while (total_steps < max_new_tokens && !aborted) {
-        chunk_codes.clear();
-
-        // Generate chunk_frames codec frames
-        for (int f = 0; f < chunk_frames && total_steps < max_new_tokens; f++) {
-            int ret = talker_->forward_decode_step(codec_step.data(), stream_);
-            if (ret < 0) goto done;  // EOS
-            chunk_codes.push_back(codec_step);
-            total_steps++;
-        }
-
-        if (chunk_codes.empty()) break;
-
-        // Reshape chunk codes to [num_groups, T]
+    // Helper lambda: decode accumulated chunk_codes and send via callback
+    auto decode_and_send = [&]() {
+        if (chunk_codes.empty() || aborted) return;
         int T = (int)chunk_codes.size();
         std::vector<int> codes_flat(num_groups * T);
         for (int t = 0; t < T; t++) {
@@ -517,19 +506,33 @@ int TTSEngine::synthesize_streaming(
                 codes_flat[g * T + t] = chunk_codes[t][g];
             }
         }
-
-        // Decode chunk to PCM
         auto pcm = st_decoder_->decode(codes_flat.data(), num_groups, T, stream_);
-
         if (!pcm.empty()) {
             total_pcm_samples += (int)pcm.size();
             if (!pcm_callback(pcm.data(), (int)pcm.size())) {
                 aborted = true;
             }
         }
+    };
+
+    while (total_steps < max_new_tokens && !aborted) {
+        chunk_codes.clear();
+
+        // Generate chunk_frames codec frames
+        bool eos = false;
+        for (int f = 0; f < chunk_frames && total_steps < max_new_tokens; f++) {
+            int ret = talker_->forward_decode_step(codec_step.data(), stream_);
+            if (ret < 0) { eos = true; break; }  // EOS
+            chunk_codes.push_back(codec_step);
+            total_steps++;
+        }
+
+        // Decode accumulated frames (including partial chunk on EOS)
+        decode_and_send();
+
+        if (eos) break;
     }
 
-done:
     auto t_end = std::chrono::steady_clock::now();
     float total_ms = std::chrono::duration<float, std::milli>(t_end - t0).count();
     float audio_s = total_pcm_samples / (float)config_.tokenizer_decoder.output_sample_rate;
