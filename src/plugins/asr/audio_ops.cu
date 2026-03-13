@@ -693,19 +693,24 @@ __global__ void causal_gqa_decode_kernel(
     int num_q_heads, int num_kv_heads, int head_dim,
     int seq_len, float scale)
 {
-    // One block per Q head (batch_size=1 for now)
+    // One block per Q head, 128 threads (4 warps)
     int q_head = blockIdx.x;
     int kv_head = q_head / (num_q_heads / num_kv_heads);
 
     const __nv_bfloat16* q_ptr = q + (size_t)q_head * head_dim;
     __nv_bfloat16* o_ptr = attn_out + (size_t)q_head * head_dim;
 
-    // Compute scores over all past tokens
+    int tid = threadIdx.x;
+    int bdim = blockDim.x;
+    int wid = tid / 32, lid = tid % 32;
+
     extern __shared__ float smem[];
     float* scores = smem;
+    __shared__ float s_reduce[8];
 
+    // ---- Phase 1: Q-K dot products (all threads participate) ----
     float max_score = -1e20f;
-    for (int t = threadIdx.x; t < seq_len; t += blockDim.x) {
+    for (int t = tid; t < seq_len; t += bdim) {
         const __nv_bfloat16* k_ptr = k_cache + ((size_t)t * num_kv_heads + kv_head) * head_dim;
         float dot = 0.0f;
         for (int d = 0; d < head_dim; d++) {
@@ -716,35 +721,55 @@ __global__ void causal_gqa_decode_kernel(
         max_score = fmaxf(max_score, dot);
     }
 
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+    // Block-level max reduction
+    for (int offset = 16; offset > 0; offset >>= 1)
         max_score = fmaxf(max_score, __shfl_down_sync(0xffffffff, max_score, offset));
-    __shared__ float s_max;
-    if (threadIdx.x == 0) s_max = max_score;
+    if (lid == 0) s_reduce[wid] = max_score;
     __syncthreads();
-    max_score = s_max;
+    if (tid == 0) {
+        float m = s_reduce[0];
+        for (int w = 1; w < (bdim + 31) / 32; w++) m = fmaxf(m, s_reduce[w]);
+        s_reduce[0] = m;
+    }
+    __syncthreads();
+    max_score = s_reduce[0];
 
+    // ---- Phase 2: Softmax ----
     float sum_exp = 0.0f;
-    for (int t = threadIdx.x; t < seq_len; t += blockDim.x) {
+    for (int t = tid; t < seq_len; t += bdim) {
         float e = expf(scores[t] - max_score);
         scores[t] = e;
         sum_exp += e;
     }
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+
+    // Block-level sum reduction
+    for (int offset = 16; offset > 0; offset >>= 1)
         sum_exp += __shfl_down_sync(0xffffffff, sum_exp, offset);
-    __shared__ float s_sum;
-    if (threadIdx.x == 0) s_sum = sum_exp;
+    if (lid == 0) s_reduce[wid] = sum_exp;
+    __syncthreads();
+    if (tid == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < (bdim + 31) / 32; w++) s += s_reduce[w];
+        s_reduce[0] = s;
+    }
+    __syncthreads();
+    float inv_sum = 1.0f / s_reduce[0];
+
+    // Normalize scores in-place
+    for (int t = tid; t < seq_len; t += bdim) {
+        scores[t] *= inv_sum;
+    }
     __syncthreads();
 
-    if (threadIdx.x == 0) {
-        float inv_sum = 1.0f / s_sum;
-        for (int d = 0; d < head_dim; d++) {
-            float acc = 0.0f;
-            for (int t = 0; t < seq_len; t++) {
-                const __nv_bfloat16* v_ptr = v_cache + ((size_t)t * num_kv_heads + kv_head) * head_dim;
-                acc += scores[t] * inv_sum * bf16_to_float(v_ptr[d]);
-            }
-            o_ptr[d] = float_to_bf16(acc);
+    // ---- Phase 3: V accumulation — FULLY PARALLEL ----
+    // Each thread handles head_dim/bdim output dimensions (coalesced V reads)
+    for (int d = tid; d < head_dim; d += bdim) {
+        float acc = 0.0f;
+        for (int t = 0; t < seq_len; t++) {
+            const __nv_bfloat16* v_ptr = v_cache + ((size_t)t * num_kv_heads + kv_head) * head_dim;
+            acc += scores[t] * bf16_to_float(v_ptr[d]);
         }
+        o_ptr[d] = float_to_bf16(acc);
     }
 }
 
@@ -757,8 +782,7 @@ void invoke_causal_gqa_decode(
     int current_seq_len,
     cudaStream_t stream) {
 
-    // batch_size=1 for ASR Phase 1
-    int block = 32;
+    int block = 128;  // 4 warps (was 32)
     size_t smem = current_seq_len * sizeof(float);
     causal_gqa_decode_kernel<<<num_q_heads, block, smem, stream>>>(
         attn_out, q, k_cache, v_cache,
