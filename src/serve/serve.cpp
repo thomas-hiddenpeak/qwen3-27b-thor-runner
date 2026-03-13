@@ -4194,13 +4194,12 @@ void ServeApp::ws_voice_generate(int client_fd,
         safe_send_text("{\"type\":\"tts.stream_start\",\"sample_rate\":24000,\"format\":\"pcm16\"}");
     }
 
-    // TTS 消费者线程: 逐句合成, 第一句用 synthesize(), 后续用 synthesize_continue()
-    // 保持 talker KV cache 连续, 确保音色一致
+    // TTS 消费者线程: 每句独立 synthesize(), 每次都带 speaker embedding
+    // 确保音色一致 + KV cache 不膨胀 + 生成步数与文本成正比
     auto* tts_raw = tts_plugin_.get();  // raw ptr for thread capture
     std::thread tts_thread;
     if (do_stream_tts) {
         tts_thread = std::thread([&, tts_raw]() {
-            bool is_first = true;
             while (true) {
                 std::string sentence;
                 {
@@ -4212,13 +4211,7 @@ void ServeApp::ws_voice_generate(int client_fd,
                     tts_queue.pop();
                 }
 
-                plugins::TtsResult result;
-                if (is_first) {
-                    result = tts_raw->synthesize(sentence, voice, 1.0f, "pcm");
-                    is_first = false;
-                } else {
-                    result = tts_raw->synthesize_continue(sentence, "pcm");
-                }
+                auto result = tts_raw->synthesize(sentence, voice, 1.0f, "pcm");
 
                 if (result.error_code == 0 && !result.audio_data.empty()) {
                     safe_send_binary(result.audio_data.data(), result.audio_data.size());
@@ -4260,12 +4253,16 @@ void ServeApp::ws_voice_generate(int client_fd,
                 last_start--;
             std::string last_ch = pending_sentence.substr(last_start);
 
-            bool is_clause_break = (pending_sentence.size() > 30 &&
+            // 句尾：至少 15 字节（~5 中文字）才在句号处切分
+            bool is_sentence_end = is_sentence_end_punct(last_ch) &&
+                                   pending_sentence.size() >= 15;
+            // 从句：100 字节以上才在逗号/分号处切分
+            bool is_clause_break = (pending_sentence.size() > 100 &&
                                     (last_ch == "，" || last_ch == "," ||
                                      last_ch == "；" || last_ch == ";" ||
                                      last_ch == "：" || last_ch == ":"));
 
-            if (is_sentence_end_punct(last_ch) || is_clause_break) {
+            if (is_sentence_end || is_clause_break) {
                 std::string sentence = pending_sentence;
                 while (!sentence.empty() && (sentence.back() == ' ' || sentence.back() == '\n'))
                     sentence.pop_back();
