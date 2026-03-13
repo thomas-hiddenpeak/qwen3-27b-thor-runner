@@ -455,6 +455,23 @@ static constexpr uint8_t WS_OP_CLOSE  = 0x08;
 static constexpr uint8_t WS_OP_PING   = 0x09;
 static constexpr uint8_t WS_OP_PONG   = 0x0A;
 
+// 完整写入 (处理部分写入和 EINTR)
+static bool send_all(int fd, const void* buf, size_t len) {
+    const uint8_t* p = static_cast<const uint8_t*>(buf);
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = ::send(fd, p, remaining, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) return false;  // shouldn't happen on blocking socket
+        p += n;
+        remaining -= (size_t)n;
+    }
+    return true;
+}
+
 // 发送 WebSocket 帧 (服务端→客户端, 无 mask)
 static bool ws_send_frame(int fd, uint8_t opcode, const uint8_t* data, size_t len) {
     uint8_t header[10];
@@ -473,8 +490,8 @@ static bool ws_send_frame(int fd, uint8_t opcode, const uint8_t* data, size_t le
             header[2 + i] = (uint8_t)(len >> ((7 - i) * 8));
         hlen = 10;
     }
-    if (::send(fd, header, hlen, MSG_NOSIGNAL) < 0) return false;
-    if (len > 0 && ::send(fd, data, len, MSG_NOSIGNAL) < 0) return false;
+    if (!send_all(fd, header, hlen)) return false;
+    if (len > 0 && !send_all(fd, data, len)) return false;
     return true;
 }
 
@@ -4364,15 +4381,28 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
     // ---- 生成控制 ----
     std::atomic<bool> generating{false};
     std::atomic<bool> interrupted{false};
+    std::atomic<bool> conn_alive{true};
     std::mutex send_mutex;
 
-    auto send_json = [&](const std::string& json) {
+    auto send_json = [&](const std::string& json) -> bool {
+        if (!conn_alive) return false;
         std::lock_guard<std::mutex> lock(send_mutex);
-        ws_send_text(client_fd, json);
+        if (!ws_send_text(client_fd, json)) {
+            conn_alive = false;
+            interrupted = true;
+            return false;
+        }
+        return true;
     };
-    auto send_audio = [&](const uint8_t* data, size_t len) {
+    auto send_audio = [&](const uint8_t* data, size_t len) -> bool {
+        if (!conn_alive) return false;
         std::lock_guard<std::mutex> lock(send_mutex);
-        ws_send_binary(client_fd, data, len);
+        if (!ws_send_binary(client_fd, data, len)) {
+            conn_alive = false;
+            interrupted = true;
+            return false;
+        }
+        return true;
     };
 
     // ---- 处理函数: ASR → LLM → TTS (在工作线程中运行) ----
@@ -4422,7 +4452,7 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
     // ---- 主循环: 使用 poll 超时避免阻塞 ----
     std::thread worker_thread;
 
-    while (running_) {
+    while (running_ && conn_alive) {
         // poll with 100ms timeout 以保持响应性
         struct pollfd pfd;
         pfd.fd = client_fd;
@@ -4438,10 +4468,12 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
         if (!ws_recv_frame(client_fd, opcode, payload)) break;
 
         if (opcode == WS_OP_CLOSE) {
+            std::lock_guard<std::mutex> lock(send_mutex);
             ws_send_frame(client_fd, WS_OP_CLOSE, nullptr, 0);
             break;
         }
         if (opcode == WS_OP_PING) {
+            std::lock_guard<std::mutex> lock(send_mutex);
             ws_send_frame(client_fd, WS_OP_PONG, payload.data(), payload.size());
             continue;
         }
@@ -4589,6 +4621,7 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
     }
 
     // 清理
+    conn_alive = false;
     interrupted = true;
     if (worker_thread.joinable()) worker_thread.join();
 
