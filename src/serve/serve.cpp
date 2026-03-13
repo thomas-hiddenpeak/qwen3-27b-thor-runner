@@ -3793,6 +3793,18 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
     std::string voice = "Chelsie";
     bool tts_enabled = true;
 
+    // ---- 流式 ASR 状态 ----
+    bool streaming_audio = false;                // 是否在接收音频流
+    std::vector<int16_t> pcm_buffer;             // 累积 PCM16 样本 (16kHz mono)
+    int stream_sample_rate = 16000;
+    // VAD (Voice Activity Detection) 参数
+    constexpr float VAD_ENERGY_THRESHOLD = 0.005f; // RMS 能量阈值
+    constexpr int VAD_SILENCE_MS = 800;            // 静音持续 ms 后判定语音结束
+    constexpr int VAD_MIN_SPEECH_MS = 200;         // 最短语音长度
+    constexpr int VAD_MAX_DURATION_S = 30;         // 最长录音 30s
+    int silence_samples = 0;                       // 连续静音样本计数
+    bool speech_detected = false;                  // 是否检测到语音开始
+
     // 发送 session.created
     ws_send_text(client_fd, "{\"type\":\"session.created\"}");
 
@@ -3810,6 +3822,98 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             ws_send_frame(client_fd, WS_OP_PONG, payload.data(), payload.size());
             continue;
         }
+
+        // ---- Binary frame: 流式 PCM 音频数据 ----
+        if (opcode == WS_OP_BINARY && streaming_audio) {
+            // payload = PCM16 LE samples (16kHz, mono)
+            size_t num_samples = payload.size() / 2;
+            if (num_samples == 0) continue;
+
+            const int16_t* samples = reinterpret_cast<const int16_t*>(payload.data());
+            size_t prev_size = pcm_buffer.size();
+            pcm_buffer.insert(pcm_buffer.end(), samples, samples + num_samples);
+
+            // 计算当前 chunk 的 RMS 能量
+            double energy_sum = 0;
+            for (size_t i = 0; i < num_samples; i++) {
+                float s = samples[i] / 32768.0f;
+                energy_sum += s * s;
+            }
+            float rms = std::sqrt((float)(energy_sum / num_samples));
+
+            if (rms > VAD_ENERGY_THRESHOLD) {
+                speech_detected = true;
+                silence_samples = 0;
+            } else {
+                silence_samples += (int)num_samples;
+            }
+
+            // 发送音频电平给客户端 (用于 UI 显示)
+            // 限频: 每 ~100ms 发一次 (1600 samples at 16kHz)
+            if (pcm_buffer.size() / 1600 > prev_size / 1600) {
+                char level_buf[64];
+                snprintf(level_buf, sizeof(level_buf),
+                         "{\"type\":\"audio.level\",\"rms\":%.4f}", rms);
+                ws_send_text(client_fd, level_buf);
+            }
+
+            float total_duration_s = (float)pcm_buffer.size() / stream_sample_rate;
+            float silence_duration_ms = (float)silence_samples * 1000.0f / stream_sample_rate;
+
+            // VAD: 语音结束检测
+            bool vad_triggered = speech_detected &&
+                                 silence_duration_ms >= VAD_SILENCE_MS &&
+                                 total_duration_s >= (VAD_MIN_SPEECH_MS / 1000.0f);
+
+            // 超时保护
+            bool timeout = total_duration_s >= VAD_MAX_DURATION_S;
+
+            if (vad_triggered || timeout) {
+                streaming_audio = false;
+                ws_send_text(client_fd, "{\"type\":\"stream.vad\"}");  // 通知客户端 VAD 触发
+
+                // 去掉尾部静音
+                int trim_samples = std::min(silence_samples, (int)pcm_buffer.size());
+                if (trim_samples > stream_sample_rate / 10) // 保留 100ms
+                    pcm_buffer.resize(pcm_buffer.size() - trim_samples + stream_sample_rate / 10);
+
+                // PCM16 → float [-1, 1]
+                std::vector<float> float_samples(pcm_buffer.size());
+                for (size_t i = 0; i < pcm_buffer.size(); i++)
+                    float_samples[i] = pcm_buffer[i] / 32768.0f;
+
+                float audio_dur = (float)float_samples.size() / stream_sample_rate;
+                fprintf(stderr, "[WS] Stream VAD: %.1fs audio, %zu samples\n",
+                        audio_dur, float_samples.size());
+
+                // ASR 转录
+                if (asr_plugin_ && asr_plugin_->is_available() && !float_samples.empty()) {
+                    ws_send_text(client_fd, "{\"type\":\"status\",\"stage\":\"asr\"}");
+
+                    auto result = asr_plugin_->transcribe_pcm(
+                        float_samples.data(), (int)float_samples.size(),
+                        stream_sample_rate, "auto");
+
+                    if (result.error_code == 0 && !result.text.empty()) {
+                        ws_send_text(client_fd, "{\"type\":\"asr\",\"text\":\"" +
+                                     json_escape(result.text) + "\"}");
+                        ws_voice_generate(client_fd, result.text, chat_history, voice, tts_enabled);
+                    } else {
+                        ws_send_text(client_fd,
+                            "{\"type\":\"error\",\"message\":\"ASR: " +
+                            json_escape(result.error_message.empty() ? "no speech detected" : result.error_message) + "\"}");
+                    }
+                }
+
+                // 重置流状态
+                pcm_buffer.clear();
+                silence_samples = 0;
+                speech_detected = false;
+            }
+
+            continue;
+        }
+
         if (opcode != WS_OP_TEXT) continue;
 
         // 解析 JSON 事件
@@ -3832,8 +3936,64 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             if (text.empty()) continue;
             ws_voice_generate(client_fd, text, chat_history, voice, tts_enabled);
 
+        } else if (event_type == "stream.start") {
+            // 开始实时音频流
+            streaming_audio = true;
+            pcm_buffer.clear();
+            pcm_buffer.reserve(stream_sample_rate * 10);  // 预分配 10s
+            silence_samples = 0;
+            speech_detected = false;
+            stream_sample_rate = json_get_int(msg, "sample_rate", 16000);
+            if (stream_sample_rate < 8000) stream_sample_rate = 8000;
+            if (stream_sample_rate > 48000) stream_sample_rate = 48000;
+            ws_send_text(client_fd, "{\"type\":\"stream.started\"}");
+            fprintf(stderr, "[WS] Audio stream started, rate=%d fd=%d\n",
+                    stream_sample_rate, client_fd);
+
+        } else if (event_type == "stream.stop") {
+            // 手动停止音频流
+            if (streaming_audio) {
+                streaming_audio = false;
+
+                // 如果有足够的音频数据, 执行 ASR
+                float audio_dur = (float)pcm_buffer.size() / stream_sample_rate;
+                if (pcm_buffer.size() >= (size_t)(stream_sample_rate * VAD_MIN_SPEECH_MS / 1000)) {
+                    std::vector<float> float_samples(pcm_buffer.size());
+                    for (size_t i = 0; i < pcm_buffer.size(); i++)
+                        float_samples[i] = pcm_buffer[i] / 32768.0f;
+
+                    fprintf(stderr, "[WS] Stream stopped manually: %.1fs audio\n", audio_dur);
+
+                    if (asr_plugin_ && asr_plugin_->is_available()) {
+                        ws_send_text(client_fd, "{\"type\":\"status\",\"stage\":\"asr\"}");
+
+                        auto result = asr_plugin_->transcribe_pcm(
+                            float_samples.data(), (int)float_samples.size(),
+                            stream_sample_rate, "auto");
+
+                        if (result.error_code == 0 && !result.text.empty()) {
+                            ws_send_text(client_fd, "{\"type\":\"asr\",\"text\":\"" +
+                                         json_escape(result.text) + "\"}");
+                            ws_voice_generate(client_fd, result.text, chat_history, voice, tts_enabled);
+                        } else {
+                            ws_send_text(client_fd,
+                                "{\"type\":\"error\",\"message\":\"ASR: " +
+                                json_escape(result.error_message.empty() ? "no speech detected" : result.error_message) + "\"}");
+                        }
+                    }
+                } else {
+                    fprintf(stderr, "[WS] Stream stopped, too short (%.1fs)\n", audio_dur);
+                    ws_send_text(client_fd, "{\"type\":\"error\",\"message\":\"录音太短\"}");
+                }
+
+                pcm_buffer.clear();
+                silence_samples = 0;
+                speech_detected = false;
+            }
+            ws_send_text(client_fd, "{\"type\":\"stream.stopped\"}");
+
         } else if (event_type == "audio") {
-            // 语音输入: ASR → LLM → TTS
+            // 旧模式: 完整音频 base64 (兼容)
             std::string audio_b64 = json_get_string(msg, "data");
             std::string format = json_get_string(msg, "format");
             if (audio_b64.empty()) continue;
@@ -3843,7 +4003,6 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 continue;
             }
 
-            // Decode audio from base64
             auto audio_bytes = base64_decode(audio_b64);
             if (audio_bytes.empty()) {
                 ws_send_text(client_fd, "{\"type\":\"error\",\"message\":\"Invalid audio data\"}");
@@ -3851,8 +4010,6 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             }
 
             ws_send_text(client_fd, "{\"type\":\"status\",\"stage\":\"asr\"}");
-
-            // 直接内存转录 — 无临时文件 I/O
             auto result = asr_plugin_->transcribe_memory(audio_bytes.data(),
                                                           audio_bytes.size(), "auto");
 
@@ -3862,10 +4019,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 continue;
             }
 
-            // 发送 ASR 结果
             ws_send_text(client_fd, "{\"type\":\"asr\",\"text\":\"" + json_escape(result.text) + "\"}");
-
-            // 继续 LLM + TTS
             ws_voice_generate(client_fd, result.text, chat_history, voice, tts_enabled);
 
         } else if (event_type == "clear") {

@@ -376,13 +376,17 @@ body {
 // ============================================================================
 let ws = null;
 let isRecording = false;
-let mediaRecorder = null;
-let audioChunks = [];
 let isProcessing = false;
 let currentMode = 'text';
 let streamingDiv = null;   // 当前正在流式输出的消息 div
 let streamingText = '';    // 累积的流式文本
 let responseT0 = 0;       // 响应开始时间
+
+// ---- 流式 ASR 状态 ----
+let audioContext = null;
+let audioWorkletNode = null;
+let mediaStream = null;
+const STREAM_SAMPLE_RATE = 16000;
 
 // ============================================================================
 // WebSocket 连接
@@ -461,17 +465,14 @@ function playNextTts() {
   ttsPlaying = true;
   const item = ttsAudioQueue.shift();
 
-  // 添加/复用 audio 元素
   if (streamingDiv) {
-    let audio = streamingDiv.querySelector('audio.tts-audio');
-    if (!audio) {
-      audio = document.createElement('audio');
-      audio.className = 'tts-audio';
-      audio.controls = true;
-      audio.style.cssText = 'display:block;margin-top:8px;width:100%;height:36px;border-radius:6px;';
-      streamingDiv.appendChild(audio);
-    }
+    // 每段 TTS 创建独立 audio 元素，可回放
+    const audio = document.createElement('audio');
+    audio.className = 'tts-audio';
+    audio.controls = true;
+    audio.style.cssText = 'display:block;margin-top:8px;width:100%;height:36px;border-radius:6px;';
     audio.src = item.url;
+    streamingDiv.appendChild(audio);
     audio.onended = () => playNextTts();
     audio.onerror = () => playNextTts();
     audio.play().catch(() => playNextTts());
@@ -491,6 +492,30 @@ function handleEvent(msg) {
     case 'status':
       if (msg.stage === 'asr') setStatus('正在转录语音...');
       else if (msg.stage === 'tts') setStatus('正在合成语音...');
+      break;
+
+    case 'stream.started':
+      setStatus('🎤 正在听...');
+      break;
+
+    case 'stream.vad':
+      // VAD 检测到语音结束, 服务端正在 ASR
+      setStatus('语音结束，正在识别...');
+      stopStreaming(false);  // 停止采集但不发 stream.stop (服务端已处理)
+      break;
+
+    case 'stream.stopped':
+      // 手动停止确认 — 如果没有触发 ASR, 解锁 UI
+      if (isProcessing && !streamingDiv) {
+        isProcessing = false;
+        document.getElementById('sendBtn').disabled = false;
+        clearStatus();
+      }
+      break;
+
+    case 'audio.level':
+      // 更新音频电平 UI
+      updateAudioLevel(msg.rms || 0);
       break;
 
     case 'asr':
@@ -687,69 +712,130 @@ function sendMessage() {
 }
 
 // ============================================================================
-// 录音 → ASR
+// 实时语音流 → ASR (AudioWorklet + PCM16 binary frames)
 // ============================================================================
 async function toggleRecording() {
   if (isProcessing) return;
   if (isRecording) {
-    stopRecording();
+    stopStreaming(true);  // 手动停止 → 发 stream.stop
   } else {
-    await startRecording();
+    await startStreaming();
   }
 }
 
-async function startRecording() {
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    audioChunks = [];
-    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-      ? 'audio/webm;codecs=opus' : 'audio/webm';
-
-    mediaRecorder = new MediaRecorder(stream, { mimeType });
-    mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) audioChunks.push(e.data);
-    };
-    mediaRecorder.onstop = async () => {
-      stream.getTracks().forEach(t => t.stop());
-      if (audioChunks.length > 0) {
-        const blob = new Blob(audioChunks, { type: mimeType });
-        await sendAudio(blob);
-      }
-    };
-    mediaRecorder.start(100);
-    isRecording = true;
-    document.getElementById('micBtn').classList.add('recording');
-    document.getElementById('recordingStatus').textContent = '🔴 录音中...';
-  } catch (err) {
-    setStatus('无法访问麦克风: ' + err.message, 'error');
-  }
-}
-
-function stopRecording() {
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-  isRecording = false;
-  document.getElementById('micBtn').classList.remove('recording');
-  document.getElementById('recordingStatus').textContent = '';
-}
-
-async function sendAudio(blob) {
+async function startStreaming() {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     setStatus('WebSocket 未连接', 'error');
     return;
   }
 
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: STREAM_SAMPLE_RATE, channelCount: 1,
+               echoCancellation: true, noiseSuppression: true }
+    });
+
+    audioContext = new AudioContext({ sampleRate: STREAM_SAMPLE_RATE });
+    const source = audioContext.createMediaStreamSource(mediaStream);
+
+    // 构造 AudioWorklet processor (inline, via Blob URL)
+    const workletCode = `
+      class PcmProcessor extends AudioWorkletProcessor {
+        process(inputs) {
+          const ch = inputs[0] && inputs[0][0];
+          if (ch && ch.length > 0) {
+            this.port.postMessage(ch);
+          }
+          return true;
+        }
+      }
+      registerProcessor('pcm-processor', PcmProcessor);
+    `;
+    const blob = new Blob([workletCode], { type: 'application/javascript' });
+    const moduleUrl = URL.createObjectURL(blob);
+    await audioContext.audioWorklet.addModule(moduleUrl);
+    URL.revokeObjectURL(moduleUrl);
+
+    audioWorkletNode = new AudioWorkletNode(audioContext, 'pcm-processor');
+    audioWorkletNode.port.onmessage = (e) => {
+      if (!isRecording || !ws || ws.readyState !== WebSocket.OPEN) return;
+      // Float32 → PCM16LE
+      const float32 = e.data;
+      const pcm16 = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32[i]));
+        pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      ws.send(pcm16.buffer);
+    };
+
+    source.connect(audioWorkletNode);
+    audioWorkletNode.connect(audioContext.destination);  // 需要连接才能持续 process
+
+    // 通知服务端开始接收
+    ws.send(JSON.stringify({ type: 'stream.start', sample_rate: STREAM_SAMPLE_RATE }));
+
+    isRecording = true;
+    isProcessing = true;
+    document.getElementById('micBtn').classList.add('recording');
+    document.getElementById('recordingStatus').textContent = '🔴 实时语音流...';
+    document.getElementById('sendBtn').disabled = true;
+
+  } catch (err) {
+    setStatus('无法访问麦克风: ' + err.message, 'error');
+  }
+}
+
+function stopStreaming(sendStop) {
+  if (!isRecording && !audioContext) return;
+
+  isRecording = false;
+  document.getElementById('micBtn').classList.remove('recording');
+  document.getElementById('recordingStatus').textContent = '';
+
+  // 关闭音频采集
+  if (audioWorkletNode) {
+    audioWorkletNode.disconnect();
+    audioWorkletNode = null;
+  }
+  if (audioContext) {
+    audioContext.close();
+    audioContext = null;
+  }
+  if (mediaStream) {
+    mediaStream.getTracks().forEach(t => t.stop());
+    mediaStream = null;
+  }
+
+  // 通知服务端停止 (手动停止时)
+  if (sendStop && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'stream.stop' }));
+  }
+}
+
+function updateAudioLevel(rms) {
+  // 可扩展: 更新 UI 音频电平指示器
+  const statusEl = document.getElementById('recordingStatus');
+  if (isRecording) {
+    const bars = Math.min(5, Math.floor(rms * 100));
+    const indicator = '█'.repeat(bars) + '░'.repeat(5 - bars);
+    statusEl.textContent = '🔴 ' + indicator + ' 实时语音流...';
+  }
+}
+
+// 兼容旧模式: base64 音频 blob 发送 (保留, 供外部调用)
+async function sendAudio(blob) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    setStatus('WebSocket 未连接', 'error');
+    return;
+  }
   isProcessing = true;
   document.getElementById('sendBtn').disabled = true;
-
-  // 将音频 blob 转为 base64 发送
   const reader = new FileReader();
   reader.onload = () => {
-    const base64 = reader.result.split(',')[1]; // strip data:...;base64,
-    ws.send(JSON.stringify({
-      type: 'audio',
-      data: base64,
-      format: 'webm'
-    }));
+    const base64 = reader.result.split(',')[1];
+    const fmt = (blob.type || 'audio/webm').split('/').pop().split(';')[0];
+    ws.send(JSON.stringify({ type: 'audio', data: base64, format: fmt }));
   };
   reader.readAsDataURL(blob);
 }

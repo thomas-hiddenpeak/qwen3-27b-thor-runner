@@ -284,6 +284,18 @@ AsrResult AsrPlugin::transcribe_memory(const uint8_t* data, size_t size,
 }
 
 // ============================================================================
+// AsrPlugin::transcribe_pcm — 默认实现 (不支持)
+// ============================================================================
+
+AsrResult AsrPlugin::transcribe_pcm(const float* /*samples*/, int /*num_samples*/,
+                                     int /*sample_rate*/, const std::string& /*language*/) {
+    AsrResult r;
+    r.error_code = 99;
+    r.error_message = "transcribe_pcm not supported by this plugin";
+    return r;
+}
+
+// ============================================================================
 // NativeAsrPlugin::transcribe_memory — 零临时文件, 直接内存解析
 // ============================================================================
 
@@ -330,6 +342,54 @@ AsrResult NativeAsrPlugin::transcribe_memory(const uint8_t* data, size_t size,
 
     fprintf(stderr, "[ASR Native] Transcribed (memory) in %.2fs: \"%s\"\n",
             elapsed_s, text.substr(0, 100).c_str());
+
+    return result;
+}
+
+// ============================================================================
+// NativeAsrPlugin::transcribe_pcm — 原始 float 样本直接转录
+// ============================================================================
+
+AsrResult NativeAsrPlugin::transcribe_pcm(const float* samples, int num_samples,
+                                           int sample_rate, const std::string& language) {
+    AsrResult result;
+
+    if (!is_available()) {
+        result.error_code = 1;
+        result.error_message = "ASR engine not loaded";
+        return result;
+    }
+
+    if (!samples || num_samples <= 0) {
+        result.error_code = 2;
+        result.error_message = "Empty audio data";
+        return result;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    std::string text = engine_->transcribe(samples, num_samples, sample_rate);
+
+    auto t1 = std::chrono::steady_clock::now();
+    float elapsed_s = std::chrono::duration<float>(t1 - t0).count();
+
+    if (text.empty()) {
+        result.error_code = 3;
+        result.error_message = "ASR transcription produced no text";
+        return result;
+    }
+
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\n')) text.erase(text.begin());
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\n')) text.pop_back();
+
+    result.text = text;
+    result.language = language;
+    result.duration_s = elapsed_s;
+
+    fprintf(stderr, "[ASR Native] Transcribed (PCM stream, %.1fs audio) in %.2fs: \"%s\"\n",
+            (float)num_samples / sample_rate, elapsed_s, text.substr(0, 100).c_str());
 
     return result;
 }
