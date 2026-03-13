@@ -3790,7 +3790,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
 
     // 会话状态
     std::vector<std::pair<std::string, std::string>> chat_history;
-    std::string voice = "Chelsie";
+    std::string voice = "serena";
     bool tts_enabled = true;
 
     // ---- 流式 ASR 状态 ----
@@ -4031,6 +4031,12 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
     fprintf(stderr, "[WS] Voice session ended fd=%d\n", client_fd);
 }
 
+// 判断 UTF-8 字符是否是句末标点
+static bool is_sentence_end_punct(const std::string& ch) {
+    return ch == "。" || ch == "！" || ch == "？" ||
+           ch == "." || ch == "!" || ch == "?" || ch == "\n";
+}
+
 void ServeApp::ws_voice_generate(int client_fd,
                                   const std::string& user_text,
                                   std::vector<std::pair<std::string, std::string>>& chat_history,
@@ -4080,13 +4086,70 @@ void ServeApp::ws_voice_generate(int client_fd,
 
     ws_send_text(client_fd, "{\"type\":\"llm.start\"}");
 
-    // Stream LLM tokens
+    // ---- 流式 LLM + TTS 交错 ----
+    // LLM 在后台线程生成, poll_tokens 在当前线程轮询
+    // 在回调中累积文本, 遇到句尾标点时暂停轮询去做 TTS
+    // TTS 完成后继续 poll, 拿到后台已经生成好的 token
+    bool do_stream_tts = tts_enabled && tts_plugin_ && tts_plugin_->is_available();
     std::string full_response;
+    std::string pending_sentence;  // 当前正在累积的句子
+    int tts_segment_idx = 0;
+    int tts_sample_rate = 0;       // 0 = 未知, 首次 TTS 时获取
+
+    // 通知客户端 TTS 输出格式: PCM16 连续流 (非独立 WAV)
+    if (do_stream_tts) {
+        tts_sample_rate = 24000;  // Qwen3-TTS 默认
+        ws_send_text(client_fd, "{\"type\":\"tts.stream_start\",\"sample_rate\":" +
+                     std::to_string(tts_sample_rate) + ",\"format\":\"pcm16\"}");
+    }
+
+    // TTS 合成并发送一个句子的 lambda
+    auto synth_and_send = [&](const std::string& sentence) {
+        if (!do_stream_tts || sentence.empty()) return;
+        auto tts_result = tts_plugin_->synthesize(sentence, voice, 1.0f, "pcm");
+        if (tts_result.error_code == 0 && !tts_result.audio_data.empty()) {
+            // 发送 PCM16 binary frame (客户端通过 AudioContext 直接播放)
+            ws_send_binary(client_fd, tts_result.audio_data.data(),
+                           tts_result.audio_data.size());
+            tts_segment_idx++;
+        }
+    };
+
     int comp_toks = poll_tokens(infer_req.request_id,
         [&](const std::string& piece) {
             full_response += piece;
+            pending_sentence += piece;
             // 发送增量
             ws_send_text(client_fd, "{\"type\":\"llm.delta\",\"delta\":\"" + json_escape(piece) + "\"}");
+
+            if (!do_stream_tts) return;
+
+            // 检查是否有句尾标点 → 触发 TTS
+            // 从 pending_sentence 末尾扫描 UTF-8 字符
+            size_t pos = pending_sentence.size();
+            if (pos == 0) return;
+
+            // 取最后一个 UTF-8 字符
+            size_t last_start = pos - 1;
+            while (last_start > 0 && (pending_sentence[last_start] & 0xC0) == 0x80)
+                last_start--;
+            std::string last_ch = pending_sentence.substr(last_start);
+
+            // 逗号/分号处，长句分割 (>30 UTF-8 chars ≈ >90 bytes)
+            bool is_clause_break = (pending_sentence.size() > 90 &&
+                                    (last_ch == "，" || last_ch == "," ||
+                                     last_ch == "；" || last_ch == ";"));
+
+            if (is_sentence_end_punct(last_ch) || is_clause_break) {
+                // Trim trailing whitespace
+                std::string sentence = pending_sentence;
+                while (!sentence.empty() && (sentence.back() == ' ' || sentence.back() == '\n'))
+                    sentence.pop_back();
+                if (!sentence.empty()) {
+                    synth_and_send(sentence);
+                }
+                pending_sentence.clear();
+            }
         },
         config_.timeout_s,
         false,   // enable_thinking = false
@@ -4098,79 +4161,27 @@ void ServeApp::ws_voice_generate(int client_fd,
         nullptr  // cached_tokens
     );
 
-    unregister_request(infer_req.request_id);
+    // 合成剩余未发送的文本
+    if (!pending_sentence.empty()) {
+        std::string sentence = pending_sentence;
+        while (!sentence.empty() && (sentence.back() == ' ' || sentence.back() == '\n'))
+            sentence.pop_back();
+        if (!sentence.empty()) {
+            synth_and_send(sentence);
+        }
+    }
 
-    // 发送完成
+    // 发送 LLM 完成
     ws_send_text(client_fd, "{\"type\":\"llm.done\",\"text\":\"" + json_escape(full_response) +
                  "\",\"prompt_tokens\":" + std::to_string(prompt_count) +
                  ",\"completion_tokens\":" + std::to_string(comp_toks) + "}");
 
     chat_history.push_back({"assistant", full_response});
 
-    // TTS: 按句分段合成, 边生成边发送
-    if (tts_enabled && tts_plugin_ && tts_plugin_->is_available() && !full_response.empty()) {
-        ws_send_text(client_fd, "{\"type\":\"status\",\"stage\":\"tts\"}");
-
-        // 按句子边界分割 (。！？.!? + 换行 + 逗号后的长句)
-        std::vector<std::string> sentences;
-        std::string current;
-        for (size_t i = 0; i < full_response.size(); ) {
-            unsigned char c = full_response[i];
-            // UTF-8 字符长度检测
-            int char_len = 1;
-            if ((c & 0xE0) == 0xC0) char_len = 2;
-            else if ((c & 0xF0) == 0xE0) char_len = 3;
-            else if ((c & 0xF8) == 0xF0) char_len = 4;
-
-            std::string ch = full_response.substr(i, char_len);
-            current += ch;
-            i += char_len;
-
-            // 中文/英文句末标点
-            bool is_sentence_end = (ch == "。" || ch == "！" || ch == "？" ||
-                                    ch == "." || ch == "!" || ch == "?" ||
-                                    ch == "\n");
-            // 逗号/分号后的长句界 (>20 chars)
-            bool is_clause_break = (current.size() > 60 &&
-                                    (ch == "，" || ch == "," || ch == "；" || ch == ";"));
-
-            if (is_sentence_end || is_clause_break) {
-                // Trim
-                while (!current.empty() && (current.back() == ' ' || current.back() == '\n'))
-                    current.pop_back();
-                if (!current.empty()) {
-                    sentences.push_back(std::move(current));
-                    current.clear();
-                }
-            }
-        }
-        if (!current.empty()) {
-            while (!current.empty() && (current.back() == ' ' || current.back() == '\n'))
-                current.pop_back();
-            if (!current.empty())
-                sentences.push_back(std::move(current));
-        }
-
-        // 逐句合成并发送 (binary WS frames, 无 base64 开销)
-        int sent_idx = 0;
-        for (auto& sentence : sentences) {
-            auto tts_result = tts_plugin_->synthesize(sentence, voice, 1.0f, "wav");
-            if (tts_result.error_code == 0 && !tts_result.audio_data.empty()) {
-                // 先发元数据 (text frame)
-                ws_send_text(client_fd, "{\"type\":\"tts.meta\",\"index\":" +
-                             std::to_string(sent_idx) + ",\"total\":" +
-                             std::to_string((int)sentences.size()) +
-                             ",\"format\":\"wav\",\"size\":" +
-                             std::to_string(tts_result.audio_data.size()) + "}");
-                // 再发音频数据 (binary frame, 无 base64 编码)
-                ws_send_binary(client_fd, tts_result.audio_data.data(),
-                               tts_result.audio_data.size());
-            }
-            sent_idx++;
-        }
-
+    // TTS 流结束
+    if (do_stream_tts) {
         ws_send_text(client_fd, "{\"type\":\"tts.done\",\"segments\":" +
-                     std::to_string(sent_idx) + "}");
+                     std::to_string(tts_segment_idx) + "}");
     }
 }
 
