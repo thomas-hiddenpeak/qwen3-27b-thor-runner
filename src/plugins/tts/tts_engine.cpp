@@ -4,6 +4,7 @@
 
 #include "tts_engine.h"
 #include "tts_ops.h"
+#include "tts_tokenizer_decoder.h"
 #include "../asr/audio_ops.h"
 #include "engine/safetensors.h"
 #include "engine/tokenizer.h"
@@ -183,7 +184,10 @@ void TTSEngine::load_model(const std::string& model_dir) {
         return;
     }
     config_.load_generation_config(dir + "generation_config.json");
-    // Phase 2: config_.load_tokenizer_config(dir + "speech_tokenizer/config.json");
+
+    // Load speech tokenizer config
+    std::string st_config = dir + "speech_tokenizer/config.json";
+    config_.load_tokenizer_config(st_config);
 
     fprintf(stderr, "[TTS] Config: talker %dL h=%d, code_predictor %dL h=%d, "
                     "vocab=%d, groups=%d\n",
@@ -206,6 +210,17 @@ void TTSEngine::load_model(const std::string& model_dir) {
 
     // 5. Initialize Talker
     talker_->initialize(stream_);
+
+    // 6. Load Speech Tokenizer Decoder
+    std::string st_dir = dir + "speech_tokenizer/";
+    st_decoder_ = std::make_unique<SpeechTokenizerDecoder>();
+    if (st_decoder_->load_weights(st_dir, config_.tokenizer_decoder)) {
+        st_decoder_->initialize(stream_);
+        fprintf(stderr, "[TTS] Speech tokenizer decoder loaded\n");
+    } else {
+        fprintf(stderr, "[TTS] WARNING: speech tokenizer decoder not loaded, WAV output disabled\n");
+        st_decoder_.reset();
+    }
 
     auto t1 = std::chrono::steady_clock::now();
     float load_time = std::chrono::duration<float>(t1 - t0).count();
@@ -308,6 +323,173 @@ void TTSEngine::set_sampling(float temperature, int top_k, float top_p, float re
 
 void TTSEngine::set_sub_sampling(float temperature, int top_k, float top_p) {
     if (talker_) talker_->set_sub_sampling(temperature, top_k, top_p);
+}
+
+// ============================================================================
+// Build instruct text tokens (for VoiceDesign mode)
+// ============================================================================
+
+std::vector<int> TTSEngine::build_instruct_text_tokens(
+    const std::string& text, const std::string& instruct)
+{
+    // VoiceDesign chat template (Python: _build_instruct_text + _build_assistant_text):
+    //   <|im_start|>user\n{instruct}<|im_end|>\n<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
+
+    std::vector<int> tokens;
+
+    // <|im_start|>user\n
+    tokens.push_back(config_.im_start_token_id);   // 151644
+    // "user" token - use tokenizer to encode "user"
+    auto user_tokens = tokenizer_.encode("user");
+    tokens.insert(tokens.end(), user_tokens.begin(), user_tokens.end());
+    tokens.push_back(198);    // "\n"
+
+    // instruct text
+    auto instruct_tokens = tokenizer_.encode(instruct);
+    tokens.insert(tokens.end(), instruct_tokens.begin(), instruct_tokens.end());
+
+    // <|im_end|>\n
+    tokens.push_back(config_.im_end_token_id);
+    tokens.push_back(198);
+
+    // <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
+    tokens.push_back(config_.im_start_token_id);
+    tokens.push_back(config_.assistant_token_id);
+    tokens.push_back(198);
+
+    auto text_tokens = tokenizer_.encode(text);
+    tokens.insert(tokens.end(), text_tokens.begin(), text_tokens.end());
+
+    tokens.push_back(config_.im_end_token_id);
+    tokens.push_back(198);
+
+    tokens.push_back(config_.im_start_token_id);
+    tokens.push_back(config_.assistant_token_id);
+    tokens.push_back(198);
+
+    return tokens;
+}
+
+// ============================================================================
+// Synthesize to WAV (end-to-end)
+// ============================================================================
+
+bool TTSEngine::synthesize_to_wav(
+    const std::string& text,
+    const std::string& output_path,
+    const std::string& speaker,
+    const std::string& language,
+    const std::string& instruct,
+    int max_new_tokens)
+{
+    if (!loaded_) {
+        fprintf(stderr, "[TTS] ERROR: model not loaded\n");
+        return false;
+    }
+
+    if (!st_decoder_ || !st_decoder_->is_loaded()) {
+        fprintf(stderr, "[TTS] ERROR: speech tokenizer decoder not loaded\n");
+        return false;
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // 1. Tokenize text (choose template based on model type)
+    std::vector<int> text_tokens;
+    if (!instruct.empty() || config_.tts_model_type == "voice_design") {
+        text_tokens = build_instruct_text_tokens(text, instruct);
+    } else {
+        text_tokens = build_text_tokens(text);
+    }
+    if (text_tokens.empty()) {
+        fprintf(stderr, "[TTS] ERROR: empty text tokens\n");
+        return false;
+    }
+
+    // 2. Build prefill + decode → codec tokens
+    talker_->reset();
+    talker_->set_max_new_tokens(max_new_tokens);
+    int prefill_len = talker_->build_prefill(
+        text_tokens.data(), (int)text_tokens.size(),
+        speaker, language, stream_);
+    talker_->forward_prefill(stream_);
+
+    std::vector<std::vector<int>> all_codes;
+    int num_groups = config_.talker.num_code_groups;
+    std::vector<int> codec_step(num_groups);
+    int step = 0;
+    while (step < max_new_tokens) {
+        int ret = talker_->forward_decode_step(codec_step.data(), stream_);
+        if (ret < 0) break;
+        all_codes.push_back(codec_step);
+        step++;
+        if (step % 100 == 0) {
+            auto tn = std::chrono::steady_clock::now();
+            float ms = std::chrono::duration<float, std::milli>(tn - t0).count();
+            fprintf(stderr, "[TTS] Talker: %d steps (%.1f ms)\n", step, ms);
+        }
+    }
+
+    auto t_talker = std::chrono::steady_clock::now();
+    float talker_ms = std::chrono::duration<float, std::milli>(t_talker - t0).count();
+    fprintf(stderr, "[TTS] Talker done: %d steps (%.1f ms, %.1f steps/s)\n",
+            step, talker_ms, step > 0 ? step / (talker_ms / 1000.0f) : 0.0f);
+
+    if (all_codes.empty()) {
+        fprintf(stderr, "[TTS] ERROR: no codec tokens generated\n");
+        return false;
+    }
+
+    // 3. Reshape codes to [num_groups, num_frames] for decoder
+    int T = (int)all_codes.size();
+    std::vector<int> codes_flat(num_groups * T);
+    for (int t = 0; t < T; t++) {
+        for (int g = 0; g < num_groups; g++) {
+            codes_flat[g * T + t] = all_codes[t][g];
+        }
+    }
+
+    // 4. Decode codec tokens → PCM
+    fprintf(stderr, "[TTS] Decoding %d frames → PCM...\n", T);
+
+    // Debug: dump codes to file for Python comparison
+    {
+        std::string codes_path = output_path + ".codes.bin";
+        FILE* cf = fopen(codes_path.c_str(), "wb");
+        if (cf) {
+            int32_t header[2] = {num_groups, T};
+            fwrite(header, sizeof(int32_t), 2, cf);
+            fwrite(codes_flat.data(), sizeof(int32_t), codes_flat.size(), cf);
+            fclose(cf);
+            fprintf(stderr, "[TTS] Codes dumped to %s (%d groups × %d frames)\n",
+                    codes_path.c_str(), num_groups, T);
+        }
+    }
+
+    auto pcm = st_decoder_->decode(codes_flat.data(), num_groups, T, stream_);
+
+    auto t_decode = std::chrono::steady_clock::now();
+    float decode_ms = std::chrono::duration<float, std::milli>(t_decode - t_talker).count();
+    fprintf(stderr, "[TTS] Decoder done: %zu samples (%.1f ms)\n", pcm.size(), decode_ms);
+
+    if (pcm.empty()) {
+        fprintf(stderr, "[TTS] ERROR: decoder produced empty PCM\n");
+        return false;
+    }
+
+    // 5. Write WAV
+    bool ok = SpeechTokenizerDecoder::write_wav(
+        output_path, pcm, config_.tokenizer_decoder.output_sample_rate);
+
+    if (ok) {
+        float duration_s = (float)pcm.size() / config_.tokenizer_decoder.output_sample_rate;
+        float total_ms = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        fprintf(stderr, "[TTS] WAV written: %s (%.1fs audio, %.1f ms total)\n",
+                output_path.c_str(), duration_s, total_ms);
+    }
+
+    return ok;
 }
 
 } // namespace tts

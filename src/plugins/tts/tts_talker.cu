@@ -856,9 +856,16 @@ void Talker::run_code_predictor(
                                         codec_embedding_w_, 1, talker_h, stream);
 
     // Project: [2, talker_h] → [2, cp_h] via small_to_mtp_projection
-    cublas_gemm(cublas_handle_, cp_hidden_buf_, cp_input_buf_, cp_projection_w_,
-                2, talker_h, cp_h, stream);
-    invoke_add_bias(cp_hidden_buf_, cp_projection_b_, 2, cp_h, stream);
+    // For 0.6B: talker_h == cp_h, no projection needed
+    if (cp_projection_w_) {
+        cublas_gemm(cublas_handle_, cp_hidden_buf_, cp_input_buf_, cp_projection_w_,
+                    2, talker_h, cp_h, stream);
+        invoke_add_bias(cp_hidden_buf_, cp_projection_b_, 2, cp_h, stream);
+    } else {
+        // No projection needed (0.6B: talker_h == cp_h == 1024)
+        cudaMemcpyAsync(cp_hidden_buf_, cp_input_buf_,
+                        2 * cp_h * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+    }
 
     // Prefill through CodePredictor layers
     for (int layer = 0; layer < cp.num_hidden_layers; layer++) {
@@ -892,9 +899,14 @@ void Talker::run_code_predictor(
                                             cp_codec_embeddings_[g - 1], 1, talker_h, stream);
 
         // Project to cp_h
-        cublas_gemm(cublas_handle_, cp_decode_hidden_, cp_embed_buf_, cp_projection_w_,
-                    1, talker_h, cp_h, stream);
-        invoke_add_bias(cp_decode_hidden_, cp_projection_b_, 1, cp_h, stream);
+        if (cp_projection_w_) {
+            cublas_gemm(cublas_handle_, cp_decode_hidden_, cp_embed_buf_, cp_projection_w_,
+                        1, talker_h, cp_h, stream);
+            invoke_add_bias(cp_decode_hidden_, cp_projection_b_, 1, cp_h, stream);
+        } else {
+            cudaMemcpyAsync(cp_decode_hidden_, cp_embed_buf_,
+                            cp_h * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+        }
 
         // Forward through CodePredictor layers (decode T=1)
         for (int layer = 0; layer < cp.num_hidden_layers; layer++) {
@@ -967,6 +979,7 @@ void Talker::forward_prefill(cudaStream_t stream) {
     generation_step_ = 0;
 
     cudaStreamSynchronize(stream);
+
     fprintf(stderr, "[TTS Talker] prefill done: %d tokens, cache_len=%d\n",
             seq_len, talker_cache_len_);
 }

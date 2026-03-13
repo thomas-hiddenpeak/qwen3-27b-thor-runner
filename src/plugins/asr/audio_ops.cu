@@ -180,8 +180,27 @@ __global__ void per_head_rmsnorm_kernel(
         float v = bf16_to_float(x_ptr[i]);
         sum_sq += v * v;
     }
+
+    // Warp reduction
     for (int offset = warpSize / 2; offset > 0; offset >>= 1)
         sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+
+    // Block reduction via shared memory (needed when blockDim.x > warpSize)
+    __shared__ float shared[32];
+    int lane = threadIdx.x % warpSize;
+    int wid = threadIdx.x / warpSize;
+    if (lane == 0) shared[wid] = sum_sq;
+    __syncthreads();
+
+    if (threadIdx.x < blockDim.x / warpSize) {
+        sum_sq = shared[threadIdx.x];
+    } else {
+        sum_sq = 0.0f;
+    }
+    if (wid == 0) {
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
 
     __shared__ float s_rsqrt;
     if (threadIdx.x == 0) s_rsqrt = rsqrtf(sum_sq / head_dim + eps);

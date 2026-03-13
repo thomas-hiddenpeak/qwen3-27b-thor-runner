@@ -14,6 +14,7 @@
 
 #include "tts_config.h"
 #include "tts_talker.h"
+#include "tts_tokenizer_decoder.h"
 #include "engine/tokenizer.h"
 #include <string>
 #include <vector>
@@ -44,6 +45,16 @@ public:
         const std::string& language = "auto",
         int max_new_tokens = 4096);
 
+    // Synthesize: text → WAV file (end-to-end)
+    // Returns true on success, false on failure
+    bool synthesize_to_wav(
+        const std::string& text,
+        const std::string& output_path,
+        const std::string& speaker = "serena",
+        const std::string& language = "auto",
+        const std::string& instruct = "",
+        int max_new_tokens = 4096);
+
     bool is_loaded() const { return loaded_; }
     const TTSConfig& config() const { return config_; }
 
@@ -54,6 +65,7 @@ public:
 private:
     TTSConfig config_;
     std::unique_ptr<Talker> talker_;
+    std::unique_ptr<SpeechTokenizerDecoder> st_decoder_;
     Tokenizer tokenizer_;
     std::string model_dir_;
 
@@ -70,6 +82,11 @@ private:
     // Input: user text
     // Output: token IDs including <|im_start|>assistant\n...text...<|im_end|>\n<|im_start|>assistant\n
     std::vector<int> build_text_tokens(const std::string& text);
+
+    // Build instruct text tokens for VoiceDesign mode
+    // <|im_start|>user\n{instruct}<|im_end|>\n<|im_start|>assistant\n...text...<|im_end|>\n<|im_start|>assistant\n
+    std::vector<int> build_instruct_text_tokens(const std::string& text,
+                                                 const std::string& instruct);
 };
 
 } // namespace tts

@@ -361,7 +361,10 @@ static int cmd_tts(int argc, char** argv) {
     std::string text;
     std::string speaker = "serena";
     std::string language = "auto";
+    std::string output_path;
+    std::string instruct;
     int max_tokens = 4096;
+    bool wav_mode = false;
 
     // Parse args
     for (int i = 2; i < argc; i++) {
@@ -376,6 +379,14 @@ static int cmd_tts(int argc, char** argv) {
             max_tokens = std::stoi(argv[++i]);
         else if ((arg == "--text" || arg == "-t") && i + 1 < argc)
             text = argv[++i];
+        else if ((arg == "--output" || arg == "-o") && i + 1 < argc) {
+            output_path = argv[++i];
+            wav_mode = true;
+        }
+        else if (arg == "--instruct" && i + 1 < argc)
+            instruct = argv[++i];
+        else if (arg == "--wav")
+            wav_mode = true;
         else if (arg[0] != '-' && text.empty())
             text = arg;
     }
@@ -393,12 +404,22 @@ static int cmd_tts(int argc, char** argv) {
         fprintf(stderr, "  --speaker <name>      Speaker name (default: serena)\n");
         fprintf(stderr, "  --language <lang>     Language hint (default: auto)\n");
         fprintf(stderr, "  --max-tokens <N>      Max codec tokens (default: 4096)\n");
+        fprintf(stderr, "  --output, -o <path>   Output WAV file path\n");
+        fprintf(stderr, "  --wav                 Enable WAV output (default: tmp/tts_output.wav)\n");
+        fprintf(stderr, "  --instruct <text>     Voice description (VoiceDesign mode)\n");
         return 1;
+    }
+
+    // Default output path
+    if (wav_mode && output_path.empty()) {
+        output_path = "tmp/tts_output.wav";
     }
 
     fprintf(stderr, "[TTS] Model: %s\n", model_dir.c_str());
     fprintf(stderr, "[TTS] Text: %s\n", text.c_str());
     fprintf(stderr, "[TTS] Speaker: %s, Language: %s\n", speaker.c_str(), language.c_str());
+    if (!instruct.empty())
+        fprintf(stderr, "[TTS] Instruct: %s\n", instruct.c_str());
 
     qwen_thor::tts::TTSEngine engine;
     engine.load_model(model_dir);
@@ -408,9 +429,16 @@ static int cmd_tts(int argc, char** argv) {
         return 1;
     }
 
+    if (wav_mode || !output_path.empty()) {
+        // End-to-end: text → WAV
+        bool ok = engine.synthesize_to_wav(text, output_path, speaker, language,
+                                           instruct, max_tokens);
+        return ok ? 0 : 1;
+    }
+
+    // Phase 1 fallback: text → codec tokens (JSON)
     auto codes = engine.synthesize(text, speaker, language, max_tokens);
 
-    // Phase 1: Output codec tokens to stdout (JSON format)
     printf("{\n  \"num_steps\": %d,\n  \"num_groups\": %d,\n  \"codes\": [\n",
            (int)codes.size(), codes.empty() ? 0 : (int)codes[0].size());
     for (size_t i = 0; i < codes.size(); i++) {
