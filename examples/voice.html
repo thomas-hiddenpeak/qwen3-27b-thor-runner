@@ -399,13 +399,16 @@ let ttsNextTime = 0;          // 下一段应播放的时间点
 let ttsSampleRate = 24000;    // 服务端 TTS 采样率
 let ttsStreamActive = false;  // 是否在流式 TTS 模式
 let wasRecording = false;     // 响应前是否在录音 (用于自动重启)
+let ttsPlayingAudio = false;  // TTS 音频是否正在播放
 
 // ============================================================================
 // WebSocket 连接
 // ============================================================================
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const url = proto + '//' + location.host + '/v1/voice';
+  // WebSocket endpoint is always on port 8080 (API server)
+  const wsHost = location.hostname + ':8080';
+  const url = proto + '//' + wsHost + '/v1/voice';
 
   ws = new WebSocket(url);
 
@@ -497,6 +500,17 @@ function handleTtsBinary(blob) {
       scrollToBottom();
     }
   }
+}
+
+// 等待 TTS 音频播放完毕 (防止麦克风采集到 TTS 回声)
+function waitForTtsPlaybackEnd(callback) {
+  if (!ttsPlayCtx || ttsNextTime <= ttsPlayCtx.currentTime) {
+    // 没有播放上下文或已播完
+    callback();
+    return;
+  }
+  const remaining = (ttsNextTime - ttsPlayCtx.currentTime) * 1000;
+  setTimeout(callback, remaining + 200);  // +200ms 安全余量
 }
 
 function handleEvent(msg) {
@@ -607,14 +621,16 @@ function handleEvent(msg) {
         }
       }
       clearStatus();
-      isProcessing = false;
-      document.getElementById('sendBtn').disabled = false;
       streamingDiv = null;
-      // 自动重启麦克风 (语音模式下)
-      if (wasRecording) {
-        wasRecording = false;
-        setTimeout(() => startStreaming(), 300);
-      }
+      // 等 TTS 音频播放完毕后再解锁 UI + 重启麦克风 (防止麦克风采集到 TTS 回声)
+      waitForTtsPlaybackEnd(() => {
+        isProcessing = false;
+        document.getElementById('sendBtn').disabled = false;
+        if (wasRecording) {
+          wasRecording = false;
+          setTimeout(() => startStreaming(), 300);
+        }
+      });
       break;
 
     case 'error':
