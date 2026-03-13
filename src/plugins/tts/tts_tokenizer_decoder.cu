@@ -520,6 +520,36 @@ __global__ void reshape_conv_weight_kernel(
     dst[j * out_ch * in_ch + oc * in_ch + ic] = src[idx];
 }
 
+// ---------- Reshape transconv weight: [in_ch, out_ch, K] → [K, out_ch, in_ch] ----------
+__global__ void reshape_transconv_weight_kernel(
+    float* __restrict__ dst, const float* __restrict__ src,
+    int in_ch, int out_ch, int K)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = in_ch * out_ch * K;
+    if (idx >= total) return;
+    int ic = idx / (out_ch * K);
+    int rem = idx % (out_ch * K);
+    int oc = rem / K;
+    int k = rem % K;
+    dst[k * out_ch * in_ch + oc * in_ch + ic] = src[idx];
+}
+
+// ---------- Interleave columns: [C, S, T_in] → [C, T_out = S*T_in] ----------
+// dst[c, q*S + r] = src[c, r, q] = src[c * S * T_in + r * T_in + q]
+__global__ void interleave_cols_kernel(
+    float* __restrict__ dst, const float* __restrict__ src,
+    int channels, int S, int T_in)
+{
+    int c = blockIdx.x;
+    int t_out = blockIdx.y * blockDim.x + threadIdx.x;
+    int T_out = S * T_in;
+    if (c >= channels || t_out >= T_out) return;
+    int q = t_out / S;
+    int r = t_out % S;
+    dst[c * T_out + t_out] = src[c * S * T_in + r * T_in + q];
+}
+
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
@@ -744,7 +774,29 @@ bool SpeechTokenizerDecoder::load_weights(
     // Final conv: [1, 96, 7] → [7, 1, 96]
     reshape_conv(final_conv_w_, 1, 96, 7);
 
-    fprintf(stderr, "[TokenizerDecoder] Loaded %zu weight tensors (conv weights reshaped for GEMM)\n", device_ptrs_.size());
+    // ===== Reshape transconv weights: [in_ch, out_ch, K] → [K, out_ch, in_ch] for GEMM =====
+    auto reshape_transconv = [&](float*& w, int in_ch, int out_ch, int K) {
+        if (!w) return;
+        int n = in_ch * out_ch * K;
+        float* tmp = nullptr;
+        cudaMalloc(&tmp, n * sizeof(float));
+        reshape_transconv_weight_kernel<<<(n + 255) / 256, 256>>>(tmp, w, in_ch, out_ch, K);
+        cudaDeviceSynchronize();
+        cudaMemcpy(w, tmp, n * sizeof(float), cudaMemcpyDeviceToDevice);
+        cudaFree(tmp);
+    };
+
+    // TransConv weights for 4 stages
+    dim = config_.decoder_dim;  // 1536
+    for (int stage = 0; stage < 4; stage++) {
+        int in_dim = (stage == 0) ? config_.decoder_dim : dim;
+        int out_dim = in_dim / 2;
+        int K = 2 * config_.upsample_rates[stage];
+        reshape_transconv(decoder_stages_[stage].transconv_w, in_dim, out_dim, K);
+        dim = out_dim;
+    }
+
+    fprintf(stderr, "[TokenizerDecoder] Loaded %zu weight tensors (conv+transconv reshaped for GEMM)\n", device_ptrs_.size());
     loaded_ = true;
     return true;
 }
@@ -1280,7 +1332,6 @@ void SpeechTokenizerDecoder::run_bigvgan(
         int upsample_rate = config_.upsample_rates[stage];  // [8, 5, 4, 3]
         int out_dim = in_dim / 2;  // 1536→768→384→192→96
         int T_new = T * upsample_rate;
-        int kernel = 2 * upsample_rate;
         size_t out_size = (size_t)out_dim * T_new * sizeof(float);
 
         // SnakeBeta activation (in-place on buf_a)
@@ -1292,14 +1343,60 @@ void SpeechTokenizerDecoder::run_bigvgan(
         // Allocate output buffer for transposed conv
         float* buf_b = (float*)decode_pool_.alloc(out_size);
 
-        // ConvTranspose1d: [in_dim, T] → [out_dim, T_new] (custom kernel, not GEMM)
-        int tc_tile_ic = std::min(in_dim, (int)(48 * 1024 / (kernel * sizeof(float))));
-        int tc_smem = tc_tile_ic * kernel * sizeof(float);
-        dim3 tc_grid(out_dim, (T_new + 255) / 256);
-        causal_transconv1d_kernel<<<tc_grid, 256, tc_smem, s>>>(
-            buf_b, buf_a, decoder_stages_[stage].transconv_w,
-            decoder_stages_[stage].transconv_b,
-            in_dim, out_dim, kernel, upsample_rate, T, T_new, tc_tile_ic);
+        // ConvTranspose1d via GEMM: [in_dim, T] → [out_dim, T_new]
+        // Decompose into S groups of 2 GEMMs each:
+        //   For r = 0..S-1: output[:, r::S] = W_r @ input + W_{r+S} @ shifted_input
+        // Weight already reshaped to [K, out_dim, in_dim]
+        {
+            int S = upsample_rate;
+            // tmp buffer in [out_dim, S, T] layout — same total size as output
+            float* tc_tmp = (float*)decode_pool_.alloc(out_size);
+
+            // Zero-padded input for shifted access: [in_dim, T + 1]
+            float* tc_padded = (float*)decode_pool_.alloc((size_t)in_dim * (T + 1) * sizeof(float));
+            dim3 tc_pad_grid(in_dim, (T + 1 + 255) / 256);
+            zero_pad_left_kernel<<<tc_pad_grid, 256, 0, s>>>(
+                tc_padded, buf_a, in_dim, T, T + 1, 1);
+
+            float alpha = 1.0f;
+            const float* tc_w = decoder_stages_[stage].transconv_w;  // [K, out_dim, in_dim]
+
+            for (int r = 0; r < S; r++) {
+                // GEMM 1: tc_tmp[:, r, :] = W_r[out_dim, in_dim] @ buf_a[in_dim, T]
+                float beta_0 = 0.0f;
+                const float* W_r = tc_w + r * out_dim * in_dim;
+                cublasSgemm(cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
+                    T, out_dim, in_dim, &alpha,
+                    buf_a, T,               // input^T [T, in_dim], lda = T
+                    W_r, in_dim,            // W_r^T [in_dim, out_dim], ldb = in_dim
+                    &beta_0,
+                    tc_tmp + r * T, S * T); // C at offset r*T, ldc = S*T
+
+                // GEMM 2: tc_tmp[:, r, :] += W_{r+S} @ padded[:, 0:T]
+                float beta_1 = 1.0f;
+                const float* W_rS = tc_w + (r + S) * out_dim * in_dim;
+                cublasSgemm(cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
+                    T, out_dim, in_dim, &alpha,
+                    tc_padded, T + 1,       // padded^T [T, in_dim], lda = T+1
+                    W_rS, in_dim,           // W_{r+S}^T, ldb = in_dim
+                    &beta_1,
+                    tc_tmp + r * T, S * T); // accumulate
+            }
+
+            // Add bias
+            if (decoder_stages_[stage].transconv_b) {
+                dim3 tc_bg(out_dim, (T_new + 255) / 256);
+                add_bias_kernel<<<tc_bg, 256, 0, s>>>(
+                    tc_tmp, decoder_stages_[stage].transconv_b, out_dim, T_new);
+            }
+
+            // Interleave: [out_dim, S, T] → [out_dim, T_new = S*T]
+            dim3 il_grid(out_dim, (T_new + 255) / 256);
+            interleave_cols_kernel<<<il_grid, 256, 0, s>>>(buf_b, tc_tmp, out_dim, S, T);
+
+            decode_pool_.free(tc_padded);
+            decode_pool_.free(tc_tmp);
+        }
 
         decode_pool_.free(buf_a);
 
