@@ -152,9 +152,9 @@ static const char* DEFAULT_VOICE_SYSTEM_PROMPT =
     "可选：平静、温柔、开心、兴奋、惊讶、认真、俏皮、安慰、关切、鼓励、好奇、轻松、热情、自信\n"
     "\n"
     "【规则】\n"
-    "1. 说话简洁自然，不要用省略号或重复\n"
-    "2. 不用 Markdown、特殊符号\n"
-    "3. 数字用中文读法";
+    "1. 每次回答只说2到4句话，直接回答问题，说完就停\n"
+    "2. 不要用省略号、不要重复、不要说总之\n"
+    "3. 不用 Markdown、特殊符号，数字用中文读法";
 
 // 从 LLM 输出的文本中提取 [情感标注] 并返回 (clean_text, emotion)
 // 例: "[温柔]你好啊" → ("你好啊", "温柔")
@@ -4377,7 +4377,7 @@ void ServeApp::ws_voice_generate(const std::string& user_text,
     InferRequest infer_req;
     infer_req.request_id     = next_request_id();
     infer_req.prompt_tokens  = std::move(prompt_tokens);
-    infer_req.max_new_tokens = 512;
+    infer_req.max_new_tokens = 150;
     infer_req.temperature    = 0.7f;
     infer_req.top_p          = 0.8f;
     infer_req.top_k          = 20;
@@ -4890,7 +4890,7 @@ void ServeApp::process_text_input(
     InferRequest infer_req;
     infer_req.request_id     = next_request_id();
     infer_req.prompt_tokens  = std::move(prompt_tokens);
-    infer_req.max_new_tokens = 512;
+    infer_req.max_new_tokens = 150;
     infer_req.temperature    = 0.7f;
     infer_req.top_p          = 0.8f;
     infer_req.top_k          = 20;
