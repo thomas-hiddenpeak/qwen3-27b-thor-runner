@@ -20,6 +20,17 @@
 #include <algorithm>
 #include <random>
 
+// Forward-declare optimized GEMV from engine (linked at build time)
+namespace qwen_thor { namespace ops {
+void invoke_dense_gemv(
+    const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C,
+    int N, int K, cudaStream_t stream);
+void invoke_dense_gemv_add(
+    const __nv_bfloat16* A, const __nv_bfloat16* B,
+    __nv_bfloat16* C, const __nv_bfloat16* residual,
+    int N, int K, cudaStream_t stream);
+}} // namespace qwen_thor::ops
+
 namespace qwen_thor {
 namespace tts {
 
@@ -396,8 +407,7 @@ void Talker::inject_continuation_text(const int* text_ids_cpu, int text_len, cud
     __nv_bfloat16* norm_out = layer_ws;
     audio_ops::invoke_rmsnorm(norm_out, hidden, final_norm_w_,
                                tc.rms_norm_eps, 1, h, stream);
-    cublas_gemm(cublas_handle_, logits_, norm_out, codec_head_w_,
-                1, h, tc.vocab_size, stream);
+    ops::invoke_dense_gemv(norm_out, codec_head_w_, logits_, tc.vocab_size, h, stream);
     invoke_suppress_tokens(logits_, tc.vocab_size - 1024, tc.vocab_size,
                            tc.codec_eos_token_id, stream);
     cudaMemcpyAsync(past_hidden_, norm_out,
@@ -812,7 +822,7 @@ void Talker::talker_layer_forward_decode(
     // Self-Attention: fused QKV projection (3 GEMV → 1)
     audio_ops::invoke_rmsnorm(norm_buf, hidden, lw.input_layernorm_w,
                                eps, 1, h, stream);
-    cublas_gemm(cublas_handle_, qkv_buf, norm_buf, lw.qkv_proj_w, 1, h, qkv_dim, stream);
+    ops::invoke_dense_gemv(norm_buf, lw.qkv_proj_w, qkv_buf, qkv_dim, h, stream);
 
     // Per-head QK RMSNorm
     audio_ops::invoke_per_head_rmsnorm(q_buf, q_buf, lw.q_norm_w, eps,
@@ -835,18 +845,16 @@ void Talker::talker_layer_forward_decode(
         1, tc.num_attention_heads, tc.num_kv_heads, tc.head_dim,
         talker_cache_len_ + 1, stream);
 
-    cublas_gemm(cublas_handle_, norm_buf, attn_out, lw.o_proj_w, 1, q_dim, h, stream);
-    audio_ops::invoke_add_residual(hidden, norm_buf, h, stream);
+    // O proj + residual fused (saves add_residual kernel launch + GMEM round-trip)
+    ops::invoke_dense_gemv_add(attn_out, lw.o_proj_w, hidden, hidden, h, q_dim, stream);
 
     // MLP: fused GateUp projection (2 GEMV → 1)
     audio_ops::invoke_rmsnorm(norm_buf, hidden, lw.post_attention_layernorm_w,
                                eps, 1, h, stream);
-    cublas_gemm(cublas_handle_, gateup_buf, norm_buf, lw.gate_up_proj_w,
-                1, h, 2 * tc.intermediate_size, stream);
+    ops::invoke_dense_gemv(norm_buf, lw.gate_up_proj_w, gateup_buf, 2 * tc.intermediate_size, h, stream);
     audio_ops::invoke_swiglu(gate_buf, gate_buf, up_buf, 1, tc.intermediate_size, stream);
-    cublas_gemm(cublas_handle_, norm_buf, gate_buf, lw.down_proj_w,
-                1, tc.intermediate_size, h, stream);
-    audio_ops::invoke_add_residual(hidden, norm_buf, h, stream);
+    // Down proj + residual fused
+    ops::invoke_dense_gemv_add(gate_buf, lw.down_proj_w, hidden, hidden, h, tc.intermediate_size, stream);
 }
 
 // ============================================================================
@@ -949,7 +957,7 @@ void Talker::cp_layer_forward_decode(
 
     // Fused QKV projection (3 GEMV → 1)
     audio_ops::invoke_rmsnorm(norm_buf, hidden, lw.input_layernorm_w, eps, 1, h, stream);
-    cublas_gemm(cublas_handle_, qkv_buf, norm_buf, lw.qkv_proj_w, 1, h, qkv_dim, stream);
+    ops::invoke_dense_gemv(norm_buf, lw.qkv_proj_w, qkv_buf, qkv_dim, h, stream);
 
     // Per-head QK RMSNorm
     audio_ops::invoke_per_head_rmsnorm(q_buf, q_buf, lw.q_norm_w, eps,
@@ -971,15 +979,15 @@ void Talker::cp_layer_forward_decode(
         1, cp.num_attention_heads, cp.num_kv_heads, cp.head_dim,
         cp_cache_len_ + 1, stream);
 
-    cublas_gemm(cublas_handle_, norm_buf, attn_out, lw.o_proj_w, 1, q_dim, h, stream);
-    audio_ops::invoke_add_residual(hidden, norm_buf, h, stream);
+    // O proj + residual fused
+    ops::invoke_dense_gemv_add(attn_out, lw.o_proj_w, hidden, hidden, h, q_dim, stream);
 
     // Fused GateUp projection (2 GEMV → 1)
     audio_ops::invoke_rmsnorm(norm_buf, hidden, lw.post_attention_layernorm_w, eps, 1, h, stream);
-    cublas_gemm(cublas_handle_, gateup_buf, norm_buf, lw.gate_up_proj_w, 1, h, 2 * cp.intermediate_size, stream);
+    ops::invoke_dense_gemv(norm_buf, lw.gate_up_proj_w, gateup_buf, 2 * cp.intermediate_size, h, stream);
     audio_ops::invoke_swiglu(gate_buf, gate_buf, up_buf, 1, cp.intermediate_size, stream);
-    cublas_gemm(cublas_handle_, norm_buf, gate_buf, lw.down_proj_w, 1, cp.intermediate_size, h, stream);
-    audio_ops::invoke_add_residual(hidden, norm_buf, h, stream);
+    // Down proj + residual fused
+    ops::invoke_dense_gemv_add(gate_buf, lw.down_proj_w, hidden, hidden, h, cp.intermediate_size, stream);
 }
 
 // ============================================================================
@@ -1031,8 +1039,7 @@ void Talker::run_code_predictor(
     __nv_bfloat16* cp_norm_out = workspace_;
     audio_ops::invoke_rmsnorm(cp_norm_out, last_hidden, cp_final_norm_w_,
                                cp.rms_norm_eps, 1, cp_h, stream);
-    cublas_gemm(cublas_handle_, cp_logits_, cp_norm_out, cp_lm_heads_[0],
-                1, cp_h, cp.vocab_size, stream);
+    ops::invoke_dense_gemv(cp_norm_out, cp_lm_heads_[0], cp_logits_, cp.vocab_size, cp_h, stream);
 
     // Sample group 1 — GPU-resident, no sync (result → codec_out_gpu_[1])
     static std::mt19937_64 cp_rng(42);
@@ -1048,8 +1055,7 @@ void Talker::run_code_predictor(
 
         // Project to cp_h
         if (cp_projection_w_) {
-            cublas_gemm(cublas_handle_, cp_decode_hidden_, cp_embed_buf_, cp_projection_w_,
-                        1, talker_h, cp_h, stream);
+            ops::invoke_dense_gemv(cp_embed_buf_, cp_projection_w_, cp_decode_hidden_, cp_h, talker_h, stream);
             invoke_add_bias(cp_decode_hidden_, cp_projection_b_, 1, cp_h, stream);
         } else {
             cudaMemcpyAsync(cp_decode_hidden_, cp_embed_buf_,
@@ -1070,8 +1076,7 @@ void Talker::run_code_predictor(
         // RMSNorm + lm_head[g]
         audio_ops::invoke_rmsnorm(cp_norm_out, cp_decode_hidden_, cp_final_norm_w_,
                                    cp.rms_norm_eps, 1, cp_h, stream);
-        cublas_gemm(cublas_handle_, cp_logits_, cp_norm_out, cp_lm_heads_[g],
-                    1, cp_h, cp.vocab_size, stream);
+        ops::invoke_dense_gemv(cp_norm_out, cp_lm_heads_[g], cp_logits_, cp.vocab_size, cp_h, stream);
 
         // GPU-resident sampling — result → codec_out_gpu_[g+1]
         invoke_gpu_sample_top_k_top_p(cp_logits_, cp.vocab_size,
@@ -1119,8 +1124,7 @@ void Talker::forward_prefill(cudaStream_t stream) {
                                tc.rms_norm_eps, 1, h, stream);
 
     // codec_head: [1, h] → [1, vocab_size]
-    cublas_gemm(cublas_handle_, logits_, norm_out, codec_head_w_,
-                1, h, tc.vocab_size, stream);
+    ops::invoke_dense_gemv(norm_out, codec_head_w_, logits_, tc.vocab_size, h, stream);
 
     // Suppress special tokens: [vocab_size-1024, vocab_size) except codec_eos
     invoke_suppress_tokens(logits_, tc.vocab_size - 1024, tc.vocab_size,
@@ -1148,6 +1152,20 @@ int Talker::forward_decode_step(int* codec_out, cudaStream_t stream) {
     int h = tc.hidden_size;
     int num_groups = tc.num_code_groups;
 
+    // Profiling events (created once, stored as statics for low overhead)
+    static cudaEvent_t ev_start, ev_sample, ev_cp, ev_embed, ev_talker, ev_head, ev_end;
+    static bool events_created = false;
+    static float acc_sample = 0, acc_cp = 0, acc_embed = 0, acc_talker = 0, acc_head = 0, acc_total = 0;
+    static int profile_count = 0;
+    if (!events_created) {
+        cudaEventCreate(&ev_start); cudaEventCreate(&ev_sample);
+        cudaEventCreate(&ev_cp); cudaEventCreate(&ev_embed);
+        cudaEventCreate(&ev_talker); cudaEventCreate(&ev_head);
+        cudaEventCreate(&ev_end);
+        events_created = true;
+    }
+    cudaEventRecord(ev_start, stream);
+
     // Step 1: Apply repetition penalty to logits
     if (rep_penalty_ != 1.0f && !generated_tokens_.empty()) {
         int n_rep = (int)generated_tokens_.size();
@@ -1163,6 +1181,7 @@ int Talker::forward_decode_step(int* codec_out, cudaStream_t stream) {
     invoke_gpu_sample_top_k_top_p(logits_, tc.vocab_size,
                                    top_k_, top_p_, temperature_,
                                    codec_out_gpu_, talker_rng(), stream);
+    cudaEventRecord(ev_sample, stream);
 
     // Single sync + D2H copy for EOS check
     cudaStreamSynchronize(stream);
@@ -1180,6 +1199,7 @@ int Talker::forward_decode_step(int* codec_out, cudaStream_t stream) {
 
     // Step 3: Run CodePredictor to generate groups 1-15 (GPU-resident, single sync)
     run_code_predictor(past_hidden_, group_0_id, codec_out + 1, stream);
+    cudaEventRecord(ev_cp, stream);
 
     // Step 4: Combine all 16 group embeddings using GPU-resident tokens
     // Group 0: use codec_out_gpu_[0]
@@ -1202,6 +1222,7 @@ int Talker::forward_decode_step(int* codec_out, cudaStream_t stream) {
     } else {
         invoke_add(decode_input_embeds_, tts_pad_embed_, h, stream);
     }
+    cudaEventRecord(ev_embed, stream);
 
     // Step 6: Set up position IDs for decode (current position)
     int pos = talker_cache_len_;
@@ -1217,6 +1238,7 @@ int Talker::forward_decode_step(int* codec_out, cudaStream_t stream) {
     for (int layer = 0; layer < tc.num_hidden_layers; layer++) {
         talker_layer_forward_decode(layer, hidden, decode_pos_gpu_, layer_ws, stream);
     }
+    cudaEventRecord(ev_talker, stream);
 
     // Final RMSNorm
     __nv_bfloat16* norm_out = layer_ws;
@@ -1224,12 +1246,12 @@ int Talker::forward_decode_step(int* codec_out, cudaStream_t stream) {
                                tc.rms_norm_eps, 1, h, stream);
 
     // codec_head → logits for next step
-    cublas_gemm(cublas_handle_, logits_, norm_out, codec_head_w_,
-                1, h, tc.vocab_size, stream);
+    ops::invoke_dense_gemv(norm_out, codec_head_w_, logits_, tc.vocab_size, h, stream);
 
     // Suppress special tokens: [vocab_size-1024, vocab_size) except codec_eos
     invoke_suppress_tokens(logits_, tc.vocab_size - 1024, tc.vocab_size,
                            tc.codec_eos_token_id, stream);
+    cudaEventRecord(ev_head, stream);
 
     // Save past_hidden for next CodePredictor call
     cudaMemcpyAsync(past_hidden_, norm_out,
@@ -1238,7 +1260,30 @@ int Talker::forward_decode_step(int* codec_out, cudaStream_t stream) {
     talker_cache_len_++;
     generation_step_++;
 
+    cudaEventRecord(ev_end, stream);
     cudaStreamSynchronize(stream);
+
+    // Accumulate profiling
+    float t_sample, t_cp, t_embed, t_talker, t_head, t_total;
+    cudaEventElapsedTime(&t_sample, ev_start, ev_sample);
+    cudaEventElapsedTime(&t_cp, ev_sample, ev_cp);
+    cudaEventElapsedTime(&t_embed, ev_cp, ev_embed);
+    cudaEventElapsedTime(&t_talker, ev_embed, ev_talker);
+    cudaEventElapsedTime(&t_head, ev_talker, ev_head);
+    cudaEventElapsedTime(&t_total, ev_start, ev_end);
+    acc_sample += t_sample; acc_cp += t_cp; acc_embed += t_embed;
+    acc_talker += t_talker; acc_head += t_head; acc_total += t_total;
+    profile_count++;
+
+    // Report every 20 steps
+    if (profile_count % 20 == 0) {
+        float n = (float)profile_count;
+        fprintf(stderr, "[TTS Profile] step=%d avg: sample=%.2f cp=%.2f embed=%.2f "
+                "talker=%.2f head=%.2f total=%.2f ms\n",
+                profile_count, acc_sample/n, acc_cp/n, acc_embed/n,
+                acc_talker/n, acc_head/n, acc_total/n);
+    }
+
     return 0;  // success
 }
 
