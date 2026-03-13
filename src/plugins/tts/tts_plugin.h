@@ -79,6 +79,11 @@ public:
                                      PcmCallback callback,
                                      int chunk_frames = 24) { return 0; }
 
+    // Continue streaming: inject new text, preserve KV cache, decode in chunks
+    virtual int continue_streaming(const std::string& text,
+                                   PcmCallback callback,
+                                   int chunk_frames = 24) { return 0; }
+
     virtual bool is_available() const = 0;
     virtual std::string name() const = 0;
 
@@ -104,6 +109,9 @@ public:
                               const std::string& voice,
                               PcmCallback callback,
                               int chunk_frames = 24) override;
+    int continue_streaming(const std::string& text,
+                           PcmCallback callback,
+                           int chunk_frames = 24) override;
     bool is_available() const override;
     std::string name() const override { return "native-qwen3-tts"; }
     void set_sampling(float temperature, int top_k, float top_p, float rep_penalty) override;

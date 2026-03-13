@@ -4217,12 +4217,12 @@ void ServeApp::ws_voice_generate(int client_fd,
         safe_send_text("{\"type\":\"tts.stream_start\",\"sample_rate\":24000,\"format\":\"pcm16\"}");
     }
 
-    // TTS 消费者线程: 每句独立 synthesize(), 每次都带 speaker embedding
-    // 确保音色一致 + KV cache 不膨胀 + 生成步数与文本成正比
+    // TTS 消费者线程: 首句独立 synthesize(), 后续 continue_streaming() 保持 KV cache
     auto* tts_raw = tts_plugin_.get();  // raw ptr for thread capture
     std::thread tts_thread;
     if (do_stream_tts) {
         tts_thread = std::thread([&, tts_raw]() {
+            bool first_sentence = true;
             while (true) {
                 std::string sentence;
                 {
@@ -4234,18 +4234,24 @@ void ServeApp::ws_voice_generate(int client_fd,
                     tts_queue.pop();
                 }
 
-                tts_raw->synthesize_streaming(sentence, voice,
-                    [&](const float* data, int num_samples) -> bool {
-                        // Convert float PCM to PCM16LE
-                        std::vector<int16_t> pcm16(num_samples);
-                        for (int i = 0; i < num_samples; i++) {
-                            float v = std::max(-1.0f, std::min(1.0f, data[i]));
-                            pcm16[i] = (int16_t)(v * 32767.0f);
-                        }
-                        safe_send_binary(reinterpret_cast<const uint8_t*>(pcm16.data()),
-                                         pcm16.size() * sizeof(int16_t));
-                        return true;
-                    }, 8);
+                auto pcm_cb = [&](const float* data, int num_samples) -> bool {
+                    // Convert float PCM to PCM16LE
+                    std::vector<int16_t> pcm16(num_samples);
+                    for (int i = 0; i < num_samples; i++) {
+                        float v = std::max(-1.0f, std::min(1.0f, data[i]));
+                        pcm16[i] = (int16_t)(v * 32767.0f);
+                    }
+                    safe_send_binary(reinterpret_cast<const uint8_t*>(pcm16.data()),
+                                     pcm16.size() * sizeof(int16_t));
+                    return true;
+                };
+
+                if (first_sentence) {
+                    tts_raw->synthesize_streaming(sentence, voice, pcm_cb, 8);
+                    first_sentence = false;
+                } else {
+                    tts_raw->continue_streaming(sentence, pcm_cb, 8);
+                }
                 tts_segment_idx++;
             }
         });
@@ -4700,6 +4706,7 @@ void ServeApp::process_text_input(
         send_json("{\"type\":\"audio.started\"}");
         auto* tts_raw = tts_plugin_.get();
         tts_thread = std::thread([&, tts_raw]() {
+            bool first_sentence = true;
             while (true) {
                 if (interrupted) break;
                 std::string sentence;
@@ -4713,34 +4720,67 @@ void ServeApp::process_text_input(
                 }
                 if (interrupted) break;
 
-                tts_raw->synthesize_streaming(sentence, voice,
-                    [&](const float* data, int num_samples) -> bool {
-                        if (interrupted) return false;
-                        // Convert float PCM to PCM16LE, send in 200ms chunks
-                        std::vector<int16_t> pcm16(num_samples);
-                        for (int i = 0; i < num_samples; i++) {
-                            float v = std::max(-1.0f, std::min(1.0f, data[i]));
-                            pcm16[i] = (int16_t)(v * 32767.0f);
-                        }
-                        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(pcm16.data());
-                        size_t remaining = pcm16.size() * sizeof(int16_t);
-                        const size_t chunk_bytes = AUDIO_CHUNK_SAMPLES * 2;
-                        while (remaining > 0 && !interrupted) {
-                            size_t send_size = std::min(remaining, chunk_bytes);
-                            send_audio(ptr, send_size);
+                auto pcm_cb = [&](const float* data, int num_samples) -> bool {
+                    if (interrupted) return false;
+                    // Convert float PCM to PCM16LE, send in 200ms chunks
+                    std::vector<int16_t> pcm16(num_samples);
+                    for (int i = 0; i < num_samples; i++) {
+                        float v = std::max(-1.0f, std::min(1.0f, data[i]));
+                        pcm16[i] = (int16_t)(v * 32767.0f);
+                    }
+                    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(pcm16.data());
+                    size_t remaining = pcm16.size() * sizeof(int16_t);
+                    const size_t chunk_bytes = AUDIO_CHUNK_SAMPLES * 2;
+                    while (remaining > 0 && !interrupted) {
+                        size_t send_size = std::min(remaining, chunk_bytes);
+                        send_audio(ptr, send_size);
                             ptr += send_size;
                             remaining -= send_size;
                         }
                         return !interrupted;
-                    }, 8);
+                    };
+
+                if (first_sentence) {
+                    fprintf(stderr, "[TTS] First sentence: %.40s...\n", sentence.c_str());
+                    tts_raw->synthesize_streaming(sentence, voice, pcm_cb, 8);
+                    first_sentence = false;
+                } else {
+                    fprintf(stderr, "[TTS] Continue sentence: %.40s...\n", sentence.c_str());
+                    tts_raw->continue_streaming(sentence, pcm_cb, 8);
+                }
             }
         });
     }
 
     auto push_tts = [&](const std::string& sentence) {
         if (!do_tts || sentence.empty()) return;
-        std::lock_guard<std::mutex> lock(tts_mutex);
-        tts_queue.push(sentence);
+        // Strip markdown formatting (*, #, -, etc.) and whitespace
+        std::string clean;
+        clean.reserve(sentence.size());
+        for (size_t i = 0; i < sentence.size(); i++) {
+            char c = sentence[i];
+            if (c == '*' || c == '#' || c == '`' || c == '$') continue;
+            // Skip numbered list prefixes like "1. " "2. "
+            if (c >= '0' && c <= '9' && i + 1 < sentence.size() && sentence[i+1] == '.') {
+                i++;  // skip digit and dot
+                if (i + 1 < sentence.size() && sentence[i+1] == ' ') i++;
+                continue;
+            }
+            clean += c;
+        }
+        // Trim whitespace
+        while (!clean.empty() && (clean.front() == ' ' || clean.front() == '\n'))
+            clean.erase(clean.begin());
+        while (!clean.empty() && (clean.back() == ' ' || clean.back() == '\n'))
+            clean.pop_back();
+        // Skip if too short (< 2 Chinese chars or < 6 bytes)
+        if (clean.size() < 6) return;
+        {
+            std::lock_guard<std::mutex> lock(tts_mutex);
+            tts_queue.push(clean);
+            fprintf(stderr, "[TTS] push_tts: queue_size=%zu, text=%.40s...\n",
+                    tts_queue.size(), clean.c_str());
+        }
         tts_cv.notify_one();
     };
 

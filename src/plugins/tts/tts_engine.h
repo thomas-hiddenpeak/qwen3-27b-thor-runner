@@ -85,6 +85,14 @@ public:
         const std::string& text,
         int max_new_tokens = 4096);
 
+    // Continue synthesis with streaming: inject new text and decode in chunks
+    // Preserves talker KV cache for voice consistency across segments
+    int continue_streaming(
+        const std::string& text,
+        int max_new_tokens = 4096,
+        int chunk_frames = 24,
+        PcmCallback pcm_callback = nullptr);
+
     int sample_rate() const { return loaded_ ? config_.tokenizer_decoder.output_sample_rate : 24000; }
     bool is_loaded() const { return loaded_; }
     const TTSConfig& config() const { return config_; }
@@ -105,6 +113,9 @@ private:
 
     cudaStream_t stream_ = 0;
     bool loaded_ = false;
+
+    // Persisted decoder left context across streaming calls (for continue_streaming)
+    std::vector<std::vector<int>> code_history_;
 
     // Internal methods
     void load_weights(const std::string& model_dir);

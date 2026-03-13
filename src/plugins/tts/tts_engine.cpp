@@ -495,22 +495,51 @@ int TTSEngine::synthesize_streaming(
     int total_pcm_samples = 0;
     bool aborted = false;
 
-    // 3. Generate + decode in chunks
+    // Left context for decoder continuity (eliminates chunk boundary artifacts)
+    const int left_ctx_frames = config_.tokenizer_decoder.left_context_size; // 25
+    const int upsample_rate = config_.tokenizer_decoder.decode_upsample_rate; // 1920
+    code_history_.clear();  // Reset for new utterance
+
+    // 3. Generate + decode in chunks with left context
     auto decode_and_send = [&]() {
         if (chunk_codes.empty() || aborted) return;
-        int T = (int)chunk_codes.size();
-        std::vector<int> codes_flat(num_groups * T);
-        for (int t = 0; t < T; t++) {
+        int T_new = (int)chunk_codes.size();
+        int ctx = std::min(left_ctx_frames, (int)code_history_.size());
+        int T_total = ctx + T_new;
+
+        std::vector<int> codes_flat(num_groups * T_total);
+        // Fill left context from history
+        int hist_start = (int)code_history_.size() - ctx;
+        for (int t = 0; t < ctx; t++) {
             for (int g = 0; g < num_groups; g++) {
-                codes_flat[g * T + t] = chunk_codes[t][g];
+                codes_flat[g * T_total + t] = code_history_[hist_start + t][g];
             }
         }
-        auto pcm = st_decoder_->decode(codes_flat.data(), num_groups, T, stream_);
-        if (!pcm.empty()) {
-            total_pcm_samples += (int)pcm.size();
-            if (!pcm_callback(pcm.data(), (int)pcm.size())) {
-                aborted = true;
+        // Fill new codes
+        for (int t = 0; t < T_new; t++) {
+            for (int g = 0; g < num_groups; g++) {
+                codes_flat[g * T_total + (ctx + t)] = chunk_codes[t][g];
             }
+        }
+
+        auto pcm = st_decoder_->decode(codes_flat.data(), num_groups, T_total, stream_);
+        if (!pcm.empty()) {
+            // Skip left context PCM samples
+            int ctx_samples = ctx * upsample_rate;
+            int valid = (int)pcm.size() - ctx_samples;
+            if (valid > 0) {
+                total_pcm_samples += valid;
+                if (!pcm_callback(pcm.data() + ctx_samples, valid)) {
+                    aborted = true;
+                }
+            }
+        }
+
+        // Append new codes to history, keep only last left_ctx_frames
+        for (auto& c : chunk_codes) code_history_.push_back(c);
+        if ((int)code_history_.size() > left_ctx_frames) {
+            code_history_.erase(code_history_.begin(),
+                code_history_.begin() + ((int)code_history_.size() - left_ctx_frames));
         }
     };
 
@@ -602,6 +631,95 @@ std::vector<float> TTSEngine::continue_to_pcm(
     fprintf(stderr, "[TTS] Continue done: %zu samples (%.1f ms total)\n", pcm.size(), total_ms);
 
     return pcm;
+}
+
+// ============================================================================
+// Continue streaming: inject new text, preserve KV cache, decode in chunks
+// ============================================================================
+
+int TTSEngine::continue_streaming(
+    const std::string& text,
+    int max_new_tokens,
+    int chunk_frames,
+    PcmCallback pcm_callback)
+{
+    if (!loaded_ || !st_decoder_ || !st_decoder_->is_loaded()) {
+        fprintf(stderr, "[TTS] ERROR: model not loaded for continue_streaming\n");
+        return 0;
+    }
+    if (!pcm_callback) return 0;
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    auto text_tokens = build_text_tokens(text);
+    if (text_tokens.empty()) return 0;
+
+    talker_->inject_continuation_text(text_tokens.data(), (int)text_tokens.size(), stream_);
+    talker_->set_max_new_tokens(max_new_tokens);
+
+    int num_groups = config_.talker.num_code_groups;
+    const int left_ctx_frames = config_.tokenizer_decoder.left_context_size;
+    const int upsample_rate = config_.tokenizer_decoder.decode_upsample_rate;
+
+    std::vector<std::vector<int>> chunk_codes;
+    // code_history_ persists from synthesize_streaming (provides cross-sentence left context)
+    std::vector<int> codec_step(num_groups);
+    int total_steps = 0;
+    int total_pcm_samples = 0;
+    bool aborted = false;
+
+    auto decode_and_send = [&]() {
+        if (chunk_codes.empty() || aborted) return;
+        int T_new = (int)chunk_codes.size();
+        int ctx = std::min(left_ctx_frames, (int)code_history_.size());
+        int T_total = ctx + T_new;
+
+        std::vector<int> codes_flat(num_groups * T_total);
+        int hist_start = (int)code_history_.size() - ctx;
+        for (int t = 0; t < ctx; t++)
+            for (int g = 0; g < num_groups; g++)
+                codes_flat[g * T_total + t] = code_history_[hist_start + t][g];
+        for (int t = 0; t < T_new; t++)
+            for (int g = 0; g < num_groups; g++)
+                codes_flat[g * T_total + (ctx + t)] = chunk_codes[t][g];
+
+        auto pcm = st_decoder_->decode(codes_flat.data(), num_groups, T_total, stream_);
+        if (!pcm.empty()) {
+            int ctx_samples = ctx * upsample_rate;
+            int valid = (int)pcm.size() - ctx_samples;
+            if (valid > 0) {
+                total_pcm_samples += valid;
+                if (!pcm_callback(pcm.data() + ctx_samples, valid)) aborted = true;
+            }
+        }
+
+        for (auto& c : chunk_codes) code_history_.push_back(c);
+        if ((int)code_history_.size() > left_ctx_frames)
+            code_history_.erase(code_history_.begin(),
+                code_history_.begin() + ((int)code_history_.size() - left_ctx_frames));
+    };
+
+    while (total_steps < max_new_tokens && !aborted) {
+        chunk_codes.clear();
+        bool eos = false;
+        for (int f = 0; f < chunk_frames && total_steps < max_new_tokens; f++) {
+            int ret = talker_->forward_decode_step(codec_step.data(), stream_);
+            if (ret < 0) { eos = true; break; }
+            chunk_codes.push_back(codec_step);
+            total_steps++;
+        }
+        decode_and_send();
+        if (eos) break;
+    }
+
+    auto t_end = std::chrono::steady_clock::now();
+    float total_ms = std::chrono::duration<float, std::milli>(t_end - t0).count();
+    float audio_s = total_pcm_samples / (float)config_.tokenizer_decoder.output_sample_rate;
+    float rtf = audio_s > 0.0f ? audio_s / (total_ms / 1000.0f) : 0.0f;
+    fprintf(stderr, "[TTS] Continue streaming done: %d steps, %d samples (%.1fs audio), %.1f ms total (%.1fx realtime)\n",
+            total_steps, total_pcm_samples, audio_s, total_ms, rtf);
+
+    return total_pcm_samples;
 }
 
 // ============================================================================

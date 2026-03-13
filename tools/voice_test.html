@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <title>Voice Chat Test</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -154,8 +155,7 @@ function toggleSettings() { $('settings').classList.toggle('show'); }
 function defaultWsUrl() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = location.hostname || '127.0.0.1';
-    const port = location.port || '8080';
-    return `${proto}//${host}:${port}/v1/realtime`;
+    return `${proto}//${host}:8080/v1/realtime`;
 }
 
 window.addEventListener('load', () => {
@@ -253,7 +253,7 @@ function handleServerMsg(msg) {
             if (!playCtx || playCtx.state === 'closed') {
                 playCtx = new AudioContext({ sampleRate: PLAYBACK_RATE });
             }
-            playNextTime = playCtx.currentTime + 0.05;
+            playNextTime = 0;  // Will be set properly on first chunk
             break;
 
         case 'audio.done':
@@ -276,12 +276,14 @@ function handleServerMsg(msg) {
 function playAudio(arrayBuf) {
     if (!playCtx || playCtx.state === 'closed') {
         playCtx = new AudioContext({ sampleRate: PLAYBACK_RATE });
-        playNextTime = playCtx.currentTime + 0.05;
+        playNextTime = 0;
     }
     if (playCtx.state === 'suspended') playCtx.resume();
 
     const int16 = new Int16Array(arrayBuf);
     const numSamples = int16.length;
+    if (numSamples === 0) return;
+
     const audioBuf = playCtx.createBuffer(1, numSamples, PLAYBACK_RATE);
     const ch = audioBuf.getChannelData(0);
     for (let i = 0; i < numSamples; i++) {
@@ -293,7 +295,10 @@ function playAudio(arrayBuf) {
     source.connect(playCtx.destination);
 
     const now = playCtx.currentTime;
-    if (playNextTime < now) playNextTime = now + 0.02;
+    // If we've fallen behind, schedule with a small buffer to avoid glitches
+    if (playNextTime < now + 0.005) {
+        playNextTime = now + 0.15;  // 150ms buffer for network jitter
+    }
     source.start(playNextTime);
     playNextTime += audioBuf.duration;
 }

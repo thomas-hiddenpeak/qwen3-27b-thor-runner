@@ -413,6 +413,18 @@ int NativeTtsPlugin::synthesize_streaming(const std::string& text,
                                           chunk_frames, callback);
 }
 
+int NativeTtsPlugin::continue_streaming(const std::string& text,
+                                         PcmCallback callback,
+                                         int chunk_frames) {
+    if (!is_available() || !callback) return 0;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    return engine_->continue_streaming(text,
+                                        config_.max_new_tokens,
+                                        chunk_frames, callback);
+}
+
 // ============================================================================
 // 工厂
 // ============================================================================
