@@ -146,16 +146,17 @@ static const char* DEFAULT_SYSTEM_PROMPT =
 static const char* DEFAULT_VOICE_SYSTEM_PROMPT =
     "你是一个语音助手，你的回答将通过语音合成（TTS）播放给用户。\n"
     "\n"
-    "【输出格式】\n"
-    "每句话前面用方括号标注该句的语气或情感，格式为 [情感描述]句子内容。\n"
-    "情感描述要简洁具体，例如：\n"
-    "- [温柔关切]你今天看起来有点累，要不要休息一下？\n"
-    "- [兴奋]太棒了，这个消息真让人开心！\n"
-    "- [平静]好的，我来帮你查一下。\n"
-    "- [俏皮]嘿嘿，猜猜看是什么？\n"
-    "- [认真]这个问题需要仔细分析一下。\n"
-    "- [惊讶]哇，这也太巧了吧！\n"
-    "- [安慰]别担心，一切都会好起来的。\n"
+    "【情感标注规则（最重要）】\n"
+    "每句话前面必须用方括号标注该句的语气或情感，格式为 [情感描述]句子内容。\n"
+    "关键要求：\n"
+    "- 每句话的情感必须根据该句的具体内容和语境独立选择\n"
+    "- 禁止所有句子使用相同的情感，相邻句子必须有变化\n"
+    "- 情感应贴合句意：问候用温柔/热情、解释用平静/认真、惊喜用兴奋/惊讶、安抚用安慰/温柔\n"
+    "\n"
+    "示例（注意每句情感不同）：\n"
+    "[热情]哎，你终于来了！[好奇]最近在忙什么呢？"
+    "[温柔关切]你今天看起来有点累。[轻松]不过没关系，休息一下就好了。"
+    "[认真]这个问题其实挺有意思的。[兴奋]我刚好知道答案！\n"
     "\n"
     "常用情感词：平静、温柔、开心、兴奋、惊讶、认真、"
     "俏皮、感慨、安慰、关切、鼓励、幽默、好奇、"
@@ -4425,11 +4426,21 @@ void ServeApp::ws_voice_generate(const std::string& user_text,
         send_text("{\"type\":\"tts.stream_start\",\"sample_rate\":24000,\"format\":\"pcm16\"}");
     }
 
-    // TTS 消费者线程: 每句独立 synthesize_streaming(), 使用 per-sentence instruct
+    // TTS 消费者线程: 第一句用 synthesize_streaming (建立音色), 后续用 continue_streaming (保持一致性)
     auto* tts_raw = tts_plugin_.get();
     std::thread tts_thread;
     if (do_stream_tts) {
         tts_thread = std::thread([&, tts_raw]() {
+            auto pcm_callback = [&](const float* data, int num_samples) -> bool {
+                if (interrupted) return false;
+                std::vector<int16_t> pcm16(num_samples);
+                for (int i = 0; i < num_samples; i++) {
+                    float v = std::max(-1.0f, std::min(1.0f, data[i]));
+                    pcm16[i] = (int16_t)(v * 32767.0f);
+                }
+                return send_binary(reinterpret_cast<const uint8_t*>(pcm16.data()),
+                                   pcm16.size() * sizeof(int16_t));
+            };
             while (true) {
                 std::string sentence;
                 std::string sent_instruct;
@@ -4446,23 +4457,25 @@ void ServeApp::ws_voice_generate(const std::string& user_text,
 
                 if (interrupted) break;
 
-                // per-sentence instruct → 回退到全局 instruct
-                const std::string& use_instruct = sent_instruct.empty() ? instruct : sent_instruct;
-                fprintf(stderr, "[TTS] Synthesize #%d [%s]: %.60s...\n",
-                        tts_segment_idx.load() + 1,
-                        use_instruct.empty() ? "default" : use_instruct.c_str(),
-                        sentence.c_str());
-                tts_raw->synthesize_streaming(sentence, voice, use_instruct,
-                    [&](const float* data, int num_samples) -> bool {
-                        if (interrupted) return false;
-                        std::vector<int16_t> pcm16(num_samples);
-                        for (int i = 0; i < num_samples; i++) {
-                            float v = std::max(-1.0f, std::min(1.0f, data[i]));
-                            pcm16[i] = (int16_t)(v * 32767.0f);
-                        }
-                        return send_binary(reinterpret_cast<const uint8_t*>(pcm16.data()),
-                                           pcm16.size() * sizeof(int16_t));
-                    }, 8);
+                int seg = tts_segment_idx.load() + 1;
+                if (seg == 1) {
+                    // 第一句: synthesize_streaming 建立音色 + 起始情感
+                    const std::string& use_instruct = sent_instruct.empty() ? instruct : sent_instruct;
+                    fprintf(stderr, "[TTS] Synthesize #%d (init) [%s]: %.60s...\n",
+                            seg, use_instruct.empty() ? "default" : use_instruct.c_str(),
+                            sentence.c_str());
+                    tts_raw->synthesize_streaming(sentence, voice, use_instruct, pcm_callback, 8);
+                } else {
+                    // 后续句: continue_streaming 保持 KV cache + 音色一致性
+                    fprintf(stderr, "[TTS] Continue #%d: %.60s...\n", seg, sentence.c_str());
+                    int ret = tts_raw->continue_streaming(sentence, pcm_callback, 8);
+                    if (ret == 0 && !interrupted) {
+                        // continuation 失败 (KV cache 溢出等), 回退到独立合成
+                        fprintf(stderr, "[TTS] Continue failed, fallback to synthesize #%d\n", seg);
+                        const std::string& use_instruct = sent_instruct.empty() ? instruct : sent_instruct;
+                        tts_raw->synthesize_streaming(sentence, voice, use_instruct, pcm_callback, 8);
+                    }
+                }
                 tts_segment_idx++;
             }
         });
@@ -4939,6 +4952,24 @@ void ServeApp::process_text_input(
         send_json("{\"type\":\"audio.started\"}");
         auto* tts_raw = tts_plugin_.get();
         tts_thread = std::thread([&, tts_raw]() {
+            auto pcm_callback = [&](const float* data, int num_samples) -> bool {
+                if (interrupted) return false;
+                std::vector<int16_t> pcm16(num_samples);
+                for (int i = 0; i < num_samples; i++) {
+                    float v = std::max(-1.0f, std::min(1.0f, data[i]));
+                    pcm16[i] = (int16_t)(v * 32767.0f);
+                }
+                const uint8_t* ptr = reinterpret_cast<const uint8_t*>(pcm16.data());
+                size_t remaining = pcm16.size() * sizeof(int16_t);
+                const size_t chunk_bytes = AUDIO_CHUNK_SAMPLES * 2;
+                while (remaining > 0 && !interrupted) {
+                    size_t send_size = std::min(remaining, chunk_bytes);
+                    send_audio(ptr, send_size);
+                    ptr += send_size;
+                    remaining -= send_size;
+                }
+                return !interrupted;
+            };
             while (true) {
                 if (interrupted) break;
                 std::string sentence;
@@ -4956,29 +4987,27 @@ void ServeApp::process_text_input(
                 if (interrupted) break;
 
                 tts_sentence_count++;
-                fprintf(stderr, "[TTS] Synthesize #%d [%s]: %.60s...\n",
-                        tts_sentence_count,
-                        sent_instruct.empty() ? "default" : sent_instruct.c_str(),
-                        sentence.c_str());
-                tts_raw->synthesize_streaming(sentence, voice, sent_instruct,
-                    [&](const float* data, int num_samples) -> bool {
-                        if (interrupted) return false;
-                        std::vector<int16_t> pcm16(num_samples);
-                        for (int i = 0; i < num_samples; i++) {
-                            float v = std::max(-1.0f, std::min(1.0f, data[i]));
-                            pcm16[i] = (int16_t)(v * 32767.0f);
-                        }
-                        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(pcm16.data());
-                        size_t remaining = pcm16.size() * sizeof(int16_t);
-                        const size_t chunk_bytes = AUDIO_CHUNK_SAMPLES * 2;
-                        while (remaining > 0 && !interrupted) {
-                            size_t send_size = std::min(remaining, chunk_bytes);
-                            send_audio(ptr, send_size);
-                            ptr += send_size;
-                            remaining -= send_size;
-                        }
-                        return !interrupted;
-                    }, 8);
+                if (tts_sentence_count == 1) {
+                    // 第一句: synthesize_streaming 建立音色
+                    fprintf(stderr, "[TTS] Synthesize #%d (init) [%s]: %.60s...\n",
+                            tts_sentence_count,
+                            sent_instruct.empty() ? "default" : sent_instruct.c_str(),
+                            sentence.c_str());
+                    tts_raw->synthesize_streaming(sentence, voice, sent_instruct,
+                                                  pcm_callback, 8);
+                } else {
+                    // 后续句: continue_streaming 保持音色一致性
+                    fprintf(stderr, "[TTS] Continue #%d: %.60s...\n",
+                            tts_sentence_count, sentence.c_str());
+                    int ret = tts_raw->continue_streaming(sentence, pcm_callback, 8);
+                    if (ret == 0 && !interrupted) {
+                        // continuation 失败, 回退到独立合成
+                        fprintf(stderr, "[TTS] Continue failed, fallback to synthesize #%d\n",
+                                tts_sentence_count);
+                        tts_raw->synthesize_streaming(sentence, voice, sent_instruct,
+                                                      pcm_callback, 8);
+                    }
+                }
             }
         });
     }

@@ -39,8 +39,8 @@ struct TtsConfig {
     std::string extra_args;                 // 额外 CLI 参数 (subprocess)
     std::string tmp_dir      = "tmp";       // 临时文件目录
     int         max_new_tokens = 4096;      // 最大生成 token 数
-    // TTS 采样参数
-    float       tts_temperature   = 0.9f;
+    // TTS 采样参数 (温度 0.7 平衡自然感与音色稳定性, 官方默认 0.9 偏高)
+    float       tts_temperature   = 0.7f;
     int         tts_top_k         = 50;
     float       tts_top_p         = 1.0f;
     float       tts_rep_penalty   = 1.05f;

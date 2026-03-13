@@ -228,7 +228,7 @@ private:
     __nv_bfloat16* cp_decode_hidden_ = nullptr;        // [cp_hidden_size]
     int* cp_pos_gpu_ = nullptr;                        // [3 * max_cp_seq_len]
 
-    // Sampling parameters
+    // Sampling parameters (overridden by set_sampling from plugin config)
     float temperature_ = 0.9f;
     int top_k_ = 50;
     float top_p_ = 1.0f;
