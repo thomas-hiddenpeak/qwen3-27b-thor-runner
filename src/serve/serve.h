@@ -174,6 +174,7 @@ private:
         const std::string& user_text,
         std::vector<std::pair<std::string, std::string>>& chat_history,
         const std::string& voice,
+        const std::string& instruct,
         const std::function<void(const std::string&)>& send_json,
         const std::function<void(const uint8_t*, size_t)>& send_audio,
         std::atomic<bool>& generating,

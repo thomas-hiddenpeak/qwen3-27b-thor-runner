@@ -4490,8 +4490,17 @@ void ServeApp::ws_voice_generate(const std::string& user_text,
 
                 if (interrupted) break;
 
-                // per-sentence instruct → 回退到全局 instruct
-                const std::string& use_instruct = sent_instruct.empty() ? instruct : sent_instruct;
+                // 合并 voice design base instruct 和 per-sentence emotion instruct
+                // VoiceDesign: instruct="音色描述", sent_instruct="用X的语气说" → 合并
+                // CustomVoice: instruct="" (空), sent_instruct="emotion" → 仅用 emotion
+                std::string use_instruct;
+                if (!sent_instruct.empty() && !instruct.empty()) {
+                    use_instruct = instruct + "，" + sent_instruct;
+                } else if (!sent_instruct.empty()) {
+                    use_instruct = sent_instruct;
+                } else {
+                    use_instruct = instruct;
+                }
                 fprintf(stderr, "[TTS] Synthesize #%d [%s]: %.60s...\n",
                         tts_segment_idx.load() + 1,
                         use_instruct.empty() ? "default" : use_instruct.c_str(),
@@ -4649,6 +4658,7 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
 
     // ---- 会话配置 ----
     std::string voice = "serena";
+    std::string tts_instruct;  // VoiceDesign 模式的音色描述指令
     int client_sample_rate = 16000;
     std::vector<std::pair<std::string, std::string>> chat_history;
 
@@ -4722,14 +4732,14 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
         if (interrupted) { generating = false; return; }
 
         // --- LLM + TTS ---
-        process_text_input(asr_text, chat_history, voice, send_json, send_audio,
-                           generating, interrupted);
+        process_text_input(asr_text, chat_history, voice, tts_instruct,
+                           send_json, send_audio, generating, interrupted);
     };
 
     auto process_text = [&](const std::string& text) {
         if (interrupted) { generating = false; return; }
-        process_text_input(text, chat_history, voice, send_json, send_audio,
-                           generating, interrupted);
+        process_text_input(text, chat_history, voice, tts_instruct,
+                           send_json, send_audio, generating, interrupted);
     };
 
     // 发送 session.created
@@ -4882,10 +4892,14 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
             if (msg_type == "session.update") {
                 auto v = get_str("voice");
                 if (!v.empty()) voice = v;
+                auto inst = get_str("tts_instruct");
+                if (!inst.empty()) tts_instruct = inst;
                 int sr = get_int("sample_rate");
                 if (sr > 0) client_sample_rate = sr;
-                fprintf(stderr, "[RT] Config: voice=%s sample_rate=%d\n",
-                        voice.c_str(), client_sample_rate);
+                fprintf(stderr, "[RT] Config: voice=%s instruct=%s sample_rate=%d\n",
+                        voice.c_str(),
+                        tts_instruct.empty() ? "(default)" : tts_instruct.c_str(),
+                        client_sample_rate);
             }
             else if (msg_type == "text") {
                 auto input_text = get_str("text");
@@ -4922,6 +4936,7 @@ void ServeApp::process_text_input(
     const std::string& user_text,
     std::vector<std::pair<std::string, std::string>>& chat_history,
     const std::string& voice,
+    const std::string& instruct,
     const std::function<void(const std::string&)>& send_json,
     const std::function<void(const uint8_t*, size_t)>& send_audio,
     std::atomic<bool>& generating,
@@ -5000,12 +5015,21 @@ void ServeApp::process_text_input(
                 }
                 if (interrupted) break;
 
+                // 合并 base instruct 和 per-sentence emotion
+                std::string use_instruct;
+                if (!sent_instruct.empty() && !instruct.empty()) {
+                    use_instruct = instruct + "，" + sent_instruct;
+                } else if (!sent_instruct.empty()) {
+                    use_instruct = sent_instruct;
+                } else {
+                    use_instruct = instruct;
+                }
                 tts_sentence_count++;
                 fprintf(stderr, "[TTS] Synthesize #%d [%s]: %.60s...\n",
                         tts_sentence_count,
-                        sent_instruct.empty() ? "default" : sent_instruct.c_str(),
+                        use_instruct.empty() ? "default" : use_instruct.c_str(),
                         sentence.c_str());
-                tts_raw->synthesize_streaming(sentence, voice, sent_instruct,
+                tts_raw->synthesize_streaming(sentence, voice, use_instruct,
                     [&](const float* data, int num_samples) -> bool {
                         if (interrupted) return false;
                         std::vector<int16_t> pcm16(num_samples);
