@@ -1,9 +1,25 @@
 #pragma once
 #include <string>
+#include <vector>
 #include <unordered_map>
 
 namespace qwen_thor {
 namespace tts {
+
+// ============================================================
+// Speaker Encoder Configuration (ECAPA-TDNN, Base model only)
+// ============================================================
+struct SpeakerEncoderConfig {
+    int mel_dim              = 128;
+    int enc_dim              = 2048;  // output speaker embedding dimension
+    std::vector<int> enc_channels     = {512, 512, 512, 512, 1536};
+    std::vector<int> enc_kernel_sizes = {5, 3, 3, 3, 1};
+    std::vector<int> enc_dilations    = {1, 2, 3, 4, 1};
+    int enc_attention_channels = 128;
+    int enc_res2net_scale    = 8;
+    int enc_se_channels      = 128;
+    int sample_rate          = 24000;
+};
 
 // ============================================================
 // Talker Configuration (28-layer GQA transformer)
@@ -111,6 +127,7 @@ struct TTSConfig {
     TalkerConfig talker;
     CodePredictorConfig code_predictor;
     TokenizerDecoderConfig tokenizer_decoder;
+    SpeakerEncoderConfig speaker_encoder;  // ECAPA-TDNN (Base model only)
 
     // Text token IDs
     int im_start_token_id  = 151644;

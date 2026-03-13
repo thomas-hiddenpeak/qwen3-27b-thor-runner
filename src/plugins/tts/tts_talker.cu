@@ -785,6 +785,220 @@ int Talker::build_prefill(
 }
 
 // ============================================================================
+// Build prefill for voice clone mode (external speaker embedding, x-vector only)
+//
+// Similar to build_prefill but uses a raw float32 speaker embedding
+// instead of looking up codec_embedding by spk_id.
+// The speaker embedding is converted to BF16 and placed at the speaker position.
+// ============================================================================
+int Talker::build_prefill_clone(
+    const int* text_ids_cpu, int text_len,
+    const float* speaker_embedding, int enc_dim,
+    const std::string& language,
+    cudaStream_t stream)
+{
+    const auto& tc = config_.talker;
+    int h = tc.hidden_size;
+
+    if (enc_dim != h) {
+        fprintf(stderr, "[TTS Talker] ERROR: speaker embedding dim %d != hidden_size %d\n",
+                enc_dim, h);
+        return -1;
+    }
+
+    // Determine language_id
+    int language_id = -1;
+    if (!language.empty() && language != "auto") {
+        auto it = tc.codec_language_id.find(language);
+        if (it != tc.codec_language_id.end()) {
+            language_id = it->second;
+        }
+    }
+
+    // ======= Build Codec Track =======
+    std::vector<int> codec_prefix;
+    if (language_id >= 0) {
+        codec_prefix = {tc.codec_think_id, tc.codec_think_bos_id,
+                        language_id, tc.codec_think_eos_id};
+    } else {
+        codec_prefix = {tc.codec_nothink_id, tc.codec_think_bos_id,
+                        tc.codec_think_eos_id};
+    }
+    std::vector<int> codec_suffix = {tc.codec_pad_id, tc.codec_bos_id};
+
+    int codec_prefix_len = (int)codec_prefix.size();
+    bool has_speaker = (speaker_embedding != nullptr);
+    int codec_total = codec_prefix_len + (has_speaker ? 1 : 0) + (int)codec_suffix.size();
+
+    // Upload codec IDs and lookup embeddings
+    int* codec_ids_gpu;
+    cudaMalloc(&codec_ids_gpu, (codec_prefix_len + 2) * sizeof(int));
+
+    cudaMemcpyAsync(codec_ids_gpu, codec_prefix.data(),
+                    codec_prefix_len * sizeof(int), cudaMemcpyHostToDevice, stream);
+    __nv_bfloat16* codec_prefix_embed;
+    cudaMalloc(&codec_prefix_embed, codec_prefix_len * h * sizeof(__nv_bfloat16));
+    audio_ops::invoke_embedding_lookup(codec_prefix_embed, codec_ids_gpu,
+                                        codec_embedding_w_, codec_prefix_len, h, stream);
+
+    // Speaker embedding: convert float32 → BF16 and upload
+    __nv_bfloat16* speaker_embed_gpu = nullptr;
+    if (has_speaker) {
+        std::vector<__nv_bfloat16> speaker_bf16(h);
+        for (int i = 0; i < h; i++) {
+            speaker_bf16[i] = __float2bfloat16(speaker_embedding[i]);
+        }
+        cudaMalloc(&speaker_embed_gpu, h * sizeof(__nv_bfloat16));
+        cudaMemcpyAsync(speaker_embed_gpu, speaker_bf16.data(),
+                        h * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice, stream);
+    }
+
+    // Codec suffix
+    cudaMemcpyAsync(codec_ids_gpu, codec_suffix.data(), 2 * sizeof(int), cudaMemcpyHostToDevice, stream);
+    __nv_bfloat16* codec_suffix_embed;
+    cudaMalloc(&codec_suffix_embed, 2 * h * sizeof(__nv_bfloat16));
+    audio_ops::invoke_embedding_lookup(codec_suffix_embed, codec_ids_gpu,
+                                        codec_embedding_w_, 2, h, stream);
+
+    // Assemble codec_embed_all
+    __nv_bfloat16* codec_embed_all;
+    cudaMalloc(&codec_embed_all, codec_total * h * sizeof(__nv_bfloat16));
+    int offset = 0;
+    cudaMemcpyAsync(codec_embed_all, codec_prefix_embed,
+                    codec_prefix_len * h * sizeof(__nv_bfloat16),
+                    cudaMemcpyDeviceToDevice, stream);
+    offset += codec_prefix_len;
+    if (has_speaker) {
+        cudaMemcpyAsync(codec_embed_all + offset * h, speaker_embed_gpu,
+                        h * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+        offset++;
+    }
+    cudaMemcpyAsync(codec_embed_all + offset * h, codec_suffix_embed,
+                    2 * h * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+
+    // ======= Build Text Track =======
+    int role_len = 3;
+    int actual_text_start = 3;
+    int actual_text_end = text_len - 5;
+    int actual_text_len = actual_text_end - actual_text_start;
+    if (actual_text_len < 1) actual_text_len = 1;
+
+    int* text_ids_gpu;
+    cudaMalloc(&text_ids_gpu, text_len * sizeof(int));
+    cudaMemcpyAsync(text_ids_gpu, text_ids_cpu, text_len * sizeof(int),
+                    cudaMemcpyHostToDevice, stream);
+
+    __nv_bfloat16* role_embed;
+    cudaMalloc(&role_embed, role_len * h * sizeof(__nv_bfloat16));
+    __nv_bfloat16* role_text_embed;
+    cudaMalloc(&role_text_embed, role_len * h * sizeof(__nv_bfloat16));
+    audio_ops::invoke_embedding_lookup(role_text_embed, text_ids_gpu,
+                                        text_embedding_w_, role_len, h, stream);
+    text_projection_forward(role_embed, role_text_embed, role_len, workspace_, stream);
+
+    // TTS special embeddings
+    int tts_special_ids[3] = {config_.tts_pad_token_id, config_.tts_bos_token_id, config_.tts_eos_token_id};
+    int* tts_ids_gpu;
+    cudaMalloc(&tts_ids_gpu, 3 * sizeof(int));
+    cudaMemcpyAsync(tts_ids_gpu, tts_special_ids, 3 * sizeof(int), cudaMemcpyHostToDevice, stream);
+    __nv_bfloat16* tts_special_text_embed;
+    cudaMalloc(&tts_special_text_embed, 3 * h * sizeof(__nv_bfloat16));
+    audio_ops::invoke_embedding_lookup(tts_special_text_embed, tts_ids_gpu,
+                                        text_embedding_w_, 3, h, stream);
+    __nv_bfloat16* tts_special_embed;
+    cudaMalloc(&tts_special_embed, 3 * h * sizeof(__nv_bfloat16));
+    text_projection_forward(tts_special_embed, tts_special_text_embed, 3, workspace_, stream);
+
+    cudaMemcpyAsync(tts_pad_embed_, tts_special_embed, h * sizeof(__nv_bfloat16),
+                    cudaMemcpyDeviceToDevice, stream);
+    __nv_bfloat16* tts_bos_embed = tts_special_embed + h;
+    __nv_bfloat16* tts_eos_embed = tts_special_embed + 2 * h;
+
+    // ======= No instruct for voice clone (instruct_embed = nullptr) =======
+
+    // ======= Construct Prefill Embedding =======
+    // Layout: [role_embed(3)] + [_talker_input_embed(codec_total-1)] + [first_text_token(1)]
+    int prefill_total = role_len + (codec_total - 1) + 1;
+    prefill_len_ = prefill_total;
+
+    // Copy role embed
+    cudaMemcpyAsync(prefill_embeds_, role_embed,
+                    role_len * h * sizeof(__nv_bfloat16),
+                    cudaMemcpyDeviceToDevice, stream);
+
+    // Build _talker_input_embed
+    __nv_bfloat16* dual_start = prefill_embeds_ + role_len * h;
+    for (int i = 0; i < codec_total - 2; i++) {
+        cudaMemcpyAsync(dual_start + i * h, tts_pad_embed_,
+                        h * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+    }
+    cudaMemcpyAsync(dual_start + (codec_total - 2) * h, tts_bos_embed,
+                    h * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+
+    invoke_add(dual_start, codec_embed_all, (codec_total - 1) * h, stream);
+
+    // First text token
+    __nv_bfloat16* first_text_pos = prefill_embeds_ + (role_len + codec_total - 1) * h;
+    __nv_bfloat16* first_text_raw;
+    cudaMalloc(&first_text_raw, h * sizeof(__nv_bfloat16));
+    audio_ops::invoke_embedding_lookup(first_text_raw, text_ids_gpu + actual_text_start,
+                                        text_embedding_w_, 1, h, stream);
+    text_projection_forward(first_text_pos, first_text_raw, 1, workspace_, stream);
+    invoke_add(first_text_pos, codec_embed_all + (codec_total - 1) * h, h, stream);
+
+    // ======= Trailing Text Hidden =======
+    int trail_text_len = actual_text_len - 1;
+    if (trail_text_len < 0) trail_text_len = 0;
+    trailing_text_len_ = trail_text_len + 1;
+
+    if (trail_text_len > 0) {
+        __nv_bfloat16* trail_text_embed;
+        cudaMalloc(&trail_text_embed, trail_text_len * h * sizeof(__nv_bfloat16));
+        audio_ops::invoke_embedding_lookup(trail_text_embed,
+                                            text_ids_gpu + actual_text_start + 1,
+                                            text_embedding_w_, trail_text_len, h, stream);
+        text_projection_forward(trailing_text_hidden_, trail_text_embed,
+                                trail_text_len, workspace_, stream);
+        cudaFree(trail_text_embed);
+    }
+    cudaMemcpyAsync(trailing_text_hidden_ + trail_text_len * h, tts_eos_embed,
+                    h * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+
+    // ======= Position IDs =======
+    std::vector<int> pos_ids(3 * prefill_total);
+    for (int d = 0; d < 3; d++) {
+        for (int i = 0; i < prefill_total; i++) {
+            pos_ids[d * prefill_total + i] = i;
+        }
+    }
+    cudaMemcpyAsync(position_ids_, pos_ids.data(),
+                    3 * prefill_total * sizeof(int), cudaMemcpyHostToDevice, stream);
+
+    generation_step_ = 0;
+    talker_cache_len_ = 0;
+    generated_tokens_.clear();
+
+    // Cleanup
+    cudaStreamSynchronize(stream);
+    cudaFree(codec_ids_gpu);
+    cudaFree(codec_prefix_embed);
+    if (speaker_embed_gpu) cudaFree(speaker_embed_gpu);
+    cudaFree(codec_suffix_embed);
+    cudaFree(codec_embed_all);
+    cudaFree(text_ids_gpu);
+    cudaFree(role_embed);
+    cudaFree(role_text_embed);
+    cudaFree(tts_ids_gpu);
+    cudaFree(tts_special_text_embed);
+    cudaFree(tts_special_embed);
+    cudaFree(first_text_raw);
+
+    fprintf(stderr, "[TTS Talker] voice clone prefill built: %d tokens, trailing_text=%d tokens\n",
+            prefill_len_, trailing_text_len_);
+    return prefill_len_;
+}
+
+// ============================================================================
 // Talker layer forward (prefill, T > 1)
 // ============================================================================
 

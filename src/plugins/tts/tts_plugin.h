@@ -107,9 +107,26 @@ public:
         std::vector<std::string> available_voices; // speaker names
         std::vector<std::string> available_languages; // language/dialect names
         std::unordered_map<std::string, std::string> speaker_dialects; // speaker → dialect (empty = standard)
+        std::vector<std::string> clone_voices;     // registered clone voice names
+        bool has_speaker_encoder = false;          // whether speaker encoder is available
         int sample_rate = 24000;
     };
     virtual ModelInfo model_info() const { return {}; }
+
+    // ===== Voice Clone API =====
+
+    // Register a voice from raw PCM audio
+    virtual bool register_clone_voice(const std::string& name,
+                                       const float* audio, int num_samples, int sample_rate) { return false; }
+
+    // Delete a registered clone voice
+    virtual bool delete_clone_voice(const std::string& name) { return false; }
+
+    // Synthesize using a registered clone voice
+    virtual TtsResult synthesize_clone(const std::string& text,
+                                        const std::string& voice_name,
+                                        const std::string& format = "wav",
+                                        const std::string& language = "") { return {}; }
 };
 
 // ============================================================================
@@ -141,6 +158,15 @@ public:
     std::string name() const override { return "native-qwen3-tts"; }
     void set_sampling(float temperature, int top_k, float top_p, float rep_penalty) override;
     ModelInfo model_info() const override;
+
+    // Voice Clone
+    bool register_clone_voice(const std::string& name,
+                               const float* audio, int num_samples, int sample_rate) override;
+    bool delete_clone_voice(const std::string& name) override;
+    TtsResult synthesize_clone(const std::string& text,
+                                const std::string& voice_name,
+                                const std::string& format = "wav",
+                                const std::string& language = "") override;
 
 private:
     TtsConfig config_;

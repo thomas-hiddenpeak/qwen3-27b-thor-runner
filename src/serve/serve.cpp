@@ -1740,6 +1740,12 @@ void ServeApp::handle_connection(int client_fd, int protocol) {
             handle_audio_speech(req, client_fd);
         } else if (req.path == "/v1/tts/info" && req.method == "GET") {
             handle_tts_info(req, client_fd);
+        } else if (req.path == "/v1/voice_clone/register" && req.method == "POST") {
+            handle_voice_clone_register(req, client_fd);
+        } else if (req.path == "/v1/voice_clone/voices" && req.method == "GET") {
+            handle_voice_clone_voices(req, client_fd);
+        } else if (req.path == "/v1/voice_clone/delete" && req.method == "POST") {
+            handle_voice_clone_delete(req, client_fd);
         } else if (req.method == "GET" && (req.path == "/" || req.path.rfind("/examples/", 0) == 0)) {
             handle_static_file(req, client_fd);
         } else {
@@ -3884,13 +3890,227 @@ void ServeApp::handle_tts_info(const HttpRequest& /*req*/, int client_fd) {
     }
     dialects_json += "}";
 
+    // clone_voices: registered voice clone names
+    std::string clone_voices_json = "[";
+    for (size_t i = 0; i < info.clone_voices.size(); i++) {
+        if (i > 0) clone_voices_json += ",";
+        clone_voices_json += "\"" + json_escape(info.clone_voices[i]) + "\"";
+    }
+    clone_voices_json += "]";
+
     resp.body = "{\"enabled\":true,"
                 "\"model_type\":\"" + json_escape(info.model_type) + "\","
                 "\"default_instruct\":\"" + json_escape(info.default_instruct) + "\","
                 "\"sample_rate\":" + std::to_string(info.sample_rate) + ","
+                "\"has_speaker_encoder\":" + (info.has_speaker_encoder ? "true" : "false") + ","
                 "\"available_voices\":" + voices_json + ","
                 "\"available_languages\":" + langs_json + ","
+                "\"clone_voices\":" + clone_voices_json + ","
                 "\"speaker_dialects\":" + dialects_json + "}";
+    send_response(client_fd, resp);
+    close(client_fd);
+}
+
+// ============================================================================
+// POST /v1/voice_clone/register — 注册克隆音色 (multipart: file=audio, name=string)
+// ============================================================================
+
+void ServeApp::handle_voice_clone_register(const HttpRequest& req, int client_fd) {
+    if (!tts_plugin_ || !tts_plugin_->is_available()) {
+        HttpResponse resp;
+        resp.status_code = 501;
+        resp.body = "{\"error\":\"TTS plugin not configured\"}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    auto form = parse_multipart(req);
+
+    std::string voice_name;
+    auto it = form.fields.find("name");
+    if (it != form.fields.end()) voice_name = it->second;
+
+    if (voice_name.empty()) {
+        HttpResponse resp;
+        resp.status_code = 400;
+        resp.body = "{\"error\":\"'name' field is required\"}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    // Validate voice name (alphanumeric + underscore/hyphen)
+    for (char c : voice_name) {
+        if (!std::isalnum(c) && c != '_' && c != '-') {
+            HttpResponse resp;
+            resp.status_code = 400;
+            resp.body = "{\"error\":\"voice name must contain only alphanumeric, underscore, or hyphen\"}";
+            send_response(client_fd, resp);
+            close(client_fd);
+            return;
+        }
+    }
+
+    // Find audio file
+    const std::string* audio_data = nullptr;
+    for (const auto& f : form.files) {
+        if (f.field_name == "file" || f.field_name == "audio") {
+            audio_data = &f.data;
+            break;
+        }
+    }
+
+    if (!audio_data || audio_data->empty()) {
+        HttpResponse resp;
+        resp.status_code = 400;
+        resp.body = "{\"error\":\"'file' or 'audio' field with audio data is required\"}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    // Load WAV/PCM from uploaded data
+    std::vector<float> pcm;
+    int sample_rate = 0;
+
+    // Try to parse as WAV
+    if (audio_data->size() > 44 && audio_data->substr(0, 4) == "RIFF") {
+        // WAV file: parse header
+        const uint8_t* d = reinterpret_cast<const uint8_t*>(audio_data->data());
+        uint16_t channels = *(uint16_t*)(d + 22);
+        uint32_t sr = *(uint32_t*)(d + 24);
+        uint16_t bits = *(uint16_t*)(d + 34);
+        sample_rate = (int)sr;
+
+        // Find data chunk
+        size_t pos = 12;
+        while (pos + 8 < audio_data->size()) {
+            std::string chunk_id(audio_data->data() + pos, 4);
+            uint32_t chunk_size = *(uint32_t*)(d + pos + 4);
+            if (chunk_id == "data") {
+                pos += 8;
+                if (bits == 16) {
+                    int num_samples = chunk_size / 2;
+                    const int16_t* samples = reinterpret_cast<const int16_t*>(d + pos);
+                    pcm.resize(num_samples / channels);
+                    for (int i = 0; i < (int)pcm.size(); i++) {
+                        pcm[i] = samples[i * channels] / 32768.0f;
+                    }
+                } else if (bits == 32) {
+                    int num_samples = chunk_size / 4;
+                    const float* samples = reinterpret_cast<const float*>(d + pos);
+                    pcm.resize(num_samples / channels);
+                    for (int i = 0; i < (int)pcm.size(); i++) {
+                        pcm[i] = samples[i * channels];
+                    }
+                }
+                break;
+            }
+            pos += 8 + chunk_size;
+        }
+    }
+
+    if (pcm.empty() || sample_rate == 0) {
+        HttpResponse resp;
+        resp.status_code = 400;
+        resp.body = "{\"error\":\"Failed to parse audio file (WAV 16-bit or 32-bit float required)\"}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    fprintf(stderr, "[Serve] Voice clone register: name=%s, samples=%zu, sr=%d\n",
+            voice_name.c_str(), pcm.size(), sample_rate);
+
+    bool ok = tts_plugin_->register_clone_voice(voice_name, pcm.data(), (int)pcm.size(), sample_rate);
+
+    HttpResponse resp;
+    if (ok) {
+        resp.body = "{\"success\":true,\"voice\":\"" + json_escape(voice_name) + "\"}";
+    } else {
+        resp.status_code = 500;
+        resp.body = "{\"error\":\"Failed to register voice (speaker encoder may not be available)\"}";
+    }
+    send_response(client_fd, resp);
+    close(client_fd);
+}
+
+// ============================================================================
+// GET /v1/voice_clone/voices — 列出已注册的克隆音色
+// ============================================================================
+
+void ServeApp::handle_voice_clone_voices(const HttpRequest& /*req*/, int client_fd) {
+    HttpResponse resp;
+    if (!tts_plugin_ || !tts_plugin_->is_available()) {
+        resp.body = "{\"voices\":[]}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    auto info = tts_plugin_->model_info();
+    std::string json = "{\"voices\":[";
+    for (size_t i = 0; i < info.clone_voices.size(); i++) {
+        if (i > 0) json += ",";
+        json += "\"" + json_escape(info.clone_voices[i]) + "\"";
+    }
+    json += "],\"has_speaker_encoder\":" +
+            std::string(info.has_speaker_encoder ? "true" : "false") + "}";
+
+    resp.body = json;
+    send_response(client_fd, resp);
+    close(client_fd);
+}
+
+// ============================================================================
+// POST /v1/voice_clone/delete — 删除已注册的克隆音色 {"name": "..."}
+// ============================================================================
+
+void ServeApp::handle_voice_clone_delete(const HttpRequest& req, int client_fd) {
+    if (!tts_plugin_ || !tts_plugin_->is_available()) {
+        HttpResponse resp;
+        resp.status_code = 501;
+        resp.body = "{\"error\":\"TTS plugin not configured\"}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    // Parse name from JSON body
+    std::string name;
+    auto pos = req.body.find("\"name\"");
+    if (pos != std::string::npos) {
+        auto colon = req.body.find(':', pos);
+        if (colon != std::string::npos) {
+            auto q1 = req.body.find('"', colon + 1);
+            if (q1 != std::string::npos) {
+                auto q2 = req.body.find('"', q1 + 1);
+                if (q2 != std::string::npos) {
+                    name = req.body.substr(q1 + 1, q2 - q1 - 1);
+                }
+            }
+        }
+    }
+
+    if (name.empty()) {
+        HttpResponse resp;
+        resp.status_code = 400;
+        resp.body = "{\"error\":\"'name' field is required\"}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    bool ok = tts_plugin_->delete_clone_voice(name);
+
+    HttpResponse resp;
+    if (ok) {
+        resp.body = "{\"success\":true,\"deleted\":\"" + json_escape(name) + "\"}";
+    } else {
+        resp.status_code = 404;
+        resp.body = "{\"error\":\"Voice '" + json_escape(name) + "' not found\"}";
+    }
     send_response(client_fd, resp);
     close(client_fd);
 }

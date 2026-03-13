@@ -337,6 +337,36 @@ TtsResult NativeTtsPlugin::synthesize(const std::string& text,
     // Serialize access — TTS engine is not thread-safe (single GPU stream)
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // Route to voice clone if voice is a registered clone voice
+    if (engine_->has_clone_voice(use_voice)) {
+        auto t0 = std::chrono::steady_clock::now();
+        auto pcm = engine_->synthesize_voice_clone(text, use_voice, use_lang,
+                                                    config_.max_new_tokens);
+        if (pcm.empty()) {
+            result.error_code = 3;
+            result.error_message = "Voice clone synthesis produced no audio";
+            return result;
+        }
+        int sr = engine_->sample_rate();
+        result.sample_rate = sr;
+        result.duration_s = (float)pcm.size() / sr;
+        if (result.format == "pcm") {
+            result.audio_data.resize(pcm.size() * 2);
+            int16_t* out = reinterpret_cast<int16_t*>(result.audio_data.data());
+            for (size_t i = 0; i < pcm.size(); i++) {
+                float v = std::max(-1.0f, std::min(1.0f, pcm[i]));
+                out[i] = (int16_t)(v * 32767.0f);
+            }
+        } else {
+            result.audio_data = build_wav_header_and_data(pcm, sr);
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        float elapsed_s = std::chrono::duration<float>(t1 - t0).count();
+        fprintf(stderr, "[TTS Native] Clone voice '%s' synthesized %.1fs audio in %.1fs\n",
+                use_voice.c_str(), result.duration_s, elapsed_s);
+        return result;
+    }
+
     auto t0 = std::chrono::steady_clock::now();
 
     auto pcm = engine_->synthesize_to_pcm(text, use_voice, use_lang, use_instruct,
@@ -481,7 +511,85 @@ TtsPlugin::ModelInfo NativeTtsPlugin::model_info() const {
     std::sort(info.available_voices.begin(), info.available_voices.end());
     std::sort(info.available_languages.begin(), info.available_languages.end());
     info.speaker_dialects = cfg.talker.spk_is_dialect;
+
+    // Voice clone info
+    info.has_speaker_encoder = engine_->has_speaker_encoder();
+    info.clone_voices = engine_->list_clone_voices();
+
     return info;
+}
+
+// ============================================================================
+// NativeTtsPlugin — Voice Clone
+// ============================================================================
+
+bool NativeTtsPlugin::register_clone_voice(const std::string& name,
+                                            const float* audio, int num_samples, int sample_rate) {
+    if (!engine_ || !engine_->is_loaded()) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    return engine_->register_voice(name, audio, num_samples, sample_rate);
+}
+
+bool NativeTtsPlugin::delete_clone_voice(const std::string& name) {
+    if (!engine_ || !engine_->is_loaded()) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    return engine_->delete_voice(name);
+}
+
+TtsResult NativeTtsPlugin::synthesize_clone(const std::string& text,
+                                             const std::string& voice_name,
+                                             const std::string& format,
+                                             const std::string& language) {
+    TtsResult result;
+    result.format = (format.empty() || format == "wav") ? "wav" : "pcm";
+
+    if (!is_available()) {
+        result.error_code = 1;
+        result.error_message = "TTS engine not loaded";
+        return result;
+    }
+    if (text.empty()) {
+        result.error_code = 2;
+        result.error_message = "Empty text input";
+        return result;
+    }
+
+    std::string use_lang = language.empty() ? config_.language : language;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    auto pcm = engine_->synthesize_voice_clone(text, voice_name, use_lang,
+                                                config_.max_new_tokens);
+    if (pcm.empty()) {
+        result.error_code = 3;
+        result.error_message = "Voice clone synthesis failed (voice: " + voice_name + ")";
+        return result;
+    }
+
+    int sr = engine_->sample_rate();
+    result.sample_rate = sr;
+    result.duration_s = (float)pcm.size() / sr;
+
+    if (result.format == "pcm") {
+        result.audio_data.resize(pcm.size() * 2);
+        int16_t* out = reinterpret_cast<int16_t*>(result.audio_data.data());
+        for (size_t i = 0; i < pcm.size(); i++) {
+            float v = std::max(-1.0f, std::min(1.0f, pcm[i]));
+            out[i] = (int16_t)(v * 32767.0f);
+        }
+    } else {
+        result.audio_data = build_wav_header_and_data(pcm, sr);
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    float elapsed_s = std::chrono::duration<float>(t1 - t0).count();
+    fprintf(stderr, "[TTS Native] Voice clone synthesized %.1fs audio in %.1fs (%.1fx realtime)\n",
+            result.duration_s, elapsed_s,
+            result.duration_s / std::max(elapsed_s, 0.001f));
+
+    return result;
 }
 
 // ============================================================================

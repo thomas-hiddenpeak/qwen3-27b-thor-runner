@@ -15,6 +15,8 @@
 #include "tts_config.h"
 #include "tts_talker.h"
 #include "tts_tokenizer_decoder.h"
+#include "tts_speaker_encoder.h"
+#include "tts_voice_manager.h"
 #include "engine/tokenizer.h"
 #include <string>
 #include <vector>
@@ -102,10 +104,52 @@ public:
     void set_sampling(float temperature, int top_k, float top_p, float rep_penalty);
     void set_sub_sampling(float temperature, int top_k, float top_p);
 
+    // ===== Voice Clone (Base model only) =====
+
+    // Extract speaker embedding from raw PCM audio
+    // Returns enc_dim-dimensional x-vector, empty on failure
+    std::vector<float> extract_speaker_embedding(
+        const float* audio, int num_samples, int sample_rate);
+
+    // Register a named voice from audio
+    bool register_voice(const std::string& name,
+                        const float* audio, int num_samples, int sample_rate);
+
+    // Register a named voice from pre-computed embedding
+    bool register_voice_embedding(const std::string& name,
+                                   const std::vector<float>& embedding);
+
+    // Delete a registered voice
+    bool delete_voice(const std::string& name);
+
+    // List registered voice names
+    std::vector<std::string> list_clone_voices() const;
+
+    // Check if a clone voice exists
+    bool has_clone_voice(const std::string& name) const;
+
+    // Synthesize with voice clone (using registered voice name)
+    std::vector<float> synthesize_voice_clone(
+        const std::string& text,
+        const std::string& voice_name,
+        const std::string& language = "auto",
+        int max_new_tokens = 4096);
+
+    // Synthesize with voice clone (using raw embedding)
+    std::vector<float> synthesize_voice_clone_embedding(
+        const std::string& text,
+        const std::vector<float>& speaker_embedding,
+        const std::string& language = "auto",
+        int max_new_tokens = 4096);
+
+    bool has_speaker_encoder() const { return speaker_encoder_ && speaker_encoder_->is_loaded(); }
+
 private:
     TTSConfig config_;
     std::unique_ptr<Talker> talker_;
     std::unique_ptr<SpeechTokenizerDecoder> st_decoder_;
+    std::unique_ptr<SpeakerEncoder> speaker_encoder_;
+    VoiceManager voice_manager_;
     Tokenizer tokenizer_;
     std::string model_dir_;
 
@@ -120,6 +164,7 @@ private:
 
     // Internal methods
     void load_weights(const std::string& model_dir);
+    void load_speaker_encoder_weights(const std::string& model_dir);
 
     // Build the full chat-template text token sequence for TTS
     // Input: user text

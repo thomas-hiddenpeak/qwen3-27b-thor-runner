@@ -123,6 +123,15 @@ public:
                       const std::string& language,
                       cudaStream_t stream = 0);
 
+    // Build prefill for voice clone mode (external speaker embedding)
+    // speaker_embedding: pre-computed enc_dim-dimensional float32 x-vector (CPU)
+    // enc_dim: dimension of the speaker embedding (must match hidden_size)
+    // Other params same as build_prefill
+    int build_prefill_clone(const int* text_ids_cpu, int text_len,
+                            const float* speaker_embedding, int enc_dim,
+                            const std::string& language,
+                            cudaStream_t stream = 0);
+
     // Run prefill through Talker transformer
     // After this call, KV cache is populated and logits are produced
     void forward_prefill(cudaStream_t stream = 0);

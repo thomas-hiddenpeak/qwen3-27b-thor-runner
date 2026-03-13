@@ -259,6 +259,17 @@ bool TTSConfig::load_from_json(const std::string& config_path) {
         }
     }
 
+    // Speaker encoder config (Base model only, top-level)
+    std::string se = json_find_object(json, "speaker_encoder_config");
+    if (!se.empty()) {
+        speaker_encoder.enc_dim = json_get_int(se, "enc_dim", speaker_encoder.enc_dim);
+        speaker_encoder.mel_dim = json_get_int(se, "mel_dim", speaker_encoder.mel_dim);
+        speaker_encoder.enc_res2net_scale = json_get_int(se, "enc_res2net_scale", speaker_encoder.enc_res2net_scale);
+        speaker_encoder.enc_se_channels = json_get_int(se, "enc_se_channels", speaker_encoder.enc_se_channels);
+        speaker_encoder.enc_attention_channels = json_get_int(se, "enc_attention_channels", speaker_encoder.enc_attention_channels);
+        speaker_encoder.sample_rate = json_get_int(se, "sample_rate", speaker_encoder.sample_rate);
+    }
+
     fprintf(stderr, "[TTS] Config loaded:\n");
     fprintf(stderr, "  model_type=%s, tts_model_type=%s\n", model_type.c_str(), tts_model_type.c_str());
     fprintf(stderr, "  talker: %dL, hidden=%d, %dQ/%dKV, head_dim=%d, ffn=%d, vocab=%d\n",

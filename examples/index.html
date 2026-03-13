@@ -740,6 +740,42 @@ footer {
                    style="width:100%;padding:6px 10px;margin-top:4px;"
                    onchange="syncInstruct(this)">
           </div>
+
+          <!-- Voice Clone section -->
+          <div id="voiceCloneDiv" style="display:none;margin-top:12px;">
+            <label style="font-weight:600;color:var(--primary);">🎤 声音克隆</label>
+            <div style="margin-top:8px;">
+              <label style="font-size:13px;">已注册音色</label>
+              <select id="cloneVoiceSelect" style="width:100%;margin-top:4px;">
+                <option value="">(请先注册音色)</option>
+              </select>
+              <button class="btn btn-secondary" onclick="deleteCloneVoice()"
+                      style="margin-top:4px;font-size:12px;padding:4px 10px;">🗑 删除选中</button>
+            </div>
+            <div style="margin-top:12px;padding:12px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);">
+              <label style="font-size:13px;font-weight:600;">注册新音色</label>
+              <div style="margin-top:8px;">
+                <input type="text" id="cloneVoiceName" placeholder="音色名称 (英文/数字/下划线)"
+                       style="width:100%;padding:6px 10px;margin-bottom:8px;">
+                <div style="display:flex;gap:8px;align-items:center;">
+                  <label class="btn btn-secondary" style="cursor:pointer;font-size:13px;padding:6px 12px;margin:0;">
+                    📁 选择音频文件
+                    <input type="file" id="cloneAudioFile" accept="audio/*" style="display:none;" onchange="onCloneFileSelected(this)">
+                  </label>
+                  <button class="btn btn-secondary" id="cloneRecordBtn" onclick="toggleCloneRecord()"
+                          style="font-size:13px;padding:6px 12px;">🎙 录音</button>
+                </div>
+                <div id="cloneFileInfo" style="font-size:12px;color:var(--text2);margin-top:4px;"></div>
+                <div id="cloneRecordingStatus" style="font-size:12px;color:var(--recording);margin-top:4px;display:none;">
+                  ● 正在录音... <span id="cloneRecordTime">0s</span>
+                </div>
+                <button class="btn btn-primary" onclick="registerCloneVoice()" style="margin-top:8px;width:100%;">
+                  ✨ 注册音色
+                </button>
+                <div id="cloneRegStatus" style="font-size:12px;margin-top:4px;"></div>
+              </div>
+            </div>
+          </div>
         </div>
         <div class="form-group">
           <label>输出格式</label>
@@ -871,6 +907,14 @@ let ttsModelType = 'custom_voice';  // custom_voice, voice_design, voice_clone
 let ttsAvailableVoices = ['serena'];
 let ttsAvailableLanguages = [];
 let ttsSpeakerDialects = {}; // speaker → dialect ("" = standard)
+let ttsCloneVoices = [];  // registered clone voice names
+
+// Voice clone recording state
+let cloneMediaStream = null;
+let cloneMediaRecorder = null;
+let cloneAudioChunks = [];
+let cloneRecordInterval = null;
+let cloneAudioBlob = null;
 
 // ============================================================================
 // TTS Info — 获取模型类型和可用音色
@@ -918,7 +962,17 @@ async function fetchTtsInfo() {
 
     // voice_clone 提示
     if (isClone) {
-      setStatus('当前加载的是复制音色模型 (voice_clone), 需要参考音频功能尚未支持');
+      setStatus('当前加载的是复制音色模型 (voice_clone), 请先注册参考音频');
+    }
+
+    // Show voice clone panel if model supports it
+    const hasEncoder = info.has_speaker_encoder || false;
+    document.getElementById('voiceCloneDiv').style.display = (isClone || hasEncoder) ? 'block' : 'none';
+
+    // Populate clone voices dropdown
+    if (info.clone_voices && info.clone_voices.length > 0) {
+      ttsCloneVoices = info.clone_voices;
+      updateCloneVoiceSelect();
     }
   } catch (e) {
     console.warn('Failed to fetch TTS info:', e);
@@ -1627,8 +1681,17 @@ async function synthesizeTts() {
   const text = document.getElementById('ttsInputText').value.trim();
   if (!text) { setTtsStatus('请输入要合成的文本', 'error'); return; }
 
-  // VoiceDesign 模式不发送 voice (无预设音色), 音色完全由 instruct 决定
-  const voice = (ttsModelType === 'voice_design') ? '' : document.getElementById('ttsVoiceSelect').value;
+  // Determine voice: clone voice takes priority, then regular voice
+  let voice = '';
+  const cloneVoiceSel = document.getElementById('cloneVoiceSelect');
+  const cloneVoice = cloneVoiceSel ? cloneVoiceSel.value : '';
+  const isClone = ttsModelType === 'voice_clone' || ttsModelType === 'base';
+  if (isClone && cloneVoice) {
+    voice = cloneVoice;
+  } else if (ttsModelType !== 'voice_design') {
+    voice = document.getElementById('ttsVoiceSelect').value;
+  }
+
   const format = document.getElementById('formatSelect').value;
   const instruct = document.getElementById('ttsTabInstruct')?.value.trim() || undefined;
   if (ttsModelType === 'voice_design') {
@@ -1765,6 +1828,185 @@ function playTtsHistory(idx) {
   document.getElementById('ttsAudioInfo').textContent =
     item.sizeKB + ' KB · ' + item.elapsed + 's · ' + (item.voice || 'default');
   player.play();
+}
+
+// ============================================================================
+// Voice Clone Functions
+// ============================================================================
+
+function updateCloneVoiceSelect() {
+  const sel = document.getElementById('cloneVoiceSelect');
+  if (!sel) return;
+  const current = sel.value;
+  sel.innerHTML = '';
+  if (ttsCloneVoices.length === 0) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = '(请先注册音色)';
+    sel.appendChild(opt);
+  } else {
+    for (const v of ttsCloneVoices) {
+      const opt = document.createElement('option');
+      opt.value = v;
+      opt.textContent = v;
+      sel.appendChild(opt);
+    }
+    if (ttsCloneVoices.includes(current)) sel.value = current;
+  }
+}
+
+function onCloneFileSelected(input) {
+  const file = input.files[0];
+  if (file) {
+    document.getElementById('cloneFileInfo').textContent =
+      '已选择: ' + file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)';
+    cloneAudioBlob = file;
+  }
+}
+
+async function toggleCloneRecord() {
+  const btn = document.getElementById('cloneRecordBtn');
+  const statusDiv = document.getElementById('cloneRecordingStatus');
+
+  if (cloneMediaRecorder && cloneMediaRecorder.state === 'recording') {
+    // Stop recording
+    cloneMediaRecorder.stop();
+    btn.textContent = '🎙 录音';
+    btn.style.background = '';
+    statusDiv.style.display = 'none';
+    if (cloneRecordInterval) { clearInterval(cloneRecordInterval); cloneRecordInterval = null; }
+    if (cloneMediaStream) { cloneMediaStream.getTracks().forEach(t => t.stop()); cloneMediaStream = null; }
+    return;
+  }
+
+  try {
+    cloneMediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    cloneMediaRecorder = new MediaRecorder(cloneMediaStream, { mimeType: 'audio/webm' });
+    cloneAudioChunks = [];
+
+    cloneMediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) cloneAudioChunks.push(e.data);
+    };
+
+    cloneMediaRecorder.onstop = async () => {
+      const webmBlob = new Blob(cloneAudioChunks, { type: 'audio/webm' });
+      // Convert webm to wav using AudioContext
+      const ctx = new AudioContext({ sampleRate: 24000 });
+      const arrayBuf = await webmBlob.arrayBuffer();
+      const decoded = await ctx.decodeAudioData(arrayBuf);
+      const channelData = decoded.getChannelData(0);
+      // Build WAV
+      const wavBuf = new ArrayBuffer(44 + channelData.length * 2);
+      const view = new DataView(wavBuf);
+      const sr = decoded.sampleRate;
+      const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+      writeStr(0, 'RIFF'); view.setUint32(4, 36 + channelData.length * 2, true); writeStr(8, 'WAVE');
+      writeStr(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+      view.setUint32(24, sr, true); view.setUint32(28, sr * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+      writeStr(36, 'data'); view.setUint32(40, channelData.length * 2, true);
+      for (let i = 0; i < channelData.length; i++) {
+        const s = Math.max(-1, Math.min(1, channelData[i]));
+        view.setInt16(44 + i * 2, s * 32767, true);
+      }
+      cloneAudioBlob = new Blob([wavBuf], { type: 'audio/wav' });
+      document.getElementById('cloneFileInfo').textContent =
+        '录音完成: ' + (cloneAudioBlob.size / 1024).toFixed(1) + ' KB, ' +
+        decoded.duration.toFixed(1) + 's';
+      ctx.close();
+    };
+
+    cloneMediaRecorder.start();
+    btn.textContent = '⏹ 停止录音';
+    btn.style.background = 'var(--recording)';
+    statusDiv.style.display = 'block';
+    let sec = 0;
+    cloneRecordInterval = setInterval(() => {
+      sec++;
+      document.getElementById('cloneRecordTime').textContent = sec + 's';
+    }, 1000);
+  } catch (err) {
+    document.getElementById('cloneRegStatus').textContent = '麦克风权限被拒绝: ' + err.message;
+    document.getElementById('cloneRegStatus').style.color = 'var(--error)';
+  }
+}
+
+async function registerCloneVoice() {
+  const name = document.getElementById('cloneVoiceName').value.trim();
+  const statusEl = document.getElementById('cloneRegStatus');
+
+  if (!name) {
+    statusEl.textContent = '请输入音色名称';
+    statusEl.style.color = 'var(--error)';
+    return;
+  }
+  if (!cloneAudioBlob) {
+    statusEl.textContent = '请选择音频文件或录音';
+    statusEl.style.color = 'var(--error)';
+    return;
+  }
+
+  statusEl.textContent = '正在注册音色...';
+  statusEl.style.color = 'var(--text2)';
+
+  try {
+    const formData = new FormData();
+    formData.append('name', name);
+    formData.append('file', cloneAudioBlob, 'audio.wav');
+
+    const resp = await fetch('/v1/voice_clone/register', {
+      method: 'POST',
+      body: formData
+    });
+
+    const json = await resp.json();
+    if (json.success) {
+      statusEl.textContent = '✅ 音色 "' + name + '" 注册成功！';
+      statusEl.style.color = 'var(--success)';
+      // Refresh voice list
+      if (!ttsCloneVoices.includes(name)) {
+        ttsCloneVoices.push(name);
+        ttsCloneVoices.sort();
+      }
+      updateCloneVoiceSelect();
+      document.getElementById('cloneVoiceSelect').value = name;
+      // Clear form
+      document.getElementById('cloneVoiceName').value = '';
+      document.getElementById('cloneFileInfo').textContent = '';
+      cloneAudioBlob = null;
+    } else {
+      statusEl.textContent = '❌ 注册失败: ' + (json.error || 'unknown error');
+      statusEl.style.color = 'var(--error)';
+    }
+  } catch (err) {
+    statusEl.textContent = '❌ 请求失败: ' + err.message;
+    statusEl.style.color = 'var(--error)';
+  }
+}
+
+async function deleteCloneVoice() {
+  const sel = document.getElementById('cloneVoiceSelect');
+  const name = sel ? sel.value : '';
+  if (!name) return;
+
+  if (!confirm('确认删除音色 "' + name + '"?')) return;
+
+  try {
+    const resp = await fetch('/v1/voice_clone/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name })
+    });
+    const json = await resp.json();
+    if (json.success) {
+      ttsCloneVoices = ttsCloneVoices.filter(v => v !== name);
+      updateCloneVoiceSelect();
+      setTtsStatus('音色 "' + name + '" 已删除', 'success');
+    } else {
+      setTtsStatus('删除失败: ' + (json.error || ''), 'error');
+    }
+  } catch (err) {
+    setTtsStatus('删除请求失败: ' + err.message, 'error');
+  }
 }
 
 // ============================================================================

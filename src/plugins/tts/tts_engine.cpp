@@ -222,6 +222,15 @@ void TTSEngine::load_model(const std::string& model_dir) {
         st_decoder_.reset();
     }
 
+    // 7. Load Speaker Encoder (Base model only — for voice clone)
+    if (config_.tts_model_type == "base") {
+        load_speaker_encoder_weights(model_dir);
+
+        // Initialize voice manager with voices directory next to model
+        std::string voices_dir = dir + "voices/";
+        voice_manager_.set_directory(voices_dir);
+    }
+
     auto t1 = std::chrono::steady_clock::now();
     float load_time = std::chrono::duration<float>(t1 - t0).count();
     fprintf(stderr, "[TTS] Model loaded in %.1fs (%zu weight tensors)\n",
@@ -742,6 +751,188 @@ bool TTSEngine::synthesize_to_wav(
                 output_path.c_str(), duration_s);
     }
     return ok;
+}
+
+// ============================================================================
+// Speaker Encoder: load weights from model.safetensors
+// ============================================================================
+
+void TTSEngine::load_speaker_encoder_weights(const std::string& model_dir) {
+    using namespace qwen_thor::io;
+
+    std::string dir = model_dir;
+    if (dir.back() != '/') dir += '/';
+
+    SafetensorsLoader loader(dir + "model.safetensors");
+
+    // Collect all speaker_encoder.* tensors as (name, (bf16_ptr, num_elements))
+    std::vector<std::pair<std::string, std::pair<const uint16_t*, size_t>>> se_weights;
+
+    for (const auto& name : loader.get_tensor_names()) {
+        if (name.rfind("speaker_encoder.", 0) == 0) {
+            auto tensor = loader.get_tensor(name);
+            if (tensor) {
+                const uint16_t* data = reinterpret_cast<const uint16_t*>(tensor->data());
+                size_t num_elements = tensor->nbytes() / 2;  // BF16 = 2 bytes
+                se_weights.push_back({name, {data, num_elements}});
+            }
+        }
+    }
+
+    if (se_weights.empty()) {
+        fprintf(stderr, "[TTS] No speaker_encoder weights found (not a Base model)\n");
+        return;
+    }
+
+    speaker_encoder_ = std::make_unique<SpeakerEncoder>();
+    speaker_encoder_->set_config(config_.speaker_encoder);
+    if (!speaker_encoder_->load_weights(se_weights)) {
+        fprintf(stderr, "[TTS] ERROR: failed to load speaker encoder weights\n");
+        speaker_encoder_.reset();
+    }
+}
+
+// ============================================================================
+// Voice Clone: extract speaker embedding
+// ============================================================================
+
+std::vector<float> TTSEngine::extract_speaker_embedding(
+    const float* audio, int num_samples, int sample_rate)
+{
+    if (!speaker_encoder_ || !speaker_encoder_->is_loaded()) {
+        fprintf(stderr, "[TTS] ERROR: speaker encoder not loaded\n");
+        return {};
+    }
+    return speaker_encoder_->extract(audio, num_samples, sample_rate);
+}
+
+// ============================================================================
+// Voice Clone: register/delete/list voices
+// ============================================================================
+
+bool TTSEngine::register_voice(const std::string& name,
+                                const float* audio, int num_samples, int sample_rate)
+{
+    auto embedding = extract_speaker_embedding(audio, num_samples, sample_rate);
+    if (embedding.empty()) return false;
+    return voice_manager_.register_voice(name, embedding);
+}
+
+bool TTSEngine::register_voice_embedding(const std::string& name,
+                                          const std::vector<float>& embedding)
+{
+    return voice_manager_.register_voice(name, embedding);
+}
+
+bool TTSEngine::delete_voice(const std::string& name)
+{
+    return voice_manager_.delete_voice(name);
+}
+
+std::vector<std::string> TTSEngine::list_clone_voices() const
+{
+    return voice_manager_.list_voices();
+}
+
+bool TTSEngine::has_clone_voice(const std::string& name) const
+{
+    return voice_manager_.has_voice(name);
+}
+
+// ============================================================================
+// Voice Clone: synthesize using registered voice name
+// ============================================================================
+
+std::vector<float> TTSEngine::synthesize_voice_clone(
+    const std::string& text,
+    const std::string& voice_name,
+    const std::string& language,
+    int max_new_tokens)
+{
+    const auto* emb = voice_manager_.get_embedding(voice_name);
+    if (!emb) {
+        fprintf(stderr, "[TTS] ERROR: clone voice '%s' not found\n", voice_name.c_str());
+        return {};
+    }
+    return synthesize_voice_clone_embedding(text, *emb, language, max_new_tokens);
+}
+
+// ============================================================================
+// Voice Clone: synthesize using raw embedding vector
+// ============================================================================
+
+std::vector<float> TTSEngine::synthesize_voice_clone_embedding(
+    const std::string& text,
+    const std::vector<float>& speaker_embedding,
+    const std::string& language,
+    int max_new_tokens)
+{
+    if (!loaded_) {
+        fprintf(stderr, "[TTS] ERROR: model not loaded\n");
+        return {};
+    }
+    if (!st_decoder_ || !st_decoder_->is_loaded()) {
+        fprintf(stderr, "[TTS] ERROR: speech tokenizer decoder not loaded\n");
+        return {};
+    }
+    if (speaker_embedding.empty()) {
+        fprintf(stderr, "[TTS] ERROR: empty speaker embedding\n");
+        return {};
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // 1. Tokenize text
+    std::vector<int> text_tokens = build_text_tokens(text);
+    if (text_tokens.empty()) {
+        fprintf(stderr, "[TTS] ERROR: empty text tokens\n");
+        return {};
+    }
+
+    // 2. Build prefill with external speaker embedding (voice clone mode)
+    talker_->reset();
+    talker_->set_max_new_tokens(max_new_tokens);
+    talker_->build_prefill_clone(text_tokens.data(), (int)text_tokens.size(),
+                                 speaker_embedding.data(), (int)speaker_embedding.size(),
+                                 language, stream_);
+    talker_->forward_prefill(stream_);
+
+    // 3. Decode
+    int num_groups = config_.talker.num_code_groups;
+    std::vector<std::vector<int>> all_codes;
+    std::vector<int> codec_step(num_groups);
+    int step = 0;
+    while (step < max_new_tokens) {
+        int ret = talker_->forward_decode_step(codec_step.data(), stream_);
+        if (ret < 0) break;
+        all_codes.push_back(codec_step);
+        step++;
+    }
+
+    auto t_talker = std::chrono::steady_clock::now();
+    float talker_ms = std::chrono::duration<float, std::milli>(t_talker - t0).count();
+    fprintf(stderr, "[TTS] Voice clone talker: %d steps (%.1f ms, %.1f steps/s)\n",
+            step, talker_ms, step > 0 ? step / (talker_ms / 1000.0f) : 0.0f);
+
+    if (all_codes.empty()) return {};
+
+    // 4. Decode to PCM
+    int T = (int)all_codes.size();
+    std::vector<int> codes_flat(num_groups * T);
+    for (int t = 0; t < T; t++) {
+        for (int g = 0; g < num_groups; g++) {
+            codes_flat[g * T + t] = all_codes[t][g];
+        }
+    }
+
+    auto pcm = st_decoder_->decode(codes_flat.data(), num_groups, T, stream_);
+
+    auto t_decode = std::chrono::steady_clock::now();
+    float total_ms = std::chrono::duration<float, std::milli>(t_decode - t0).count();
+    fprintf(stderr, "[TTS] Voice clone done: %zu samples (%.1f ms total)\n",
+            pcm.size(), total_ms);
+
+    return pcm;
 }
 
 } // namespace tts

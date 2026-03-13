@@ -154,6 +154,11 @@ private:
     void handle_audio_speech(const HttpRequest& req, int client_fd);
     void handle_tts_info(const HttpRequest& req, int client_fd);
 
+    // ---- Voice Clone API ----
+    void handle_voice_clone_register(const HttpRequest& req, int client_fd);
+    void handle_voice_clone_voices(const HttpRequest& req, int client_fd);
+    void handle_voice_clone_delete(const HttpRequest& req, int client_fd);
+
     // ---- WebSocket 语音对话 ----
     void handle_websocket_voice(int client_fd, const HttpRequest& req);
     void ws_voice_generate(
