@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voice Chat Test</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+       background: #1a1a2e; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
+
+header { display: flex; align-items: center; padding: 12px 20px; background: #16213e;
+         border-bottom: 1px solid #0f3460; gap: 12px; }
+header h1 { font-size: 18px; font-weight: 600; flex-shrink: 0; }
+#status { font-size: 13px; padding: 4px 10px; border-radius: 12px; background: #333;
+          flex-shrink: 0; }
+#status.connected { background: #0a6640; color: #a7f3d0; }
+#status.error { background: #7c2d12; color: #fca5a5; }
+#state { font-size: 12px; color: #999; margin-left: 8px; }
+.spacer { flex: 1; }
+#settingsBtn { background: none; border: none; color: #999; font-size: 20px; cursor: pointer; }
+#settingsBtn:hover { color: #fff; }
+
+#settings { display: none; padding: 12px 20px; background: #16213e;
+            border-bottom: 1px solid #0f3460; }
+#settings.show { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+#settings label { font-size: 13px; color: #aaa; }
+#settings input { background: #1a1a2e; border: 1px solid #333; color: #e0e0e0;
+                  padding: 4px 8px; border-radius: 4px; font-size: 13px; }
+#settings input[type=text] { width: 300px; }
+#settings button { padding: 4px 12px; background: #0f3460; border: 1px solid #1a56db;
+                   color: #93c5fd; border-radius: 4px; cursor: pointer; font-size: 13px; }
+
+#chat { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+.msg { max-width: 80%; padding: 10px 14px; border-radius: 12px; font-size: 14px;
+       line-height: 1.5; word-break: break-word; }
+.msg.user { align-self: flex-end; background: #1a56db; color: #fff; border-bottom-right-radius: 4px; }
+.msg.assistant { align-self: flex-start; background: #2a2a3e; color: #e0e0e0;
+                 border-bottom-left-radius: 4px; }
+.msg.system { align-self: center; background: none; color: #666; font-size: 12px;
+              font-style: italic; }
+.msg .label { font-size: 11px; color: #888; margin-bottom: 4px; }
+.msg.assistant .label { color: #60a5fa; }
+.msg.user .label { color: #93c5fd; }
+
+footer { display: flex; align-items: center; padding: 12px 20px; background: #16213e;
+         border-top: 1px solid #0f3460; gap: 12px; }
+#micBtn { width: 48px; height: 48px; border-radius: 50%; border: 2px solid #333;
+          background: #1a1a2e; color: #999; font-size: 22px; cursor: pointer;
+          display: flex; align-items: center; justify-content: center; transition: all 0.2s; }
+#micBtn.active { border-color: #ef4444; background: #7f1d1d; color: #fca5a5;
+                 animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.4); }
+                   50% { box-shadow: 0 0 0 8px rgba(239,68,68,0); } }
+#textInput { flex: 1; padding: 10px 14px; background: #1a1a2e; border: 1px solid #333;
+             border-radius: 8px; color: #e0e0e0; font-size: 14px; outline: none; }
+#textInput:focus { border-color: #1a56db; }
+#sendBtn { padding: 10px 20px; background: #1a56db; border: none; color: #fff;
+           border-radius: 8px; cursor: pointer; font-size: 14px; }
+#sendBtn:hover { background: #1e40af; }
+</style>
+</head>
+<body>
+<header>
+    <h1>Voice Chat</h1>
+    <span id="status">Disconnected</span>
+    <span id="state"></span>
+    <span class="spacer"></span>
+    <button id="settingsBtn" onclick="toggleSettings()">⚙</button>
+</header>
+
+<div id="settings">
+    <label>Server: <input type="text" id="serverUrl"></label>
+    <label>Voice: <input type="text" id="voiceInput" value="serena"></label>
+    <button onclick="applySettings()">Connect</button>
+</div>
+
+<div id="chat"></div>
+
+<footer>
+    <button id="micBtn" onclick="toggleMic()">🎤</button>
+    <input type="text" id="textInput" placeholder="Type a message..." onkeydown="if(event.key==='Enter')sendText()">
+    <button id="sendBtn" onclick="sendText()">Send</button>
+</footer>
+
+<script>
+// ============================================================================
+// 配置
+// ============================================================================
+const SAMPLE_RATE = 16000;       // 麦克风采样率 (发送给服务端)
+const CHUNK_MS = 60;             // 每帧音频 ms
+const PLAYBACK_RATE = 24000;     // TTS 音频采样率
+
+// ============================================================================
+// 状态
+// ============================================================================
+let ws = null;
+let micStream = null;
+let audioCtx = null;
+let workletNode = null;
+let playCtx = null;
+let playNextTime = 0;
+let micActive = false;
+
+// ============================================================================
+// UI 辅助
+// ============================================================================
+const $ = id => document.getElementById(id);
+const statusEl = $('status');
+const stateEl = $('state');
+const chatEl = $('chat');
+
+function setStatus(text, cls) {
+    statusEl.textContent = text;
+    statusEl.className = cls || '';
+}
+function setState(text) { stateEl.textContent = text; }
+
+function addMsg(role, text) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + role;
+    const label = document.createElement('div');
+    label.className = 'label';
+    label.textContent = role === 'user' ? 'You' : role === 'assistant' ? 'AI' : '';
+    const content = document.createElement('div');
+    content.textContent = text;
+    if (label.textContent) div.appendChild(label);
+    div.appendChild(content);
+    chatEl.appendChild(div);
+    chatEl.scrollTop = chatEl.scrollHeight;
+    return content;
+}
+
+let currentAssistantEl = null;
+let currentAssistantText = '';
+
+function appendAssistant(delta) {
+    if (!currentAssistantEl) {
+        currentAssistantText = '';
+        currentAssistantEl = addMsg('assistant', '');
+    }
+    currentAssistantText += delta;
+    currentAssistantEl.textContent = currentAssistantText;
+    chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function finishAssistant() { currentAssistantEl = null; currentAssistantText = ''; }
+
+// ============================================================================
+// Settings
+// ============================================================================
+function toggleSettings() { $('settings').classList.toggle('show'); }
+
+function defaultWsUrl() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = location.hostname || '127.0.0.1';
+    const port = location.port || '8080';
+    return `${proto}//${host}:${port}/v1/realtime`;
+}
+
+window.addEventListener('load', () => {
+    $('serverUrl').value = defaultWsUrl();
+    connect();
+});
+
+function applySettings() {
+    if (ws) ws.close();
+    connect();
+}
+
+// ============================================================================
+// WebSocket 连接
+// ============================================================================
+function connect() {
+    const url = $('serverUrl').value;
+    setStatus('Connecting...', '');
+    setState('');
+
+    ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+        setStatus('Connected', 'connected');
+        // 发送会话配置
+        ws.send(JSON.stringify({
+            type: 'session.update',
+            voice: $('voiceInput').value,
+            sample_rate: SAMPLE_RATE
+        }));
+    };
+
+    ws.onclose = () => {
+        setStatus('Disconnected', '');
+        setState('');
+        ws = null;
+        // 自动重连
+        setTimeout(() => { if (!ws) connect(); }, 3000);
+    };
+
+    ws.onerror = () => {
+        setStatus('Error', 'error');
+    };
+
+    ws.onmessage = (evt) => {
+        if (evt.data instanceof ArrayBuffer) {
+            // 二进制: TTS 音频 PCM16LE 24kHz mono
+            playAudio(evt.data);
+        } else {
+            // JSON 控制消息
+            const msg = JSON.parse(evt.data);
+            handleServerMsg(msg);
+        }
+    };
+}
+
+// ============================================================================
+// 处理服务端消息
+// ============================================================================
+function handleServerMsg(msg) {
+    switch (msg.type) {
+        case 'session.created':
+            addMsg('system', 'Session ready');
+            break;
+
+        case 'input.speech_started':
+            setState('🔴 Listening...');
+            break;
+
+        case 'input.speech_stopped':
+            setState('Processing...');
+            break;
+
+        case 'input.transcription':
+            if (msg.text) addMsg('user', msg.text);
+            setState('Thinking...');
+            break;
+
+        case 'response.started':
+            setState('Speaking...');
+            break;
+
+        case 'response.delta':
+            appendAssistant(msg.delta);
+            break;
+
+        case 'response.done':
+            finishAssistant();
+            setState('');
+            break;
+
+        case 'audio.started':
+            // TTS 音频即将到来, 准备播放上下文
+            if (!playCtx || playCtx.state === 'closed') {
+                playCtx = new AudioContext({ sampleRate: PLAYBACK_RATE });
+            }
+            playNextTime = playCtx.currentTime + 0.05;
+            break;
+
+        case 'audio.done':
+            setState('');
+            break;
+
+        case 'error':
+            addMsg('system', 'Error: ' + msg.message);
+            setState('');
+            break;
+
+        default:
+            console.log('Unknown message:', msg);
+    }
+}
+
+// ============================================================================
+// 音频播放 (接收 PCM16LE → AudioContext)
+// ============================================================================
+function playAudio(arrayBuf) {
+    if (!playCtx || playCtx.state === 'closed') {
+        playCtx = new AudioContext({ sampleRate: PLAYBACK_RATE });
+        playNextTime = playCtx.currentTime + 0.05;
+    }
+    if (playCtx.state === 'suspended') playCtx.resume();
+
+    const int16 = new Int16Array(arrayBuf);
+    const numSamples = int16.length;
+    const audioBuf = playCtx.createBuffer(1, numSamples, PLAYBACK_RATE);
+    const ch = audioBuf.getChannelData(0);
+    for (let i = 0; i < numSamples; i++) {
+        ch[i] = int16[i] / 32768.0;
+    }
+
+    const source = playCtx.createBufferSource();
+    source.buffer = audioBuf;
+    source.connect(playCtx.destination);
+
+    const now = playCtx.currentTime;
+    if (playNextTime < now) playNextTime = now + 0.02;
+    source.start(playNextTime);
+    playNextTime += audioBuf.duration;
+}
+
+// ============================================================================
+// 麦克风控制
+// ============================================================================
+async function toggleMic() {
+    if (micActive) {
+        stopMic();
+    } else {
+        await startMic();
+    }
+}
+
+async function startMic() {
+    try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+            audio: { sampleRate: SAMPLE_RATE, channelCount: 1, echoCancellation: true,
+                     noiseSuppression: true, autoGainControl: true }
+        });
+    } catch (e) {
+        addMsg('system', 'Microphone access denied');
+        return;
+    }
+
+    audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+    const actualRate = audioCtx.sampleRate;
+
+    // AudioWorklet processor (inline)
+    const processorCode = `
+        class PcmSender extends AudioWorkletProcessor {
+            constructor() { super(); this.buffer = []; }
+            process(inputs) {
+                const input = inputs[0];
+                if (input && input[0]) {
+                    const samples = input[0];
+                    // Float32 → PCM16LE
+                    const pcm = new Int16Array(samples.length);
+                    for (let i = 0; i < samples.length; i++) {
+                        let s = Math.max(-1, Math.min(1, samples[i]));
+                        pcm[i] = s < 0 ? s * 32768 : s * 32767;
+                    }
+                    this.port.postMessage(pcm.buffer, [pcm.buffer]);
+                }
+                return true;
+            }
+        }
+        registerProcessor('pcm-sender', PcmSender);
+    `;
+    const blob = new Blob([processorCode], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    await audioCtx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+
+    const source = audioCtx.createMediaStreamSource(micStream);
+    workletNode = new AudioWorkletNode(audioCtx, 'pcm-sender');
+    workletNode.port.onmessage = (evt) => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(evt.data);  // binary PCM16LE
+        }
+    };
+    source.connect(workletNode);
+    workletNode.connect(audioCtx.destination);  // needed to keep worklet alive
+
+    // 告知服务端实际采样率
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'session.update',
+            sample_rate: actualRate,
+            voice: $('voiceInput').value
+        }));
+    }
+
+    micActive = true;
+    $('micBtn').classList.add('active');
+}
+
+function stopMic() {
+    if (workletNode) { workletNode.disconnect(); workletNode = null; }
+    if (audioCtx) { audioCtx.close(); audioCtx = null; }
+    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+    micActive = false;
+    $('micBtn').classList.remove('active');
+}
+
+// ============================================================================
+// 文本输入
+// ============================================================================
+function sendText() {
+    const input = $('textInput');
+    const text = input.value.trim();
+    if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+    addMsg('user', text);
+    ws.send(JSON.stringify({ type: 'text', text: text }));
+    input.value = '';
+}
+</script>
+</body>
+</html>

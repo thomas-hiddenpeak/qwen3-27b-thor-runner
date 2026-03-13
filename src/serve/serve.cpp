@@ -1562,6 +1562,11 @@ void ServeApp::handle_connection(int client_fd, int protocol) {
             std::string val = upgrade_it->second;
             std::transform(val.begin(), val.end(), val.begin(), ::tolower);
             if (val == "websocket") {
+                if (protocol == 1 && req.path == "/v1/realtime") {
+                    handle_websocket_realtime(client_fd, req);
+                    close(client_fd);
+                    return;
+                }
                 if (protocol == 1 && req.path == "/v1/voice") {
                     handle_websocket_voice(client_fd, req);
                     close(client_fd);
@@ -1624,7 +1629,8 @@ void ServeApp::handle_connection(int client_fd, int protocol) {
             handle_audio_transcriptions(req, client_fd);
         } else if (req.path == "/v1/audio/speech" && req.method == "POST") {
             handle_audio_speech(req, client_fd);
-        } else if (req.method == "GET" && (req.path == "/" || req.path.rfind("/examples/", 0) == 0)) {
+        } else if (req.method == "GET" && (req.path == "/" || req.path.rfind("/examples/", 0) == 0
+                                               || req.path.rfind("/tools/", 0) == 0)) {
             handle_static_file(req, client_fd);
         } else {
             HttpResponse resp;
@@ -4305,6 +4311,461 @@ void ServeApp::ws_voice_generate(int client_fd,
         safe_send_text("{\"type\":\"tts.done\",\"segments\":" +
                      std::to_string(tts_segment_idx.load()) + "}");
     }
+}
+
+// ============================================================================
+// WebSocket /v1/realtime — 持续双向语音通道
+//
+// 协议:
+//   Client→Server:
+//     Binary:  PCM16LE 音频帧 (持续发送, 服务端做 VAD)
+//     JSON:    {type:"session.update", voice:"...", sample_rate:N}
+//     JSON:    {type:"text", text:"..."}     — 文本输入
+//     JSON:    {type:"interrupt"}            — 中断当前生成
+//
+//   Server→Client:
+//     JSON:    {type:"session.created"}
+//     JSON:    {type:"input.speech_started"}
+//     JSON:    {type:"input.speech_stopped"}
+//     JSON:    {type:"input.transcription", text:"..."}
+//     JSON:    {type:"response.started"}
+//     JSON:    {type:"response.delta", delta:"..."}
+//     JSON:    {type:"response.done", text:"..."}
+//     JSON:    {type:"audio.started"}
+//     Binary:  PCM16LE 24kHz mono 音频帧 (TTS, 分块发送)
+//     JSON:    {type:"audio.done"}
+//     JSON:    {type:"error", message:"..."}
+// ============================================================================
+
+void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) {
+    if (!ws_handshake(client_fd, req)) {
+        fprintf(stderr, "[RT] Handshake failed fd=%d\n", client_fd);
+        return;
+    }
+    fprintf(stderr, "[RT] Realtime session started fd=%d\n", client_fd);
+
+    // ---- 会话配置 ----
+    std::string voice = "serena";
+    int client_sample_rate = 16000;
+    std::vector<std::pair<std::string, std::string>> chat_history;
+
+    // ---- 音频缓冲 + VAD ----
+    std::vector<int16_t> pcm_buffer;
+    constexpr float RT_VAD_ENERGY = 0.01f;
+    constexpr int RT_VAD_SILENCE_MS = 600;           // 静音多久判定语音结束
+    constexpr int RT_VAD_MIN_SPEECH_MS = 300;        // 最短语音
+    constexpr int RT_VAD_MAX_S = 30;                 // 最长录音
+    constexpr float RT_VAD_MIN_AVG_ENERGY = 0.008f;  // 整段最低平均 RMS
+    int silence_samples = 0;
+    bool speech_active = false;
+    double total_energy_sum = 0;
+    int total_samples_counted = 0;
+
+    // ---- 生成控制 ----
+    std::atomic<bool> generating{false};
+    std::atomic<bool> interrupted{false};
+    std::mutex send_mutex;
+
+    auto send_json = [&](const std::string& json) {
+        std::lock_guard<std::mutex> lock(send_mutex);
+        ws_send_text(client_fd, json);
+    };
+    auto send_audio = [&](const uint8_t* data, size_t len) {
+        std::lock_guard<std::mutex> lock(send_mutex);
+        ws_send_binary(client_fd, data, len);
+    };
+
+    // ---- 处理函数: ASR → LLM → TTS (在工作线程中运行) ----
+    auto process_voice_input = [&](std::vector<int16_t> audio, int sr) {
+        if (interrupted) { generating = false; return; }
+
+        // --- ASR ---
+        std::string asr_text;
+        if (asr_plugin_ && asr_plugin_->is_available()) {
+            std::vector<float> float_pcm(audio.size());
+            for (size_t i = 0; i < audio.size(); i++)
+                float_pcm[i] = audio[i] / 32768.0f;
+
+            auto result = asr_plugin_->transcribe_pcm(
+                float_pcm.data(), (int)float_pcm.size(), sr);
+            asr_text = result.text;
+            // 去除前后空白
+            while (!asr_text.empty() && (asr_text.front() == ' ' || asr_text.front() == '\n'))
+                asr_text.erase(asr_text.begin());
+            while (!asr_text.empty() && (asr_text.back() == ' ' || asr_text.back() == '\n'))
+                asr_text.pop_back();
+        }
+
+        if (asr_text.empty()) {
+            send_json("{\"type\":\"input.transcription\",\"text\":\"\"}");
+            generating = false;
+            return;
+        }
+
+        send_json("{\"type\":\"input.transcription\",\"text\":\"" + json_escape(asr_text) + "\"}");
+        if (interrupted) { generating = false; return; }
+
+        // --- LLM + TTS ---
+        process_text_input(asr_text, chat_history, voice, send_json, send_audio,
+                           generating, interrupted);
+    };
+
+    auto process_text = [&](const std::string& text) {
+        if (interrupted) { generating = false; return; }
+        process_text_input(text, chat_history, voice, send_json, send_audio,
+                           generating, interrupted);
+    };
+
+    // 发送 session.created
+    send_json("{\"type\":\"session.created\"}");
+
+    // ---- 主循环: 使用 poll 超时避免阻塞 ----
+    std::thread worker_thread;
+
+    while (running_) {
+        // poll with 100ms timeout 以保持响应性
+        struct pollfd pfd;
+        pfd.fd = client_fd;
+        pfd.events = POLLIN;
+        int ret = ::poll(&pfd, 1, 100);
+
+        if (ret < 0) break;  // error
+        if (ret == 0) continue;  // timeout, 继续循环
+        if (!(pfd.revents & POLLIN)) break;
+
+        uint8_t opcode;
+        std::vector<uint8_t> payload;
+        if (!ws_recv_frame(client_fd, opcode, payload)) break;
+
+        if (opcode == WS_OP_CLOSE) {
+            ws_send_frame(client_fd, WS_OP_CLOSE, nullptr, 0);
+            break;
+        }
+        if (opcode == WS_OP_PING) {
+            ws_send_frame(client_fd, WS_OP_PONG, payload.data(), payload.size());
+            continue;
+        }
+
+        // ---- Binary: 持续音频流 ----
+        if (opcode == WS_OP_BINARY) {
+            size_t num_samples = payload.size() / 2;
+            if (num_samples == 0) continue;
+
+            const int16_t* samples = reinterpret_cast<const int16_t*>(payload.data());
+
+            // 计算 RMS 能量
+            double energy_sum = 0;
+            for (size_t i = 0; i < num_samples; i++) {
+                float s = samples[i] / 32768.0f;
+                energy_sum += s * s;
+            }
+            float rms = std::sqrt((float)(energy_sum / num_samples));
+
+            // 正在生成时: 如果检测到用户说话 → 中断
+            if (generating) {
+                if (rms > RT_VAD_ENERGY * 3) {
+                    interrupted = true;
+                    // 等待工作线程结束
+                    if (worker_thread.joinable()) worker_thread.join();
+                    generating = false;
+                    interrupted = false;
+                    send_json("{\"type\":\"response.done\",\"text\":\"\",\"interrupted\":true}");
+                    send_json("{\"type\":\"audio.done\"}");
+                }
+                continue;
+            }
+
+            // VAD 处理
+            if (rms > RT_VAD_ENERGY) {
+                if (!speech_active) {
+                    speech_active = true;
+                    pcm_buffer.clear();
+                    total_energy_sum = 0;
+                    total_samples_counted = 0;
+                    silence_samples = 0;
+                    send_json("{\"type\":\"input.speech_started\"}");
+                }
+                silence_samples = 0;
+            } else if (speech_active) {
+                silence_samples += (int)num_samples;
+            }
+
+            if (speech_active) {
+                pcm_buffer.insert(pcm_buffer.end(), samples, samples + num_samples);
+                total_energy_sum += energy_sum;
+                total_samples_counted += (int)num_samples;
+
+                // 检查静音超时 → 语音结束
+                int silence_ms = silence_samples * 1000 / client_sample_rate;
+                int total_ms = (int)pcm_buffer.size() * 1000 / client_sample_rate;
+
+                bool speech_ended = (silence_ms >= RT_VAD_SILENCE_MS && total_ms > RT_VAD_MIN_SPEECH_MS);
+                bool max_reached = (total_ms >= RT_VAD_MAX_S * 1000);
+
+                if (speech_ended || max_reached) {
+                    speech_active = false;
+                    send_json("{\"type\":\"input.speech_stopped\"}");
+
+                    // 检查平均能量
+                    float avg_rms = total_samples_counted > 0
+                        ? std::sqrt((float)(total_energy_sum / total_samples_counted)) : 0;
+
+                    if (avg_rms < RT_VAD_MIN_AVG_ENERGY) {
+                        // 太安静, 不触发 ASR
+                        pcm_buffer.clear();
+                        continue;
+                    }
+
+                    // 启动处理线程
+                    if (worker_thread.joinable()) worker_thread.join();
+                    generating = true;
+                    interrupted = false;
+                    auto audio_copy = std::move(pcm_buffer);
+                    pcm_buffer.clear();
+                    int sr = client_sample_rate;
+                    worker_thread = std::thread([&, audio_copy, sr]() {
+                        process_voice_input(std::move(audio_copy), sr);
+                    });
+                }
+            }
+            continue;
+        }
+
+        // ---- Text: JSON 控制消息 ----
+        if (opcode == WS_OP_TEXT && !payload.empty()) {
+            std::string text(payload.begin(), payload.end());
+
+            // 简单 JSON 解析
+            auto get_str = [&](const std::string& key) -> std::string {
+                std::string search = "\"" + key + "\"";
+                auto pos = text.find(search);
+                if (pos == std::string::npos) return "";
+                pos = text.find(':', pos + search.size());
+                if (pos == std::string::npos) return "";
+                pos = text.find('"', pos + 1);
+                if (pos == std::string::npos) return "";
+                auto end = text.find('"', pos + 1);
+                if (end == std::string::npos) return "";
+                return text.substr(pos + 1, end - pos - 1);
+            };
+            auto get_int = [&](const std::string& key) -> int {
+                std::string search = "\"" + key + "\"";
+                auto pos = text.find(search);
+                if (pos == std::string::npos) return -1;
+                pos = text.find(':', pos + search.size());
+                if (pos == std::string::npos) return -1;
+                pos++;
+                while (pos < text.size() && text[pos] == ' ') pos++;
+                return std::atoi(text.c_str() + pos);
+            };
+
+            std::string msg_type = get_str("type");
+
+            if (msg_type == "session.update") {
+                auto v = get_str("voice");
+                if (!v.empty()) voice = v;
+                int sr = get_int("sample_rate");
+                if (sr > 0) client_sample_rate = sr;
+                fprintf(stderr, "[RT] Config: voice=%s sample_rate=%d\n",
+                        voice.c_str(), client_sample_rate);
+            }
+            else if (msg_type == "text") {
+                auto input_text = get_str("text");
+                if (!input_text.empty() && !generating) {
+                    if (worker_thread.joinable()) worker_thread.join();
+                    generating = true;
+                    interrupted = false;
+                    worker_thread = std::thread([&, input_text]() {
+                        process_text(input_text);
+                    });
+                }
+            }
+            else if (msg_type == "interrupt") {
+                if (generating) {
+                    interrupted = true;
+                }
+            }
+        }
+    }
+
+    // 清理
+    interrupted = true;
+    if (worker_thread.joinable()) worker_thread.join();
+
+    fprintf(stderr, "[RT] Realtime session ended fd=%d\n", client_fd);
+}
+
+// ============================================================================
+// process_text_input — LLM 生成 + TTS 合成 + 分块音频发送
+// ============================================================================
+
+void ServeApp::process_text_input(
+    const std::string& user_text,
+    std::vector<std::pair<std::string, std::string>>& chat_history,
+    const std::string& voice,
+    const std::function<void(const std::string&)>& send_json,
+    const std::function<void(const uint8_t*, size_t)>& send_audio,
+    std::atomic<bool>& generating,
+    std::atomic<bool>& interrupted)
+{
+    const auto& tok = backend_.tokenizer();
+    if (!tok.is_loaded()) {
+        send_json("{\"type\":\"error\",\"message\":\"Tokenizer not loaded\"}");
+        generating = false;
+        return;
+    }
+
+    chat_history.push_back({"user", user_text});
+    while (chat_history.size() > 20) chat_history.erase(chat_history.begin());
+
+    std::vector<std::pair<std::string, std::string>> messages;
+    messages.push_back({"system", "你是通义千问，一个有帮助的AI助手。请简洁、自然地回答问题。"});
+    for (auto& [role, content] : chat_history) messages.push_back({role, content});
+
+    auto prompt_tokens = tok.apply_chat_template(messages, true, false);
+
+    InferRequest infer_req;
+    infer_req.request_id     = next_request_id();
+    infer_req.prompt_tokens  = std::move(prompt_tokens);
+    infer_req.max_new_tokens = 512;
+    infer_req.temperature    = 0.7f;
+    infer_req.top_p          = 0.8f;
+    infer_req.top_k          = 20;
+    infer_req.presence_penalty = 1.5f;
+    infer_req.stream         = true;
+
+    register_request(infer_req.request_id);
+
+    if (!backend_.submit(infer_req)) {
+        unregister_request(infer_req.request_id);
+        send_json("{\"type\":\"error\",\"message\":\"Request queue full\"}");
+        generating = false;
+        return;
+    }
+
+    bool do_tts = tts_plugin_ && tts_plugin_->is_available();
+
+    send_json("{\"type\":\"response.started\"}");
+
+    // ---- TTS 生产者-消费者 ----
+    std::queue<std::string> tts_queue;
+    std::mutex tts_mutex;
+    std::condition_variable tts_cv;
+    bool tts_done_flag = false;
+
+    constexpr size_t AUDIO_CHUNK_SAMPLES = 4800;  // 200ms @ 24kHz
+
+    std::thread tts_thread;
+    if (do_tts) {
+        send_json("{\"type\":\"audio.started\"}");
+        auto* tts_raw = tts_plugin_.get();
+        tts_thread = std::thread([&, tts_raw]() {
+            while (true) {
+                if (interrupted) break;
+                std::string sentence;
+                {
+                    std::unique_lock<std::mutex> lock(tts_mutex);
+                    tts_cv.wait(lock, [&]{ return !tts_queue.empty() || tts_done_flag; });
+                    if (tts_queue.empty() && tts_done_flag) break;
+                    if (tts_queue.empty()) continue;
+                    sentence = std::move(tts_queue.front());
+                    tts_queue.pop();
+                }
+                if (interrupted) break;
+
+                auto result = tts_raw->synthesize(sentence, voice, 1.0f, "pcm");
+
+                if (interrupted) break;
+                if (result.error_code != 0 || result.audio_data.empty()) continue;
+
+                // 分块发送音频 (200ms 一帧, 而不是一次性全发)
+                const uint8_t* ptr = result.audio_data.data();
+                size_t remaining = result.audio_data.size();
+                const size_t chunk_bytes = AUDIO_CHUNK_SAMPLES * 2;  // PCM16 = 2 bytes/sample
+
+                while (remaining > 0 && !interrupted) {
+                    size_t send_size = std::min(remaining, chunk_bytes);
+                    send_audio(ptr, send_size);
+                    ptr += send_size;
+                    remaining -= send_size;
+                }
+            }
+        });
+    }
+
+    auto push_tts = [&](const std::string& sentence) {
+        if (!do_tts || sentence.empty()) return;
+        std::lock_guard<std::mutex> lock(tts_mutex);
+        tts_queue.push(sentence);
+        tts_cv.notify_one();
+    };
+
+    // ---- LLM 流式生成 ----
+    std::string full_response;
+    std::string pending_sentence;
+
+    poll_tokens(infer_req.request_id,
+        [&](const std::string& piece) {
+            if (interrupted) return;
+            full_response += piece;
+            pending_sentence += piece;
+
+            send_json("{\"type\":\"response.delta\",\"delta\":\"" + json_escape(piece) + "\"}");
+
+            if (!do_tts) return;
+
+            // 句尾检测
+            size_t pos = pending_sentence.size();
+            if (pos == 0) return;
+            size_t last_start = pos - 1;
+            while (last_start > 0 && (pending_sentence[last_start] & 0xC0) == 0x80)
+                last_start--;
+            std::string last_ch = pending_sentence.substr(last_start);
+
+            bool is_sent_end = is_sentence_end_punct(last_ch) && pending_sentence.size() >= 15;
+            bool is_clause = (pending_sentence.size() > 100 &&
+                             (last_ch == "，" || last_ch == "," ||
+                              last_ch == "；" || last_ch == ";" ||
+                              last_ch == "：" || last_ch == ":"));
+
+            if (is_sent_end || is_clause) {
+                std::string sentence = pending_sentence;
+                while (!sentence.empty() && (sentence.back() == ' ' || sentence.back() == '\n'))
+                    sentence.pop_back();
+                if (!sentence.empty()) push_tts(sentence);
+                pending_sentence.clear();
+            }
+        },
+        config_.timeout_s,
+        false, {}, {}, {}, nullptr, &interrupted, nullptr
+    );
+
+    // 推送剩余
+    if (!pending_sentence.empty()) {
+        std::string sentence = pending_sentence;
+        while (!sentence.empty() && (sentence.back() == ' ' || sentence.back() == '\n'))
+            sentence.pop_back();
+        if (!sentence.empty()) push_tts(sentence);
+    }
+
+    // LLM 完成
+    bool was_interrupted = interrupted.load();
+    send_json("{\"type\":\"response.done\",\"text\":\"" + json_escape(full_response) +
+              "\",\"interrupted\":" + (was_interrupted ? "true" : "false") + "}");
+    chat_history.push_back({"assistant", full_response});
+
+    // 等待 TTS 完成
+    if (do_tts && tts_thread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(tts_mutex);
+            tts_done_flag = true;
+            tts_cv.notify_one();
+        }
+        tts_thread.join();
+        send_json("{\"type\":\"audio.done\"}");
+    }
+
+    generating = false;
 }
 
 } // namespace serve
