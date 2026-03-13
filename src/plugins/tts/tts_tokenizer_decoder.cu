@@ -959,7 +959,7 @@ void SpeechTokenizerDecoder::run_upsample(
         if (stage == 1) {
             stage_out = output;
         } else {
-            cudaMalloc(&stage_out, out_size);
+            stage_out = (float*)decode_pool_.alloc(out_size);
         }
 
         // ConvTranspose1d: [dim, T] → [dim, T_new], no padding (kernel=stride)
@@ -973,12 +973,9 @@ void SpeechTokenizerDecoder::run_upsample(
         auto& cn = upsample_[stage].convnext;
 
         // Allocate temp buffers for ConvNeXt
-        float* dw_out = nullptr;    // [dim, T_new]
-        float* dw_tl = nullptr;     // [T_new, dim]
-        float* pw1_out = nullptr;   // [T_new, 4*dim]
-        cudaMalloc(&dw_out, out_size);
-        cudaMalloc(&dw_tl, out_size);
-        cudaMalloc(&pw1_out, (size_t)4 * dim * T_new * sizeof(float));
+        float* dw_out = (float*)decode_pool_.alloc(out_size);
+        float* dw_tl = (float*)decode_pool_.alloc(out_size);
+        float* pw1_out = (float*)decode_pool_.alloc((size_t)4 * dim * T_new * sizeof(float));
 
         // Depthwise Conv1d (groups=dim, k=7)
         dim3 dw_grid(dim, (T_new + 255) / 256);
@@ -1029,13 +1026,13 @@ void SpeechTokenizerDecoder::run_upsample(
         add_kernel<<<(total + 255) / 256, 256, 0, s>>>(stage_out, dw_out, total);
 
         // Free ConvNeXt temp buffers
-        cudaFree(dw_out);
-        cudaFree(dw_tl);
-        cudaFree(pw1_out);
+        decode_pool_.free(dw_out);
+        decode_pool_.free(dw_tl);
+        decode_pool_.free(pw1_out);
 
         // Free previous stage input if we allocated it
         if (stage > 0 && stage_in != input) {
-            cudaFree(stage_in);
+            decode_pool_.free(stage_in);
         }
 
         stage_in = stage_out;
@@ -1061,8 +1058,7 @@ void SpeechTokenizerDecoder::run_bigvgan(
     // Each stage upsamples T significantly, so buffers grow
 
     // Initial conv: [latent=1024, T] → [dec_dim=1536, T]
-    float* conv_out = nullptr;
-    cudaMalloc(&conv_out, (size_t)dec_dim * T * sizeof(float));
+    float* conv_out = (float*)decode_pool_.alloc((size_t)dec_dim * T * sizeof(float));
     dim3 grid(dec_dim, (T + 255) / 256);
     causal_conv1d_kernel<<<grid, 256, 0, s>>>(
         conv_out, input, initial_conv_w_, initial_conv_b_,
@@ -1086,8 +1082,7 @@ void SpeechTokenizerDecoder::run_bigvgan(
             decoder_stages_[stage].snake_beta, in_dim, T);
 
         // Allocate output buffer for transposed conv
-        float* buf_b = nullptr;
-        cudaMalloc(&buf_b, out_size);
+        float* buf_b = (float*)decode_pool_.alloc(out_size);
 
         // ConvTranspose1d: [in_dim, T] → [out_dim, T_new] (right-crop = kernel - stride)
         dim3 tc_grid(out_dim, (T_new + 255) / 256);
@@ -1097,13 +1092,11 @@ void SpeechTokenizerDecoder::run_bigvgan(
             in_dim, out_dim, kernel, upsample_rate, T, T_new);
 
         // Free input buffer (no longer needed after transconv reads it)
-        cudaFree(buf_a);
+        decode_pool_.free(buf_a);
 
         // Allocate residual and temp buffers for ResBlocks
-        float* res_buf = nullptr;
-        float* temp_buf = nullptr;
-        cudaMalloc(&res_buf, out_size);
-        cudaMalloc(&temp_buf, out_size);
+        float* res_buf = (float*)decode_pool_.alloc(out_size);
+        float* temp_buf = (float*)decode_pool_.alloc(out_size);
 
         // 3 ResBlocks with dilations [1, 3, 9]
         for (int r = 0; r < 3; r++) {
@@ -1140,8 +1133,8 @@ void SpeechTokenizerDecoder::run_bigvgan(
         }
 
         // Free ResBlock temp buffers
-        cudaFree(res_buf);
-        cudaFree(temp_buf);
+        decode_pool_.free(res_buf);
+        decode_pool_.free(temp_buf);
 
         // Next stage: buf_b becomes buf_a
         buf_a = buf_b;
@@ -1161,7 +1154,7 @@ void SpeechTokenizerDecoder::run_bigvgan(
         output, buf_a, final_conv_w_, final_conv_b_,
         final_dim, 1, 7, T, T, 1, 1);
 
-    cudaFree(buf_a);
+    decode_pool_.free(buf_a);
 
     // Clamp to [-1, 1]
     clamp_kernel<<<(T + 255) / 256, 256, 0, s>>>(output, T, -1.0f, 1.0f);
@@ -1191,8 +1184,7 @@ std::vector<float> SpeechTokenizerDecoder::chunked_decode(
         int chunk_len = end - chunk_start;
 
         // Allocate temp for chunk codes and outputs
-        int* chunk_codes = nullptr;
-        cudaMalloc(&chunk_codes, config_.num_quantizers * chunk_len * sizeof(int));
+        int* chunk_codes = (int*)decode_pool_.alloc(config_.num_quantizers * chunk_len * sizeof(int));
 
         // Copy chunk codes: for each quantizer, copy chunk_len ints
         for (int q = 0; q < config_.num_quantizers; q++) {
@@ -1203,33 +1195,29 @@ std::vector<float> SpeechTokenizerDecoder::chunked_decode(
         }
 
         // RVQ dequant → [512, chunk_len]
-        float* latent = nullptr;
         size_t latent_size = config_.codebook_dim * chunk_len * sizeof(float);
-        cudaMalloc(&latent, latent_size);
+        float* latent = (float*)decode_pool_.alloc(latent_size);
 
         rvq_dequant(chunk_codes, chunk_len, latent, s);
 
         if (start == 0) debug_tensor("rvq_dequant", latent, std::min(config_.codebook_dim * chunk_len, 1000), s);
 
         // Pre-conv → [1024, chunk_len]
-        float* pre_conv_out = nullptr;
-        cudaMalloc(&pre_conv_out, config_.latent_dim * chunk_len * sizeof(float));
+        float* pre_conv_out = (float*)decode_pool_.alloc(config_.latent_dim * chunk_len * sizeof(float));
         run_pre_conv(latent, chunk_len, pre_conv_out, s);
 
         if (start == 0) debug_tensor("pre_conv", pre_conv_out, std::min(config_.latent_dim * chunk_len, 1000), s);
 
         // Pre-transformer → [1024, chunk_len]
-        float* pt_out = nullptr;
-        cudaMalloc(&pt_out, config_.latent_dim * chunk_len * sizeof(float));
+        float* pt_out = (float*)decode_pool_.alloc(config_.latent_dim * chunk_len * sizeof(float));
         run_pre_transformer(pre_conv_out, chunk_len, pt_out, s);
 
         if (start == 0) debug_tensor("pre_transformer", pt_out, std::min(config_.latent_dim * chunk_len, 1000), s);
 
         // Upsample → [1024, chunk_len * 4]
         int T_up;
-        float* upsample_out = nullptr;
         int T_after_up = chunk_len * 4;
-        cudaMalloc(&upsample_out, (size_t)config_.latent_dim * T_after_up * sizeof(float));
+        float* upsample_out = (float*)decode_pool_.alloc((size_t)config_.latent_dim * T_after_up * sizeof(float));
         run_upsample(pt_out, chunk_len, upsample_out, T_up, s);
 
         if (start == 0) debug_tensor("upsample", upsample_out, std::min(config_.latent_dim * T_up, 1000), s);
@@ -1237,8 +1225,7 @@ std::vector<float> SpeechTokenizerDecoder::chunked_decode(
         // BigVGAN → [1, T_pcm]
         int T_pcm;
         int expected_pcm = chunk_len * upsample;
-        float* pcm_out = nullptr;
-        cudaMalloc(&pcm_out, expected_pcm * sizeof(float));
+        float* pcm_out = (float*)decode_pool_.alloc(expected_pcm * sizeof(float));
         run_bigvgan(upsample_out, T_up, pcm_out, T_pcm, s);
 
         if (start == 0) debug_tensor("bigvgan_pcm", pcm_out, std::min(T_pcm, 1000), s);
@@ -1255,13 +1242,13 @@ std::vector<float> SpeechTokenizerDecoder::chunked_decode(
             all_pcm.insert(all_pcm.end(), chunk_pcm.begin(), chunk_pcm.end());
         }
 
-        // Cleanup
-        cudaFree(chunk_codes);
-        cudaFree(latent);
-        cudaFree(pre_conv_out);
-        cudaFree(pt_out);
-        cudaFree(upsample_out);
-        cudaFree(pcm_out);
+        // Return buffers to pool
+        decode_pool_.free(chunk_codes);
+        decode_pool_.free(latent);
+        decode_pool_.free(pre_conv_out);
+        decode_pool_.free(pt_out);
+        decode_pool_.free(upsample_out);
+        decode_pool_.free(pcm_out);
 
         start = end;
     }
@@ -1279,55 +1266,49 @@ std::vector<float> SpeechTokenizerDecoder::decode(
 
     // Upload codes to GPU: [num_groups, num_frames]
     int total = num_groups * num_frames;
-    int* d_codes = nullptr;
-    cudaMalloc(&d_codes, total * sizeof(int));
+    int* d_codes = (int*)decode_pool_.alloc(total * sizeof(int));
     cudaMemcpy(d_codes, codes_cpu, total * sizeof(int), cudaMemcpyHostToDevice);
 
     std::vector<float> pcm;
     if (num_frames <= config_.chunk_size + config_.left_context_size) {
         // Small enough to decode in one shot
-        float* latent = nullptr;
-        cudaMalloc(&latent, config_.codebook_dim * num_frames * sizeof(float));
+        float* latent = (float*)decode_pool_.alloc(config_.codebook_dim * num_frames * sizeof(float));
         rvq_dequant(d_codes, num_frames, latent, s);
         debug_tensor("rvq_dequant", latent, std::min(config_.codebook_dim * num_frames, 1000), s);
 
-        float* pre_conv_out = nullptr;
-        cudaMalloc(&pre_conv_out, config_.latent_dim * num_frames * sizeof(float));
+        float* pre_conv_out = (float*)decode_pool_.alloc(config_.latent_dim * num_frames * sizeof(float));
         run_pre_conv(latent, num_frames, pre_conv_out, s);
         debug_tensor("pre_conv", pre_conv_out, std::min(config_.latent_dim * num_frames, 1000), s);
 
-        float* pt_out = nullptr;
-        cudaMalloc(&pt_out, config_.latent_dim * num_frames * sizeof(float));
+        float* pt_out = (float*)decode_pool_.alloc(config_.latent_dim * num_frames * sizeof(float));
         run_pre_transformer(pre_conv_out, num_frames, pt_out, s);
         debug_tensor("pre_transformer", pt_out, std::min(config_.latent_dim * num_frames, 1000), s);
 
         int T_up;
         int T_after_up = num_frames * 4;
-        float* up_out = nullptr;
-        cudaMalloc(&up_out, (size_t)config_.latent_dim * T_after_up * sizeof(float));
+        float* up_out = (float*)decode_pool_.alloc((size_t)config_.latent_dim * T_after_up * sizeof(float));
         run_upsample(pt_out, num_frames, up_out, T_up, s);
         debug_tensor("upsample", up_out, std::min(config_.latent_dim * T_up, 1000), s);
 
         int T_pcm;
         int expected_pcm = num_frames * config_.decode_upsample_rate;
-        float* pcm_out = nullptr;
-        cudaMalloc(&pcm_out, (size_t)expected_pcm * sizeof(float));
+        float* pcm_out = (float*)decode_pool_.alloc((size_t)expected_pcm * sizeof(float));
         run_bigvgan(up_out, T_up, pcm_out, T_pcm, s);
         debug_tensor("bigvgan_pcm", pcm_out, std::min(T_pcm, 1000), s);
 
         pcm.resize(T_pcm);
         cudaMemcpy(pcm.data(), pcm_out, T_pcm * sizeof(float), cudaMemcpyDeviceToHost);
 
-        cudaFree(latent);
-        cudaFree(pre_conv_out);
-        cudaFree(pt_out);
-        cudaFree(up_out);
-        cudaFree(pcm_out);
+        decode_pool_.free(latent);
+        decode_pool_.free(pre_conv_out);
+        decode_pool_.free(pt_out);
+        decode_pool_.free(up_out);
+        decode_pool_.free(pcm_out);
     } else {
         pcm = chunked_decode(d_codes, num_frames, s);
     }
 
-    cudaFree(d_codes);
+    decode_pool_.free(d_codes);
     return pcm;
 }
 

@@ -20,9 +20,47 @@
 #include <cublas_v2.h>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 namespace qwen_thor {
 namespace tts {
+
+// GPU memory pool: caches freed allocations by size for zero-overhead reuse.
+// After the first decode() call, all subsequent calls with the same T reuse
+// cached blocks — eliminates ~26 cudaMalloc/cudaFree per decode pass.
+struct GpuMemPool {
+    std::unordered_map<void*, size_t> live;
+    std::unordered_map<size_t, std::vector<void*>> free_list;
+
+    void* alloc(size_t bytes) {
+        size_t a = (bytes + 255) & ~255;
+        auto& fl = free_list[a];
+        void* p;
+        if (!fl.empty()) {
+            p = fl.back();
+            fl.pop_back();
+        } else {
+            cudaMalloc(&p, a);
+        }
+        live[p] = a;
+        return p;
+    }
+
+    void free(void* ptr) {
+        auto it = live.find(ptr);
+        if (it != live.end()) {
+            free_list[it->second].push_back(ptr);
+            live.erase(it);
+        }
+    }
+
+    ~GpuMemPool() {
+        for (auto& [p, sz] : live) cudaFree(p);
+        for (auto& [sz, ptrs] : free_list) {
+            for (auto p : ptrs) cudaFree(p);
+        }
+    }
+};
 
 // Per-layer weights for pre-transformer (8 layers)
 struct TokenizerTransformerLayerWeights {
@@ -146,6 +184,9 @@ private:
 
     // Weight ownership tracking
     std::vector<void*> device_ptrs_;
+
+    // GPU memory pool for decode pipeline (eliminates per-call cudaMalloc/cudaFree)
+    GpuMemPool decode_pool_;
 
     // ===== Internal methods =====
 

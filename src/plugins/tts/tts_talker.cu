@@ -696,8 +696,6 @@ void Talker::talker_layer_forward_prefill(
     cublas_gemm(cublas_handle_, norm_buf, gate_buf, lw.down_proj_w,
                 seq_len, tc.intermediate_size, h, stream);
     audio_ops::invoke_add_residual(hidden, norm_buf, seq_len * h, stream);
-
-    cudaStreamSynchronize(stream);
 }
 
 // ============================================================================
@@ -769,7 +767,8 @@ void Talker::talker_layer_forward_decode(
                 1, tc.intermediate_size, h, stream);
     audio_ops::invoke_add_residual(hidden, norm_buf, h, stream);
 
-    cudaStreamSynchronize(stream);
+    // No per-layer sync needed: all ops enqueued on same stream,
+    // ordering guaranteed. Final sync at end of forward_decode_step.
 }
 
 // ============================================================================
@@ -843,8 +842,6 @@ void Talker::cp_layer_forward_prefill(
     audio_ops::invoke_swiglu(gate_buf, gate_buf, up_buf, seq_len, cp.intermediate_size, stream);
     cublas_gemm(cublas_handle_, norm_buf, gate_buf, lw.down_proj_w, seq_len, cp.intermediate_size, h, stream);
     audio_ops::invoke_add_residual(hidden, norm_buf, seq_len * h, stream);
-
-    cudaStreamSynchronize(stream);
 }
 
 void Talker::cp_layer_forward_decode(
@@ -907,7 +904,7 @@ void Talker::cp_layer_forward_decode(
     cublas_gemm(cublas_handle_, norm_buf, gate_buf, lw.down_proj_w, 1, cp.intermediate_size, h, stream);
     audio_ops::invoke_add_residual(hidden, norm_buf, h, stream);
 
-    cudaStreamSynchronize(stream);
+    // No per-layer sync needed: all ops on same stream.
 }
 
 // ============================================================================
@@ -1081,18 +1078,17 @@ int Talker::forward_decode_step(int* codec_out, cudaStream_t stream) {
                                    rep_penalty_, stream);
     }
 
-    // Step 2: Sample group 0 (needs CPU sync for EOS check + rep_penalty tracking)
+    // Step 2: Sample group 0 on GPU (vocab=3072 fits in SMEM)
     static std::mt19937_64 talker_rng(12345);
-    invoke_sample_top_k_top_p(logits_, tc.vocab_size,
-                               top_k_, top_p_, temperature_,
-                               sampled_token_, talker_rng(), stream);
-    // invoke_sample_top_k_top_p already syncs internally
+    invoke_gpu_sample_top_k_top_p(logits_, tc.vocab_size,
+                                   top_k_, top_p_, temperature_,
+                                   codec_out_gpu_, talker_rng(), stream);
 
-    int group_0_id = sampled_token_[0];
+    // Single sync + D2H copy for EOS check
+    cudaStreamSynchronize(stream);
+    int group_0_id;
+    cudaMemcpy(&group_0_id, codec_out_gpu_, sizeof(int), cudaMemcpyDeviceToHost);
     codec_out[0] = group_0_id;
-
-    // Store group_0 on GPU for CodePredictor embedding lookup
-    cudaMemcpyAsync(codec_out_gpu_, &group_0_id, sizeof(int), cudaMemcpyHostToDevice, stream);
 
     // Check EOS
     if (group_0_id == tc.codec_eos_token_id) {
