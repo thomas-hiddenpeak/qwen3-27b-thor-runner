@@ -496,7 +496,6 @@ int TTSEngine::synthesize_streaming(
     bool aborted = false;
 
     // 3. Generate + decode in chunks
-    // Helper lambda: decode accumulated chunk_codes and send via callback
     auto decode_and_send = [&]() {
         if (chunk_codes.empty() || aborted) return;
         int T = (int)chunk_codes.size();
@@ -522,7 +521,7 @@ int TTSEngine::synthesize_streaming(
         bool eos = false;
         for (int f = 0; f < chunk_frames && total_steps < max_new_tokens; f++) {
             int ret = talker_->forward_decode_step(codec_step.data(), stream_);
-            if (ret < 0) { eos = true; break; }  // EOS
+            if (ret < 0) { eos = true; break; }
             chunk_codes.push_back(codec_step);
             total_steps++;
         }

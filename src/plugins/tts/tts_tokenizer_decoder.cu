@@ -41,7 +41,11 @@ __global__ void codebook_lookup_add_kernel(
 // weight stored as [out_dim, in_dim]
 // This is just a batched GEMV over T positions
 
-// ---------- Causal Conv1d: output[out_c, t] = sum_{k,ic} weight[oc,ic,k] * input[ic, t-pad+k] + bias[oc] ----------
+// ---------- Causal Conv1d with SMEM weight caching ----------
+// output[out_c, t] = sum_{k,ic} weight[oc,ic,k] * input[ic, t-pad+k] + bias[oc]
+// Weight per output channel is cached in shared memory, eliminating redundant
+// global memory reads across threads in the same block.
+// Dynamic SMEM size = in_channels * kernel_size * sizeof(float)
 __global__ void causal_conv1d_kernel(
     float* __restrict__ output,           // [out_channels, T_out]
     const float* __restrict__ input,      // [in_channels, T_in]
@@ -50,20 +54,31 @@ __global__ void causal_conv1d_kernel(
     int in_channels, int out_channels, int kernel_size,
     int T_in, int T_out, int dilation, int stride)
 {
+    extern __shared__ float w_smem[];
     int oc = blockIdx.x;
     int t_out = blockIdx.y * blockDim.x + threadIdx.x;
-    if (oc >= out_channels || t_out >= T_out) return;
+    if (oc >= out_channels) return;
+
+    // Cooperatively load weight for this output channel into SMEM
+    int w_size = in_channels * kernel_size;
+    int w_offset = oc * w_size;
+    for (int i = threadIdx.x; i < w_size; i += blockDim.x) {
+        w_smem[i] = weight[w_offset + i];
+    }
+    __syncthreads();
+
+    if (t_out >= T_out) return;
 
     int eff_k = (kernel_size - 1) * dilation + 1;
     int pad = eff_k - stride;  // left padding for causal
 
     float sum = bias ? bias[oc] : 0.0f;
     for (int ic = 0; ic < in_channels; ic++) {
+        const float* w = w_smem + ic * kernel_size;
         for (int k = 0; k < kernel_size; k++) {
             int t_in = t_out * stride + k * dilation - pad;
             if (t_in >= 0 && t_in < T_in) {
-                sum += weight[(oc * in_channels + ic) * kernel_size + k] *
-                       input[ic * T_in + t_in];
+                sum += w[k] * input[ic * T_in + t_in];
             }
         }
     }
@@ -93,10 +108,12 @@ __global__ void depthwise_causal_conv1d_kernel(
     output[ch * T_out + t] = sum;
 }
 
-// ---------- Causal Transposed Conv1d ----------
+// ---------- Causal Transposed Conv1d with stride-skip + SMEM weight ----------
 // ConvTranspose1d with right-side cropping (causal):
 // Full output T = (T_in - 1) * stride + kernel, then crop right (kernel - stride)
 // Result: T_out = T_in * stride
+// Optimization: only iterate k values where (t_out - k) % stride == 0,
+// reducing iterations from kernel_size to kernel_size/stride.
 __global__ void causal_transconv1d_kernel(
     float* __restrict__ output,           // [out_channels, T_out]
     const float* __restrict__ input,      // [in_channels, T_in]
@@ -105,31 +122,29 @@ __global__ void causal_transconv1d_kernel(
     int in_channels, int out_channels, int kernel_size, int stride,
     int T_in, int T_out)
 {
-    // Each thread computes one output element
     int oc = blockIdx.x;
     int t_out = blockIdx.y * blockDim.x + threadIdx.x;
     if (oc >= out_channels || t_out >= T_out) return;
 
     float sum = bias ? bias[oc] : 0.0f;
+
+    // Only k values where (t_out - k) % stride == 0 contribute
+    int r = t_out % stride;
     for (int ic = 0; ic < in_channels; ic++) {
-        for (int k = 0; k < kernel_size; k++) {
-            // Full transconv: t_out_full = t_in * stride + k
-            // With right-crop, t_out_full == t_out for the first T_out positions
-            int t_in_x_stride = t_out - k;
-            if (t_in_x_stride >= 0 && t_in_x_stride % stride == 0) {
-                int t_in = t_in_x_stride / stride;
-                if (t_in >= 0 && t_in < T_in) {
-                    sum += weight[(ic * out_channels + oc) * kernel_size + k] *
-                           input[ic * T_in + t_in];
-                }
+        for (int k = r; k < kernel_size; k += stride) {
+            int t_in = (t_out - k) / stride;
+            if (t_in >= 0 && t_in < T_in) {
+                sum += weight[(ic * out_channels + oc) * kernel_size + k] *
+                       input[ic * T_in + t_in];
             }
         }
     }
     output[oc * T_out + t_out] = sum;
 }
 
-// ---------- SnakeBeta activation ----------
+// ---------- SnakeBeta activation (fast math) ----------
 // x + (1/(exp(beta) + eps)) * sin²(x * exp(alpha))
+// Uses exp2f + LOG2E instead of expf, __sinf for fast sine
 __global__ void snake_beta_kernel(
     float* __restrict__ x,                // [channels, T] — in-place
     const float* __restrict__ alpha,      // [channels]
@@ -140,10 +155,11 @@ __global__ void snake_beta_kernel(
     int t = blockIdx.y * blockDim.x + threadIdx.x;
     if (ch >= channels || t >= T) return;
 
-    float a = expf(alpha[ch]);
-    float b = expf(beta[ch]);
+    constexpr float LOG2E = 1.4426950408889634f;
+    float a = exp2f(alpha[ch] * LOG2E);
+    float b = exp2f(beta[ch] * LOG2E);
     float val = x[ch * T + t];
-    float s = sinf(val * a);
+    float s = __sinf(val * a);
     x[ch * T + t] = val + (1.0f / (b + 1e-9f)) * s * s;
 }
 
@@ -683,7 +699,8 @@ void SpeechTokenizerDecoder::run_pre_conv(
     int out_c = config_.latent_dim;    // 1024
     int k = 3;
     dim3 grid(out_c, (T + 255) / 256);
-    causal_conv1d_kernel<<<grid, 256, 0, s>>>(
+    int smem = in_c * k * sizeof(float);
+    causal_conv1d_kernel<<<grid, 256, smem, s>>>(
         output, input, pre_conv_w_, pre_conv_b_,
         in_c, out_c, k, T, T, /*dilation=*/1, /*stride=*/1);
 }
@@ -1060,7 +1077,8 @@ void SpeechTokenizerDecoder::run_bigvgan(
     // Initial conv: [latent=1024, T] → [dec_dim=1536, T]
     float* conv_out = (float*)decode_pool_.alloc((size_t)dec_dim * T * sizeof(float));
     dim3 grid(dec_dim, (T + 255) / 256);
-    causal_conv1d_kernel<<<grid, 256, 0, s>>>(
+    int smem_init = latent * 7 * sizeof(float);
+    causal_conv1d_kernel<<<grid, 256, smem_init, s>>>(
         conv_out, input, initial_conv_w_, initial_conv_b_,
         latent, dec_dim, 7, T, T, 1, 1);
 
@@ -1113,7 +1131,8 @@ void SpeechTokenizerDecoder::run_bigvgan(
 
             // Conv1 (dilated): [out_dim, T_new] → [out_dim, T_new]
             dim3 c1_grid(out_dim, (T_new + 255) / 256);
-            causal_conv1d_kernel<<<c1_grid, 256, 0, s>>>(
+            int smem_c1 = out_dim * 7 * sizeof(float);
+            causal_conv1d_kernel<<<c1_grid, 256, smem_c1, s>>>(
                 temp_buf, buf_b, rb.conv1_w, rb.conv1_b,
                 out_dim, out_dim, 7, T_new, T_new, dil, 1);
 
@@ -1123,7 +1142,8 @@ void SpeechTokenizerDecoder::run_bigvgan(
 
             // Conv2 (k=1): [out_dim, T_new] → [out_dim, T_new]
             dim3 c2_grid(out_dim, (T_new + 255) / 256);
-            causal_conv1d_kernel<<<c2_grid, 256, 0, s>>>(
+            int smem_c2 = out_dim * 1 * sizeof(float);
+            causal_conv1d_kernel<<<c2_grid, 256, smem_c2, s>>>(
                 buf_b, temp_buf, rb.conv2_w, rb.conv2_b,
                 out_dim, out_dim, 1, T_new, T_new, 1, 1);
 
@@ -1150,7 +1170,8 @@ void SpeechTokenizerDecoder::run_bigvgan(
 
     // Final conv: [96, T] → [1, T]
     dim3 fc_grid(1, (T + 255) / 256);
-    causal_conv1d_kernel<<<fc_grid, 256, 0, s>>>(
+    int smem_final = final_dim * 7 * sizeof(float);
+    causal_conv1d_kernel<<<fc_grid, 256, smem_final, s>>>(
         output, buf_a, final_conv_w_, final_conv_b_,
         final_dim, 1, 7, T, T, 1, 1);
 
@@ -1267,7 +1288,7 @@ std::vector<float> SpeechTokenizerDecoder::decode(
     // Upload codes to GPU: [num_groups, num_frames]
     int total = num_groups * num_frames;
     int* d_codes = (int*)decode_pool_.alloc(total * sizeof(int));
-    cudaMemcpy(d_codes, codes_cpu, total * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_codes, codes_cpu, total * sizeof(int), cudaMemcpyHostToDevice, s);
 
     std::vector<float> pcm;
     if (num_frames <= config_.chunk_size + config_.left_context_size) {
@@ -1297,7 +1318,8 @@ std::vector<float> SpeechTokenizerDecoder::decode(
         debug_tensor("bigvgan_pcm", pcm_out, std::min(T_pcm, 1000), s);
 
         pcm.resize(T_pcm);
-        cudaMemcpy(pcm.data(), pcm_out, T_pcm * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(pcm.data(), pcm_out, T_pcm * sizeof(float), cudaMemcpyDeviceToHost, s);
+        cudaStreamSynchronize(s);
 
         decode_pool_.free(latent);
         decode_pool_.free(pre_conv_out);
