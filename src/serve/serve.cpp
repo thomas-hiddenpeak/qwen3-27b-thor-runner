@@ -4112,44 +4112,48 @@ void ServeApp::ws_voice_generate(int client_fd,
         safe_send_text("{\"type\":\"tts.stream_start\",\"sample_rate\":24000,\"format\":\"pcm16\"}");
     }
 
-    // TTS 消费者线程: 等待所有文本收集完毕 → 一次性合成 (保证音色一致)
+    // TTS 消费者线程: 逐句合成, 第一句用 synthesize(), 后续用 synthesize_continue()
+    // 保持 talker KV cache 连续, 确保音色一致
     auto* tts_raw = tts_plugin_.get();  // raw ptr for thread capture
     std::thread tts_thread;
     if (do_stream_tts) {
         tts_thread = std::thread([&, tts_raw]() {
-            // 等待 LLM 完成，收集所有句子
-            std::vector<std::string> sentences;
-            {
-                std::unique_lock<std::mutex> lock(tts_mutex);
-                tts_cv.wait(lock, [&]{ return tts_done_flag; });
-                while (!tts_queue.empty()) {
-                    sentences.push_back(std::move(tts_queue.front()));
+            bool is_first = true;
+            while (true) {
+                std::string sentence;
+                {
+                    std::unique_lock<std::mutex> lock(tts_mutex);
+                    tts_cv.wait(lock, [&]{ return !tts_queue.empty() || tts_done_flag; });
+                    if (tts_queue.empty() && tts_done_flag) break;
+                    if (tts_queue.empty()) continue;
+                    sentence = std::move(tts_queue.front());
                     tts_queue.pop();
                 }
-            }
 
-            // 拼接为完整文本，单次合成保证音色一致
-            if (!sentences.empty()) {
-                std::string full_text;
-                for (auto& s : sentences) {
-                    if (!full_text.empty()) full_text += ' ';
-                    full_text += s;
+                plugins::TtsResult result;
+                if (is_first) {
+                    result = tts_raw->synthesize(sentence, voice, 1.0f, "pcm");
+                    is_first = false;
+                } else {
+                    result = tts_raw->synthesize_continue(sentence, "pcm");
                 }
 
-                auto result = tts_raw->synthesize(full_text, voice, 1.0f, "pcm");
                 if (result.error_code == 0 && !result.audio_data.empty()) {
                     safe_send_binary(result.audio_data.data(), result.audio_data.size());
-                    tts_segment_idx = 1;
+                    tts_segment_idx++;
                 }
             }
         });
     }
 
-    // 推送句子到 TTS 队列 (不阻塞 poll_tokens, 最终由 TTS 线程一次性合成)
+    // 推送句子到 TTS 队列, 通知消费者线程立即合成
     auto push_tts = [&](const std::string& sentence) {
         if (!do_stream_tts || sentence.empty()) return;
-        std::lock_guard<std::mutex> lock(tts_mutex);
-        tts_queue.push(sentence);
+        {
+            std::lock_guard<std::mutex> lock(tts_mutex);
+            tts_queue.push(sentence);
+        }
+        tts_cv.notify_one();
     };
 
     // ---- LLM 流式生成 (主线程) ----

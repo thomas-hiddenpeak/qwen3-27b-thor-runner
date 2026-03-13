@@ -456,6 +456,68 @@ std::vector<float> TTSEngine::synthesize_to_pcm(
 }
 
 // ============================================================================
+// Continue synthesis (preserve talker KV cache for voice consistency)
+// ============================================================================
+
+std::vector<float> TTSEngine::continue_to_pcm(
+    const std::string& text,
+    int max_new_tokens)
+{
+    if (!loaded_ || !st_decoder_ || !st_decoder_->is_loaded()) {
+        fprintf(stderr, "[TTS] ERROR: model not loaded for continuation\n");
+        return {};
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Tokenize new text (same format as normal synthesis)
+    auto text_tokens = build_text_tokens(text);
+    if (text_tokens.empty()) {
+        fprintf(stderr, "[TTS] ERROR: empty continuation text tokens\n");
+        return {};
+    }
+
+    // Inject new text without resetting KV cache
+    talker_->inject_continuation_text(text_tokens.data(), (int)text_tokens.size(), stream_);
+    talker_->set_max_new_tokens(max_new_tokens);
+
+    // Continue decoding from current talker state
+    int num_groups = config_.talker.num_code_groups;
+    std::vector<std::vector<int>> all_codes;
+    std::vector<int> codec_step(num_groups);
+    int step = 0;
+    while (step < max_new_tokens) {
+        int ret = talker_->forward_decode_step(codec_step.data(), stream_);
+        if (ret < 0) break;
+        all_codes.push_back(codec_step);
+        step++;
+    }
+
+    auto t_talker = std::chrono::steady_clock::now();
+    float talker_ms = std::chrono::duration<float, std::milli>(t_talker - t0).count();
+    fprintf(stderr, "[TTS] Continue talker: %d steps (%.1f ms)\n", step, talker_ms);
+
+    if (all_codes.empty()) return {};
+
+    // Reshape and decode to PCM
+    int T = (int)all_codes.size();
+    std::vector<int> codes_flat(num_groups * T);
+    for (int t = 0; t < T; t++) {
+        for (int g = 0; g < num_groups; g++) {
+            codes_flat[g * T + t] = all_codes[t][g];
+        }
+    }
+
+    auto pcm = st_decoder_->decode(codes_flat.data(), num_groups, T, stream_);
+
+    auto t_decode = std::chrono::steady_clock::now();
+    float total_ms = std::chrono::duration<float, std::milli>(t_decode - t0).count();
+    fprintf(stderr, "[TTS] Continue done: %zu samples (%.1f ms total)\n", pcm.size(), total_ms);
+
+    return pcm;
+}
+
+// ============================================================================
 // Synthesize to WAV (end-to-end)
 // ============================================================================
 

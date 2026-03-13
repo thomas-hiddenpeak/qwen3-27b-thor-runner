@@ -64,6 +64,13 @@ public:
         const std::string& instruct = "",
         int max_new_tokens = 4096);
 
+    // Continue synthesis: inject new text and continue decoding without resetting
+    // Preserves talker KV cache for voice consistency across segments
+    // Returns PCM float samples for the continuation segment
+    std::vector<float> continue_to_pcm(
+        const std::string& text,
+        int max_new_tokens = 4096);
+
     int sample_rate() const { return loaded_ ? config_.tokenizer_decoder.output_sample_rate : 24000; }
     bool is_loaded() const { return loaded_; }
     const TTSConfig& config() const { return config_; }

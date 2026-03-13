@@ -244,6 +244,56 @@ void Talker::reset() {
 }
 
 // ============================================================================
+// Inject continuation text (no reset, preserves KV cache for voice consistency)
+// ============================================================================
+
+void Talker::inject_continuation_text(const int* text_ids_cpu, int text_len, cudaStream_t stream) {
+    const auto& tc = config_.talker;
+    int h = tc.hidden_size;
+
+    // text_ids layout: <|im_start|> assistant \n <text> <|im_end|> \n <|im_start|> assistant \n
+    int actual_text_start = 3;
+    int actual_text_end = text_len - 5;
+    int actual_text_len = actual_text_end - actual_text_start;
+    if (actual_text_len < 1) actual_text_len = 1;
+
+    // Use workspace for temporaries (workspace is pre-allocated and large enough)
+    // Layout: [text_ids_gpu: text_len ints] [text_embed: actual_text_len * h bf16]
+    //         [eos_text_embed: h bf16]
+    int* text_ids_gpu = reinterpret_cast<int*>(workspace_);
+    size_t ids_bf16 = (text_len * sizeof(int) + sizeof(__nv_bfloat16) - 1) / sizeof(__nv_bfloat16);
+    __nv_bfloat16* text_embed = workspace_ + ids_bf16;
+    __nv_bfloat16* eos_text_embed = text_embed + actual_text_len * h;
+
+    cudaMemcpyAsync(text_ids_gpu, text_ids_cpu, text_len * sizeof(int),
+                    cudaMemcpyHostToDevice, stream);
+
+    // Compute text embeddings → text_projection → trailing_text_hidden_
+    audio_ops::invoke_embedding_lookup(text_embed, text_ids_gpu + actual_text_start,
+                                        text_embedding_w_, actual_text_len, h, stream);
+    text_projection_forward(trailing_text_hidden_, text_embed, actual_text_len, workspace_ + ids_bf16 + (actual_text_len + 1) * h, stream);
+
+    // Append tts_eos_embed at the end
+    int tts_eos_id = config_.tts_eos_token_id;
+    cudaMemcpyAsync(text_ids_gpu, &tts_eos_id, sizeof(int), cudaMemcpyHostToDevice, stream);
+    audio_ops::invoke_embedding_lookup(eos_text_embed, text_ids_gpu,
+                                        text_embedding_w_, 1, h, stream);
+    text_projection_forward(trailing_text_hidden_ + actual_text_len * h,
+                            eos_text_embed, 1, workspace_ + ids_bf16 + (actual_text_len + 1) * h, stream);
+
+    trailing_text_len_ = actual_text_len + 1;  // text tokens + tts_eos
+    generation_step_ = 0;  // restart text injection from beginning
+    // KV cache (talker_cache_len_) is NOT reset — voice context preserved
+    // CodePredictor cache must reset per new decode segment
+    cp_cache_len_ = 0;
+
+    cudaStreamSynchronize(stream);
+
+    fprintf(stderr, "[TTS Talker] continuation text injected: %d tokens, cache_len=%d\n",
+            trailing_text_len_, talker_cache_len_);
+}
+
+// ============================================================================
 // Text Projection: output = Linear2(SiLU(Linear1(input)))
 // ============================================================================
 

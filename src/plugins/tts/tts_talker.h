@@ -95,6 +95,11 @@ public:
     void initialize(cudaStream_t stream = 0);
     void reset();   // Reset all KV caches for new generation
 
+    // Inject new text for continuation (no reset, no re-prefill)
+    // Updates trailing_text_hidden_ with new text embeddings, resets generation_step_
+    // KV cache and talker_cache_len_ are preserved for voice consistency
+    void inject_continuation_text(const int* text_ids_cpu, int text_len, cudaStream_t stream = 0);
+
     // ===== Generation =====
 
     // Build prefill embeddings for CustomVoice mode

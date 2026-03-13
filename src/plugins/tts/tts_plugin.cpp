@@ -207,6 +207,12 @@ TtsResult SubprocessTtsPlugin::synthesize(const std::string& text,
     return result;
 }
 
+TtsResult SubprocessTtsPlugin::synthesize_continue(const std::string& text,
+                                                    const std::string& format) {
+    // Subprocess mode cannot maintain state — fall back to regular synthesis
+    return synthesize(text, config_.voice, config_.speed, format);
+}
+
 // ============================================================================
 // NativeTtsPlugin — 使用内置 Qwen3-TTS 引擎
 // ============================================================================
@@ -325,6 +331,59 @@ TtsResult NativeTtsPlugin::synthesize(const std::string& text,
             result.duration_s, elapsed_s,
             result.duration_s / std::max(elapsed_s, 0.001f),
             result.audio_data.size());
+
+    return result;
+}
+
+TtsResult NativeTtsPlugin::synthesize_continue(const std::string& text,
+                                                const std::string& format) {
+    TtsResult result;
+    result.format = (format.empty() || format == "wav") ? "wav" : "pcm";
+
+    if (!is_available()) {
+        result.error_code = 1;
+        result.error_message = "TTS engine not loaded";
+        return result;
+    }
+
+    if (text.empty()) {
+        result.error_code = 2;
+        result.error_message = "Empty continuation text";
+        return result;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    auto pcm = engine_->continue_to_pcm(text, config_.max_new_tokens);
+
+    if (pcm.empty()) {
+        result.error_code = 3;
+        result.error_message = "TTS continuation produced no audio";
+        return result;
+    }
+
+    int sr = engine_->sample_rate();
+    result.sample_rate = sr;
+    result.duration_s = (float)pcm.size() / sr;
+
+    if (result.format == "pcm") {
+        result.audio_data.resize(pcm.size() * 2);
+        int16_t* out = reinterpret_cast<int16_t*>(result.audio_data.data());
+        for (size_t i = 0; i < pcm.size(); i++) {
+            float v = std::max(-1.0f, std::min(1.0f, pcm[i]));
+            out[i] = (int16_t)(v * 32767.0f);
+        }
+    } else {
+        result.audio_data = build_wav_header_and_data(pcm, sr);
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    float elapsed_s = std::chrono::duration<float>(t1 - t0).count();
+    fprintf(stderr, "[TTS Native] Continue %.1fs audio in %.1fs (%.1fx realtime)\n",
+            result.duration_s, elapsed_s,
+            result.duration_s / std::max(elapsed_s, 0.001f));
 
     return result;
 }

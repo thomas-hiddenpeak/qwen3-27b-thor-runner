@@ -66,6 +66,10 @@ public:
                                  float speed = 1.0f,
                                  const std::string& format = "wav") = 0;
 
+    // Continue synthesis without resetting talker state (voice consistency)
+    virtual TtsResult synthesize_continue(const std::string& text,
+                                          const std::string& format = "pcm") = 0;
+
     virtual bool is_available() const = 0;
     virtual std::string name() const = 0;
 };
@@ -82,6 +86,8 @@ public:
                          const std::string& voice = "",
                          float speed = 1.0f,
                          const std::string& format = "wav") override;
+    TtsResult synthesize_continue(const std::string& text,
+                                  const std::string& format = "pcm") override;
     bool is_available() const override;
     std::string name() const override { return "native-qwen3-tts"; }
 
@@ -102,6 +108,8 @@ public:
                          const std::string& voice = "",
                          float speed = 1.0f,
                          const std::string& format = "wav") override;
+    TtsResult synthesize_continue(const std::string& text,
+                                  const std::string& format = "pcm") override;
     bool is_available() const override;
     std::string name() const override { return "subprocess-tts"; }
 
