@@ -337,8 +337,9 @@ __global__ void rope_f32_kernel(
     k[idx1] = k0 * sin_a + k1 * cos_a;
 }
 
-// ---------- Softmax with causal + sliding window mask ----------
+// ---------- Softmax with causal + sliding window mask (warp-level) ----------
 // scores: [num_heads, T, T], mask based on sliding_window
+// Uses warp-wide reduction for max and sum instead of single-thread serial
 __global__ void masked_softmax_kernel(
     float* __restrict__ scores,           // [num_heads, T, T]
     int T, int sliding_window)
@@ -348,26 +349,70 @@ __global__ void masked_softmax_kernel(
     if (row >= T) return;
 
     float* row_ptr = scores + (h * T + row) * T;
-
-    // Apply mask: set positions to -inf where col > row (causal) or col < row - sliding_window + 1
     int min_col = (sliding_window > 0) ? max(0, row - sliding_window + 1) : 0;
-    float max_val = -1e30f;
-    for (int c = 0; c < T; c++) {
-        if (c > row || c < min_col) {
-            row_ptr[c] = -1e30f;
-        }
-        max_val = fmaxf(max_val, row_ptr[c]);
-    }
 
-    // Softmax
-    float sum = 0.0f;
-    for (int c = 0; c < T; c++) {
-        row_ptr[c] = expf(row_ptr[c] - max_val);
-        sum += row_ptr[c];
+    constexpr float LOG2E = 1.4426950408889634f;
+
+    // Step 1: mask + find max (warp-cooperative)
+    float local_max = -1e30f;
+    for (int c = threadIdx.x; c < T; c += blockDim.x) {
+        if (c > row || c < min_col) row_ptr[c] = -1e30f;
+        local_max = fmaxf(local_max, row_ptr[c]);
     }
-    float inv_sum = 1.0f / (sum + 1e-9f);
-    for (int c = 0; c < T; c++) {
+    for (int s = warpSize / 2; s > 0; s >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, s));
+
+    // Step 2: exp + sum
+    float local_sum = 0.0f;
+    for (int c = threadIdx.x; c < T; c += blockDim.x) {
+        float e = exp2f((row_ptr[c] - local_max) * LOG2E);
+        row_ptr[c] = e;
+        local_sum += e;
+    }
+    for (int s = warpSize / 2; s > 0; s >>= 1)
+        local_sum += __shfl_xor_sync(0xffffffff, local_sum, s);
+
+    // Step 3: normalize
+    float inv_sum = 1.0f / (local_sum + 1e-9f);
+    for (int c = threadIdx.x; c < T; c += blockDim.x)
         row_ptr[c] *= inv_sum;
+}
+
+// ---------- Head transpose: [T, num_heads * head_dim] → [num_heads, T, head_dim] ----------
+// Replaces per-head cudaMemcpy2D with a single kernel launch
+__global__ void head_transpose_3_kernel(
+    float* __restrict__ Q_out,
+    float* __restrict__ K_out,
+    float* __restrict__ V_out,
+    const float* __restrict__ q_in,
+    const float* __restrict__ k_in,
+    const float* __restrict__ v_in,
+    int T, int num_heads, int head_dim)
+{
+    int h = blockIdx.x;
+    int t = blockIdx.y;
+    int total_qkv_dim = num_heads * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        int src = t * total_qkv_dim + h * head_dim + d;
+        int dst = h * T * head_dim + t * head_dim + d;
+        Q_out[dst] = q_in[src];
+        K_out[dst] = k_in[src];
+        V_out[dst] = v_in[src];
+    }
+}
+
+// ---------- Head transpose back: [num_heads, T, head_dim] → [T, num_heads * head_dim] ----------
+__global__ void head_transpose_back_kernel(
+    float* __restrict__ out,
+    const float* __restrict__ in,
+    int T, int num_heads, int head_dim)
+{
+    int h = blockIdx.x;
+    int t = blockIdx.y;
+    int total_qkv_dim = num_heads * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        out[t * total_qkv_dim + h * head_dim + d] =
+            in[h * T * head_dim + t * head_dim + d];
     }
 }
 
@@ -756,62 +801,15 @@ void SpeechTokenizerDecoder::transformer_layer_forward(
     rope_f32_kernel<<<rope_grid, 256, 0, s>>>(
         q, k, T, total_qkv_dim, head_dim, config_.rope_theta);
 
-    // 4. Attention: scores = Q @ K.T / sqrt(head_dim)
-    // Reshape Q, K, V: [T, num_heads, head_dim] → [num_heads, T, head_dim] (batch GEMM)
-    // Use cublasSgemmStridedBatched
+    // 4. Transpose Q/K/V to [num_heads, T, head_dim] for batched GEMM
     float scale = 1.0f / sqrtf((float)head_dim);
-    // Q is [T, num_heads * head_dim] in row-major = num_heads groups of [T, head_dim]
-    // We need [num_heads, T, head_dim]. The data is already interleaved if viewed as
-    // [T, num_heads, head_dim]. We need to transpose first two dims.
-    // Let's transpose Q/K/V to [num_heads, T, head_dim]
-    // Q[t, h, d] = q[t * total_qkv_dim + h * head_dim + d]
-    // We want Q_t[h, t, d] = q[t * total_qkv_dim + h * head_dim + d]
-    // This is a stride: for head h, stride between t positions = total_qkv_dim
-
-    // cublasSgemmStridedBatched can handle this with appropriate strides
-    // A = Q, shape [T, head_dim] per head, stride = total_qkv_dim (between T rows)
-    // Actually, Q is T×total_qkv_dim row-major. For head h, elements at positions
-    // Q[t][h*head_dim ... h*head_dim+head_dim-1]
-    // In column-major for cuBLAS: Q col-major is [total_qkv_dim, T]
-    // Head h data: starts at offset h*head_dim, stride total_qkv_dim per column
-
-    // scores[h, i, j] = sum_d Q[i, h, d] * K[j, h, d] * scale
-    // = (Q_h @ K_h^T) * scale where Q_h is [T, head_dim], K_h is [T, head_dim]
-
-    // Using SgemmStridedBatched:
-    // C[h] = Q_h @ K_h^T, C is [T, T], Q_h is [T, head_dim], K_h is [T, head_dim]
-    // cuBLAS col-major: C = alpha * op(A) * op(B) + beta * C
-    // A = K_h^T of shape [head_dim, T] → op(A) = K_h^T → CUBLAS_OP_T, A is [T, head_dim] col-major
-    // B = Q_h of shape [T, head_dim] → op(B) = Q_h → CUBLAS_OP_N as [head_dim, T] col-major?
-    // Hmm, this is getting confusing with strides. Let me just use a simple approach.
-
-    // Simple approach: reorganize Q/K/V to [num_heads, T, head_dim] contiguously
-    // Then use batched GEMM
-    float* Q_reorg = up_out + T * inter;  // [num_heads, T, head_dim]
+    float* Q_reorg = up_out + T * inter;
     float* K_reorg = Q_reorg + (size_t)num_heads * T * head_dim;
     float* V_reorg = K_reorg + (size_t)num_heads * T * head_dim;
-    // Reorganize: Q_reorg[h, t, d] = q[t * total_qkv_dim + h * head_dim + d]
-    // This is a transpose of dim 0 and 1 with dim 2 staying
-    for (int h_idx = 0; h_idx < num_heads; h_idx++) {
-        // Copy head h_idx data: for each t, copy head_dim elements
-        // src stride: total_qkv_dim, dst stride: head_dim
-        // Use cudaMemcpy2D
-        cudaMemcpy2DAsync(
-            Q_reorg + h_idx * T * head_dim, head_dim * sizeof(float),
-            q + h_idx * head_dim, total_qkv_dim * sizeof(float),
-            head_dim * sizeof(float), T,
-            cudaMemcpyDeviceToDevice, s);
-        cudaMemcpy2DAsync(
-            K_reorg + h_idx * T * head_dim, head_dim * sizeof(float),
-            k + h_idx * head_dim, total_qkv_dim * sizeof(float),
-            head_dim * sizeof(float), T,
-            cudaMemcpyDeviceToDevice, s);
-        cudaMemcpy2DAsync(
-            V_reorg + h_idx * T * head_dim, head_dim * sizeof(float),
-            v + h_idx * head_dim, total_qkv_dim * sizeof(float),
-            head_dim * sizeof(float), T,
-            cudaMemcpyDeviceToDevice, s);
-    }
+
+    dim3 ht_grid(num_heads, T);
+    head_transpose_3_kernel<<<ht_grid, head_dim, 0, s>>>(
+        Q_reorg, K_reorg, V_reorg, q, k, v, T, num_heads, head_dim);
 
     // Batched GEMM: scores[h] = Q_h @ K_h^T, [T, T] = [T, head_dim] @ [head_dim, T]
     // In col-major: C[T,T] = A^T[T,head_dim] * B[head_dim,T]... no
@@ -838,9 +836,9 @@ void SpeechTokenizerDecoder::transformer_layer_forward(
         attn_scores, T, T * T,             // C = scores, [T, T] col-major
         num_heads);
 
-    // 5. Apply causal + sliding window mask + softmax
+    // 5. Apply causal + sliding window mask + softmax (warp-level)
     dim3 sm_grid(num_heads, T);
-    masked_softmax_kernel<<<sm_grid, 1, 0, s>>>(attn_scores, T, sw);
+    masked_softmax_kernel<<<sm_grid, 32, 0, s>>>(attn_scores, T, sw);
 
     // 6. Attention output: attn_out[h] = scores[h] @ V[h], [T, head_dim]
     // Col-major: C[head_dim, T] = V[head_dim, T] * scores[T, T]
@@ -856,14 +854,9 @@ void SpeechTokenizerDecoder::transformer_layer_forward(
         Q_reorg, head_dim, T * head_dim,  // reuse Q_reorg for output
         num_heads);
 
-    // 7. Reorganize back to [T, total_qkv_dim] and apply o_proj
-    for (int h_idx = 0; h_idx < num_heads; h_idx++) {
-        cudaMemcpy2DAsync(
-            attn_out + h_idx * head_dim, total_qkv_dim * sizeof(float),
-            Q_reorg + h_idx * T * head_dim, head_dim * sizeof(float),
-            head_dim * sizeof(float), T,
-            cudaMemcpyDeviceToDevice, s);
-    }
+    // 7. Transpose back to [T, total_qkv_dim] and apply o_proj
+    head_transpose_back_kernel<<<ht_grid, head_dim, 0, s>>>(
+        attn_out, Q_reorg, T, num_heads, head_dim);
 
     // o_proj: [T, total_qkv_dim] → [T, h]
     cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
