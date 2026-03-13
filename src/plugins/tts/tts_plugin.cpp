@@ -235,6 +235,12 @@ NativeTtsPlugin::NativeTtsPlugin(const TtsConfig& config)
     engine_->load_model(config.model_path);
     fprintf(stderr, "[TTS Native] Model loaded, sample_rate=%d, model_type=%s\n",
             engine_->sample_rate(), engine_->config().tts_model_type.c_str());
+
+    // VoiceDesign 模型没有预设音色, 音色由 instruct 决定
+    if (engine_->config().tts_model_type == "voice_design") {
+        config_.voice.clear();
+    }
+
     // Apply initial sampling parameters from config
     engine_->set_sampling(config.tts_temperature, config.tts_top_k,
                           config.tts_top_p, config.tts_rep_penalty);
@@ -321,6 +327,12 @@ TtsResult NativeTtsPlugin::synthesize(const std::string& text,
     std::string use_voice = voice.empty() ? config_.voice : voice;
     std::string use_instruct = instruct.empty() ? config_.instruct : instruct;
     std::string use_lang = language.empty() ? config_.language : language;
+
+    fprintf(stderr, "[TTS Native] synthesize: voice=%s instruct=%s(%s) lang=%s\n",
+            use_voice.empty() ? "(none)" : use_voice.c_str(),
+            use_instruct.empty() ? "(none)" : use_instruct.c_str(),
+            instruct.empty() ? "config" : "api",
+            use_lang.empty() ? "auto" : use_lang.c_str());
 
     // Serialize access — TTS engine is not thread-safe (single GPU stream)
     std::lock_guard<std::mutex> lock(mutex_);

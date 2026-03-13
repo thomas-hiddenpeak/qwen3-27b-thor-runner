@@ -882,9 +882,9 @@ async function fetchTtsInfo() {
     if (!info.enabled) return;
 
     ttsModelType = info.model_type || 'custom_voice';
-    if (info.available_voices && info.available_voices.length > 0) {
-      ttsAvailableVoices = info.available_voices;
-    }
+    // VoiceDesign/VoiceClone 可能没有预设音色, 需要清空默认
+    ttsAvailableVoices = (info.available_voices && info.available_voices.length > 0)
+        ? info.available_voices : [];
     if (info.available_languages && info.available_languages.length > 0) {
       ttsAvailableLanguages = info.available_languages;
     }
@@ -1618,9 +1618,15 @@ async function synthesizeTts() {
   const text = document.getElementById('ttsInputText').value.trim();
   if (!text) { setTtsStatus('请输入要合成的文本', 'error'); return; }
 
-  const voice = document.getElementById('ttsVoiceSelect').value;
+  // VoiceDesign 模式不发送 voice (无预设音色), 音色完全由 instruct 决定
+  const voice = (ttsModelType === 'voice_design') ? '' : document.getElementById('ttsVoiceSelect').value;
   const format = document.getElementById('formatSelect').value;
   const apiBase = window.location.origin;
+
+  const instruct = document.getElementById('ttsTabInstruct')?.value.trim() || undefined;
+  if (ttsModelType === 'voice_design') {
+    console.log('[TTS Tab] VoiceDesign synthesis, instruct:', instruct || '(use default)');
+  }
 
   const btn = document.getElementById('synthesizeBtn');
   btn.disabled = true;
@@ -1642,7 +1648,7 @@ async function synthesizeTts() {
         response_format: format,
         speed: 1.0,
         language: document.getElementById('ttsLangSelect').value || undefined,
-        instruct: document.getElementById('ttsTabInstruct')?.value.trim() || undefined
+        instruct: instruct
       })
     });
 
