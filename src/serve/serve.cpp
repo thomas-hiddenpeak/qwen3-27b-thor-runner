@@ -3788,6 +3788,7 @@ void ServeApp::handle_audio_speech(const HttpRequest& req, int client_fd) {
     format = get_str("response_format");
     speed = get_num("speed", 1.0f);
     std::string instruct = get_str("instruct");
+    std::string language = get_str("language");
 
     if (input_text.empty()) {
         HttpResponse resp;
@@ -3800,12 +3801,13 @@ void ServeApp::handle_audio_speech(const HttpRequest& req, int client_fd) {
         return;
     }
 
-    fprintf(stderr, "[Serve] TTS: text=%zu chars, voice=%s, speed=%.1f, format=%s, instruct=%s\n",
+    fprintf(stderr, "[Serve] TTS: text=%zu chars, voice=%s, speed=%.1f, format=%s, instruct=%s, lang=%s\n",
             input_text.size(), voice.c_str(), speed, format.c_str(),
-            instruct.empty() ? "(none)" : instruct.c_str());
+            instruct.empty() ? "(none)" : instruct.c_str(),
+            language.empty() ? "(auto)" : language.c_str());
 
     // 调用 TTS 插件
-    auto result = tts_plugin_->synthesize(input_text, voice, speed, format, instruct);
+    auto result = tts_plugin_->synthesize(input_text, voice, speed, format, instruct, language);
 
     if (result.error_code != 0) {
         HttpResponse resp;
@@ -3852,10 +3854,18 @@ void ServeApp::handle_tts_info(const HttpRequest& /*req*/, int client_fd) {
     }
     voices_json += "]";
 
+    std::string langs_json = "[";
+    for (size_t i = 0; i < info.available_languages.size(); i++) {
+        if (i > 0) langs_json += ",";
+        langs_json += "\"" + json_escape(info.available_languages[i]) + "\"";
+    }
+    langs_json += "]";
+
     resp.body = "{\"enabled\":true,"
                 "\"model_type\":\"" + json_escape(info.model_type) + "\","
                 "\"sample_rate\":" + std::to_string(info.sample_rate) + ","
-                "\"available_voices\":" + voices_json + "}";
+                "\"available_voices\":" + voices_json + ","
+                "\"available_languages\":" + langs_json + "}";
     send_response(client_fd, resp);
     close(client_fd);
 }
@@ -3944,6 +3954,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
     std::vector<std::pair<std::string, std::string>> chat_history;
     std::string voice = "serena";
     std::string tts_instruct;  // VoiceDesign 模式的音色描述指令
+    std::string tts_language;  // TTS 语言/方言 (空=auto)
     bool tts_enabled = true;
 
     // ---- 连接活跃性 + 生成控制 ----
@@ -3992,30 +4003,33 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
 
     // 启动生成 (worker thread)
     auto start_generate = [&](std::string text, std::string voice_copy,
-                               std::string instruct_copy, bool tts_copy) {
+                               std::string instruct_copy, bool tts_copy,
+                               std::string lang_copy) {
         if (generating || !conn_alive) return;
         if (worker_thread.joinable()) worker_thread.join();
         generating = true;
         interrupted = false;
         worker_thread = std::thread([&, text = std::move(text),
                                      voice_copy = std::move(voice_copy),
-                                     instruct_copy = std::move(instruct_copy), tts_copy]() {
+                                     instruct_copy = std::move(instruct_copy),
+                                     lang_copy = std::move(lang_copy), tts_copy]() {
             ws_voice_generate(text, chat_history, voice_copy, instruct_copy, tts_copy,
-                              safe_send_text, safe_send_binary, generating, interrupted);
+                              safe_send_text, safe_send_binary, generating, interrupted, lang_copy);
         });
     };
 
     // 启动语音输入 (ASR → LLM → TTS, 在 worker thread)
     auto start_voice_input = [&](std::vector<int16_t> audio, int sr,
                                   std::string voice_copy, std::string instruct_copy,
-                                  bool tts_copy) {
+                                  bool tts_copy, std::string lang_copy) {
         if (generating || !conn_alive) return;
         if (worker_thread.joinable()) worker_thread.join();
         generating = true;
         interrupted = false;
         worker_thread = std::thread([&, audio = std::move(audio), sr,
                                      voice_copy = std::move(voice_copy),
-                                     instruct_copy = std::move(instruct_copy), tts_copy]() {
+                                     instruct_copy = std::move(instruct_copy),
+                                     lang_copy = std::move(lang_copy), tts_copy]() {
             if (interrupted) { generating = false; return; }
 
             // ASR
@@ -4054,7 +4068,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             if (interrupted) { generating = false; return; }
 
             ws_voice_generate(asr_text, chat_history, voice_copy, instruct_copy, tts_copy,
-                              safe_send_text, safe_send_binary, generating, interrupted);
+                              safe_send_text, safe_send_binary, generating, interrupted, lang_copy);
         });
     };
 
@@ -4169,7 +4183,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 speech_detected = false;
                 total_energy_sum = 0;
                 total_speech_samples = 0;
-                start_voice_input(std::move(audio_copy), stream_sample_rate, voice, tts_instruct, tts_enabled);
+                start_voice_input(std::move(audio_copy), stream_sample_rate, voice, tts_instruct, tts_enabled, tts_language);
             }
             continue;
         }
@@ -4190,6 +4204,9 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             // VoiceDesign instruct
             std::string inst = json_get_string(msg, "tts_instruct");
             if (!inst.empty()) tts_instruct = inst;
+            // Language/dialect
+            std::string lang = json_get_string(msg, "tts_language");
+            if (msg.find("\"tts_language\"") != std::string::npos) tts_language = lang;
             if (tts_plugin_ && msg.find("\"tts_temperature\"") != std::string::npos) {
                 float tts_temp = (float)json_get_number(msg, "tts_temperature", 0.9);
                 int tts_topk = json_get_int(msg, "tts_top_k", 50);
@@ -4203,7 +4220,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             if (generating) continue;
             std::string text = json_get_string(msg, "text");
             if (!text.empty()) {
-                start_generate(std::move(text), voice, tts_instruct, tts_enabled);
+                start_generate(std::move(text), voice, tts_instruct, tts_enabled, tts_language);
             }
 
         } else if (event_type == "stream.start") {
@@ -4251,7 +4268,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                     speech_detected = false;
                     total_energy_sum = 0;
                     total_speech_samples = 0;
-                    start_voice_input(std::move(audio_copy), stream_sample_rate, voice, tts_instruct, tts_enabled);
+                    start_voice_input(std::move(audio_copy), stream_sample_rate, voice, tts_instruct, tts_enabled, tts_language);
                 } else {
                     fprintf(stderr, "[WS] Stream stopped, too short (%.1fs)\n", audio_dur);
                     safe_send_text("{\"type\":\"error\",\"message\":\"录音太短\"}");
@@ -4282,7 +4299,8 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             worker_thread = std::thread([&, audio_b64 = std::move(audio_b64),
                                          voice_copy = voice,
                                          instruct_copy = tts_instruct,
-                                         tts_copy = tts_enabled]() {
+                                         tts_copy = tts_enabled,
+                                         lang_copy = tts_language]() {
                 auto audio_bytes = base64_decode(audio_b64);
                 if (audio_bytes.empty()) {
                     safe_send_text("{\"type\":\"error\",\"message\":\"Invalid audio data\"}");
@@ -4305,7 +4323,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 if (interrupted) { generating = false; return; }
 
                 ws_voice_generate(result.text, chat_history, voice_copy, instruct_copy, tts_copy,
-                                  safe_send_text, safe_send_binary, generating, interrupted);
+                                  safe_send_text, safe_send_binary, generating, interrupted, lang_copy);
             });
 
         } else if (event_type == "interrupt" || event_type == "tts.stop") {
@@ -4344,7 +4362,8 @@ void ServeApp::ws_voice_generate(const std::string& user_text,
                                   const std::function<bool(const std::string&)>& send_text,
                                   const std::function<bool(const uint8_t*, size_t)>& send_binary,
                                   std::atomic<bool>& generating,
-                                  std::atomic<bool>& interrupted) {
+                                  std::atomic<bool>& interrupted,
+                                  const std::string& language) {
     const auto& tok = backend_.tokenizer();
     if (!tok.is_loaded()) {
         send_text("{\"type\":\"error\",\"message\":\"Tokenizer not loaded\"}");
@@ -4446,7 +4465,7 @@ void ServeApp::ws_voice_generate(const std::string& user_text,
                         }
                         return send_binary(reinterpret_cast<const uint8_t*>(pcm16.data()),
                                            pcm16.size() * sizeof(int16_t));
-                    }, 8);
+                    }, 8, language);
                 tts_segment_idx++;
             }
         });

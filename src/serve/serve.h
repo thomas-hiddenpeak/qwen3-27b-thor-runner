@@ -164,7 +164,8 @@ private:
         const std::function<bool(const std::string&)>& send_text,
         const std::function<bool(const uint8_t*, size_t)>& send_binary,
         std::atomic<bool>& generating,
-        std::atomic<bool>& interrupted);
+        std::atomic<bool>& interrupted,
+        const std::string& language = "");
 
     // ---- WebSocket /v1/realtime — 持续双向语音通道 ----
     void handle_websocket_realtime(int client_fd, const HttpRequest& req);

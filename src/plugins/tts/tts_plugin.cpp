@@ -103,7 +103,8 @@ TtsResult SubprocessTtsPlugin::synthesize(const std::string& text,
                                            const std::string& voice,
                                            float speed,
                                            const std::string& format,
-                                           const std::string& instruct) {
+                                           const std::string& instruct,
+                                           const std::string& language) {
     TtsResult result;
     result.format = format.empty() ? config_.format : format;
 
@@ -300,7 +301,8 @@ TtsResult NativeTtsPlugin::synthesize(const std::string& text,
                                        const std::string& voice,
                                        float speed,
                                        const std::string& format,
-                                       const std::string& instruct) {
+                                       const std::string& instruct,
+                                       const std::string& language) {
     TtsResult result;
     result.format = (format.empty() || format == "wav") ? "wav" : "pcm";
 
@@ -318,13 +320,14 @@ TtsResult NativeTtsPlugin::synthesize(const std::string& text,
 
     std::string use_voice = voice.empty() ? config_.voice : voice;
     std::string use_instruct = instruct.empty() ? config_.instruct : instruct;
+    std::string use_lang = language.empty() ? config_.language : language;
 
     // Serialize access — TTS engine is not thread-safe (single GPU stream)
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto t0 = std::chrono::steady_clock::now();
 
-    auto pcm = engine_->synthesize_to_pcm(text, use_voice, config_.language, use_instruct,
+    auto pcm = engine_->synthesize_to_pcm(text, use_voice, use_lang, use_instruct,
                                            config_.max_new_tokens);
 
     if (pcm.empty()) {
@@ -458,8 +461,12 @@ TtsPlugin::ModelInfo NativeTtsPlugin::model_info() const {
     for (const auto& [name, id] : cfg.talker.spk_id) {
         info.available_voices.push_back(name);
     }
+    for (const auto& [name, id] : cfg.talker.codec_language_id) {
+        info.available_languages.push_back(name);
+    }
     // Sort for stable ordering
     std::sort(info.available_voices.begin(), info.available_voices.end());
+    std::sort(info.available_languages.begin(), info.available_languages.end());
     return info;
 }
 

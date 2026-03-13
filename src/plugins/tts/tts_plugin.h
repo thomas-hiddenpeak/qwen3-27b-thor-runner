@@ -72,7 +72,8 @@ public:
                                  const std::string& voice = "",
                                  float speed = 1.0f,
                                  const std::string& format = "wav",
-                                 const std::string& instruct = "") = 0;
+                                 const std::string& instruct = "",
+                                 const std::string& language = "") = 0;
 
     // Continue synthesis without resetting talker state (voice consistency)
     virtual TtsResult synthesize_continue(const std::string& text,
@@ -103,6 +104,7 @@ public:
     struct ModelInfo {
         std::string model_type;                    // custom_voice, voice_design, voice_clone
         std::vector<std::string> available_voices; // speaker names
+        std::vector<std::string> available_languages; // language/dialect names
         int sample_rate = 24000;
     };
     virtual ModelInfo model_info() const { return {}; }
@@ -120,7 +122,8 @@ public:
                          const std::string& voice = "",
                          float speed = 1.0f,
                          const std::string& format = "wav",
-                         const std::string& instruct = "") override;
+                         const std::string& instruct = "",
+                         const std::string& language = "") override;
     TtsResult synthesize_continue(const std::string& text,
                                   const std::string& format = "pcm") override;
     int synthesize_streaming(const std::string& text,
@@ -154,7 +157,8 @@ public:
                          const std::string& voice = "",
                          float speed = 1.0f,
                          const std::string& format = "wav",
-                         const std::string& instruct = "") override;
+                         const std::string& instruct = "",
+                         const std::string& language = "") override;
     TtsResult synthesize_continue(const std::string& text,
                                   const std::string& format = "pcm") override;
     bool is_available() const override;

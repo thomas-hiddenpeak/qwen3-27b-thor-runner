@@ -610,6 +610,9 @@ footer {
     <select id="voiceSelect" onchange="sendConfig()">
       <option value="serena">Serena</option>
     </select>
+    <select id="langSelect" onchange="sendConfig()" title="TTS 语言/方言">
+      <option value="">自动</option>
+    </select>
     <label>
       <span>TTS</span>
       <label class="toggle-switch">
@@ -715,6 +718,10 @@ footer {
           <label>说话人</label>
           <select id="ttsVoiceSelect">
             <option value="serena">Serena</option>
+          </select>
+          <label style="margin-top:8px;">语言/方言</label>
+          <select id="ttsLangSelect">
+            <option value="">自动</option>
           </select>
           <!-- VoiceDesign instruct for TTS tab -->
           <div id="ttsTabInstructDiv" style="display:none;margin-top:8px;">
@@ -851,6 +858,7 @@ let ttsDone = false;
 // TTS model info
 let ttsModelType = 'custom_voice';  // custom_voice, voice_design, voice_clone
 let ttsAvailableVoices = ['serena'];
+let ttsAvailableLanguages = [];
 
 // ============================================================================
 // TTS Info — 获取模型类型和可用音色
@@ -865,6 +873,10 @@ async function fetchTtsInfo() {
     ttsModelType = info.model_type || 'custom_voice';
     if (info.available_voices && info.available_voices.length > 0) {
       ttsAvailableVoices = info.available_voices;
+    }
+    if (info.available_languages && info.available_languages.length > 0) {
+      ttsAvailableLanguages = info.available_languages;
+      updateLangSelect();
     }
     if (info.sample_rate) ttsSampleRate = info.sample_rate;
 
@@ -904,6 +916,27 @@ function updateVoiceSelects() {
     if (ttsAvailableVoices.includes(current)) {
       sel.value = current;
     }
+  }
+}
+
+const langDisplayNames = {
+  chinese: '中文', english: 'English', german: 'Deutsch', italian: 'Italiano',
+  portuguese: 'Português', spanish: 'Español', japanese: '日本語', korean: '한국어',
+  french: 'Français', russian: 'Русский', beijing_dialect: '北京话', sichuan_dialect: '四川话'
+};
+
+function updateLangSelect() {
+  const selects = [document.getElementById('langSelect'), document.getElementById('ttsLangSelect')];
+  for (const sel of selects) {
+    const current = sel.value;
+    sel.innerHTML = '<option value="">自动</option>';
+    for (const lang of ttsAvailableLanguages) {
+      const opt = document.createElement('option');
+      opt.value = lang;
+      opt.textContent = langDisplayNames[lang] || lang;
+      sel.appendChild(opt);
+    }
+    if (current && ttsAvailableLanguages.includes(current)) sel.value = current;
   }
 }
 
@@ -966,6 +999,7 @@ function sendConfig() {
   const tts = document.getElementById('ttsToggle').checked;
   const msg = {
     type: 'config', voice, tts,
+    tts_language: document.getElementById('langSelect').value,
     tts_temperature: parseFloat(document.getElementById('ttsTemp').value),
     tts_top_k: parseInt(document.getElementById('ttsTopK').value),
     tts_top_p: parseFloat(document.getElementById('ttsTopP').value),
@@ -1509,7 +1543,8 @@ async function synthesizeTts() {
         input: text,
         voice: voice,
         response_format: format,
-        speed: 1.0
+        speed: 1.0,
+        language: document.getElementById('ttsLangSelect').value || undefined
       })
     });
 
