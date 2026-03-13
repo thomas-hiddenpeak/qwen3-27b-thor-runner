@@ -924,7 +924,7 @@ function updateVoiceSelects() {
     for (const v of ttsAvailableVoices) {
       const opt = document.createElement('option');
       opt.value = v;
-      opt.textContent = v.charAt(0).toUpperCase() + v.slice(1).replace(/_/g, ' ');
+      opt.textContent = voiceDisplayNames[v] || (v.charAt(0).toUpperCase() + v.slice(1).replace(/_/g, ' '));
       sel.appendChild(opt);
     }
     if (ttsAvailableVoices.includes(current)) {
@@ -932,6 +932,12 @@ function updateVoiceSelects() {
     }
   }
 }
+
+const voiceDisplayNames = {
+  serena: 'Serena', vivian: 'Vivian', uncle_fu: 'Uncle Fu',
+  ryan: 'Ryan', aiden: 'Aiden', ono_anna: 'Ono Anna', sohee: 'Sohee',
+  eric: 'Eric (四川话)', dylan: 'Dylan (北京话)'
+};
 
 const langDisplayNames = {
   chinese: '中文', english: 'English', german: 'Deutsch', italian: 'Italiano',
@@ -971,12 +977,20 @@ function updateLangSelect() {
     if (current && langs.includes(current)) {
       sel.value = current;
     } else {
-      sel.value = '';  // 重置为"自动"
+      // 方言角色默认选中其方言, 标准角色默认"自动"
+      const dialect = ttsSpeakerDialects[v];
+      sel.value = (dialect && langs.includes(dialect)) ? dialect : '';
     }
   }
 }
 
 function onVoiceChanged() {
+  const voice = document.getElementById('voiceSelect').value;
+  const dialect = ttsSpeakerDialects[voice];
+  if (dialect) {
+    // 方言角色: 自动切换到其方言
+    document.getElementById('langSelect').value = dialect;
+  }
   updateLangSelect();
 }
 
