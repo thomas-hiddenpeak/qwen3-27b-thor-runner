@@ -85,7 +85,8 @@ public:
                                      const std::string& voice,
                                      const std::string& instruct,
                                      PcmCallback callback,
-                                     int chunk_frames = 24) { return 0; }
+                                     int chunk_frames = 24,
+                                     const std::string& language = "") { return 0; }
 
     // Continue streaming: inject new text, preserve KV cache, decode in chunks
     virtual int continue_streaming(const std::string& text,
@@ -126,7 +127,8 @@ public:
                               const std::string& voice,
                               const std::string& instruct,
                               PcmCallback callback,
-                              int chunk_frames = 24) override;
+                              int chunk_frames = 24,
+                              const std::string& language = "") override;
     int continue_streaming(const std::string& text,
                            PcmCallback callback,
                            int chunk_frames = 24) override;

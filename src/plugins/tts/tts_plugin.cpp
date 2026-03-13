@@ -417,17 +417,18 @@ int NativeTtsPlugin::synthesize_streaming(const std::string& text,
                                            const std::string& voice,
                                            const std::string& instruct,
                                            PcmCallback callback,
-                                           int chunk_frames) {
+                                           int chunk_frames,
+                                           const std::string& language) {
     if (!is_available() || !callback) return 0;
 
     std::lock_guard<std::mutex> lock(mutex_);
 
     std::string speaker = voice;
-    std::string language = "auto";
+    std::string use_lang = language.empty() ? config_.language : language;
     // Use instruct from call parameter, fall back to config default
     std::string use_instruct = instruct.empty() ? config_.instruct : instruct;
 
-    return engine_->synthesize_streaming(text, speaker, language, use_instruct,
+    return engine_->synthesize_streaming(text, speaker, use_lang, use_instruct,
                                           config_.max_new_tokens,
                                           chunk_frames, callback);
 }
