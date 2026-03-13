@@ -406,9 +406,8 @@ let ttsPlayingAudio = false;  // TTS 音频是否正在播放
 // ============================================================================
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  // WebSocket endpoint is always on port 8080 (API server)
-  const wsHost = location.hostname + ':8080';
-  const url = proto + '//' + wsHost + '/v1/voice';
+  // 直接用 location.host (通过 8080 静态文件服务访问时端口一致)
+  const url = proto + '//' + location.host + '/v1/voice';
 
   ws = new WebSocket(url);
 
