@@ -483,6 +483,43 @@ __global__ void zero_kernel(float* __restrict__ x, int n) {
     x[i] = 0.0f;
 }
 
+// ---------- Zero-pad input on the left: [C, T] → [C, T + pad] ----------
+__global__ void zero_pad_left_kernel(
+    float* __restrict__ dst, const float* __restrict__ src,
+    int channels, int T_src, int T_dst, int pad)
+{
+    int ch = blockIdx.x;
+    int t = blockIdx.y * blockDim.x + threadIdx.x;
+    if (ch >= channels || t >= T_dst) return;
+    dst[ch * T_dst + t] = (t < pad) ? 0.0f : src[ch * T_src + (t - pad)];
+}
+
+// ---------- Add per-channel bias: data[ch, t] += bias[ch] ----------
+__global__ void add_bias_kernel(
+    float* __restrict__ data, const float* __restrict__ bias,
+    int channels, int T)
+{
+    int ch = blockIdx.x;
+    int t = blockIdx.y * blockDim.x + threadIdx.x;
+    if (ch >= channels || t >= T) return;
+    data[ch * T + t] += bias[ch];
+}
+
+// ---------- Reshape conv weight: [out_ch, in_ch, k] → [k, out_ch, in_ch] ----------
+__global__ void reshape_conv_weight_kernel(
+    float* __restrict__ dst, const float* __restrict__ src,
+    int out_ch, int in_ch, int k)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = out_ch * in_ch * k;
+    if (idx >= total) return;
+    int oc = idx / (in_ch * k);
+    int rem = idx % (in_ch * k);
+    int ic = rem / k;
+    int j = rem % k;
+    dst[j * out_ch * in_ch + oc * in_ch + ic] = src[idx];
+}
+
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
@@ -678,7 +715,36 @@ bool SpeechTokenizerDecoder::load_weights(
     final_conv_w_ = load_f32("decoder.decoder.6.conv.weight");
     final_conv_b_ = load_f32("decoder.decoder.6.conv.bias");
 
-    fprintf(stderr, "[TokenizerDecoder] Loaded %zu weight tensors\n", device_ptrs_.size());
+    // ===== Reshape conv1d weights: [out_ch, in_ch, k] → [k, out_ch, in_ch] for GEMM =====
+    auto reshape_conv = [&](float*& w, int out_ch, int in_ch, int k) {
+        if (!w || k <= 1) return;  // k=1 doesn't need reshape
+        int n = out_ch * in_ch * k;
+        float* tmp = nullptr;
+        cudaMalloc(&tmp, n * sizeof(float));
+        reshape_conv_weight_kernel<<<(n + 255) / 256, 256>>>(tmp, w, out_ch, in_ch, k);
+        cudaDeviceSynchronize();
+        cudaMemcpy(w, tmp, n * sizeof(float), cudaMemcpyDeviceToDevice);
+        cudaFree(tmp);
+    };
+
+    // Initial conv: [1536, 1024, 7] → [7, 1536, 1024]
+    reshape_conv(initial_conv_w_, config_.decoder_dim, config_.latent_dim, 7);
+
+    // ResBlock conv1 weights (k=7)
+    int dim = config_.decoder_dim;  // 1536
+    for (int stage = 0; stage < 4; stage++) {
+        dim = (stage == 0) ? config_.decoder_dim : dim / 2;
+        int out_dim = dim / 2;
+        for (int r = 0; r < 3; r++) {
+            reshape_conv(decoder_stages_[stage].res_blocks[r].conv1_w, out_dim, out_dim, 7);
+            // conv2 is k=1, no reshape needed
+        }
+    }
+
+    // Final conv: [1, 96, 7] → [7, 1, 96]
+    reshape_conv(final_conv_w_, 1, 96, 7);
+
+    fprintf(stderr, "[TokenizerDecoder] Loaded %zu weight tensors (conv weights reshaped for GEMM)\n", device_ptrs_.size());
     loaded_ = true;
     return true;
 }
@@ -1135,16 +1201,71 @@ void SpeechTokenizerDecoder::run_bigvgan(
     int T = T_in;
     static const int dilations[3] = {1, 3, 9};
 
-    // Use dynamic allocation per stage to avoid buffer overflow
-    // Each stage upsamples T significantly, so buffers grow
+    cublasSetStream(cublas_, s);
+
+    // Helper: conv1d via k cuBLAS SGEMMs (weights pre-reshaped to [k, out_ch, in_ch])
+    // conv1d: output[oc, t] = bias[oc] + sum_{j,ic} W[j, oc, ic] * input[ic, t + j*d - pad]
+    auto conv1d_gemm = [&](float* out, const float* inp, const float* weight_reshaped,
+                           const float* bias, int in_ch, int out_ch, int k, int T_len,
+                           int dilation, const float* residual) {
+        int pad = (k - 1) * dilation;
+        float alpha = 1.0f;
+
+        if (k == 1) {
+            // Direct GEMM, no padding
+            float beta = (residual && residual == out) ? 1.0f : 0.0f;
+            if (residual && residual != out) {
+                cudaMemcpyAsync(out, residual, (size_t)out_ch * T_len * sizeof(float),
+                                cudaMemcpyDeviceToDevice, s);
+                beta = 1.0f;
+            }
+            // Row-major C[out_ch, T] = W[out_ch, in_ch] @ I[in_ch, T]
+            // cuBLAS col-major: C^T[T, out_ch] = I^T[T, in_ch] × W^T[in_ch, out_ch]
+            cublasSgemm(cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
+                T_len, out_ch, in_ch, &alpha,
+                inp, T_len,              // I^T [T, in_ch], lda = T
+                weight_reshaped, in_ch,  // W^T [in_ch, out_ch], ldb = in_ch
+                &beta, out, T_len);      // C^T [T, out_ch], ldc = T
+        } else {
+            // Zero-pad input: [in_ch, T] → [in_ch, T + pad]
+            int T_padded = T_len + pad;
+            float* padded = (float*)decode_pool_.alloc((size_t)in_ch * T_padded * sizeof(float));
+            dim3 pad_grid(in_ch, (T_padded + 255) / 256);
+            zero_pad_left_kernel<<<pad_grid, 256, 0, s>>>(padded, inp, in_ch, T_len, T_padded, pad);
+
+            // Copy residual to output if needed
+            if (residual && residual == out) {
+                // residual already in output, first GEMM uses β=1
+            } else if (residual) {
+                cudaMemcpyAsync(out, residual, (size_t)out_ch * T_len * sizeof(float),
+                                cudaMemcpyDeviceToDevice, s);
+            }
+
+            // k GEMMs: output += W_j @ padded[:, j*d : j*d + T]
+            for (int j = 0; j < k; j++) {
+                float beta = (j == 0 && !residual) ? 0.0f : 1.0f;
+                const float* W_j = weight_reshaped + j * out_ch * in_ch;
+                const float* I_j = padded + j * dilation;  // pointer offset in time dim
+                cublasSgemm(cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
+                    T_len, out_ch, in_ch, &alpha,
+                    I_j, T_padded,           // I_j^T [T, in_ch], lda = T_padded
+                    W_j, in_ch,              // W_j^T [in_ch, out_ch], ldb = in_ch
+                    &beta, out, T_len);      // C^T [T, out_ch], ldc = T
+            }
+            decode_pool_.free(padded);
+        }
+
+        // Add bias
+        if (bias) {
+            dim3 bg(out_ch, (T_len + 255) / 256);
+            add_bias_kernel<<<bg, 256, 0, s>>>(out, bias, out_ch, T_len);
+        }
+    };
 
     // Initial conv: [latent=1024, T] → [dec_dim=1536, T]
     float* conv_out = (float*)decode_pool_.alloc((size_t)dec_dim * T * sizeof(float));
-    dim3 grid(dec_dim, (T + 255) / 256);
-    int smem_init = latent * 7 * sizeof(float);
-    causal_conv1d_kernel<<<grid, 256, smem_init, s>>>(
-        conv_out, input, initial_conv_w_, initial_conv_b_,
-        latent, dec_dim, 7, T, T, 1, 1);
+    conv1d_gemm(conv_out, input, initial_conv_w_, initial_conv_b_,
+                latent, dec_dim, 7, T, 1, nullptr);
 
     float* buf_a = conv_out;
     int in_dim = dec_dim;
@@ -1171,8 +1292,7 @@ void SpeechTokenizerDecoder::run_bigvgan(
         // Allocate output buffer for transposed conv
         float* buf_b = (float*)decode_pool_.alloc(out_size);
 
-        // ConvTranspose1d: [in_dim, T] → [out_dim, T_new] (right-crop = kernel - stride)
-        // Tile input channels to fit SMEM (48KB max per block)
+        // ConvTranspose1d: [in_dim, T] → [out_dim, T_new] (custom kernel, not GEMM)
         int tc_tile_ic = std::min(in_dim, (int)(48 * 1024 / (kernel * sizeof(float))));
         int tc_smem = tc_tile_ic * kernel * sizeof(float);
         dim3 tc_grid(out_dim, (T_new + 255) / 256);
@@ -1181,48 +1301,38 @@ void SpeechTokenizerDecoder::run_bigvgan(
             decoder_stages_[stage].transconv_b,
             in_dim, out_dim, kernel, upsample_rate, T, T_new, tc_tile_ic);
 
-        // Free input buffer (no longer needed after transconv reads it)
         decode_pool_.free(buf_a);
 
-        // Allocate residual and temp buffers for ResBlocks
+        // Allocate temp buffer for ResBlocks (res_buf used for intermediate conv outputs)
         float* res_buf = (float*)decode_pool_.alloc(out_size);
         float* temp_buf = (float*)decode_pool_.alloc(out_size);
 
         // 3 ResBlocks with dilations [1, 3, 9]
-        // Uses out-of-place SnakeBeta1 to preserve buf_b as residual (no memcpy needed)
         for (int r = 0; r < 3; r++) {
             auto& rb = decoder_stages_[stage].res_blocks[r];
             int dil = dilations[r];
             dim3 sb1(out_dim, (T_new + 255) / 256);
 
-            // SnakeBeta1 (out-of-place: buf_b → temp_buf, buf_b preserved as residual)
+            // SnakeBeta1 (out-of-place: buf_b → temp_buf)
             snake_beta_oop_kernel<<<sb1, 256, 0, s>>>(
                 temp_buf, buf_b, rb.act1_alpha, rb.act1_beta, out_dim, T_new);
 
-            // Conv1 (dilated): [out_dim, T_new] → [out_dim, T_new]
-            dim3 c1_grid(out_dim, (T_new + 255) / 256);
-            int smem_c1 = out_dim * 7 * sizeof(float);
-            causal_conv1d_kernel<<<c1_grid, 256, smem_c1, s>>>(
-                res_buf, temp_buf, rb.conv1_w, rb.conv1_b,
-                out_dim, out_dim, 7, T_new, T_new, dil, 1);
+            // Conv1 (dilated, k=7): cuBLAS GEMM
+            conv1d_gemm(res_buf, temp_buf, rb.conv1_w, rb.conv1_b,
+                        out_dim, out_dim, 7, T_new, dil, nullptr);
 
             // SnakeBeta2 (in-place on res_buf)
             snake_beta_kernel<<<sb1, 256, 0, s>>>(
                 res_buf, rb.act2_alpha, rb.act2_beta, out_dim, T_new);
 
-            // Conv2 (k=1) + fused residual add: buf_b = conv2(res_buf) + buf_b
-            dim3 c2_grid(out_dim, (T_new + 255) / 256);
-            int smem_c2 = out_dim * 1 * sizeof(float);
-            causal_conv1d_kernel<<<c2_grid, 256, smem_c2, s>>>(
-                buf_b, res_buf, rb.conv2_w, rb.conv2_b,
-                out_dim, out_dim, 1, T_new, T_new, 1, 1, buf_b);
+            // Conv2 (k=1) + residual add: buf_b = conv2(res_buf) + buf_b
+            conv1d_gemm(buf_b, res_buf, rb.conv2_w, rb.conv2_b,
+                        out_dim, out_dim, 1, T_new, 1, buf_b);
         }
 
-        // Free ResBlock temp buffers
         decode_pool_.free(res_buf);
         decode_pool_.free(temp_buf);
 
-        // Next stage: buf_b becomes buf_a
         buf_a = buf_b;
         in_dim = out_dim;
         T = T_new;
@@ -1235,12 +1345,9 @@ void SpeechTokenizerDecoder::run_bigvgan(
     snake_beta_kernel<<<fs_grid, 256, 0, s>>>(
         buf_a, final_snake_alpha_, final_snake_beta_, final_dim, T);
 
-    // Final conv: [96, T] → [1, T]
-    dim3 fc_grid(1, (T + 255) / 256);
-    int smem_final = final_dim * 7 * sizeof(float);
-    causal_conv1d_kernel<<<fc_grid, 256, smem_final, s>>>(
-        output, buf_a, final_conv_w_, final_conv_b_,
-        final_dim, 1, 7, T, T, 1, 1);
+    // Final conv: [96, T] → [1, T] via GEMM
+    conv1d_gemm(output, buf_a, final_conv_w_, final_conv_b_,
+                final_dim, 1, 7, T, 1, nullptr);
 
     decode_pool_.free(buf_a);
 
@@ -1253,7 +1360,7 @@ void SpeechTokenizerDecoder::run_bigvgan(
     for (int i = 0; i < 4; i++) {
         cudaEventElapsedTime(&stage_ms[i], ev_stage[i], ev_stage[i+1]);
     }
-    fprintf(stderr, "[BigVGAN Profile] Stage0(1536→768,×8)=%.1fms Stage1(768→384,×5)=%.1fms "
+    fprintf(stderr, "[BigVGAN GEMM] Stage0(1536→768,×8)=%.1fms Stage1(768→384,×5)=%.1fms "
             "Stage2(384→192,×4)=%.1fms Stage3(192→96,×3)=%.1fms\n",
             stage_ms[0], stage_ms[1], stage_ms[2], stage_ms[3]);
     for (int i = 0; i < 5; i++) cudaEventDestroy(ev_stage[i]);
