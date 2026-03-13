@@ -103,6 +103,7 @@ public:
     // Model info: type, available voices, sample rate
     struct ModelInfo {
         std::string model_type;                    // custom_voice, voice_design, voice_clone
+        std::string default_instruct;              // VoiceDesign 默认音色描述
         std::vector<std::string> available_voices; // speaker names
         std::vector<std::string> available_languages; // language/dialect names
         std::unordered_map<std::string, std::string> speaker_dialects; // speaker → dialect (empty = standard)

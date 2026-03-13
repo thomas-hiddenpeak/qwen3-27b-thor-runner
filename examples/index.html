@@ -903,6 +903,14 @@ async function fetchTtsInfo() {
     document.getElementById('instructLabel').style.display = isDesign ? 'block' : 'none';
     document.getElementById('ttsTabInstructDiv').style.display = isDesign ? 'block' : 'none';
 
+    // VoiceDesign: 用 API 返回的默认 instruct 初始化输入框
+    if (isDesign && info.default_instruct) {
+      const instructEl = document.getElementById('ttsInstruct');
+      const tabInstructEl = document.getElementById('ttsTabInstruct');
+      if (instructEl && !instructEl.value) instructEl.value = info.default_instruct;
+      if (tabInstructEl && !tabInstructEl.value) tabInstructEl.value = info.default_instruct;
+    }
+
     // voice_design 模式隐藏 voice 选择
     document.getElementById('voiceSelect').style.display = (isDesign || isClone) ? 'none' : '';
     document.getElementById('ttsVoiceSelect').parentElement.style.display = (isDesign || isClone) ? 'none' : '';
@@ -1059,9 +1067,10 @@ function sendConfig() {
     tts_top_p: parseFloat(document.getElementById('ttsTopP').value),
     tts_rep_penalty: parseFloat(document.getElementById('ttsRepPenalty').value)
   };
-  // VoiceDesign instruct
+  // VoiceDesign instruct — 始终发送 (空值让服务端用默认)
   const instruct = document.getElementById('ttsInstruct').value.trim();
-  if (instruct) msg.tts_instruct = instruct;
+  if (ttsModelType === 'voice_design') msg.tts_instruct = instruct;
+  else if (instruct) msg.tts_instruct = instruct;
   ws.send(JSON.stringify(msg));
 }
 
@@ -1632,7 +1641,8 @@ async function synthesizeTts() {
         voice: voice,
         response_format: format,
         speed: 1.0,
-        language: document.getElementById('ttsLangSelect').value || undefined
+        language: document.getElementById('ttsLangSelect').value || undefined,
+        instruct: document.getElementById('ttsTabInstruct')?.value.trim() || undefined
       })
     });
 

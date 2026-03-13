@@ -457,6 +457,7 @@ TtsPlugin::ModelInfo NativeTtsPlugin::model_info() const {
     if (!engine_ || !engine_->is_loaded()) return info;
     const auto& cfg = engine_->config();
     info.model_type = cfg.tts_model_type;
+    info.default_instruct = config_.instruct;  // VoiceDesign 默认音色描述
     info.sample_rate = cfg.tokenizer_decoder.output_sample_rate;
     for (const auto& [name, id] : cfg.talker.spk_id) {
         info.available_voices.push_back(name);

@@ -3886,6 +3886,7 @@ void ServeApp::handle_tts_info(const HttpRequest& /*req*/, int client_fd) {
 
     resp.body = "{\"enabled\":true,"
                 "\"model_type\":\"" + json_escape(info.model_type) + "\","
+                "\"default_instruct\":\"" + json_escape(info.default_instruct) + "\","
                 "\"sample_rate\":" + std::to_string(info.sample_rate) + ","
                 "\"available_voices\":" + voices_json + ","
                 "\"available_languages\":" + langs_json + ","
@@ -3977,7 +3978,12 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
     // 会话状态
     std::vector<std::pair<std::string, std::string>> chat_history;
     std::string voice = "serena";
-    std::string tts_instruct;  // VoiceDesign 模式的音色描述指令
+    // VoiceDesign: 从 TTS config 初始化 base instruct, 保证音色描述始终生效
+    std::string tts_instruct;
+    if (tts_plugin_) {
+        auto info = tts_plugin_->model_info();
+        tts_instruct = info.default_instruct;
+    }
     std::string tts_language;  // TTS 语言/方言 (空=auto)
     bool tts_enabled = true;
 
@@ -4225,9 +4231,17 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             if (tts_pos != std::string::npos) {
                 tts_enabled = json_get_bool(msg, "tts", true);
             }
-            // VoiceDesign instruct
-            std::string inst = json_get_string(msg, "tts_instruct");
-            if (!inst.empty()) tts_instruct = inst;
+            // VoiceDesign instruct (显式设置, 含空字符串=恢复默认)
+            if (msg.find("\"tts_instruct\"") != std::string::npos) {
+                std::string inst = json_get_string(msg, "tts_instruct");
+                if (inst.empty() && tts_plugin_) {
+                    tts_instruct = tts_plugin_->model_info().default_instruct;
+                } else {
+                    tts_instruct = inst;
+                }
+                fprintf(stderr, "[WS] tts_instruct updated: %s\n",
+                        tts_instruct.empty() ? "(empty)" : tts_instruct.c_str());
+            }
             // System prompt (per-session override)
             if (msg.find("\"system_prompt\"") != std::string::npos) {
                 std::string sp = json_get_string(msg, "system_prompt");
@@ -4658,7 +4672,12 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
 
     // ---- 会话配置 ----
     std::string voice = "serena";
-    std::string tts_instruct;  // VoiceDesign 模式的音色描述指令
+    // VoiceDesign: 从 TTS config 初始化 base instruct
+    std::string tts_instruct;
+    if (tts_plugin_) {
+        auto info = tts_plugin_->model_info();
+        tts_instruct = info.default_instruct;
+    }
     int client_sample_rate = 16000;
     std::vector<std::pair<std::string, std::string>> chat_history;
 
