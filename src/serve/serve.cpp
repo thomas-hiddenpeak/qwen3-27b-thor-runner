@@ -4468,15 +4468,20 @@ void ServeApp::ws_voice_generate(const std::string& user_text,
         });
     }
 
-    // 推送句子到 TTS 队列 (自动解析 [情感标注] → TTS instruct)
+    // 推送句子到 TTS 队列 (自动解析 [情感标注] → TTS instruct, 后续句子继承前句情感)
+    std::string last_emotion;  // 记住最近的情感标签, 防止多句输出时情绪跳变
     auto push_tts = [&](const std::string& sentence) {
         if (!do_stream_tts || sentence.empty()) return;
         auto [clean_text, emotion] = extract_tts_instruct(sentence);
         if (clean_text.empty()) return;
+        // 有新情感则更新, 否则继承上一句
+        if (!emotion.empty()) {
+            last_emotion = emotion;
+        }
         // Format emotion as proper TTS instruct (e.g., "温柔" → "用温柔的语气说")
         std::string formatted_instruct;
-        if (!emotion.empty()) {
-            formatted_instruct = "用" + emotion + "的语气说";
+        if (!last_emotion.empty()) {
+            formatted_instruct = "用" + last_emotion + "的语气说";
         }
         {
             std::lock_guard<std::mutex> lock(tts_mutex);
@@ -4978,6 +4983,7 @@ void ServeApp::process_text_input(
         });
     }
 
+    std::string last_emotion;  // 记住最近的情感标签, 防止多句输出时情绪跳变
     auto push_tts = [&](const std::string& sentence) {
         if (!do_tts || sentence.empty()) return;
         // Strip markdown formatting (*, #, -, etc.) and whitespace
@@ -5004,10 +5010,14 @@ void ServeApp::process_text_input(
         // 提取 [情感标注] → TTS instruct
         auto [text_part, emotion] = extract_tts_instruct(clean);
         if (text_part.size() < 6) return;
+        // 有新情感则更新, 否则继承上一句
+        if (!emotion.empty()) {
+            last_emotion = emotion;
+        }
         // Format emotion as proper TTS instruct (e.g., "温柔" → "用温柔的语气说")
         std::string formatted_instruct;
-        if (!emotion.empty()) {
-            formatted_instruct = "用" + emotion + "的语气说";
+        if (!last_emotion.empty()) {
+            formatted_instruct = "用" + last_emotion + "的语气说";
         }
         {
             std::lock_guard<std::mutex> lock(tts_mutex);
