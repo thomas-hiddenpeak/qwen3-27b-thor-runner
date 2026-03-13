@@ -231,6 +231,15 @@ bool NativeTtsPlugin::is_available() const {
     return engine_ && engine_->is_loaded();
 }
 
+void NativeTtsPlugin::set_sampling(float temperature, int top_k, float top_p, float rep_penalty) {
+    if (engine_) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        engine_->set_sampling(temperature, top_k, top_p, rep_penalty);
+        fprintf(stderr, "[TTS Native] Sampling updated: temp=%.2f top_k=%d top_p=%.2f rep=%.2f\n",
+                temperature, top_k, top_p, rep_penalty);
+    }
+}
+
 // Build WAV header in memory
 static std::vector<uint8_t> build_wav_header_and_data(
     const std::vector<float>& pcm, int sample_rate)

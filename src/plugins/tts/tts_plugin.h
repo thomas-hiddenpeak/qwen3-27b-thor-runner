@@ -72,6 +72,9 @@ public:
 
     virtual bool is_available() const = 0;
     virtual std::string name() const = 0;
+
+    // Set TTS sampling parameters (temperature, top_k, top_p, repetition_penalty)
+    virtual void set_sampling(float temperature, int top_k, float top_p, float rep_penalty) {}
 };
 
 // ============================================================================
@@ -90,6 +93,7 @@ public:
                                   const std::string& format = "pcm") override;
     bool is_available() const override;
     std::string name() const override { return "native-qwen3-tts"; }
+    void set_sampling(float temperature, int top_k, float top_p, float rep_penalty) override;
 
 private:
     TtsConfig config_;

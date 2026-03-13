@@ -264,6 +264,7 @@ void Talker::inject_continuation_text(const int* text_ids_cpu, int text_len, cud
     size_t ids_bf16 = (text_len * sizeof(int) + sizeof(__nv_bfloat16) - 1) / sizeof(__nv_bfloat16);
     __nv_bfloat16* text_embed = workspace_ + ids_bf16;
     __nv_bfloat16* eos_text_embed = text_embed + actual_text_len * h;
+    __nv_bfloat16* proj_ws = workspace_ + ids_bf16 + (actual_text_len + 1) * h;
 
     cudaMemcpyAsync(text_ids_gpu, text_ids_cpu, text_len * sizeof(int),
                     cudaMemcpyHostToDevice, stream);
@@ -271,7 +272,7 @@ void Talker::inject_continuation_text(const int* text_ids_cpu, int text_len, cud
     // Compute text embeddings → text_projection → trailing_text_hidden_
     audio_ops::invoke_embedding_lookup(text_embed, text_ids_gpu + actual_text_start,
                                         text_embedding_w_, actual_text_len, h, stream);
-    text_projection_forward(trailing_text_hidden_, text_embed, actual_text_len, workspace_ + ids_bf16 + (actual_text_len + 1) * h, stream);
+    text_projection_forward(trailing_text_hidden_, text_embed, actual_text_len, proj_ws, stream);
 
     // Append tts_eos_embed at the end
     int tts_eos_id = config_.tts_eos_token_id;
@@ -279,17 +280,50 @@ void Talker::inject_continuation_text(const int* text_ids_cpu, int text_len, cud
     audio_ops::invoke_embedding_lookup(eos_text_embed, text_ids_gpu,
                                         text_embedding_w_, 1, h, stream);
     text_projection_forward(trailing_text_hidden_ + actual_text_len * h,
-                            eos_text_embed, 1, workspace_ + ids_bf16 + (actual_text_len + 1) * h, stream);
+                            eos_text_embed, 1, proj_ws, stream);
 
     trailing_text_len_ = actual_text_len + 1;  // text tokens + tts_eos
-    generation_step_ = 0;  // restart text injection from beginning
-    // KV cache (talker_cache_len_) is NOT reset — voice context preserved
-    // CodePredictor cache must reset per new decode segment
+
+    // Reset generation state for new segment
+    generated_tokens_.clear();
     cp_cache_len_ = 0;
+
+    // ---- Bootstrap forward pass: generate fresh logits ----
+    // Build input: tts_pad_embed_ (neutral codec) + trailing_text_hidden_[0] (first text)
+    // This mirrors the "last prefill position" pattern: text_proj(text) + codec_embed
+    __nv_bfloat16* hidden = workspace_;
+    cudaMemcpyAsync(hidden, tts_pad_embed_, h * sizeof(__nv_bfloat16),
+                    cudaMemcpyDeviceToDevice, stream);
+    invoke_add(hidden, trailing_text_hidden_, h, stream);
+
+    // Position = current cache length
+    int pos = talker_cache_len_;
+    int pos_ids[3] = {pos, pos, pos};
+    cudaMemcpyAsync(decode_pos_gpu_, pos_ids, 3 * sizeof(int), cudaMemcpyHostToDevice, stream);
+
+    // Forward through all talker layers (T=1 decode)
+    __nv_bfloat16* layer_ws = hidden + h;
+    for (int layer = 0; layer < tc.num_hidden_layers; layer++) {
+        talker_layer_forward_decode(layer, hidden, decode_pos_gpu_, layer_ws, stream);
+    }
+
+    // RMSNorm → past_hidden + codec_head → logits
+    __nv_bfloat16* norm_out = layer_ws;
+    audio_ops::invoke_rmsnorm(norm_out, hidden, final_norm_w_,
+                               tc.rms_norm_eps, 1, h, stream);
+    cublas_gemm(cublas_handle_, logits_, norm_out, codec_head_w_,
+                1, h, tc.vocab_size, stream);
+    invoke_suppress_tokens(logits_, tc.vocab_size - 1024, tc.vocab_size,
+                           tc.codec_eos_token_id, stream);
+    cudaMemcpyAsync(past_hidden_, norm_out,
+                    h * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
+
+    talker_cache_len_++;
+    generation_step_ = 1;  // consumed first text token in bootstrap
 
     cudaStreamSynchronize(stream);
 
-    fprintf(stderr, "[TTS Talker] continuation text injected: %d tokens, cache_len=%d\n",
+    fprintf(stderr, "[TTS Talker] continuation injected: %d text tokens, bootstrap cache_len=%d\n",
             trailing_text_len_, talker_cache_len_);
 }
 

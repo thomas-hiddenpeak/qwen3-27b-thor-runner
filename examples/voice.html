@@ -342,6 +342,34 @@ body {
         <span class="toggle-slider"></span>
       </label>
     </label>
+    <button onclick="toggleTtsSettings()" style="padding:5px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;cursor:pointer;" title="TTS 采样参数">⚙️</button>
+  </div>
+</div>
+
+<!-- TTS Settings Panel -->
+<div id="ttsSettings" style="display:none;padding:10px 24px;background:var(--surface);border-bottom:1px solid var(--border);font-size:13px;">
+  <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap;">
+    <label style="color:var(--text2)">Temperature:
+      <input type="range" id="ttsTemp" min="0.1" max="1.5" step="0.05" value="0.9"
+             oninput="document.getElementById('ttsTempVal').textContent=this.value" onchange="sendConfig()">
+      <span id="ttsTempVal" style="color:var(--text);min-width:30px;display:inline-block">0.9</span>
+    </label>
+    <label style="color:var(--text2)">Top-K:
+      <input type="range" id="ttsTopK" min="1" max="100" step="1" value="50"
+             oninput="document.getElementById('ttsTopKVal').textContent=this.value" onchange="sendConfig()">
+      <span id="ttsTopKVal" style="color:var(--text);min-width:24px;display:inline-block">50</span>
+    </label>
+    <label style="color:var(--text2)">Top-P:
+      <input type="range" id="ttsTopP" min="0.1" max="1.0" step="0.05" value="1.0"
+             oninput="document.getElementById('ttsTopPVal').textContent=this.value" onchange="sendConfig()">
+      <span id="ttsTopPVal" style="color:var(--text);min-width:30px;display:inline-block">1.0</span>
+    </label>
+    <label style="color:var(--text2)">Rep Penalty:
+      <input type="range" id="ttsRepPenalty" min="1.0" max="1.5" step="0.01" value="1.05"
+             oninput="document.getElementById('ttsRepVal').textContent=this.value" onchange="sendConfig()">
+      <span id="ttsRepVal" style="color:var(--text);min-width:30px;display:inline-block">1.05</span>
+    </label>
+    <button onclick="resetTtsDefaults()" style="padding:4px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text2);font-size:12px;cursor:pointer;">重置默认</button>
   </div>
 </div>
 
@@ -443,7 +471,31 @@ function sendConfig() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const voice = document.getElementById('voiceSelect').value;
   const tts = document.getElementById('ttsToggle').checked;
-  ws.send(JSON.stringify({ type: 'config', voice, tts }));
+  const msg = {
+    type: 'config', voice, tts,
+    tts_temperature: parseFloat(document.getElementById('ttsTemp').value),
+    tts_top_k: parseInt(document.getElementById('ttsTopK').value),
+    tts_top_p: parseFloat(document.getElementById('ttsTopP').value),
+    tts_rep_penalty: parseFloat(document.getElementById('ttsRepPenalty').value)
+  };
+  ws.send(JSON.stringify(msg));
+}
+
+function toggleTtsSettings() {
+  const panel = document.getElementById('ttsSettings');
+  panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+}
+
+function resetTtsDefaults() {
+  document.getElementById('ttsTemp').value = 0.9;
+  document.getElementById('ttsTempVal').textContent = '0.9';
+  document.getElementById('ttsTopK').value = 50;
+  document.getElementById('ttsTopKVal').textContent = '50';
+  document.getElementById('ttsTopP').value = 1.0;
+  document.getElementById('ttsTopPVal').textContent = '1.0';
+  document.getElementById('ttsRepPenalty').value = 1.05;
+  document.getElementById('ttsRepVal').textContent = '1.05';
+  sendConfig();
 }
 
 // ============================================================================

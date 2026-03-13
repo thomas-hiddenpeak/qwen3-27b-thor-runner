@@ -3799,12 +3799,15 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
     std::vector<int16_t> pcm_buffer;             // 累积 PCM16 样本 (16kHz mono)
     int stream_sample_rate = 16000;
     // VAD (Voice Activity Detection) 参数
-    constexpr float VAD_ENERGY_THRESHOLD = 0.005f; // RMS 能量阈值
+    constexpr float VAD_ENERGY_THRESHOLD = 0.02f;  // RMS 能量阈值 (提高避免误识别非语音噪音)
     constexpr int VAD_SILENCE_MS = 800;            // 静音持续 ms 后判定语音结束
-    constexpr int VAD_MIN_SPEECH_MS = 200;         // 最短语音长度
+    constexpr int VAD_MIN_SPEECH_MS = 500;         // 最短语音长度 (过滤短噪声)
     constexpr int VAD_MAX_DURATION_S = 30;         // 最长录音 30s
+    constexpr float VAD_MIN_SPEECH_ENERGY = 0.015f; // 整段音频最低平均 RMS (低于此认为无语音)
     int silence_samples = 0;                       // 连续静音样本计数
     bool speech_detected = false;                  // 是否检测到语音开始
+    double total_energy_sum = 0;                   // 累计能量 (用于平均 RMS 检查)
+    int total_speech_samples = 0;                  // 有语音的样本数
 
     // 发送 session.created
     ws_send_text(client_fd, "{\"type\":\"session.created\"}");
@@ -3845,9 +3848,11 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             if (rms > VAD_ENERGY_THRESHOLD) {
                 speech_detected = true;
                 silence_samples = 0;
+                total_speech_samples += (int)num_samples;
             } else {
                 silence_samples += (int)num_samples;
             }
+            total_energy_sum += energy_sum;
 
             // 发送音频电平给客户端 (用于 UI 显示)
             // 限频: 每 ~100ms 发一次 (1600 samples at 16kHz)
@@ -3873,6 +3878,26 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 streaming_audio = false;
                 ws_send_text(client_fd, "{\"type\":\"stream.vad\"}");  // 通知客户端 VAD 触发
 
+                // 检查整段语音的平均能量 — 过低说明实际无有效语音
+                float avg_rms = (pcm_buffer.size() > 0)
+                    ? std::sqrt((float)(total_energy_sum / pcm_buffer.size()))
+                    : 0.0f;
+                float speech_ratio = (float)total_speech_samples / std::max(1, (int)pcm_buffer.size());
+
+                if (avg_rms < VAD_MIN_SPEECH_ENERGY || speech_ratio < 0.1f) {
+                    fprintf(stderr, "[WS] Rejected audio: avg_rms=%.4f speech_ratio=%.1f%% (too quiet)\n",
+                            avg_rms, speech_ratio * 100);
+                    pcm_buffer.clear();
+                    silence_samples = 0;
+                    speech_detected = false;
+                    total_energy_sum = 0;
+                    total_speech_samples = 0;
+                    // 通知客户端没有检测到有效语音
+                    ws_send_text(client_fd,
+                        "{\"type\":\"error\",\"message\":\"未检测到有效语音\"}");
+                    continue;
+                }
+
                 // 去掉尾部静音
                 int trim_samples = std::min(silence_samples, (int)pcm_buffer.size());
                 if (trim_samples > stream_sample_rate / 10) // 保留 100ms
@@ -3884,8 +3909,8 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                     float_samples[i] = pcm_buffer[i] / 32768.0f;
 
                 float audio_dur = (float)float_samples.size() / stream_sample_rate;
-                fprintf(stderr, "[WS] Stream VAD: %.1fs audio, %zu samples\n",
-                        audio_dur, float_samples.size());
+                fprintf(stderr, "[WS] Stream VAD: %.1fs audio, %zu samples, avg_rms=%.4f speech=%.0f%%\n",
+                        audio_dur, float_samples.size(), avg_rms, speech_ratio * 100);
 
                 // ASR 转录
                 if (asr_plugin_ && asr_plugin_->is_available() && !float_samples.empty()) {
@@ -3895,14 +3920,31 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                         float_samples.data(), (int)float_samples.size(),
                         stream_sample_rate, "auto");
 
+                    // 过滤无效识别结果 (噪音/无意义短文)
+                    bool valid_text = false;
                     if (result.error_code == 0 && !result.text.empty()) {
+                        // 计算实际字符数 (UTF-8, 排除空格标点)
+                        int char_count = 0;
+                        for (size_t i = 0; i < result.text.size(); ) {
+                            unsigned char c = result.text[i];
+                            int len = 1;
+                            if (c >= 0xC0) len = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : 2;
+                            if (c > 0x20 && c != '.' && c != ',' && c != '!' && c != '?')
+                                char_count++;
+                            i += len;
+                        }
+                        valid_text = (char_count >= 2);  // 至少2个有效字符
+                    }
+
+                    if (valid_text) {
                         ws_send_text(client_fd, "{\"type\":\"asr\",\"text\":\"" +
                                      json_escape(result.text) + "\"}");
                         ws_voice_generate(client_fd, result.text, chat_history, voice, tts_enabled);
                     } else {
+                        fprintf(stderr, "[WS] ASR filtered: '%s' (too short or empty)\n",
+                                result.text.c_str());
                         ws_send_text(client_fd,
-                            "{\"type\":\"error\",\"message\":\"ASR: " +
-                            json_escape(result.error_message.empty() ? "no speech detected" : result.error_message) + "\"}");
+                            "{\"type\":\"error\",\"message\":\"未识别到有效语音内容\"}");
                     }
                 }
 
@@ -3910,6 +3952,8 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 pcm_buffer.clear();
                 silence_samples = 0;
                 speech_detected = false;
+                total_energy_sum = 0;
+                total_speech_samples = 0;
             }
 
             continue;
@@ -3928,6 +3972,14 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             auto tts_pos = msg.find("\"tts\"");
             if (tts_pos != std::string::npos) {
                 tts_enabled = json_get_bool(msg, "tts", true);
+            }
+            // TTS 采样参数
+            if (tts_plugin_ && msg.find("\"tts_temperature\"") != std::string::npos) {
+                float tts_temp = (float)json_get_number(msg, "tts_temperature", 0.9);
+                int tts_topk = json_get_int(msg, "tts_top_k", 50);
+                float tts_topp = (float)json_get_number(msg, "tts_top_p", 1.0);
+                float tts_rep = (float)json_get_number(msg, "tts_rep_penalty", 1.05);
+                tts_plugin_->set_sampling(tts_temp, tts_topk, tts_topp, tts_rep);
             }
             ws_send_text(client_fd, "{\"type\":\"config.updated\"}");
 
@@ -3963,7 +4015,21 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                     for (size_t i = 0; i < pcm_buffer.size(); i++)
                         float_samples[i] = pcm_buffer[i] / 32768.0f;
 
-                    fprintf(stderr, "[WS] Stream stopped manually: %.1fs audio\n", audio_dur);
+                    // 能量检查: 过滤静音/低噪声
+                    float avg_rms = std::sqrt((float)(total_energy_sum / std::max((size_t)1, pcm_buffer.size())));
+                    if (avg_rms < VAD_MIN_SPEECH_ENERGY) {
+                        fprintf(stderr, "[WS] Stream stopped: rejected (avg_rms=%.4f too quiet)\n", avg_rms);
+                        ws_send_text(client_fd, "{\"type\":\"error\",\"message\":\"未检测到语音\"}");
+                        pcm_buffer.clear();
+                        silence_samples = 0;
+                        speech_detected = false;
+                        total_energy_sum = 0;
+                        total_speech_samples = 0;
+                        ws_send_text(client_fd, "{\"type\":\"stream.stopped\"}");
+                        continue;
+                    }
+
+                    fprintf(stderr, "[WS] Stream stopped manually: %.1fs audio, avg_rms=%.4f\n", audio_dur, avg_rms);
 
                     if (asr_plugin_ && asr_plugin_->is_available()) {
                         ws_send_text(client_fd, "{\"type\":\"status\",\"stage\":\"asr\"}");
@@ -3972,14 +4038,30 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                             float_samples.data(), (int)float_samples.size(),
                             stream_sample_rate, "auto");
 
+                        // 过滤无效识别结果
+                        bool valid_text = false;
                         if (result.error_code == 0 && !result.text.empty()) {
+                            int char_count = 0;
+                            for (size_t i = 0; i < result.text.size(); ) {
+                                unsigned char c = result.text[i];
+                                int len = 1;
+                                if (c >= 0xC0) len = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : 2;
+                                if (c > 0x20 && c != '.' && c != ',' && c != '!' && c != '?')
+                                    char_count++;
+                                i += len;
+                            }
+                            valid_text = (char_count >= 2);
+                        }
+
+                        if (valid_text) {
                             ws_send_text(client_fd, "{\"type\":\"asr\",\"text\":\"" +
                                          json_escape(result.text) + "\"}");
                             ws_voice_generate(client_fd, result.text, chat_history, voice, tts_enabled);
                         } else {
+                            fprintf(stderr, "[WS] ASR filtered (manual stop): '%s'\n",
+                                    result.text.c_str());
                             ws_send_text(client_fd,
-                                "{\"type\":\"error\",\"message\":\"ASR: " +
-                                json_escape(result.error_message.empty() ? "no speech detected" : result.error_message) + "\"}");
+                                "{\"type\":\"error\",\"message\":\"未识别到有效语音内容\"}");
                         }
                     }
                 } else {
