@@ -39,16 +39,15 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 24px;
+  padding: 8px 20px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
-  flex-wrap: wrap;
   gap: 8px;
 }
 
 .header h1 {
-  font-size: 18px;
+  font-size: 17px;
   font-weight: 700;
   background: linear-gradient(135deg, var(--primary), #a78bfa);
   -webkit-background-clip: text;
@@ -63,47 +62,150 @@ body {
   flex-wrap: wrap;
 }
 
-.header-controls label { font-size: 12px; color: var(--text2); }
+/* ======== Split Layout ======== */
+.split-layout {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
 
-.header-controls select {
-  padding: 6px 10px;
+.left-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.right-panel {
+  width: 420px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.right-panel.hidden { display: none; }
+
+/* ======== Panel Sections ======== */
+.panel-section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 14px;
+  cursor: pointer;
+  user-select: none;
+  font-weight: 600;
+  font-size: 13px;
+  transition: background 0.15s;
+  border-radius: 10px;
+}
+
+.panel-header:hover { background: var(--surface2); }
+
+.panel-header .toggle-icon {
+  font-size: 10px;
+  color: var(--text2);
+  transition: transform 0.2s;
+}
+
+.panel-header .toggle-icon.collapsed { transform: rotate(-90deg); }
+
+.panel-body {
+  padding: 0 14px 14px;
+}
+
+.panel-body.collapsed { display: none; }
+
+/* ======== Right Panel Forms ======== */
+.right-panel .form-group { margin-bottom: 10px; }
+
+.right-panel .form-group:last-child { margin-bottom: 0; }
+
+.right-panel .form-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text2);
+  margin-bottom: 4px;
+}
+
+.right-panel select,
+.right-panel input[type="text"],
+.right-panel textarea {
+  width: 100%;
+  padding: 7px 10px;
   background: var(--surface2);
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--text);
   font-size: 13px;
   outline: none;
-}
-
-/* ======== Tab bar ======== */
-.tab-bar {
-  display: flex;
-  gap: 0;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-}
-
-.tab-bar button {
-  padding: 10px 24px;
-  background: transparent;
-  border: none;
-  border-bottom: 2px solid transparent;
-  color: var(--text2);
-  font-size: 14px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.2s;
   font-family: inherit;
+  transition: border-color 0.2s;
+  box-sizing: border-box;
+  max-width: 100%;
 }
 
-.tab-bar button:hover { color: var(--text); }
-.tab-bar button.active { color: var(--primary); border-bottom-color: var(--primary); }
+.right-panel select:focus,
+.right-panel input:focus,
+.right-panel textarea:focus { border-color: var(--primary); }
 
-.tab-content { display: none; flex: 1; overflow: hidden; flex-direction: column; }
-.tab-content.active { display: flex; }
+.right-panel select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' fill='%239ca0ab'%3E%3Cpath d='M5 7L0 2h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 28px;
+  min-height: 32px;
+  overflow: visible;
+}
 
-/* ======== Voice Chat Tab ======== */
+.right-panel textarea {
+  resize: vertical;
+  min-height: 60px;
+  line-height: 1.5;
+}
+
+.param-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--text2);
+}
+
+.param-row label { min-width: 70px; }
+
+.param-row input[type="range"] { flex: 1; height: 4px; }
+
+.param-row .param-val {
+  min-width: 32px;
+  text-align: right;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.row-flex { display: flex; gap: 8px; }
+.row-flex > * { flex: 1; }
+
+.btn-row { display: flex; gap: 6px; margin-top: 8px; }
+
+/* ======== Chat Area ======== */
 .chat-area {
   flex: 1;
   overflow-y: auto;
@@ -153,7 +255,7 @@ body {
   margin-top: 6px;
 }
 
-/* Input area */
+/* ======== Input Area ======== */
 .input-area {
   padding: 16px 24px;
   background: var(--surface);
@@ -189,7 +291,7 @@ body {
 .input-row textarea::placeholder { color: var(--text2); }
 
 .mic-btn {
-  width: 48px; height: 48px;
+  width: 44px; height: 44px;
   border-radius: 50%;
   border: 2px solid var(--border);
   background: var(--surface2);
@@ -210,7 +312,7 @@ body {
   animation: pulse 1.5s ease infinite;
 }
 
-.mic-btn svg { width: 22px; height: 22px; }
+.mic-btn svg { width: 20px; height: 20px; }
 
 @keyframes pulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
@@ -218,7 +320,7 @@ body {
 }
 
 .send-btn {
-  width: 48px; height: 48px;
+  width: 44px; height: 44px;
   border-radius: 50%;
   border: none;
   background: var(--primary);
@@ -235,19 +337,20 @@ body {
 .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .send-btn svg { width: 20px; height: 20px; }
 
+/* ======== Mode Toggle & Controls ======== */
 .mode-toggle {
   display: flex;
-  gap: 4px;
+  gap: 0;
   background: var(--surface2);
-  border-radius: 8px;
-  padding: 3px;
+  border-radius: 6px;
+  padding: 2px;
 }
 
 .mode-toggle button {
-  padding: 5px 12px;
+  padding: 4px 10px;
   font-size: 12px;
   border: none;
-  border-radius: 6px;
+  border-radius: 5px;
   background: transparent;
   color: var(--text2);
   cursor: pointer;
@@ -260,7 +363,7 @@ body {
 .toggle-switch {
   position: relative;
   display: inline-block;
-  width: 36px; height: 20px;
+  width: 34px; height: 18px;
 }
 
 .toggle-switch input { opacity: 0; width: 0; height: 0; }
@@ -271,14 +374,14 @@ body {
   top: 0; left: 0; right: 0; bottom: 0;
   background: var(--surface2);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 9px;
   transition: 0.3s;
 }
 
 .toggle-slider:before {
   content: '';
   position: absolute;
-  height: 14px; width: 14px;
+  height: 12px; width: 12px;
   left: 2px; bottom: 2px;
   background: var(--text2);
   border-radius: 50%;
@@ -288,17 +391,16 @@ body {
 .toggle-switch input:checked + .toggle-slider { background: var(--primary); border-color: var(--primary); }
 .toggle-switch input:checked + .toggle-slider:before { transform: translateX(16px); background: #fff; }
 
-/* Connection status */
 .ws-status {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  font-size: 12px;
+  gap: 5px;
+  font-size: 11px;
   color: var(--text2);
 }
 
 .ws-dot {
-  width: 8px; height: 8px;
+  width: 7px; height: 7px;
   border-radius: 50%;
   background: var(--error);
   transition: background 0.3s;
@@ -310,7 +412,7 @@ body {
   display: flex;
   gap: 16px;
   align-items: center;
-  margin-top: 8px;
+  margin-top: 6px;
   font-size: 12px;
   color: var(--text2);
 }
@@ -334,90 +436,17 @@ body {
 
 @keyframes blink { 50% { opacity: 0; } }
 
-/* ======== TTS Tab ======== */
-.tts-container {
-  width: 100%;
-  max-width: 720px;
-  padding: 24px;
-  margin: 0 auto;
-  overflow-y: auto;
-  flex: 1;
-}
-
-.card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 24px;
-  margin-bottom: 16px;
-}
-
-.form-group { margin-bottom: 16px; }
-
-.form-group label {
-  display: block;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text2);
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  margin-bottom: 6px;
-}
-
-.tts-container textarea {
-  width: 100%;
-  min-height: 120px;
-  padding: 12px 16px;
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text);
-  font-size: 16px;
-  line-height: 1.6;
-  resize: vertical;
-  outline: none;
-  transition: border-color 0.2s;
-  font-family: inherit;
-}
-
-.tts-container textarea:focus { border-color: var(--primary); }
-
-.row { display: flex; gap: 12px; }
-.row > * { flex: 1; }
-
-.tts-container select, .tts-container input[type="text"] {
-  width: 100%;
-  padding: 10px 14px;
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text);
-  font-size: 14px;
-  outline: none;
-  transition: border-color 0.2s;
-  appearance: none;
-  font-family: inherit;
-}
-
-.tts-container select:focus, .tts-container input:focus { border-color: var(--primary); }
-
-.tts-container select {
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%239ca0ab'%3E%3Cpath d='M6 8L1 3h10z'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 14px center;
-  padding-right: 36px;
-}
-
+/* ======== Buttons ======== */
 .btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  padding: 12px 28px;
-  font-size: 15px;
+  gap: 6px;
+  padding: 8px 16px;
+  font-size: 13px;
   font-weight: 600;
   border: none;
-  border-radius: 8px;
+  border-radius: 6px;
   cursor: pointer;
   transition: all 0.2s;
   font-family: inherit;
@@ -429,23 +458,41 @@ body {
   width: 100%;
 }
 
-.btn-primary:hover:not(:disabled) { background: var(--primary-hover); transform: translateY(-1px); }
+.btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
 .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .btn-secondary {
   background: var(--surface2);
   color: var(--text);
   border: 1px solid var(--border);
-  padding: 8px 16px;
-  font-size: 13px;
+  padding: 6px 12px;
+  font-size: 12px;
 }
 
 .btn-secondary:hover { background: var(--border); }
 
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: 4px;
+}
+
+.btn-danger {
+  background: transparent;
+  color: var(--error);
+  border: 1px solid var(--error);
+  padding: 4px 10px;
+  font-size: 11px;
+}
+
+.btn-danger:hover { background: rgba(248,113,113,0.1); }
+
+/* ======== TTS Status & Player ======== */
 .tts-status {
   text-align: center;
-  padding: 12px;
-  font-size: 14px;
+  padding: 8px;
+  font-size: 13px;
   color: var(--text2);
   display: none;
 }
@@ -454,13 +501,13 @@ body {
 .tts-status.error { color: var(--error); }
 .tts-status.success { color: var(--success); }
 
-.player { display: none; margin-top: 16px; }
+.player { display: none; margin-top: 10px; }
 .player.visible { display: block; }
 
 .player audio {
   width: 100%;
-  height: 48px;
-  border-radius: 8px;
+  height: 40px;
+  border-radius: 6px;
   outline: none;
 }
 
@@ -468,24 +515,25 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-top: 8px;
-  font-size: 13px;
+  margin-top: 6px;
+  font-size: 12px;
   color: var(--text2);
 }
 
+/* ======== Presets ======== */
 .presets {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 8px;
+  gap: 6px;
+  margin-top: 6px;
 }
 
 .preset {
-  padding: 6px 12px;
+  padding: 4px 10px;
   background: var(--surface2);
   border: 1px solid var(--border);
-  border-radius: 20px;
-  font-size: 13px;
+  border-radius: 16px;
+  font-size: 12px;
   color: var(--text2);
   cursor: pointer;
   transition: all 0.2s;
@@ -493,21 +541,15 @@ body {
 
 .preset:hover { background: var(--border); color: var(--text); }
 
-.history-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text2);
-  margin-bottom: 12px;
-}
-
+/* ======== History ======== */
 .history-item {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 14px;
+  gap: 10px;
+  padding: 8px 10px;
   background: var(--surface2);
-  border-radius: 8px;
-  margin-bottom: 8px;
+  border-radius: 6px;
+  margin-bottom: 6px;
   cursor: pointer;
   transition: background 0.2s;
 }
@@ -516,21 +558,20 @@ body {
 
 .history-item .text {
   flex: 1;
-  font-size: 14px;
+  font-size: 13px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .history-item .item-meta {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--text2);
   white-space: nowrap;
 }
 
 .history-item .play-icon {
-  width: 32px;
-  height: 32px;
+  width: 28px; height: 28px;
   border-radius: 50%;
   background: var(--primary);
   display: flex;
@@ -539,16 +580,12 @@ body {
   flex-shrink: 0;
 }
 
-.play-icon svg {
-  width: 14px;
-  height: 14px;
-  fill: white;
-  margin-left: 2px;
-}
+.play-icon svg { width: 12px; height: 12px; fill: white; margin-left: 2px; }
 
+/* ======== Misc ======== */
 .spinner {
   display: inline-block;
-  width: 16px; height: 16px;
+  width: 14px; height: 14px;
   border: 2px solid rgba(255,255,255,0.3);
   border-top-color: #fff;
   border-radius: 50%;
@@ -557,38 +594,30 @@ body {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* API docs */
-.api-section { margin-top: 24px; }
-
-.api-section summary {
-  cursor: pointer;
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text2);
-  padding: 8px 0;
+.clone-audio-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
 }
 
-.api-section pre {
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 16px;
-  font-size: 13px;
-  overflow-x: auto;
-  line-height: 1.5;
-  margin-top: 8px;
-  color: var(--text);
-  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+.divider {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 10px 0;
 }
 
-.api-section code { color: var(--primary); }
+.hint { font-size: 11px; color: var(--text2); margin-top: 4px; }
 
-footer {
-  padding: 12px;
-  text-align: center;
-  font-size: 12px;
-  color: var(--text2);
-  flex-shrink: 0;
+/* ======== Responsive ======== */
+@media (max-width: 900px) {
+  .right-panel { width: 360px; }
+}
+
+@media (max-width: 700px) {
+  .split-layout { flex-direction: column; }
+  .left-panel { flex: none; height: 50vh; }
+  .right-panel { width: 100%; border-left: none; border-top: 1px solid var(--border); }
 }
 </style>
 </head>
@@ -607,276 +636,290 @@ footer {
       <button id="modeVoice" onclick="setMode('voice')">语音</button>
       <button id="modeAuto" onclick="setMode('auto')">自动</button>
     </div>
-    <select id="voiceSelect" onchange="onVoiceChanged(); sendConfig()">
-      <option value="serena">Serena</option>
-    </select>
-    <select id="langSelect" onchange="sendConfig()" title="TTS 语言/方言">
-      <option value="">自动</option>
-    </select>
-    <label>
-      <span>TTS</span>
-      <label class="toggle-switch">
-        <input type="checkbox" id="ttsToggle" checked onchange="sendConfig()">
-        <span class="toggle-slider"></span>
-      </label>
-    </label>
-    <button id="stopTtsBtn" onclick="stopTts()" style="display:none;padding:5px 10px;background:#e74c3c;border:none;border-radius:6px;color:white;font-size:12px;cursor:pointer;" title="停止语音播放">⏹ 停止</button>
-    <button onclick="toggleTtsSettings()" style="padding:5px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;cursor:pointer;" title="TTS 采样参数">⚙️</button>
+    <button id="stopTtsBtn" onclick="stopTts()" style="display:none;padding:4px 10px;background:#e74c3c;border:none;border-radius:5px;color:white;font-size:11px;cursor:pointer;" title="停止语音播放">⏹ 停止</button>
+    <button onclick="toggleSidebar()" style="padding:4px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:12px;cursor:pointer;" title="显示/隐藏设置面板">⚙️ 设置</button>
   </div>
 </div>
 
-<!-- TTS Settings Panel -->
-<div id="ttsSettings" style="display:none;padding:10px 24px;background:var(--surface);border-bottom:1px solid var(--border);font-size:13px;">
-  <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap;">
-    <!-- VoiceDesign instruct input (hidden for custom_voice) -->
-    <label id="instructLabel" style="display:none;color:var(--text2);width:100%">音色描述 (VoiceDesign):
-      <input type="text" id="ttsInstruct" placeholder="例: 请用温柔甜美的女声朗读"
-             style="width:100%;padding:4px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;margin-top:4px;"
-             onchange="syncInstruct(this); sendConfig()">
-    </label>
-    <label style="color:var(--text2)">Temperature:
-      <input type="range" id="ttsTemp" min="0.1" max="1.5" step="0.05" value="0.9"
-             oninput="document.getElementById('ttsTempVal').textContent=this.value" onchange="sendConfig()">
-      <span id="ttsTempVal" style="color:var(--text);min-width:30px;display:inline-block">0.9</span>
-    </label>
-    <label style="color:var(--text2)">Top-K:
-      <input type="range" id="ttsTopK" min="1" max="100" step="1" value="50"
-             oninput="document.getElementById('ttsTopKVal').textContent=this.value" onchange="sendConfig()">
-      <span id="ttsTopKVal" style="color:var(--text);min-width:24px;display:inline-block">50</span>
-    </label>
-    <label style="color:var(--text2)">Top-P:
-      <input type="range" id="ttsTopP" min="0.1" max="1.0" step="0.05" value="1.0"
-             oninput="document.getElementById('ttsTopPVal').textContent=this.value" onchange="sendConfig()">
-      <span id="ttsTopPVal" style="color:var(--text);min-width:30px;display:inline-block">1.0</span>
-    </label>
-    <label style="color:var(--text2)">Rep Penalty:
-      <input type="range" id="ttsRepPenalty" min="1.0" max="1.5" step="0.01" value="1.05"
-             oninput="document.getElementById('ttsRepVal').textContent=this.value" onchange="sendConfig()">
-      <span id="ttsRepVal" style="color:var(--text);min-width:30px;display:inline-block">1.05</span>
-    </label>
-    <button onclick="resetTtsDefaults()" style="padding:4px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text2);font-size:12px;cursor:pointer;">重置默认</button>
-  </div>
-  <!-- System Prompt Editor -->
-  <div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-      <span style="color:var(--text2);font-weight:500;">系统提示词</span>
-      <button onclick="toggleSystemPrompt()" id="sysPromptToggleBtn" style="padding:2px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-size:11px;cursor:pointer;">展开</button>
-      <button onclick="applySystemPrompt()" style="padding:2px 8px;background:#27ae60;border:none;border-radius:4px;color:white;font-size:11px;cursor:pointer;">应用</button>
-      <button onclick="resetSystemPrompt()" style="padding:2px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-size:11px;cursor:pointer;">恢复默认</button>
-    </div>
-    <textarea id="systemPromptEditor" style="display:none;width:100%;min-height:120px;padding:8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;font-family:monospace;resize:vertical;line-height:1.5;" placeholder="输入系统提示词..."></textarea>
-  </div>
-</div>
+<!-- ========== Main Split Layout ========== -->
+<div class="split-layout">
 
-<!-- ========== Tab Bar ========== -->
-<div class="tab-bar">
-  <button class="active" onclick="switchTab('voice', this)">💬 语音对话</button>
-  <button onclick="switchTab('tts', this)">🔊 TTS 合成</button>
-</div>
-
-<!-- ========== Voice Chat Tab ========== -->
-<div class="tab-content active" id="tab-voice">
-  <div class="chat-area" id="chatArea">
-    <div class="message assistant">
-      <div class="role-tag">Assistant</div>
-      <div class="content">你好！我是 Qwen 语音助手。你可以用文字或语音和我对话。</div>
-    </div>
-  </div>
-
-  <div class="status-bar" id="statusBar"></div>
-
-  <div class="input-area">
-    <div class="input-row">
-      <textarea id="inputText" placeholder="输入消息... (Ctrl+Enter 发送)" rows="1"
-                oninput="autoResize(this)"></textarea>
-      <button class="mic-btn" id="micBtn" onclick="toggleRecording()" title="按住说话">
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5z"/>
-          <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
-        </svg>
-      </button>
-      <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="发送">
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
-        </svg>
-      </button>
-    </div>
-    <div class="settings-row">
-      <span id="recordingStatus"></span>
-    </div>
-  </div>
-</div>
-
-<!-- ========== TTS Tab ========== -->
-<div class="tab-content" id="tab-tts">
-  <div class="tts-container">
-    <div class="card">
-      <div class="form-group">
-        <label>输入文本</label>
-        <textarea id="ttsInputText" placeholder="请输入要合成的文本...">你好，我是通义千问。很高兴为你服务！</textarea>
-        <div class="presets">
-          <span class="preset" data-text="你好，我是通义千问。很高兴为你服务！">中文问候</span>
-          <span class="preset" data-text="Hello, I'm Qwen. How can I help you today?">English</span>
-          <span class="preset" data-text="春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。">古诗</span>
-          <span class="preset" data-text="今天天气真好，我们一起出去散步吧。阳光明媚，微风轻拂，正是踏青的好时节。">长句</span>
-          <span class="preset" data-text="1加1等于2，圆周率约等于3.14159。">数字</span>
-        </div>
+  <!-- ===== Left Panel: Chat ===== -->
+  <div class="left-panel">
+    <div class="chat-area" id="chatArea">
+      <div class="message assistant">
+        <div class="role-tag">Assistant</div>
+        <div class="content">你好！我是 Qwen 语音助手。你可以用文字或语音和我对话。</div>
       </div>
+    </div>
 
-      <div class="row">
-        <div class="form-group">
-          <label>说话人</label>
-          <select id="ttsVoiceSelect" onchange="updateLangSelect()">
+    <div class="status-bar" id="statusBar"></div>
+
+    <div class="input-area">
+      <div class="input-row">
+        <textarea id="inputText" placeholder="输入消息... (Ctrl+Enter 发送)" rows="1"
+                  oninput="autoResize(this)"></textarea>
+        <button class="mic-btn" id="micBtn" onclick="toggleRecording()" title="按住说话">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5z"/>
+            <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+          </svg>
+        </button>
+        <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="发送">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+          </svg>
+        </button>
+      </div>
+      <div class="settings-row">
+        <span id="recordingStatus"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Right Panel: Settings ===== -->
+  <div class="right-panel" id="rightPanel">
+
+    <!-- Section 1: 对话设置 -->
+    <div class="panel-section">
+      <div class="panel-header" onclick="togglePanel('chatSettingsBody')">
+        <span>💬 对话设置</span>
+        <span class="toggle-icon" id="chatSettingsBody_icon">▾</span>
+      </div>
+      <div class="panel-body" id="chatSettingsBody">
+        <div class="form-group" id="voiceSelectGroup">
+          <label class="form-label">说话人</label>
+          <select id="voiceSelect" onchange="onVoiceChanged(); sendConfig()">
             <option value="serena">Serena</option>
           </select>
-          <label style="margin-top:8px;">语言/方言</label>
-          <select id="ttsLangSelect">
+        </div>
+        <div class="form-group">
+          <label class="form-label">语言/方言</label>
+          <select id="langSelect" onchange="sendConfig()">
             <option value="">自动</option>
           </select>
-          <!-- VoiceDesign instruct for TTS tab -->
-          <div id="ttsTabInstructDiv" style="display:none;margin-top:8px;">
-            <label>音色描述 (VoiceDesign)</label>
-            <input type="text" id="ttsTabInstruct" placeholder="例: 请用温柔甜美的女声朗读"
-                   style="width:100%;padding:6px 10px;margin-top:4px;"
-                   onchange="syncInstruct(this)">
-          </div>
+        </div>
+        <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+          <span class="form-label" style="margin-bottom:0">语音合成</span>
+          <label class="toggle-switch">
+            <input type="checkbox" id="ttsToggle" checked onchange="sendConfig()">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+    </div>
 
-          <!-- Voice Clone section -->
-          <div id="voiceCloneDiv" style="display:none;margin-top:12px;">
-            <label style="font-weight:600;color:var(--primary);">🎤 声音克隆</label>
-            <div style="margin-top:8px;">
-              <label style="font-size:13px;">已注册音色</label>
-              <select id="cloneVoiceSelect" style="width:100%;margin-top:4px;">
-                <option value="">(请先注册音色)</option>
+    <!-- Section 2: 采样参数 -->
+    <div class="panel-section">
+      <div class="panel-header" onclick="togglePanel('samplingBody')">
+        <span>⚙️ 采样参数</span>
+        <span class="toggle-icon collapsed" id="samplingBody_icon">▾</span>
+      </div>
+      <div class="panel-body collapsed" id="samplingBody">
+        <div class="param-row">
+          <label>Temperature</label>
+          <input type="range" id="ttsTemp" min="0.1" max="1.5" step="0.05" value="0.9"
+                 oninput="document.getElementById('ttsTempVal').textContent=this.value" onchange="sendConfig()">
+          <span class="param-val" id="ttsTempVal">0.9</span>
+        </div>
+        <div class="param-row">
+          <label>Top-K</label>
+          <input type="range" id="ttsTopK" min="1" max="100" step="1" value="50"
+                 oninput="document.getElementById('ttsTopKVal').textContent=this.value" onchange="sendConfig()">
+          <span class="param-val" id="ttsTopKVal">50</span>
+        </div>
+        <div class="param-row">
+          <label>Top-P</label>
+          <input type="range" id="ttsTopP" min="0.1" max="1.0" step="0.05" value="1.0"
+                 oninput="document.getElementById('ttsTopPVal').textContent=this.value" onchange="sendConfig()">
+          <span class="param-val" id="ttsTopPVal">1.0</span>
+        </div>
+        <div class="param-row">
+          <label>Rep Penalty</label>
+          <input type="range" id="ttsRepPenalty" min="1.0" max="1.5" step="0.01" value="1.05"
+                 oninput="document.getElementById('ttsRepVal').textContent=this.value" onchange="sendConfig()">
+          <span class="param-val" id="ttsRepVal">1.05</span>
+        </div>
+        <button class="btn btn-secondary btn-sm" onclick="resetTtsDefaults()" style="margin-top:4px;">重置默认</button>
+      </div>
+    </div>
+
+    <!-- Section 3: 系统提示词 -->
+    <div class="panel-section">
+      <div class="panel-header" onclick="togglePanel('sysPromptBody')">
+        <span>📝 系统提示词</span>
+        <span class="toggle-icon collapsed" id="sysPromptBody_icon">▾</span>
+      </div>
+      <div class="panel-body collapsed" id="sysPromptBody">
+        <textarea id="systemPromptEditor" rows="6" placeholder="输入系统提示词..."
+                  style="min-height:100px;font-size:12px;line-height:1.5;"></textarea>
+        <div class="btn-row">
+          <button class="btn btn-sm" style="background:#27ae60;color:white;" onclick="applySystemPrompt()">应用</button>
+          <button class="btn btn-secondary btn-sm" onclick="resetSystemPrompt()">恢复默认</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Section 4: 音色设计 (voice_design only) -->
+    <div class="panel-section" id="voiceDesignSection" style="display:none">
+      <div class="panel-header" onclick="togglePanel('voiceDesignBody')">
+        <span>🎨 音色设计</span>
+        <span class="toggle-icon" id="voiceDesignBody_icon">▾</span>
+      </div>
+      <div class="panel-body" id="voiceDesignBody">
+        <div class="form-group">
+          <label class="form-label">音色描述 (Instruct)</label>
+          <input type="text" id="ttsInstruct" placeholder="例: 请用温柔甜美的女声朗读" onchange="sendConfig()">
+          <div class="hint">描述期望的音色特征,用于控制生成语音的风格</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Section 5: 音色克隆 -->
+    <div class="panel-section" id="voiceCloneSection" style="display:none">
+      <div class="panel-header" onclick="togglePanel('voiceCloneBody')">
+        <span>🎤 音色克隆</span>
+        <span class="toggle-icon" id="voiceCloneBody_icon">▾</span>
+      </div>
+      <div class="panel-body" id="voiceCloneBody">
+        <!-- Register new voice -->
+        <div class="form-group">
+          <label class="form-label">音色名称</label>
+          <input type="text" id="cloneVoiceName" placeholder="英文/数字/下划线">
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">参考音频</label>
+          <div class="clone-audio-actions">
+            <label class="btn btn-secondary btn-sm" style="cursor:pointer;margin:0;">
+              📁 选择文件
+              <input type="file" id="cloneAudioFile" accept="audio/*" style="display:none;" onchange="onCloneFileSelected(this)">
+            </label>
+            <button class="btn btn-secondary btn-sm" id="cloneRecordBtn" onclick="toggleCloneRecord()">🎙 录音</button>
+          </div>
+          <div id="cloneFileInfo" class="hint"></div>
+          <div id="cloneRecordingStatus" style="font-size:12px;color:var(--recording);margin-top:4px;display:none;">
+            ● 正在录音... <span id="cloneRecordTime">0s</span>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">参考文本 <span style="font-weight:normal;color:var(--text2)">(可选,提升克隆效果)</span></label>
+          <div style="display:flex;gap:6px;">
+            <textarea id="cloneRefText" rows="2" placeholder="输入参考音频对应的文本内容..." style="min-height:48px;flex:1;"></textarea>
+            <button class="btn btn-secondary btn-sm" id="cloneAsrBtn" onclick="recognizeCloneAudio()" title="自动识别参考音频文本" style="flex-shrink:0;height:fit-content;margin-top:0;" disabled>🔍 识别</button>
+          </div>
+          <div id="cloneRefTextStatus" class="hint"></div>
+        </div>
+
+        <button class="btn btn-primary" onclick="registerCloneVoice()" style="margin-top:4px;">
+          ✨ 注册音色
+        </button>
+        <div id="cloneRegStatus" class="hint" style="margin-top:4px;"></div>
+      </div>
+    </div>
+
+    <!-- Section 6: 语音合成 -->
+    <div class="panel-section">
+      <div class="panel-header" onclick="togglePanel('ttsSynthBody')">
+        <span>🔊 语音合成</span>
+        <span class="toggle-icon" id="ttsSynthBody_icon">▾</span>
+      </div>
+      <div class="panel-body" id="ttsSynthBody">
+        <div class="form-group">
+          <label class="form-label">输入文本</label>
+          <textarea id="ttsInputText" rows="3" placeholder="请输入要合成的文本...">你好，我是通义千问。很高兴为你服务！</textarea>
+          <div class="presets">
+            <span class="preset" data-text="你好，我是通义千问。很高兴为你服务！">中文问候</span>
+            <span class="preset" data-text="Hello, I'm Qwen. How can I help you today?">English</span>
+            <span class="preset" data-text="春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。">古诗</span>
+            <span class="preset" data-text="今天天气真好，我们一起出去散步吧。阳光明媚，微风轻拂，正是踏青的好时节。">长句</span>
+          </div>
+        </div>
+
+        <!-- Regular voice select (hidden for design/clone models) -->
+        <div class="form-group" id="synthVoiceGroup">
+          <div class="row-flex">
+            <div>
+              <label class="form-label">说话人</label>
+              <select id="ttsVoiceSelect" onchange="updateTtsLangSelect()">
+                <option value="serena">Serena</option>
               </select>
-              <button class="btn btn-secondary" onclick="deleteCloneVoice()"
-                      style="margin-top:4px;font-size:12px;padding:4px 10px;">🗑 删除选中</button>
             </div>
-            <div style="margin-top:12px;padding:12px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);">
-              <label style="font-size:13px;font-weight:600;">注册新音色</label>
-              <div style="margin-top:8px;">
-                <input type="text" id="cloneVoiceName" placeholder="音色名称 (英文/数字/下划线)"
-                       style="width:100%;padding:6px 10px;margin-bottom:8px;">
-                <div style="display:flex;gap:8px;align-items:center;">
-                  <label class="btn btn-secondary" style="cursor:pointer;font-size:13px;padding:6px 12px;margin:0;">
-                    📁 选择音频文件
-                    <input type="file" id="cloneAudioFile" accept="audio/*" style="display:none;" onchange="onCloneFileSelected(this)">
-                  </label>
-                  <button class="btn btn-secondary" id="cloneRecordBtn" onclick="toggleCloneRecord()"
-                          style="font-size:13px;padding:6px 12px;">🎙 录音</button>
-                </div>
-                <div id="cloneFileInfo" style="font-size:12px;color:var(--text2);margin-top:4px;"></div>
-                <div id="cloneRecordingStatus" style="font-size:12px;color:var(--recording);margin-top:4px;display:none;">
-                  ● 正在录音... <span id="cloneRecordTime">0s</span>
-                </div>
-                <button class="btn btn-primary" onclick="registerCloneVoice()" style="margin-top:8px;width:100%;">
-                  ✨ 注册音色
-                </button>
-                <div id="cloneRegStatus" style="font-size:12px;margin-top:4px;"></div>
-              </div>
+            <div>
+              <label class="form-label">语言</label>
+              <select id="ttsLangSelect">
+                <option value="">自动</option>
+              </select>
             </div>
           </div>
         </div>
+
+        <!-- Clone voice select (shown when clone voices exist) -->
+        <div class="form-group" id="synthCloneGroup" style="display:none">
+          <label class="form-label">克隆音色</label>
+          <div style="display:flex;gap:6px;">
+            <select id="cloneVoiceSelect" style="flex:1;">
+              <option value="">(请先注册音色)</option>
+            </select>
+            <button class="btn-danger btn-sm" onclick="deleteCloneVoice()" title="删除选中音色">🗑</button>
+          </div>
+        </div>
+
         <div class="form-group">
-          <label>输出格式</label>
+          <label class="form-label">输出格式</label>
           <select id="formatSelect">
             <option value="wav">WAV</option>
             <option value="pcm">PCM (raw)</option>
           </select>
         </div>
-      </div>
 
-      <button class="btn btn-primary" id="synthesizeBtn" onclick="synthesizeTts()">
-        合成语音
-      </button>
+        <button class="btn btn-primary" id="synthesizeBtn" onclick="synthesizeTts()">
+          合成语音
+        </button>
 
-      <div class="tts-status" id="ttsStatus"></div>
+        <div class="tts-status" id="ttsStatus"></div>
 
-      <div class="player" id="ttsPlayer">
-        <audio id="ttsAudioPlayer" controls></audio>
-        <div class="player-info">
-          <span id="ttsAudioInfo"></span>
-          <div>
-            <button class="btn btn-secondary" onclick="downloadAudio()">⬇ 下载</button>
+        <div class="player" id="ttsPlayer">
+          <audio id="ttsAudioPlayer" controls></audio>
+          <div class="player-info">
+            <span id="ttsAudioInfo"></span>
+            <button class="btn btn-secondary btn-sm" onclick="downloadAudio()">⬇ 下载</button>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- History -->
-    <div class="card" id="ttsHistoryCard" style="display:none">
-      <div class="history-title">历史记录</div>
-      <div id="ttsHistoryList"></div>
+    <!-- Section 7: 合成历史 -->
+    <div class="panel-section" id="ttsHistoryCard" style="display:none">
+      <div class="panel-header" onclick="togglePanel('ttsHistoryBody')">
+        <span>📜 合成历史</span>
+        <span class="toggle-icon" id="ttsHistoryBody_icon">▾</span>
+      </div>
+      <div class="panel-body" id="ttsHistoryBody">
+        <div id="ttsHistoryList"></div>
+      </div>
     </div>
 
-    <!-- API Reference -->
-    <details class="api-section card">
-      <summary>📖 API 参考</summary>
-      <h3 style="margin: 12px 0 8px; font-size: 15px;">POST /v1/audio/speech</h3>
-      <p style="font-size: 13px; color: var(--text2); margin-bottom: 12px;">
-        OpenAI 兼容的 TTS 端点。返回二进制音频数据。
-      </p>
-      <pre>{
-  "model": "qwen3-tts",
-  "input": "你好，世界！",
-  "voice": "serena",
-  "response_format": "wav",
-  "speed": 1.0
-}</pre>
-
-      <h3 style="margin: 16px 0 8px; font-size: 15px;">cURL 示例</h3>
-      <pre>curl -X POST http://localhost:8080/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{"input":"你好世界","voice":"serena"}' \
-  --output speech.wav</pre>
-
-      <h3 style="margin: 16px 0 8px; font-size: 15px;">Python 示例</h3>
-      <pre>from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:8080/v1", api_key="none")
-response = client.audio.speech.create(
-    model="qwen3-tts",
-    voice="serena",
-    input="你好，我是通义千问！",
-    response_format="wav"
-)
-response.stream_to_file("output.wav")</pre>
-
-      <h3 style="margin: 16px 0 8px; font-size: 15px;">JavaScript Fetch</h3>
-      <pre>const response = await fetch('/v1/audio/speech', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    input: '你好世界',
-    voice: 'serena',
-    response_format: 'wav'
-  })
-});
-const blob = await response.blob();
-const url = URL.createObjectURL(blob);
-const audio = new Audio(url);
-audio.play();</pre>
-    </details>
-  </div>
-</div>
-
-<footer>
-  Qwen3-TTS on Jetson AGX Thor &bull; SM110a Blackwell &bull; Native CUDA Inference
-</footer>
+  </div><!-- /right-panel -->
+</div><!-- /split-layout -->
 
 <script>
 // ============================================================================
-// Tab Switching
+// API Base URL — auto-detect or configure
 // ============================================================================
-function switchTab(tabId, btnEl) {
-  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.tab-bar button').forEach(b => b.classList.remove('active'));
-  document.getElementById('tab-' + tabId).classList.add('active');
-  btnEl.classList.add('active');
-}
+// If served from the engine's built-in static file server (port 8080),
+// relative URLs work. If served from a separate file server (e.g. port 8888),
+// we need to point to the engine's API port.
+const API_PORT = 8080;
+const API_HOST = location.hostname + ':' + API_PORT;
+const API_BASE = (location.port == API_PORT) ? '' : 'http://' + API_HOST;
+const WS_BASE = (location.port == API_PORT)
+  ? ((location.protocol === 'https:') ? 'wss://' : 'ws://') + location.host
+  : 'ws://' + API_HOST;
 
 // ============================================================================
-// Voice Chat State
+// State
 // ============================================================================
 let ws = null;
 let isRecording = false;
@@ -903,11 +946,12 @@ let ttsTotalSize = 0;
 let ttsDone = false;
 
 // TTS model info
-let ttsModelType = 'custom_voice';  // custom_voice, voice_design, voice_clone
+let ttsModelType = 'custom_voice';
 let ttsAvailableVoices = ['serena'];
 let ttsAvailableLanguages = [];
-let ttsSpeakerDialects = {}; // speaker → dialect ("" = standard)
-let ttsCloneVoices = [];  // registered clone voice names
+let ttsSpeakerDialects = {};
+let ttsCloneVoices = [];
+let hasAsr = false;
 
 // Voice clone recording state
 let cloneMediaStream = null;
@@ -917,17 +961,31 @@ let cloneRecordInterval = null;
 let cloneAudioBlob = null;
 
 // ============================================================================
+// Panel Toggle
+// ============================================================================
+function togglePanel(id) {
+  const body = document.getElementById(id);
+  const icon = document.getElementById(id + '_icon');
+  if (!body) return;
+  body.classList.toggle('collapsed');
+  if (icon) icon.classList.toggle('collapsed');
+}
+
+function toggleSidebar() {
+  document.getElementById('rightPanel').classList.toggle('hidden');
+}
+
+// ============================================================================
 // TTS Info — 获取模型类型和可用音色
 // ============================================================================
 async function fetchTtsInfo() {
   try {
-    const resp = await fetch('/v1/tts/info');
+    const resp = await fetch(API_BASE + '/v1/tts/info');
     if (!resp.ok) return;
     const info = await resp.json();
     if (!info.enabled) return;
 
     ttsModelType = info.model_type || 'custom_voice';
-    // VoiceDesign/VoiceClone 可能没有预设音色, 需要清空默认
     ttsAvailableVoices = (info.available_voices && info.available_voices.length > 0)
         ? info.available_voices : [];
     if (info.available_languages && info.available_languages.length > 0) {
@@ -938,41 +996,51 @@ async function fetchTtsInfo() {
     }
     if (info.sample_rate) ttsSampleRate = info.sample_rate;
 
-    // 更新语音下拉框
     updateVoiceSelects();
     updateLangSelect();
+    updateTtsLangSelect();
 
-    // VoiceDesign 模式显示 instruct 输入
     const isDesign = ttsModelType === 'voice_design';
-    const isClone = ttsModelType === 'voice_clone';
-    document.getElementById('instructLabel').style.display = isDesign ? 'block' : 'none';
-    document.getElementById('ttsTabInstructDiv').style.display = isDesign ? 'block' : 'none';
+    const isClone = ttsModelType === 'voice_clone' || ttsModelType === 'base';
 
-    // VoiceDesign: 用 API 返回的默认 instruct 初始化输入框
+    // Voice Design section visibility
+    document.getElementById('voiceDesignSection').style.display = isDesign ? '' : 'none';
+
+    // VoiceDesign: load default instruct
     if (isDesign && info.default_instruct) {
       const instructEl = document.getElementById('ttsInstruct');
-      const tabInstructEl = document.getElementById('ttsTabInstruct');
       if (instructEl && !instructEl.value) instructEl.value = info.default_instruct;
-      if (tabInstructEl && !tabInstructEl.value) tabInstructEl.value = info.default_instruct;
     }
 
-    // voice_design 模式隐藏 voice 选择
-    document.getElementById('voiceSelect').style.display = (isDesign || isClone) ? 'none' : '';
-    document.getElementById('ttsVoiceSelect').parentElement.style.display = (isDesign || isClone) ? 'none' : '';
+    // Hide voice selects when no preset voices
+    const hasVoices = ttsAvailableVoices.length > 0;
+    // voiceSelectGroup visibility is managed by updateVoiceSelects()
+    document.getElementById('synthVoiceGroup').style.display = hasVoices ? '' : 'none';
 
-    // voice_clone 提示
-    if (isClone) {
-      setStatus('当前加载的是复制音色模型 (voice_clone), 请先注册参考音频');
+    // ASR availability
+    hasAsr = info.has_asr || false;
+    const asrBtn = document.getElementById('cloneAsrBtn');
+    if (asrBtn) {
+      asrBtn.disabled = !hasAsr;
+      asrBtn.title = hasAsr ? '自动识别参考音频文本' : 'ASR 未加载 (需配置 asr_enabled=true)';
     }
 
-    // Show voice clone panel if model supports it
+    // Voice clone section
     const hasEncoder = info.has_speaker_encoder || false;
-    document.getElementById('voiceCloneDiv').style.display = (isClone || hasEncoder) ? 'block' : 'none';
+    document.getElementById('voiceCloneSection').style.display = (isClone || hasEncoder) ? '' : 'none';
 
-    // Populate clone voices dropdown
+    // Clone voices
     if (info.clone_voices && info.clone_voices.length > 0) {
       ttsCloneVoices = info.clone_voices;
-      updateCloneVoiceSelect();
+    }
+    updateCloneVoiceSelect();
+
+    // Show clone voice select in synthesis when clone voices exist
+    document.getElementById('synthCloneGroup').style.display =
+      (ttsCloneVoices.length > 0 || isClone || hasEncoder) ? '' : 'none';
+
+    if (isClone) {
+      setStatus('加载了克隆音色模型, 请先注册参考音频');
     }
   } catch (e) {
     console.warn('Failed to fetch TTS info:', e);
@@ -981,19 +1049,34 @@ async function fetchTtsInfo() {
 
 function updateVoiceSelects() {
   const selects = [document.getElementById('voiceSelect'), document.getElementById('ttsVoiceSelect')];
+  const isCloneModel = ttsModelType === 'voice_clone' || ttsModelType === 'base';
   for (const sel of selects) {
     const current = sel.value;
     sel.innerHTML = '';
+    // Add preset voices
     for (const v of ttsAvailableVoices) {
       const opt = document.createElement('option');
       opt.value = v;
       opt.textContent = voiceDisplayNames[v] || (v.charAt(0).toUpperCase() + v.slice(1).replace(/_/g, ' '));
       sel.appendChild(opt);
     }
-    if (ttsAvailableVoices.includes(current)) {
-      sel.value = current;
+    // Add clone voices to chat voiceSelect (with separator)
+    if (sel.id === 'voiceSelect' && isCloneModel && ttsCloneVoices.length > 0) {
+      const grp = document.createElement('optgroup');
+      grp.label = '── 克隆音色 ──';
+      for (const v of ttsCloneVoices) {
+        const opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = '🎙 ' + v;
+        grp.appendChild(opt);
+      }
+      sel.appendChild(grp);
     }
+    if (ttsAvailableVoices.includes(current) || ttsCloneVoices.includes(current)) sel.value = current;
   }
+  // Show voice select group when any voice available
+  const hasAnyVoice = ttsAvailableVoices.length > 0 || (isCloneModel && ttsCloneVoices.length > 0);
+  document.getElementById('voiceSelectGroup').style.display = hasAnyVoice ? '' : 'none';
 }
 
 const voiceDisplayNames = {
@@ -1008,42 +1091,53 @@ const langDisplayNames = {
   french: 'Français', russian: 'Русский', beijing_dialect: '北京话', sichuan_dialect: '四川话'
 };
 
-// 已知的方言语言名 (用于区分 standard vs dialect)
 const dialectLanguages = new Set(['beijing_dialect', 'sichuan_dialect']);
 
 function getFilteredLanguages(voice) {
   const dialect = ttsSpeakerDialects[voice];
   if (dialect) {
-    // 方言角色: 显示其对应方言 + 所有标准语言
     return ttsAvailableLanguages.filter(l => l === dialect || !dialectLanguages.has(l));
   }
-  // 标准角色: 只显示标准语言
   return ttsAvailableLanguages.filter(l => !dialectLanguages.has(l));
 }
 
 function updateLangSelect() {
   const voice = document.getElementById('voiceSelect').value;
-  const selects = [
-    { sel: document.getElementById('langSelect'), voice: voice },
-    { sel: document.getElementById('ttsLangSelect'), voice: document.getElementById('ttsVoiceSelect').value }
-  ];
-  for (const { sel, voice: v } of selects) {
-    const current = sel.value;
-    const langs = getFilteredLanguages(v);
-    sel.innerHTML = '<option value="">自动</option>';
-    for (const lang of langs) {
-      const opt = document.createElement('option');
-      opt.value = lang;
-      opt.textContent = langDisplayNames[lang] || lang;
-      sel.appendChild(opt);
-    }
-    if (current && langs.includes(current)) {
-      sel.value = current;
-    } else {
-      // 方言角色默认选中其方言, 标准角色默认"自动"
-      const dialect = ttsSpeakerDialects[v];
-      sel.value = (dialect && langs.includes(dialect)) ? dialect : '';
-    }
+  const sel = document.getElementById('langSelect');
+  const current = sel.value;
+  const langs = getFilteredLanguages(voice);
+  sel.innerHTML = '<option value="">自动</option>';
+  for (const lang of langs) {
+    const opt = document.createElement('option');
+    opt.value = lang;
+    opt.textContent = langDisplayNames[lang] || lang;
+    sel.appendChild(opt);
+  }
+  if (current && langs.includes(current)) {
+    sel.value = current;
+  } else {
+    const dialect = ttsSpeakerDialects[voice];
+    sel.value = (dialect && langs.includes(dialect)) ? dialect : '';
+  }
+}
+
+function updateTtsLangSelect() {
+  const voice = document.getElementById('ttsVoiceSelect').value;
+  const sel = document.getElementById('ttsLangSelect');
+  const current = sel.value;
+  const langs = getFilteredLanguages(voice);
+  sel.innerHTML = '<option value="">自动</option>';
+  for (const lang of langs) {
+    const opt = document.createElement('option');
+    opt.value = lang;
+    opt.textContent = langDisplayNames[lang] || lang;
+    sel.appendChild(opt);
+  }
+  if (current && langs.includes(current)) {
+    sel.value = current;
+  } else {
+    const dialect = ttsSpeakerDialects[voice];
+    sel.value = (dialect && langs.includes(dialect)) ? dialect : '';
   }
 }
 
@@ -1051,18 +1145,16 @@ function onVoiceChanged() {
   const voice = document.getElementById('voiceSelect').value;
   const dialect = ttsSpeakerDialects[voice];
   if (dialect) {
-    // 方言角色: 自动切换到其方言
     document.getElementById('langSelect').value = dialect;
   }
   updateLangSelect();
 }
 
 // ============================================================================
-// WebSocket 连接
+// WebSocket
 // ============================================================================
 function connectWS() {
-  const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
-  const url = proto + '//' + location.host + '/v1/voice';
+  const url = WS_BASE + '/v1/voice';
   ws = new WebSocket(url);
 
   ws.onopen = () => {
@@ -1070,7 +1162,6 @@ function connectWS() {
     document.getElementById('wsLabel').textContent = '已连接';
     fetchTtsInfo();
     sendConfig();
-    // 断线前在录音，重连后自动恢复
     if (wasRecording) {
       wasRecording = false;
       setTimeout(() => startStreaming(), 500);
@@ -1080,7 +1171,6 @@ function connectWS() {
   ws.onclose = () => {
     document.getElementById('wsDot').classList.remove('connected');
     document.getElementById('wsLabel').textContent = '已断开';
-    // 重置所有会话状态，防止重连后交互被阻塞
     isProcessing = false;
     document.getElementById('sendBtn').disabled = false;
     if (streamingDiv) {
@@ -1091,7 +1181,7 @@ function connectWS() {
     ttsStreamActive = false;
     if (ttsPlayCtx) { ttsPlayCtx.close(); ttsPlayCtx = null; }
     ttsPreBuffer = [];
-    wasRecording = isRecording; // 记住断线前是否在录音，重连后自动恢复
+    wasRecording = isRecording;
     stopStreaming(false);
     setTimeout(connectWS, 3000);
   };
@@ -1110,14 +1200,6 @@ function connectWS() {
   };
 }
 
-// 同步两个 instruct 输入框 (聊天界面 ttsInstruct ↔ TTS Tab ttsTabInstruct)
-function syncInstruct(source) {
-  const a = document.getElementById('ttsInstruct');
-  const b = document.getElementById('ttsTabInstruct');
-  if (source === a && b) b.value = a.value;
-  else if (source === b && a) a.value = b.value;
-}
-
 function sendConfig() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const voice = document.getElementById('voiceSelect').value;
@@ -1130,16 +1212,10 @@ function sendConfig() {
     tts_top_p: parseFloat(document.getElementById('ttsTopP').value),
     tts_rep_penalty: parseFloat(document.getElementById('ttsRepPenalty').value)
   };
-  // VoiceDesign instruct — 始终发送 (空值让服务端用默认)
   const instruct = document.getElementById('ttsInstruct').value.trim();
   if (ttsModelType === 'voice_design') msg.tts_instruct = instruct;
   else if (instruct) msg.tts_instruct = instruct;
   ws.send(JSON.stringify(msg));
-}
-
-function toggleTtsSettings() {
-  const panel = document.getElementById('ttsSettings');
-  panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
 }
 
 function resetTtsDefaults() {
@@ -1155,18 +1231,6 @@ function resetTtsDefaults() {
 }
 
 let defaultSystemPrompt = '';
-
-function toggleSystemPrompt() {
-  const editor = document.getElementById('systemPromptEditor');
-  const btn = document.getElementById('sysPromptToggleBtn');
-  if (editor.style.display === 'none') {
-    editor.style.display = 'block';
-    btn.textContent = '收起';
-  } else {
-    editor.style.display = 'none';
-    btn.textContent = '展开';
-  }
-}
 
 function applySystemPrompt() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -1251,15 +1315,10 @@ function waitForTtsPlaybackEnd(callback) {
   setTimeout(callback, remaining + 200);
 }
 
-// ============================================================================
-// TTS Stop — 停止语音播放和生成
-// ============================================================================
 function stopTts() {
-  // 1. 通知服务端中断
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'interrupt' }));
   }
-  // 2. 停止本地音频播放
   ttsStreamActive = false;
   ttsPreBuffer = [];
   if (ttsPlayCtx) {
@@ -1267,9 +1326,7 @@ function stopTts() {
     ttsPlayCtx = null;
   }
   ttsNextTime = 0;
-  // 3. 隐藏停止按钮
   document.getElementById('stopTtsBtn').style.display = 'none';
-  // 4. 恢复 UI 状态
   isProcessing = false;
   document.getElementById('sendBtn').disabled = false;
   if (streamingDiv) {
@@ -1292,12 +1349,8 @@ function handleEvent(msg) {
     case 'config.updated':
       if (msg.system_prompt !== undefined) {
         const editor = document.getElementById('systemPromptEditor');
-        if (!editor.value) {
-          editor.value = msg.system_prompt;
-        }
-        if (!defaultSystemPrompt) {
-          defaultSystemPrompt = msg.system_prompt;
-        }
+        if (!editor.value) editor.value = msg.system_prompt;
+        if (!defaultSystemPrompt) defaultSystemPrompt = msg.system_prompt;
       }
       break;
 
@@ -1458,7 +1511,7 @@ function handleEvent(msg) {
 }
 
 // ============================================================================
-// UI Helpers (Voice Chat)
+// UI Helpers
 // ============================================================================
 function setMode(mode) {
   currentMode = mode;
@@ -1521,7 +1574,7 @@ function createStreamingMessage() {
 }
 
 // ============================================================================
-// Send Text Message (Voice Chat)
+// Send Text Message
 // ============================================================================
 function sendMessage() {
   const input = document.getElementById('inputText');
@@ -1539,7 +1592,7 @@ function sendMessage() {
 }
 
 // ============================================================================
-// Streaming ASR (AudioWorklet + PCM16)
+// Streaming ASR
 // ============================================================================
 async function toggleRecording() {
   if (isProcessing) return;
@@ -1637,7 +1690,7 @@ function updateAudioLevel(rms) {
 }
 
 // ============================================================================
-// Keyboard Shortcuts (Voice Chat)
+// Keyboard Shortcuts
 // ============================================================================
 document.getElementById('inputText').addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
@@ -1655,7 +1708,7 @@ document.addEventListener('keydown', e => {
 });
 
 // ============================================================================
-// TTS Tab — REST API Synthesis
+// TTS Synthesis (REST API)
 // ============================================================================
 let ttsCurrentBlob = null;
 let ttsCurrentUrl = null;
@@ -1681,7 +1734,7 @@ async function synthesizeTts() {
   const text = document.getElementById('ttsInputText').value.trim();
   if (!text) { setTtsStatus('请输入要合成的文本', 'error'); return; }
 
-  // Determine voice: clone voice takes priority, then regular voice
+  // Determine voice: clone voice takes priority
   let voice = '';
   const cloneVoiceSel = document.getElementById('cloneVoiceSelect');
   const cloneVoice = cloneVoiceSel ? cloneVoiceSel.value : '';
@@ -1693,10 +1746,7 @@ async function synthesizeTts() {
   }
 
   const format = document.getElementById('formatSelect').value;
-  const instruct = document.getElementById('ttsTabInstruct')?.value.trim() || undefined;
-  if (ttsModelType === 'voice_design') {
-    console.log('[TTS Tab] VoiceDesign synthesis, instruct:', instruct || '(use default)');
-  }
+  const instruct = document.getElementById('ttsInstruct')?.value.trim() || undefined;
 
   const btn = document.getElementById('synthesizeBtn');
   btn.disabled = true;
@@ -1708,7 +1758,7 @@ async function synthesizeTts() {
   const t0 = performance.now();
 
   try {
-    const response = await fetch('/v1/audio/speech', {
+    const response = await fetch(API_BASE + '/v1/audio/speech', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1766,11 +1816,9 @@ async function wrapPcmAsWav(blob, sampleRate) {
   const pcmData = await blob.arrayBuffer();
   const wavBuffer = new ArrayBuffer(44 + pcmData.byteLength);
   const view = new DataView(wavBuffer);
-
   function writeStr(offset, str) {
     for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
   }
-
   writeStr(0, 'RIFF');
   view.setUint32(4, 36 + pcmData.byteLength, true);
   writeStr(8, 'WAVE');
@@ -1784,7 +1832,6 @@ async function wrapPcmAsWav(blob, sampleRate) {
   view.setUint16(34, 16, true);
   writeStr(36, 'data');
   view.setUint32(40, pcmData.byteLength, true);
-
   new Uint8Array(wavBuffer, 44).set(new Uint8Array(pcmData));
   return new Blob([wavBuffer], { type: 'audio/wav' });
 }
@@ -1807,10 +1854,8 @@ function addTtsHistory(text, voice, audioUrl, elapsed, sizeKB) {
 function renderTtsHistory() {
   const card = document.getElementById('ttsHistoryCard');
   const list = document.getElementById('ttsHistoryList');
-
   if (ttsHistory.length === 0) { card.style.display = 'none'; return; }
-  card.style.display = 'block';
-
+  card.style.display = '';
   list.innerHTML = ttsHistory.map((item, idx) =>
     '<div class="history-item" onclick="playTtsHistory(' + idx + ')">' +
     '<div class="play-icon"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></div>' +
@@ -1833,7 +1878,6 @@ function playTtsHistory(idx) {
 // ============================================================================
 // Voice Clone Functions
 // ============================================================================
-
 function updateCloneVoiceSelect() {
   const sel = document.getElementById('cloneVoiceSelect');
   if (!sel) return;
@@ -1853,6 +1897,13 @@ function updateCloneVoiceSelect() {
     }
     if (ttsCloneVoices.includes(current)) sel.value = current;
   }
+  // Show/hide clone voice group in synthesis section
+  const group = document.getElementById('synthCloneGroup');
+  if (group) {
+    group.style.display = ttsCloneVoices.length > 0 ? '' : 'none';
+  }
+  // Also update chat voiceSelect to include clone voices
+  updateVoiceSelects();
 }
 
 function onCloneFileSelected(input) {
@@ -1869,7 +1920,6 @@ async function toggleCloneRecord() {
   const statusDiv = document.getElementById('cloneRecordingStatus');
 
   if (cloneMediaRecorder && cloneMediaRecorder.state === 'recording') {
-    // Stop recording
     cloneMediaRecorder.stop();
     btn.textContent = '🎙 录音';
     btn.style.background = '';
@@ -1890,12 +1940,10 @@ async function toggleCloneRecord() {
 
     cloneMediaRecorder.onstop = async () => {
       const webmBlob = new Blob(cloneAudioChunks, { type: 'audio/webm' });
-      // Convert webm to wav using AudioContext
       const ctx = new AudioContext({ sampleRate: 24000 });
       const arrayBuf = await webmBlob.arrayBuffer();
       const decoded = await ctx.decodeAudioData(arrayBuf);
       const channelData = decoded.getChannelData(0);
-      // Build WAV
       const wavBuf = new ArrayBuffer(44 + channelData.length * 2);
       const view = new DataView(wavBuf);
       const sr = decoded.sampleRate;
@@ -1930,6 +1978,54 @@ async function toggleCloneRecord() {
   }
 }
 
+async function recognizeCloneAudio() {
+  const statusEl = document.getElementById('cloneRefTextStatus');
+
+  if (!hasAsr) {
+    statusEl.textContent = 'ASR 语音识别未加载。请在启动配置中添加 asr_enabled=true 和 asr_model 参数';
+    statusEl.style.color = 'var(--error)';
+    return;
+  }
+
+  if (!cloneAudioBlob) {
+    statusEl.textContent = '请先上传或录制参考音频';
+    statusEl.style.color = 'var(--error)';
+    return;
+  }
+
+  statusEl.textContent = '正在识别...';
+  statusEl.style.color = 'var(--text2)';
+
+  try {
+    const formData = new FormData();
+    formData.append('file', cloneAudioBlob, 'audio.wav');
+    formData.append('language', 'auto');
+
+    const resp = await fetch(API_BASE + '/v1/audio/transcriptions', {
+      method: 'POST',
+      body: formData
+    });
+
+    if (!resp.ok) {
+      const errMsg = resp.status === 404 ? 'ASR 服务未加载' : 'HTTP ' + resp.status;
+      throw new Error(errMsg);
+    }
+
+    const json = await resp.json();
+    if (json.text) {
+      document.getElementById('cloneRefText').value = json.text;
+      statusEl.textContent = '✅ 识别完成';
+      statusEl.style.color = 'var(--success)';
+    } else {
+      statusEl.textContent = '识别结果为空';
+      statusEl.style.color = 'var(--text2)';
+    }
+  } catch (err) {
+    statusEl.textContent = '识别失败: ' + err.message;
+    statusEl.style.color = 'var(--error)';
+  }
+}
+
 async function registerCloneVoice() {
   const name = document.getElementById('cloneVoiceName').value.trim();
   const statusEl = document.getElementById('cloneRegStatus');
@@ -1951,9 +2047,15 @@ async function registerCloneVoice() {
   try {
     const formData = new FormData();
     formData.append('name', name);
-    formData.append('file', cloneAudioBlob, 'audio.wav');
+    formData.append('audio', cloneAudioBlob, 'audio.wav');
 
-    const resp = await fetch('/v1/voice_clone/register', {
+    // Include reference text if provided (for future ICL mode)
+    const refText = document.getElementById('cloneRefText').value.trim();
+    if (refText) {
+      formData.append('reference_text', refText);
+    }
+
+    const resp = await fetch(API_BASE + '/v1/voice_clone/register', {
       method: 'POST',
       body: formData
     });
@@ -1962,16 +2064,20 @@ async function registerCloneVoice() {
     if (json.success) {
       statusEl.textContent = '✅ 音色 "' + name + '" 注册成功！';
       statusEl.style.color = 'var(--success)';
-      // Refresh voice list
       if (!ttsCloneVoices.includes(name)) {
         ttsCloneVoices.push(name);
         ttsCloneVoices.sort();
       }
       updateCloneVoiceSelect();
       document.getElementById('cloneVoiceSelect').value = name;
+      // Auto-select newly registered voice for chat and notify server
+      document.getElementById('voiceSelect').value = name;
+      sendConfig();
       // Clear form
       document.getElementById('cloneVoiceName').value = '';
       document.getElementById('cloneFileInfo').textContent = '';
+      document.getElementById('cloneRefText').value = '';
+      document.getElementById('cloneRefTextStatus').textContent = '';
       cloneAudioBlob = null;
     } else {
       statusEl.textContent = '❌ 注册失败: ' + (json.error || 'unknown error');
@@ -1991,7 +2097,7 @@ async function deleteCloneVoice() {
   if (!confirm('确认删除音色 "' + name + '"?')) return;
 
   try {
-    const resp = await fetch('/v1/voice_clone/delete', {
+    const resp = await fetch(API_BASE + '/v1/voice_clone/delete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name })
@@ -2000,6 +2106,7 @@ async function deleteCloneVoice() {
     if (json.success) {
       ttsCloneVoices = ttsCloneVoices.filter(v => v !== name);
       updateCloneVoiceSelect();
+      sendConfig();  // Update chat voice after deletion
       setTtsStatus('音色 "' + name + '" 已删除', 'success');
     } else {
       setTtsStatus('删除失败: ' + (json.error || ''), 'error');

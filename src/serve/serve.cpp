@@ -3903,6 +3903,7 @@ void ServeApp::handle_tts_info(const HttpRequest& /*req*/, int client_fd) {
                 "\"default_instruct\":\"" + json_escape(info.default_instruct) + "\","
                 "\"sample_rate\":" + std::to_string(info.sample_rate) + ","
                 "\"has_speaker_encoder\":" + (info.has_speaker_encoder ? "true" : "false") + ","
+                "\"has_asr\":" + ((asr_plugin_ && asr_plugin_->is_available()) ? "true" : "false") + ","
                 "\"available_voices\":" + voices_json + ","
                 "\"available_languages\":" + langs_json + ","
                 "\"clone_voices\":" + clone_voices_json + ","

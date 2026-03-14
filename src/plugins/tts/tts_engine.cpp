@@ -484,13 +484,23 @@ int TTSEngine::synthesize_streaming(
     }
     if (text_tokens.empty()) return 0;
 
-    // 2. Prefill
+    // 2. Prefill — check if speaker is a registered clone voice
     talker_->reset();
     talker_->set_max_new_tokens(max_new_tokens);
-    talker_->build_prefill(text_tokens.data(), (int)text_tokens.size(),
-                           instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
-                           (int)instruct_tokens.size(),
-                           speaker, language, stream_);
+    const auto* clone_emb = voice_manager_.get_embedding(speaker);
+    if (clone_emb) {
+        // Clone voice: use build_prefill_clone with speaker embedding
+        fprintf(stderr, "[TTS] Streaming with clone voice '%s'\n", speaker.c_str());
+        talker_->build_prefill_clone(text_tokens.data(), (int)text_tokens.size(),
+                                     clone_emb->data(), (int)clone_emb->size(),
+                                     language, stream_);
+    } else {
+        // Preset speaker: use standard build_prefill
+        talker_->build_prefill(text_tokens.data(), (int)text_tokens.size(),
+                               instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
+                               (int)instruct_tokens.size(),
+                               speaker, language, stream_);
+    }
     talker_->forward_prefill(stream_);
 
     int num_groups = config_.talker.num_code_groups;
