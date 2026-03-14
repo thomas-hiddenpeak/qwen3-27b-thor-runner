@@ -578,7 +578,9 @@ void invoke_rope_1d(__nv_bfloat16* q, __nv_bfloat16* k,
 
 // ============================================================================
 // Bidirectional MHA (ASR Encoder)
-// Naive implementation — correctness first, optimize later
+// V2: Parallelized V accumulation, multi-warp reduction, efficient grid
+// Grid: (total_tokens, 1, num_heads) — 1 block per (token, head), no wasted blocks
+// Block: head_dim threads — 1 thread per output dimension
 // ============================================================================
 
 __global__ void bidirectional_mha_kernel(
@@ -587,31 +589,38 @@ __global__ void bidirectional_mha_kernel(
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
     const int* __restrict__ cu_seqlens,
-    int num_heads, int head_dim,
+    int num_segments, int num_heads, int head_dim,
     float scale)
 {
-    // Each block: one (segment_token, head)
-    // blockIdx.x iterates over segment tokens
-    int seg = blockIdx.y;  // segment index
-    int seg_start = cu_seqlens[seg];
-    int seg_end = cu_seqlens[seg + 1];
+    int global_token = blockIdx.x;
+    int head = blockIdx.z;
+    int tid = threadIdx.x;
+    int bdim = blockDim.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    int num_warps = bdim / 32;
+
+    // Find segment for this token (linear search, typically 2-5 segments)
+    int seg_start = 0, seg_end = 0;
+    for (int s = 0; s < num_segments; s++) {
+        if (global_token < cu_seqlens[s + 1]) {
+            seg_start = cu_seqlens[s];
+            seg_end = cu_seqlens[s + 1];
+            break;
+        }
+    }
     int seg_len = seg_end - seg_start;
 
-    int local_token = blockIdx.x;
-    if (local_token >= seg_len) return;
-    int global_token = seg_start + local_token;
-    int head = blockIdx.z;
-
-    // Q for this token/head
     const __nv_bfloat16* q_ptr = q + ((size_t)global_token * num_heads + head) * head_dim;
     __nv_bfloat16* o_ptr = attn_out + ((size_t)global_token * num_heads + head) * head_dim;
 
-    // Compute attention scores (softmax over segment)
     extern __shared__ float smem[];
-    float* scores = smem;  // [seg_len]
+    float* scores = smem;
+    __shared__ float reduce_buf[8];
 
-    float max_score = -1e20f;
-    for (int j = threadIdx.x; j < seg_len; j += blockDim.x) {
+    // Phase 1: QK^T scores
+    float local_max = -1e20f;
+    for (int j = tid; j < seg_len; j += bdim) {
         const __nv_bfloat16* k_ptr = k + ((size_t)(seg_start + j) * num_heads + head) * head_dim;
         float dot = 0.0f;
         for (int d = 0; d < head_dim; d++) {
@@ -619,40 +628,49 @@ __global__ void bidirectional_mha_kernel(
         }
         dot *= scale;
         scores[j] = dot;
-        max_score = fmaxf(max_score, dot);
+        local_max = fmaxf(local_max, dot);
     }
-    // Reduce max
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        max_score = fmaxf(max_score, __shfl_down_sync(0xffffffff, max_score, offset));
-    __shared__ float s_max;
-    if (threadIdx.x == 0) s_max = max_score;
-    __syncthreads();
-    max_score = s_max;
 
-    // Exp and sum
-    float sum_exp = 0.0f;
-    for (int j = threadIdx.x; j < seg_len; j += blockDim.x) {
-        float e = expf(scores[j] - max_score);
+    // Multi-warp max reduction
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    if (lane_id == 0) reduce_buf[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float m = reduce_buf[0];
+        for (int w = 1; w < num_warps; w++) m = fmaxf(m, reduce_buf[w]);
+        reduce_buf[0] = m;
+    }
+    __syncthreads();
+    float max_score = reduce_buf[0];
+
+    // Phase 2: Softmax exp + sum
+    float local_sum = 0.0f;
+    for (int j = tid; j < seg_len; j += bdim) {
+        float e = exp2f((scores[j] - max_score) * 1.4426950408889634f);
         scores[j] = e;
-        sum_exp += e;
+        local_sum += e;
     }
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        sum_exp += __shfl_down_sync(0xffffffff, sum_exp, offset);
-    __shared__ float s_sum;
-    if (threadIdx.x == 0) s_sum = sum_exp;
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    if (lane_id == 0) reduce_buf[warp_id] = local_sum;
     __syncthreads();
-    float inv_sum = 1.0f / s_sum;
+    if (tid == 0) {
+        float s = reduce_buf[0];
+        for (int w = 1; w < num_warps; w++) s += reduce_buf[w];
+        reduce_buf[0] = s;
+    }
+    __syncthreads();
+    float inv_sum = 1.0f / reduce_buf[0];
 
-    // Weighted sum of V
-    if (threadIdx.x == 0) {
-        for (int d = 0; d < head_dim; d++) {
-            float acc = 0.0f;
-            for (int j = 0; j < seg_len; j++) {
-                const __nv_bfloat16* v_ptr = v + ((size_t)(seg_start + j) * num_heads + head) * head_dim;
-                acc += scores[j] * inv_sum * bf16_to_float(v_ptr[d]);
-            }
-            o_ptr[d] = float_to_bf16(acc);
+    // Phase 3: Weighted sum of V — fully parallelized over head_dim
+    for (int d = tid; d < head_dim; d += bdim) {
+        float acc = 0.0f;
+        for (int j = 0; j < seg_len; j++) {
+            const __nv_bfloat16* v_ptr = v + ((size_t)(seg_start + j) * num_heads + head) * head_dim;
+            acc += scores[j] * bf16_to_float(v_ptr[d]);
         }
+        o_ptr[d] = float_to_bf16(acc * inv_sum);
     }
 }
 
@@ -665,19 +683,16 @@ void invoke_bidirectional_mha(
     int num_segments,
     cudaStream_t stream) {
 
-    // Find max segment length (needs CPU access to cu_seqlens)
-    // For now use total_tokens as upper bound (safe but may over-allocate shared mem)
-    // In practice segments are ≤ n_window_infer = 800
-    int max_seg_len = 1024;  // Safe upper bound for shared memory
-
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    dim3 grid(max_seg_len, num_segments, num_heads);
-    int block = 32;  // Single warp for simplicity
+    // One block per (token, head) pair — no wasted blocks
+    dim3 grid(total_tokens, 1, num_heads);
+    int block = head_dim;  // 64 for encoder = 2 warps
+    int max_seg_len = (total_tokens < 1536) ? total_tokens : 1536;
     size_t smem_size = max_seg_len * sizeof(float);
 
     bidirectional_mha_kernel<<<grid, block, smem_size, stream>>>(
-        attn_out, q, k, v, cu_seqlens, num_heads, head_dim, scale);
+        attn_out, q, k, v, cu_seqlens, num_segments, num_heads, head_dim, scale);
 }
 
 // ============================================================================
@@ -792,7 +807,8 @@ void invoke_causal_gqa_decode(
 
 // ============================================================================
 // Causal GQA Prefill Attention (T > 1)
-// Naive: correctness first
+// V2: Parallelized V accumulation, multi-warp reduction
+// Block: head_dim threads (128 for decoder)
 // ============================================================================
 
 __global__ void causal_gqa_prefill_kernel(
@@ -811,14 +827,20 @@ __global__ void causal_gqa_prefill_kernel(
     const __nv_bfloat16* q_ptr = q + ((size_t)token * num_q_heads + q_head) * head_dim;
     __nv_bfloat16* o_ptr = attn_out + ((size_t)token * num_q_heads + q_head) * head_dim;
 
-    // Causal: attend to positions [0, token]
     int attend_len = token + 1;
+    int tid = threadIdx.x;
+    int bdim = blockDim.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    int num_warps = bdim / 32;
 
-    float max_score = -1e20f;
     extern __shared__ float smem[];
     float* scores = smem;
+    __shared__ float reduce_buf[8];
 
-    for (int t = threadIdx.x; t < attend_len; t += blockDim.x) {
+    // Phase 1: QK^T
+    float local_max = -1e20f;
+    for (int t = tid; t < attend_len; t += bdim) {
         const __nv_bfloat16* k_ptr = k + ((size_t)t * num_kv_heads + kv_head) * head_dim;
         float dot = 0.0f;
         for (int d = 0; d < head_dim; d++) {
@@ -826,37 +848,49 @@ __global__ void causal_gqa_prefill_kernel(
         }
         dot *= scale;
         scores[t] = dot;
-        max_score = fmaxf(max_score, dot);
+        local_max = fmaxf(local_max, dot);
     }
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        max_score = fmaxf(max_score, __shfl_down_sync(0xffffffff, max_score, offset));
-    __shared__ float s_max;
-    if (threadIdx.x == 0) s_max = max_score;
-    __syncthreads();
-    max_score = s_max;
 
-    float sum_exp = 0.0f;
-    for (int t = threadIdx.x; t < attend_len; t += blockDim.x) {
-        float e = expf(scores[t] - max_score);
+    // Multi-warp max reduction
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    if (lane_id == 0) reduce_buf[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float m = reduce_buf[0];
+        for (int w = 1; w < num_warps; w++) m = fmaxf(m, reduce_buf[w]);
+        reduce_buf[0] = m;
+    }
+    __syncthreads();
+    float max_score = reduce_buf[0];
+
+    // Phase 2: exp + sum
+    float local_sum = 0.0f;
+    for (int t = tid; t < attend_len; t += bdim) {
+        float e = exp2f((scores[t] - max_score) * 1.4426950408889634f);
         scores[t] = e;
-        sum_exp += e;
+        local_sum += e;
     }
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        sum_exp += __shfl_down_sync(0xffffffff, sum_exp, offset);
-    __shared__ float s_sum;
-    if (threadIdx.x == 0) s_sum = sum_exp;
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    if (lane_id == 0) reduce_buf[warp_id] = local_sum;
     __syncthreads();
+    if (tid == 0) {
+        float s = reduce_buf[0];
+        for (int w = 1; w < num_warps; w++) s += reduce_buf[w];
+        reduce_buf[0] = s;
+    }
+    __syncthreads();
+    float inv_sum = 1.0f / reduce_buf[0];
 
-    if (threadIdx.x == 0) {
-        float inv_sum = 1.0f / s_sum;
-        for (int d = 0; d < head_dim; d++) {
-            float acc = 0.0f;
-            for (int t = 0; t < attend_len; t++) {
-                const __nv_bfloat16* v_ptr = v + ((size_t)t * num_kv_heads + kv_head) * head_dim;
-                acc += scores[t] * inv_sum * bf16_to_float(v_ptr[d]);
-            }
-            o_ptr[d] = float_to_bf16(acc);
+    // Phase 3: V accumulation — parallelized over head_dim
+    for (int d = tid; d < head_dim; d += bdim) {
+        float acc = 0.0f;
+        for (int t = 0; t < attend_len; t++) {
+            const __nv_bfloat16* v_ptr = v + ((size_t)t * num_kv_heads + kv_head) * head_dim;
+            acc += scores[t] * bf16_to_float(v_ptr[d]);
         }
+        o_ptr[d] = float_to_bf16(acc * inv_sum);
     }
 }
 
@@ -868,7 +902,7 @@ void invoke_causal_gqa_prefill(
     cudaStream_t stream) {
 
     dim3 grid(seq_len, num_q_heads);
-    int block = 32;
+    int block = head_dim;  // 128 for decoder = 4 warps
     size_t smem = seq_len * sizeof(float);
     causal_gqa_prefill_kernel<<<grid, block, smem, stream>>>(
         attn_out, q, k, v, seq_len,

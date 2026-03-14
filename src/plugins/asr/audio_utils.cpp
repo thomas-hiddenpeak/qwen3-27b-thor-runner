@@ -273,19 +273,61 @@ inline float mel_to_hz(float mel) {
     return 700.0f * (std::pow(10.0f, mel / 2595.0f) - 1.0f);
 }
 
-// Real-valued DFT (slow reference, sufficient for audio preprocessing)
-void rdft(const float* x, int n, float* real_out, float* imag_out) {
-    int half = n / 2 + 1;
-    for (int k = 0; k < half; k++) {
-        float re = 0, im = 0;
-        for (int t = 0; t < n; t++) {
-            float angle = 2.0f * (float)M_PI * k * t / n;
-            re += x[t] * std::cos(angle);
-            im -= x[t] * std::sin(angle);
+// Radix-2 in-place FFT (Cooley-Tukey, decimation-in-time)
+// Input/output: re[n], im[n] where n must be power of 2
+static void fft_radix2(float* re, float* im, int n) {
+    // Bit-reversal permutation
+    for (int i = 1, j = 0; i < n; i++) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            std::swap(re[i], re[j]);
+            std::swap(im[i], im[j]);
         }
-        real_out[k] = re;
-        imag_out[k] = im;
     }
+    // Butterfly stages
+    for (int len = 2; len <= n; len <<= 1) {
+        float ang = -2.0f * (float)M_PI / len;
+        float wre = std::cos(ang), wim = std::sin(ang);
+        for (int i = 0; i < n; i += len) {
+            float cur_re = 1.0f, cur_im = 0.0f;
+            for (int j = 0; j < len / 2; j++) {
+                float tre = re[i + j + len/2] * cur_re - im[i + j + len/2] * cur_im;
+                float tim = re[i + j + len/2] * cur_im + im[i + j + len/2] * cur_re;
+                re[i + j + len/2] = re[i + j] - tre;
+                im[i + j + len/2] = im[i + j] - tim;
+                re[i + j] += tre;
+                im[i + j] += tim;
+                float new_re = cur_re * wre - cur_im * wim;
+                cur_im = cur_re * wim + cur_im * wre;
+                cur_re = new_re;
+            }
+        }
+    }
+}
+
+// Next power of 2 >= n
+static int next_pow2(int n) {
+    int p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+// Real-valued DFT using radix-2 FFT (zero-padded to power of 2)
+void rdft(const float* x, int n, float* real_out, float* imag_out) {
+    int nfft = next_pow2(n);
+    // Use thread-local buffers to avoid per-call allocation
+    thread_local std::vector<float> re_buf, im_buf;
+    re_buf.assign(nfft, 0.0f);
+    im_buf.assign(nfft, 0.0f);
+    std::memcpy(re_buf.data(), x, n * sizeof(float));
+
+    fft_radix2(re_buf.data(), im_buf.data(), nfft);
+
+    int half = n / 2 + 1;
+    std::memcpy(real_out, re_buf.data(), half * sizeof(float));
+    std::memcpy(imag_out, im_buf.data(), half * sizeof(float));
 }
 
 } // anonymous namespace
@@ -377,6 +419,19 @@ void compute_mel_cached(const float* samples, int num_samples,
     std::vector<float> mel_spec(n_mels * num_frames, 0.0f);
     std::vector<float> frame(n_fft);
     std::vector<float> fft_real(n_freqs), fft_imag(n_freqs);
+    std::vector<float> power(n_freqs);
+
+    // Precompute non-zero ranges for each mel bin (sparse filterbank)
+    std::vector<int> mel_start(n_mels, n_freqs);
+    std::vector<int> mel_end(n_mels, 0);
+    for (int m = 0; m < n_mels; m++) {
+        for (int k = 0; k < n_freqs; k++) {
+            if (mel_fb[m * n_freqs + k] != 0.0f) {
+                if (k < mel_start[m]) mel_start[m] = k;
+                if (k + 1 > mel_end[m]) mel_end[m] = k + 1;
+            }
+        }
+    }
 
     for (int t = 0; t < num_frames; t++) {
         // Window input
@@ -384,15 +439,19 @@ void compute_mel_cached(const float* samples, int num_samples,
             frame[i] = padded[t * hop + i] * window[i];
         }
 
-        // DFT
+        // FFT
         rdft(frame.data(), n_fft, fft_real.data(), fft_imag.data());
 
-        // Power spectrum and mel filterbank
+        // Power spectrum (computed once, not 128 times)
+        for (int k = 0; k < n_freqs; k++) {
+            power[k] = fft_real[k] * fft_real[k] + fft_imag[k] * fft_imag[k];
+        }
+
+        // Mel filterbank (sparse: only iterate non-zero range per mel bin)
         for (int m = 0; m < n_mels; m++) {
             float sum = 0;
-            for (int k = 0; k < n_freqs; k++) {
-                float power = fft_real[k] * fft_real[k] + fft_imag[k] * fft_imag[k];
-                sum += mel_fb[m * n_freqs + k] * power;
+            for (int k = mel_start[m]; k < mel_end[m]; k++) {
+                sum += mel_fb[m * n_freqs + k] * power[k];
             }
             mel_spec[m * num_frames + t] = sum;
         }

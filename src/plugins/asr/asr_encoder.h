@@ -115,6 +115,7 @@ private:
     // Workspace (预分配)
     __nv_bfloat16* workspace_ = nullptr;
     size_t workspace_size_ = 0;
+    __nv_bfloat16* im2col_buf_ = nullptr;  // im2col scratch for Conv2D
 
     bool initialized_ = false;
 

@@ -1,7 +1,7 @@
 // asr_encoder.cu — Qwen3-ASR Audio Encoder 实现
 //
 // Conv2D frontend + 24-layer bidirectional Transformer + post-projection
-// Conv2D 使用直接 CUDA kernel (k=3, stride=2, pad=1), 线性投影使用 cuBLAS
+// Conv1 uses naive kernel (C_in=1), Conv2/Conv3 use im2col + cuBLAS GEMM (tensor core)
 
 #include "asr_encoder.h"
 #include "audio_ops.h"
@@ -113,6 +113,75 @@ __global__ void add_bias_kernel(
 }
 
 // ============================================================================
+// im2col kernel for Conv2D k=3, stride=2, padding=1
+// Input:  [N, C_in, H, W]  NCHW
+// Output: [N*H_out*W_out, C_in*9]  row-major
+// ============================================================================
+
+__global__ void im2col_k3s2p1_kernel(
+    __nv_bfloat16* __restrict__ col,
+    const __nv_bfloat16* __restrict__ input,
+    int N, int C_in, int H, int W, int H_out, int W_out)
+{
+    int M = N * H_out * W_out;
+    int K = C_in * 9;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * K) return;
+
+    int k = idx % K;
+    int m = idx / K;
+
+    int w_out = m % W_out;
+    int h_out = (m / W_out) % H_out;
+    int n = m / (H_out * W_out);
+
+    int kw = k % 3;
+    int kh = (k / 3) % 3;
+    int c = k / 9;
+
+    int h_in = h_out * 2 - 1 + kh;  // stride=2, pad=1
+    int w_in = w_out * 2 - 1 + kw;
+
+    __nv_bfloat16 val = __float2bfloat16(0.0f);
+    if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {
+        val = input[((size_t)n * C_in + c) * H * W + (size_t)h_in * W + w_in];
+    }
+    col[idx] = val;
+}
+
+// ============================================================================
+// NHWC → NCHW + bias + GELU (fused)
+// src: [N*H*W, C] row-major (GEMM output)
+// dst: [N, C, H, W] NCHW
+// ============================================================================
+
+__global__ void nhwc_to_nchw_bias_gelu_kernel(
+    __nv_bfloat16* __restrict__ dst,
+    const __nv_bfloat16* __restrict__ src,
+    const __nv_bfloat16* __restrict__ bias,
+    int N, int C, int H, int W)
+{
+    int total = N * C * H * W;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    // NCHW decomposition
+    int w = idx % W;
+    int h = (idx / W) % H;
+    int c = (idx / (W * H)) % C;
+    int n = idx / (C * H * W);
+
+    // NHWC source: row = n*H*W + h*W + w, col = c
+    int src_idx = ((n * H + h) * W + w) * C + c;
+    float val = __bfloat162float(src[src_idx]) + __bfloat162float(bias[c]);
+
+    // GELU (exact)
+    val = val * 0.5f * (1.0f + erff(val * 0.7071067811865476f));
+
+    dst[idx] = __float2bfloat16(val);
+}
+
+// ============================================================================
 // Copy mel chunks from [128, total_frames] to padded [batch, 128, padded_len]
 // ============================================================================
 
@@ -174,14 +243,14 @@ __global__ void gelu_inplace_kernel(__nv_bfloat16* __restrict__ x, int n) {
 }
 
 // ============================================================================
-// cuBLAS BF16 linear projection: out = input @ weight^T + bias
+// BF16 linear projection: out = input @ weight^T + bias
 // ============================================================================
 // input:  [M, K] row-major BF16
 // weight: [N, K] row-major BF16
 // bias:   [N] BF16 or nullptr
 // out:    [M, N] row-major BF16
 
-static void cublas_bf16_linear(
+static void bf16_linear(
     cublasHandle_t handle,
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
@@ -217,6 +286,7 @@ AudioEncoder::AudioEncoder(const ASRConfig& config)
 AudioEncoder::~AudioEncoder() {
     if (workspace_) cudaFree(workspace_);
     if (pe_table_) cudaFree(pe_table_);
+    if (im2col_buf_) cudaFree(im2col_buf_);
     if (cublas_handle_) cublasDestroy(cublas_handle_);
 }
 
@@ -308,6 +378,11 @@ void AudioEncoder::initialize(cudaStream_t stream) {
     cudaMalloc(&workspace_, workspace_size_ * sizeof(__nv_bfloat16));
     cudaMemset(workspace_, 0, workspace_size_ * sizeof(__nv_bfloat16));
 
+    // im2col buffer for Conv2D im2col+GEMM
+    // Largest is Conv2: batch*h2*w2 * C_in*9 (im2col) + batch*h2*w2 * C_out (NHWC output)
+    size_t im2col_size = (size_t)CONV_BATCH_SIZE * h2 * w2 * (dhs * 9 + dhs);
+    cudaMalloc(&im2col_buf_, im2col_size * sizeof(__nv_bfloat16));
+
     // Sinusoidal PE: [max_source_positions, d_model]
     cudaMalloc(&pe_table_, (size_t)max_tokens * d * sizeof(__nv_bfloat16));
     audio_ops::compute_sinusoidal_pe(pe_table_, max_tokens, d, 10000.0f, stream);
@@ -322,6 +397,8 @@ void AudioEncoder::initialize(cudaStream_t stream) {
 
 // ============================================================================
 // conv2d_forward: single Conv2D layer (k=3, stride=2, pad=1)
+// For C_in=1: naive per-element kernel (trivial compute)
+// For C_in>=2: im2col + cuBLAS GEMM + NHWC→NCHW transpose (tensor core path)
 // ============================================================================
 
 void AudioEncoder::conv2d_forward(
@@ -334,13 +411,45 @@ void AudioEncoder::conv2d_forward(
     int total = batch * C_out * H_out * W_out;
     if (total == 0) return;
 
-    int block = 256;
-    int grid = (total + block - 1) / block;
-    conv2d_gelu_kernel<<<grid, block, 0, stream>>>(
-        input, weight, bias, output,
-        batch, C_in, H_in, W_in,
-        C_out, H_out, W_out,
-        true /* apply_gelu */);
+    if (C_in <= 1) {
+        // Naive kernel: 9 FMA per element, output-BW bound
+        conv2d_gelu_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+            input, weight, bias, output,
+            batch, C_in, H_in, W_in,
+            C_out, H_out, W_out, true);
+        return;
+    }
+
+    // im2col + GEMM path for large C_in (e.g., 480)
+    int M = batch * H_out * W_out;
+    int K = C_in * 9;
+
+    // 1. im2col: input[N, C_in, H, W] → im2col_buf_[M, K]
+    int im2col_total = M * K;
+    im2col_k3s2p1_kernel<<<(im2col_total + 255) / 256, 256, 0, stream>>>(
+        im2col_buf_, input,
+        batch, C_in, H_in, W_in, H_out, W_out);
+
+    // 2. GEMM: im2col_buf_[M, K] × weight^T[K, C_out] → nhwc_out[M, C_out]
+    //    nhwc_out is stored at im2col_buf_ + M*K (non-overlapping with im2col data)
+    __nv_bfloat16* nhwc_out = im2col_buf_ + (size_t)M * K;
+
+    cublasSetStream(cublas_handle_, stream);
+    float alpha = 1.0f, beta = 0.0f;
+    cublasGemmEx(cublas_handle_,
+                 CUBLAS_OP_T, CUBLAS_OP_N,
+                 C_out, M, K,
+                 &alpha,
+                 weight, CUDA_R_16BF, K,       // [C_out, K] row = [K, C_out] col
+                 im2col_buf_, CUDA_R_16BF, K,   // [M, K] row = [K, M] col
+                 &beta,
+                 nhwc_out, CUDA_R_16BF, C_out,  // [M, C_out] row = [C_out, M] col
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+
+    // 3. NHWC→NCHW + bias + GELU
+    nhwc_to_nchw_bias_gelu_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+        output, nhwc_out, bias,
+        batch, C_out, H_out, W_out);
 }
 
 // ============================================================================
@@ -382,9 +491,9 @@ void AudioEncoder::encoder_layer_forward(
                                  eps, seq_len, d, stream);
 
     // 2. Q/K/V projections
-    cublas_bf16_linear(cublas_handle_, q_buf, norm_buf, lw.q_proj_w, lw.q_proj_b, seq_len, d, d, stream);
-    cublas_bf16_linear(cublas_handle_, k_buf, norm_buf, lw.k_proj_w, lw.k_proj_b, seq_len, d, d, stream);
-    cublas_bf16_linear(cublas_handle_, v_buf, norm_buf, lw.v_proj_w, lw.v_proj_b, seq_len, d, d, stream);
+    bf16_linear(cublas_handle_, q_buf, norm_buf, lw.q_proj_w, lw.q_proj_b, seq_len, d, d, stream);
+    bf16_linear(cublas_handle_, k_buf, norm_buf, lw.k_proj_w, lw.k_proj_b, seq_len, d, d, stream);
+    bf16_linear(cublas_handle_, v_buf, norm_buf, lw.v_proj_w, lw.v_proj_b, seq_len, d, d, stream);
 
     // 3. Bidirectional MHA (Q/K/V already [seq_len, d_model] = [seq_len, 16, 64] reinterpreted)
     // norm_buf is consumed, reuse as attention output
@@ -398,7 +507,7 @@ void AudioEncoder::encoder_layer_forward(
     // 4. Output projection
     // Reshape attn_out [seq_len, 16*64] → [seq_len, 1024], project to [seq_len, 1024]
     // Reuse q_buf as output buffer
-    cublas_bf16_linear(cublas_handle_, q_buf, norm_buf, lw.o_proj_w, lw.o_proj_b, seq_len, d, d, stream);
+    bf16_linear(cublas_handle_, q_buf, norm_buf, lw.o_proj_w, lw.o_proj_b, seq_len, d, d, stream);
 
     // 5. Residual add
     audio_ops::invoke_add_residual(hidden_states, q_buf, seq_len * d, stream);
@@ -411,11 +520,11 @@ void AudioEncoder::encoder_layer_forward(
                                  eps, seq_len, d, stream);
 
     // 7. FC1 + GELU: [seq_len, 1024] → [seq_len, 4096]
-    cublas_bf16_linear(cublas_handle_, ffn_buf, norm_buf, lw.fc1_w, lw.fc1_b, seq_len, d, ffn_dim, stream);
+    bf16_linear(cublas_handle_, ffn_buf, norm_buf, lw.fc1_w, lw.fc1_b, seq_len, d, ffn_dim, stream);
     audio_ops::invoke_gelu(ffn_buf, ffn_buf, seq_len * ffn_dim, stream);
 
     // 8. FC2: [seq_len, 4096] → [seq_len, 1024]
-    cublas_bf16_linear(cublas_handle_, norm_buf, ffn_buf, lw.fc2_w, lw.fc2_b, seq_len, ffn_dim, d, stream);
+    bf16_linear(cublas_handle_, norm_buf, ffn_buf, lw.fc2_w, lw.fc2_b, seq_len, ffn_dim, d, stream);
 
     // 9. Residual add
     audio_ops::invoke_add_residual(hidden_states, norm_buf, seq_len * d, stream);
@@ -423,8 +532,6 @@ void AudioEncoder::encoder_layer_forward(
     // 10. BF16 clamp (prevent overflow, same as Python's fp16 clamp)
     audio_ops::invoke_bf16_clamp(hidden_states, seq_len * d,
                                   -65000.0f, 65000.0f, stream);
-
-    cudaStreamSynchronize(stream);
 }
 
 // ============================================================================
@@ -511,6 +618,11 @@ void AudioEncoder::forward(
     int* cu_seqlens_gpu = reinterpret_cast<int*>(int_ws);
     int* chunk_meta_gpu = cu_seqlens_gpu + MAX_SEGMENTS + 1;
 
+    // --- Profiling: record start of conv phase ---
+    cudaEvent_t ev_conv_start;
+    cudaEventCreate(&ev_conv_start);
+    cudaEventRecord(ev_conv_start, stream);
+
     // --- Phase 1: Conv2D pipeline (process chunks in batches) ---
     int max_conv_time = w3;  // tokens per full chunk after conv = 13
 
@@ -539,42 +651,25 @@ void AudioEncoder::forward(
             mel_bins, chunk_mel_len, mel_frames);
 
         // Conv2D pipeline: mel → conv2d1 → conv2d2 → conv2d3
-        // Layer 1: [batch, 1, 128, 100] → [batch, 480, 64, 50]
+        // Layer 1: [batch, 1, 128, 100] → [batch, 480, 64, 50]  (naive: C_in=1)
         int cur_C = 1, cur_H = mel_bins, cur_W = chunk_mel_len;
-        {
-            int H_out = ASRConfig::conv_output_size(cur_H);
-            int W_out = ASRConfig::conv_output_size(cur_W);
-            int total = batch_count * dhs * H_out * W_out;
-            conv2d_gelu_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
-                mel_padded, conv2d1_w_, conv2d1_b_, conv_buf_a,
-                batch_count, cur_C, cur_H, cur_W,
-                dhs, H_out, W_out, true);
-            cur_C = dhs; cur_H = H_out; cur_W = W_out;
-        }
+        conv2d_forward(mel_padded, batch_count, cur_C, cur_H, cur_W,
+                       conv2d1_w_, conv2d1_b_, dhs, conv_buf_a, stream);
+        cur_C = dhs;
+        cur_H = ASRConfig::conv_output_size(cur_H);
+        cur_W = ASRConfig::conv_output_size(cur_W);
 
-        // Layer 2: [batch, 480, 64, 50] → [batch, 480, 32, 25]
-        {
-            int H_out = ASRConfig::conv_output_size(cur_H);
-            int W_out = ASRConfig::conv_output_size(cur_W);
-            int total = batch_count * dhs * H_out * W_out;
-            conv2d_gelu_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
-                conv_buf_a, conv2d2_w_, conv2d2_b_, conv_buf_b,
-                batch_count, cur_C, cur_H, cur_W,
-                dhs, H_out, W_out, true);
-            cur_C = dhs; cur_H = H_out; cur_W = W_out;
-        }
+        // Layer 2: [batch, 480, 64, 50] → [batch, 480, 32, 25]  (im2col+GEMM)
+        conv2d_forward(conv_buf_a, batch_count, cur_C, cur_H, cur_W,
+                       conv2d2_w_, conv2d2_b_, dhs, conv_buf_b, stream);
+        cur_H = ASRConfig::conv_output_size(cur_H);
+        cur_W = ASRConfig::conv_output_size(cur_W);
 
-        // Layer 3: [batch, 480, 32, 25] → [batch, 480, 16, 13]
-        {
-            int H_out = ASRConfig::conv_output_size(cur_H);
-            int W_out = ASRConfig::conv_output_size(cur_W);
-            int total = batch_count * dhs * H_out * W_out;
-            conv2d_gelu_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
-                conv_buf_b, conv2d3_w_, conv2d3_b_, conv_buf_a,
-                batch_count, cur_C, cur_H, cur_W,
-                dhs, H_out, W_out, true);
-            cur_H = H_out; cur_W = W_out;
-        }
+        // Layer 3: [batch, 480, 32, 25] → [batch, 480, 16, 13]  (im2col+GEMM)
+        conv2d_forward(conv_buf_b, batch_count, cur_C, cur_H, cur_W,
+                       conv2d3_w_, conv2d3_b_, dhs, conv_buf_a, stream);
+        cur_H = ASRConfig::conv_output_size(cur_H);
+        cur_W = ASRConfig::conv_output_size(cur_W);
 
         // Transpose: [batch, 480, h3, w3] → [batch, w3, 480*h3=7680]
         {
@@ -589,7 +684,7 @@ void AudioEncoder::forward(
         {
             int M_total = batch_count * cur_W;  // batch * 13
             int K_dim = config_.conv_out_features();  // 7680
-            cublas_bf16_linear(cublas_handle_, conv_buf_a,
+            bf16_linear(cublas_handle_, conv_buf_a,
                                conv_buf_b, conv_out_w_, nullptr,
                                M_total, K_dim, d, stream);
         }
@@ -600,7 +695,6 @@ void AudioEncoder::forward(
                                   batch_count * cur_W, d, 0, stream);
 
         // Extract valid tokens to hidden_states buffer
-        cudaStreamSynchronize(stream);
         for (int bi = 0; bi < batch_count; bi++) {
             int chunk_idx = batch_start + bi;
             int valid = chunk_output_lens[chunk_idx];
@@ -636,12 +730,20 @@ void AudioEncoder::forward(
                     cu_seqlens_host.size() * sizeof(int),
                     cudaMemcpyHostToDevice, stream);
 
+    // --- Profiling: CUDA events for phase timing ---
+    cudaEvent_t ev_conv_end, ev_layers_end, ev_post_end;
+    cudaEventCreate(&ev_conv_end);
+    cudaEventCreate(&ev_layers_end);
+    cudaEventCreate(&ev_post_end);
+    cudaEventRecord(ev_conv_end, stream);
+
     // --- Phase 3: 24 Transformer encoder layers ---
     for (int layer = 0; layer < config_.encoder_layers; layer++) {
         encoder_layer_forward(layer, hidden_states, total_tokens,
                               cu_seqlens_gpu, num_segments,
                               transformer_ws, stream);
     }
+    cudaEventRecord(ev_layers_end, stream);
 
     // --- Phase 4: Post-processing ---
     // ln_post
@@ -652,16 +754,29 @@ void AudioEncoder::forward(
 
     // proj1 + GELU
     __nv_bfloat16* proj_buf = post_buf + (size_t)total_tokens * d;
-    cublas_bf16_linear(cublas_handle_, proj_buf, post_buf, proj1_w_, proj1_b_,
+    bf16_linear(cublas_handle_, proj_buf, post_buf, proj1_w_, proj1_b_,
                        total_tokens, d, d, stream);
     gelu_inplace_kernel<<<((size_t)total_tokens * d + 255) / 256, 256, 0, stream>>>(
         proj_buf, total_tokens * d);
 
     // proj2: [total_tokens, 1024] → [total_tokens, 2048]
-    cublas_bf16_linear(cublas_handle_, encoder_out, proj_buf, proj2_w_, proj2_b_,
+    bf16_linear(cublas_handle_, encoder_out, proj_buf, proj2_w_, proj2_b_,
                        total_tokens, d, output_dim, stream);
+    cudaEventRecord(ev_post_end, stream);
 
     cudaStreamSynchronize(stream);
+
+    // Report phase timing
+    float conv_ms, layers_ms, post_ms;
+    cudaEventElapsedTime(&conv_ms, ev_conv_start, ev_conv_end);
+    cudaEventElapsedTime(&layers_ms, ev_conv_end, ev_layers_end);
+    cudaEventElapsedTime(&post_ms, ev_layers_end, ev_post_end);
+    fprintf(stderr, "[Encoder Profile] tokens=%d segs=%d | Conv: %.1fms | Layers: %.1fms | Post: %.1fms | Total: %.1fms\n",
+            total_tokens, num_segments, conv_ms, layers_ms, post_ms, conv_ms + layers_ms + post_ms);
+    cudaEventDestroy(ev_conv_start);
+    cudaEventDestroy(ev_conv_end);
+    cudaEventDestroy(ev_layers_end);
+    cudaEventDestroy(ev_post_end);
 }
 
 } // namespace asr

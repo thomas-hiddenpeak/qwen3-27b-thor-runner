@@ -320,3 +320,4 @@ bench: prompt=17 TTFT=467ms gen=10.4 tok/s (engine-based, MTP enabled)
 - 每次执行程序前先 kill 之前的进程
 - 调试新功能时，禁止使用 tail 过滤输出
 - 在调试过程中，如果用户没有明确提示出现了热节流，不要考虑热节流。
+- 所有的python测试可以在conda环境vllm中运行，禁止在系统python环境中运行测试。使用 uv 安装组件，禁止替换原有的pytorch ，这是专用版本，替换后将会失效。

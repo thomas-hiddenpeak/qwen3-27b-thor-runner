@@ -15,10 +15,10 @@ namespace qwen_thor {
 namespace asr {
 
 // ============================================================================
-// cuBLAS BF16 linear: out = input @ weight^T (no bias for decoder)
+// BF16 linear: out = input @ weight^T (no bias for decoder)
 // ============================================================================
 
-static void cublas_linear_nobias(
+static void linear_nobias(
     cublasHandle_t handle,
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
@@ -167,9 +167,9 @@ void TextDecoder::decoder_layer_forward_prefill(
                                eps, seq_len, h, stream);
 
     // 2. Q/K/V projections (no bias)
-    cublas_linear_nobias(cublas_handle_, q_buf, norm_buf, lw.q_proj_w, seq_len, h, q_dim, stream);
-    cublas_linear_nobias(cublas_handle_, k_buf, norm_buf, lw.k_proj_w, seq_len, h, kv_dim, stream);
-    cublas_linear_nobias(cublas_handle_, v_buf, norm_buf, lw.v_proj_w, seq_len, h, kv_dim, stream);
+    linear_nobias(cublas_handle_, q_buf, norm_buf, lw.q_proj_w, seq_len, h, q_dim, stream);
+    linear_nobias(cublas_handle_, k_buf, norm_buf, lw.k_proj_w, seq_len, h, kv_dim, stream);
+    linear_nobias(cublas_handle_, v_buf, norm_buf, lw.v_proj_w, seq_len, h, kv_dim, stream);
 
     // 3. Per-head Q/K RMSNorm
     // Q: [seq_len, num_q_heads * head_dim] → reinterpret as [seq_len * num_q_heads, head_dim]
@@ -201,7 +201,7 @@ void TextDecoder::decoder_layer_forward_prefill(
         seq_len, num_q_heads, num_kv_heads, head_dim, stream);
 
     // 7. Output projection: [seq_len, q_dim] → [seq_len, h]
-    cublas_linear_nobias(cublas_handle_, norm_buf, attn_out, lw.o_proj_w, seq_len, q_dim, h, stream);
+    linear_nobias(cublas_handle_, norm_buf, attn_out, lw.o_proj_w, seq_len, q_dim, h, stream);
 
     // 8. Residual add
     audio_ops::invoke_add_residual(hidden_states, norm_buf, seq_len * h, stream);
@@ -214,19 +214,17 @@ void TextDecoder::decoder_layer_forward_prefill(
 
     // 10. Gate + Up projections: [seq_len, h] → [seq_len, ffn]
     int ffn = config_.decoder_intermediate_size;
-    cublas_linear_nobias(cublas_handle_, gate_buf, norm_buf, lw.gate_proj_w, seq_len, h, ffn, stream);
-    cublas_linear_nobias(cublas_handle_, up_buf, norm_buf, lw.up_proj_w, seq_len, h, ffn, stream);
+    linear_nobias(cublas_handle_, gate_buf, norm_buf, lw.gate_proj_w, seq_len, h, ffn, stream);
+    linear_nobias(cublas_handle_, up_buf, norm_buf, lw.up_proj_w, seq_len, h, ffn, stream);
 
     // 11. SwiGLU: out = silu(gate) * up
     audio_ops::invoke_swiglu(gate_buf, gate_buf, up_buf, seq_len, ffn, stream);
 
     // 12. Down projection: [seq_len, ffn] → [seq_len, h]
-    cublas_linear_nobias(cublas_handle_, norm_buf, gate_buf, lw.down_proj_w, seq_len, ffn, h, stream);
+    linear_nobias(cublas_handle_, norm_buf, gate_buf, lw.down_proj_w, seq_len, ffn, h, stream);
 
     // 13. Residual add
     audio_ops::invoke_add_residual(hidden_states, norm_buf, seq_len * h, stream);
-
-    cudaStreamSynchronize(stream);
 }
 
 // ============================================================================
@@ -262,9 +260,9 @@ void TextDecoder::decoder_layer_forward_decode(
     audio_ops::invoke_rmsnorm(norm_buf, hidden_states, lw.input_layernorm_w,
                                eps, 1, h, stream);
 
-    cublas_linear_nobias(cublas_handle_, q_buf, norm_buf, lw.q_proj_w, 1, h, q_dim, stream);
-    cublas_linear_nobias(cublas_handle_, k_buf, norm_buf, lw.k_proj_w, 1, h, kv_dim, stream);
-    cublas_linear_nobias(cublas_handle_, v_buf, norm_buf, lw.v_proj_w, 1, h, kv_dim, stream);
+    linear_nobias(cublas_handle_, q_buf, norm_buf, lw.q_proj_w, 1, h, q_dim, stream);
+    linear_nobias(cublas_handle_, k_buf, norm_buf, lw.k_proj_w, 1, h, kv_dim, stream);
+    linear_nobias(cublas_handle_, v_buf, norm_buf, lw.v_proj_w, 1, h, kv_dim, stream);
 
     audio_ops::invoke_per_head_rmsnorm(q_buf, q_buf, lw.q_norm_w,
                                         eps, 1, num_q_heads, head_dim, stream);
@@ -291,7 +289,7 @@ void TextDecoder::decoder_layer_forward_decode(
         cache_seq_len_ + 1,  // current total seq len including this token
         stream);
 
-    cublas_linear_nobias(cublas_handle_, norm_buf, attn_out, lw.o_proj_w, 1, q_dim, h, stream);
+    linear_nobias(cublas_handle_, norm_buf, attn_out, lw.o_proj_w, 1, q_dim, h, stream);
     audio_ops::invoke_add_residual(hidden_states, norm_buf, h, stream);
 
     // === MLP ===
@@ -299,13 +297,11 @@ void TextDecoder::decoder_layer_forward_decode(
                                eps, 1, h, stream);
 
     int ffn = config_.decoder_intermediate_size;
-    cublas_linear_nobias(cublas_handle_, gate_buf, norm_buf, lw.gate_proj_w, 1, h, ffn, stream);
-    cublas_linear_nobias(cublas_handle_, up_buf, norm_buf, lw.up_proj_w, 1, h, ffn, stream);
+    linear_nobias(cublas_handle_, gate_buf, norm_buf, lw.gate_proj_w, 1, h, ffn, stream);
+    linear_nobias(cublas_handle_, up_buf, norm_buf, lw.up_proj_w, 1, h, ffn, stream);
     audio_ops::invoke_swiglu(gate_buf, gate_buf, up_buf, 1, ffn, stream);
-    cublas_linear_nobias(cublas_handle_, norm_buf, gate_buf, lw.down_proj_w, 1, ffn, h, stream);
+    linear_nobias(cublas_handle_, norm_buf, gate_buf, lw.down_proj_w, 1, ffn, h, stream);
     audio_ops::invoke_add_residual(hidden_states, norm_buf, h, stream);
-
-    cudaStreamSynchronize(stream);
 }
 
 // ============================================================================
@@ -354,7 +350,7 @@ void TextDecoder::forward_prefill(
                                config_.rms_norm_eps, 1, h, stream);
 
     // LM head: [1, h] → [1, vocab_size]
-    cublas_linear_nobias(cublas_handle_, logits_out, norm_out, lm_head_w_,
+    linear_nobias(cublas_handle_, logits_out, norm_out, lm_head_w_,
                           1, h, config_.vocab_size, stream);
 
     cache_seq_len_ = seq_len;
@@ -405,7 +401,7 @@ void TextDecoder::forward_decode(
                                config_.rms_norm_eps, 1, h, stream);
 
     // LM head
-    cublas_linear_nobias(cublas_handle_, logits_out, norm_out, lm_head_w_,
+    linear_nobias(cublas_handle_, logits_out, norm_out, lm_head_w_,
                           1, h, config_.vocab_size, stream);
 
     cache_seq_len_++;

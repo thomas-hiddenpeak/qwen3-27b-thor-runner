@@ -1037,9 +1037,44 @@ Mel 帧到 encoder token 的压缩比约 **7.7:1** (2× Conv2d stride + Transfor
 
 ### 12.6 优化方向
 
+以下优化已在 v2 中实施:
+
+| 优化 | 实际收益 | 说明 |
+|------|----------|------|
+| ✅ Radix-2 FFT | Mel -25× (30s: 2340→37ms) | 替换 O(N²) 朴素 DFT, Cooley-Tukey 算法 |
+| ✅ 稀疏 Mel Filterbank | Mel -58% | 跳过零值频段, 内积从 201→~15 次/bin |
+| ✅ MHA V 并行化 | Prefill -60%, Encode -5% | 修复 V 累加序列化 (thread 0→全 head_dim) |
+| ✅ 移除冗余 cudaStreamSync | 52 个 sync 消除 | Encoder/Decoder 层内同步不必要 |
+| ✅ Conv2D im2col+GEMM | Conv -68% (246→79ms) | 替换朴素 kernel, cuBLAS tensor core |
+| ❌ Encoder CUTLASS SM110 | 无改善 (反而 decoder 回退) | 已评估并回退, cuBLAS 对 ASR 维度更优 |
+
+### 12.7 优化后性能 (v2)
+
+> **测试日期**: 2026-07 (v2 优化后)
+
+| 音频 | 时长 | Encode (ms) | Prefill (ms) | Decode (ms) | Total (ms) | RTF | vs 基线 |
+|------|------|-------------|--------------|-------------|------------|-----|---------|
+| test_speech_real.wav | 4.1s | 93 | 37 | 425 | 555 | 0.135 | -30.5% |
+| bench_10s.wav | 10.0s | 106 | 54 | 69 | 229 | 0.023 | -79.5% |
+| bench_30s.wav | 30.0s | 163 | 214 | 78 | 455 | 0.015 | -86.6% |
+
+**Encoder Profile (30s audio, GPU CUDA event timing):**
+
+| 阶段 | 基线 | 优化后 | 改善 |
+|------|------|--------|------|
+| Conv2D frontend | ~246ms | 79ms | -67.8% |
+| 24 Transformer layers | ~46ms | 46ms | — |
+| Post-processing | ~0.2ms | 0.2ms | — |
+| Mel (CPU) | ~2340ms | 37ms | -98.4% |
+| **GPU Total** | ~292ms | 125ms | -57.2% |
+| **Encoder Total** | ~2631ms | 163ms | -93.8% |
+
+**实时倍率**: 30s 音频 66× 实时 (RTF=0.015), 基线 8.9× 实时 (RTF=0.113)
+
+### 12.8 剩余优化空间
+
 | 方向 | 预期收益 | 说明 |
 |------|----------|------|
-| Encoder CUTLASS SM110 | Encode -30~50% | 当前用 cuBLAS, 可替换为 CUTLASS SM110 Tensor Core |
+| GPU Mel (cuFFT) | Mel 37→5ms | CPU→GPU 迁移, 消除 H2D 往返 |
 | Decoder GEMV + MTP | Decode +50~100% | 复用主引擎的 GEMV 优化和 MTP 投机解码 |
-| Mel 特征 GPU 计算 | TTFT -5~10% | 当前 CPU FFT, 可用 cuFFT 替代 |
 | Batch 推理 | 吞吐 N× | 多路音频合并 batch, 权重读一次 |
