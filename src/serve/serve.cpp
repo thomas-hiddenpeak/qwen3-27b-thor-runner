@@ -4485,6 +4485,11 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 float tts_rep = (float)json_get_number(msg, "tts_rep_penalty", 1.05);
                 tts_plugin_->set_sampling(tts_temp, tts_topk, tts_topp, tts_rep);
             }
+            fprintf(stderr, "[WS] config updated: voice=%s tts=%s lang=%s fd=%d\n",
+                    voice.empty() ? "(empty)" : voice.c_str(),
+                    tts_enabled ? "on" : "off",
+                    tts_language.empty() ? "auto" : tts_language.c_str(),
+                    client_fd);
             // 返回当前系统提示词 (供 WebUI 初始化)
             {
                 const std::string& sp = config_.voice_system_prompt.empty()
@@ -4496,6 +4501,11 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             if (generating) continue;
             std::string text = json_get_string(msg, "text");
             if (!text.empty()) {
+                fprintf(stderr, "[WS] chat request: voice=%s tts=%s lang=%s chars=%zu fd=%d\n",
+                        voice.empty() ? "(empty)" : voice.c_str(),
+                        tts_enabled ? "on" : "off",
+                        tts_language.empty() ? "auto" : tts_language.c_str(),
+                        text.size(), client_fd);
                 start_generate(std::move(text), voice, tts_instruct, tts_enabled, tts_language);
             }
 
