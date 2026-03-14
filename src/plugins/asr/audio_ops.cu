@@ -1061,6 +1061,23 @@ void invoke_argmax(const __nv_bfloat16* logits, int* result_idx, int n,
 }
 
 // ============================================================================
+// EOS 抑制: 将两个 EOS token 的 logits 设为 -inf
+// ============================================================================
+
+__global__ void suppress_eos_kernel(
+    __nv_bfloat16* __restrict__ logits,
+    int eos_id1, int eos_id2)
+{
+    logits[eos_id1] = __float2bfloat16(-1e30f);
+    logits[eos_id2] = __float2bfloat16(-1e30f);
+}
+
+void invoke_suppress_eos(__nv_bfloat16* logits, int eos_id1, int eos_id2,
+                         cudaStream_t stream) {
+    suppress_eos_kernel<<<1, 1, 0, stream>>>(logits, eos_id1, eos_id2);
+}
+
+// ============================================================================
 // F32 → BF16 conversion kernel
 // ============================================================================
 

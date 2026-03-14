@@ -41,6 +41,10 @@ struct ServeConfig {
     std::string model_name = "qwen3.5-27b"; // 模型显示名称
     int         timeout_s  = 300;           // 请求超时 (秒)
     int         max_output_tokens_cap = 512; // 单请求最大生成 token 上限 (稳定性护栏)
+    int         voice_max_turns = 10;        // 语音对话最大轮次 (每轮 = 1 user + 1 assistant)
+    int         voice_max_output_tokens = 150; // 语音对话单次最大生成 token
+    int         voice_max_turns_default = 10;
+    int         voice_max_output_tokens_default = 150;
     std::string voice_system_prompt;         // 语音对话系统提示词 (运行时可覆盖)
     std::string voice_system_prompt_default;   // config 文件中的初始默认值 (用于 WebUI reset)
 

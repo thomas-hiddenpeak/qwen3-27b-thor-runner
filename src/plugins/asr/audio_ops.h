@@ -195,6 +195,11 @@ void invoke_write_kv_cache(__nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
 void invoke_argmax(const __nv_bfloat16* logits, int* result_idx, int n,
                    cudaStream_t stream = 0);
 
+// EOS 抑制: 将指定 token 的 logits 设为 -inf, 防止模型提前终止
+// 用于长音频中语音停顿导致的 EOS 误判
+void invoke_suppress_eos(__nv_bfloat16* logits, int eos_id1, int eos_id2,
+                         cudaStream_t stream = 0);
+
 // BF16 转换: float32 → BF16 (GPU kernel, 避免 CPU 逐元素转换 + H2D 拷贝)
 void invoke_f32_to_bf16(__nv_bfloat16* out, const float* in, int n,
                         cudaStream_t stream = 0);

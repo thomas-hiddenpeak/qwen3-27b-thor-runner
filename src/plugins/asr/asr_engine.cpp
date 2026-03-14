@@ -311,7 +311,7 @@ void ASREngine::init_mel_cache() {
 
 std::string ASREngine::transcribe(
     const float* samples, int num_samples, int sample_rate,
-    float temperature, int max_new_tokens)
+    float temperature, int max_new_tokens, bool suppress_early_eos)
 {
     if (!loaded_) {
         fprintf(stderr, "[ASR] ERROR: model not loaded\n");
@@ -427,7 +427,24 @@ std::string ASREngine::transcribe(
     fprintf(stderr, "[ASR] Prefill: %d tokens (%.1f ms)\n", prompt_len, prefill_ms);
 
     // 9. Autoregressive decode (GPU argmax — no D2H logits transfer)
+    //
+    // EOS 抑制 (可选): 根据音频时长设置最小输出 token 数。
+    // 语音停顿可能导致模型过早生成 <|im_end|>, 在最小 token 数之前
+    // 将 EOS logits 设为 -inf, 强制模型继续转录后续内容。
+    int min_new_tokens = 0;
+    if (suppress_early_eos) {
+        float audio_duration_s = (float)audio_len / 16000.0f;
+        min_new_tokens = std::max(1, (int)(audio_duration_s * 0.4f));
+        fprintf(stderr, "[ASR] EOS suppression: audio=%.1fs, min_new_tokens=%d\n",
+                audio_duration_s, min_new_tokens);
+    }
+
     std::vector<int> output_tokens;
+
+    // 首个 token: 若需要抑制 EOS 则先抑制再 argmax
+    if (min_new_tokens > 0) {
+        audio_ops::invoke_suppress_eos(logits_, IM_END, ENDOFTEXT, stream_);
+    }
     audio_ops::invoke_argmax(logits_, token_id_gpu_, config_.vocab_size, stream_);
     cudaStreamSynchronize(stream_);
     int next_token = *token_id_gpu_;
@@ -444,6 +461,11 @@ std::string ASREngine::transcribe(
                         cudaMemcpyHostToDevice, stream_);
 
         decoder_->forward_decode(next_token, position_ids_, logits_, stream_);
+
+        // EOS 抑制: 未达到最小 token 数时禁止生成 EOS
+        if ((int)output_tokens.size() < min_new_tokens) {
+            audio_ops::invoke_suppress_eos(logits_, IM_END, ENDOFTEXT, stream_);
+        }
         audio_ops::invoke_argmax(logits_, token_id_gpu_, config_.vocab_size, stream_);
         cudaStreamSynchronize(stream_);
         next_token = *token_id_gpu_;
@@ -502,7 +524,7 @@ std::string ASREngine::transcribe(
 
 std::string ASREngine::transcribe_file(
     const std::string& wav_path,
-    float temperature, int max_new_tokens)
+    float temperature, int max_new_tokens, bool suppress_early_eos)
 {
     // Load WAV file
     audio::AudioData wav;
@@ -512,7 +534,7 @@ std::string ASREngine::transcribe_file(
     }
 
     return transcribe(wav.samples.data(), (int)wav.samples.size(), wav.sample_rate,
-                      temperature, max_new_tokens);
+                      temperature, max_new_tokens, suppress_early_eos);
 }
 
 } // namespace asr

@@ -9,6 +9,10 @@
 #include <numeric>
 #include <fstream>
 #include <iostream>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <thread>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -99,6 +103,137 @@ bool load_wav_from_memory(const uint8_t* data, size_t size, AudioData& out) {
         out.samples[i] = sum / channels;
     }
 
+    return true;
+}
+
+bool load_audio_from_memory(const uint8_t* data, size_t size, AudioData& out,
+                            const std::string& filename_hint) {
+    // 先尝试 WAV 解析
+    if (load_wav_from_memory(data, size, out)) {
+        return true;
+    }
+
+    // WAV 解析失败, 通过 ffmpeg 转码为 PCM16 mono 16kHz
+    // 使用临时文件 (M4A/MP4 等容器需要 seek, 管道不支持)
+    fprintf(stderr, "[audio] Not WAV, trying ffmpeg transcode (%zu bytes)...\n", size);
+
+    // 提取扩展名 (ffmpeg 对 m4a/mp4 等容器需要扩展名辅助探测)
+    std::string suffix;
+    if (!filename_hint.empty()) {
+        auto dot = filename_hint.rfind('.');
+        if (dot != std::string::npos) suffix = filename_hint.substr(dot);
+    }
+
+    // 写入临时文件 (带扩展名)
+    std::string tmp_path;
+    int tmp_fd;
+    if (!suffix.empty()) {
+        std::string tmpl = "/tmp/qwen_audio_XXXXXX" + suffix;
+        std::vector<char> tmpl_buf(tmpl.begin(), tmpl.end());
+        tmpl_buf.push_back('\0');
+        tmp_fd = mkstemps(tmpl_buf.data(), (int)suffix.size());
+        if (tmp_fd >= 0) tmp_path = tmpl_buf.data();
+    } else {
+        char tmpl[] = "/tmp/qwen_audio_XXXXXX";
+        tmp_fd = mkstemp(tmpl);
+        if (tmp_fd >= 0) tmp_path = tmpl;
+    }
+    if (tmp_fd < 0) {
+        std::cerr << "[audio] mkstemp() failed" << std::endl;
+        return false;
+    }
+
+    size_t written = 0;
+    while (written < size) {
+        ssize_t n = write(tmp_fd, data + written, size - written);
+        if (n <= 0) break;
+        written += n;
+    }
+    close(tmp_fd);
+
+    if (written != size) {
+        std::cerr << "[audio] failed to write temp file" << std::endl;
+        unlink(tmp_path.c_str());
+        return false;
+    }
+
+    fprintf(stderr, "[audio] temp file: %s (%zu bytes)\n", tmp_path.c_str(), size);
+
+    // ffmpeg 转码: 输入临时文件, 输出 pipe:1
+    int stdout_pipe[2];
+    if (pipe(stdout_pipe) != 0) {
+        std::cerr << "[audio] pipe() failed" << std::endl;
+        unlink(tmp_path.c_str());
+        return false;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        std::cerr << "[audio] fork() failed" << std::endl;
+        close(stdout_pipe[0]); close(stdout_pipe[1]);
+        unlink(tmp_path.c_str());
+        return false;
+    }
+
+    if (pid == 0) {
+        // 子进程: ffmpeg
+        close(stdout_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        close(stdout_pipe[1]);
+        // 将 ffmpeg stderr 输出到父进程 stderr (便于诊断)
+        // stdin 关闭, ffmpeg 从文件读取
+        close(STDIN_FILENO);
+
+        execlp("ffmpeg", "ffmpeg",
+               "-i", tmp_path.c_str(),
+               "-f", "s16le",
+               "-acodec", "pcm_s16le",
+               "-ac", "1",
+               "-ar", "16000",
+               "pipe:1",
+               nullptr);
+        _exit(127);
+    }
+
+    // 父进程
+    close(stdout_pipe[1]);
+
+    // 读取 ffmpeg stdout (PCM16 raw data)
+    std::vector<uint8_t> pcm_buf;
+    pcm_buf.reserve(size * 4);
+    uint8_t tmp[8192];
+    while (true) {
+        ssize_t n = read(stdout_pipe[0], tmp, sizeof(tmp));
+        if (n <= 0) break;
+        pcm_buf.insert(pcm_buf.end(), tmp, tmp + n);
+    }
+    close(stdout_pipe[0]);
+
+    // 等待 ffmpeg 退出
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    // 清理临时文件
+    unlink(tmp_path.c_str());
+
+    if (pcm_buf.empty()) {
+        std::cerr << "[audio] ffmpeg produced no output (exit status=" << WEXITSTATUS(status) << ")" << std::endl;
+        return false;
+    }
+
+    // 解析 raw PCM16 mono 16kHz
+    int num_samples = pcm_buf.size() / 2;
+    out.sample_rate = 16000;
+    out.channels = 1;
+    out.samples.resize(num_samples);
+
+    const int16_t* src = reinterpret_cast<const int16_t*>(pcm_buf.data());
+    for (int i = 0; i < num_samples; i++) {
+        out.samples[i] = src[i] / 32768.0f;
+    }
+
+    fprintf(stderr, "[audio] ffmpeg transcode OK: %d samples @ %d Hz (%.2fs)\n",
+            num_samples, out.sample_rate, (float)num_samples / out.sample_rate);
     return true;
 }
 

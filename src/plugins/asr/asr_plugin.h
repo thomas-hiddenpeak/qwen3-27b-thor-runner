@@ -69,14 +69,18 @@ public:
 
     // 转录内存中的音频数据 (跳过临时文件 I/O)
     // 默认实现: 写临时文件 → 调用 transcribe(), 子类可覆盖
+    // suppress_early_eos: 抑制停顿导致的过早 EOS, 适用于长音频场景
     virtual AsrResult transcribe_memory(const uint8_t* data, size_t size,
-                                        const std::string& language = "auto");
+                                        const std::string& language = "auto",
+                                        const std::string& filename_hint = "",
+                                        bool suppress_early_eos = false);
 
     // 转录原始 PCM float 样本 (流式 ASR 使用)
     // samples: float 数组 [-1, 1], sample_rate: 采样率
     virtual AsrResult transcribe_pcm(const float* samples, int num_samples,
                                      int sample_rate = 16000,
-                                     const std::string& language = "auto");
+                                     const std::string& language = "auto",
+                                     bool suppress_early_eos = false);
 
     // 检查插件是否可用 (可执行文件存在, 模型存在等)
     virtual bool is_available() const = 0;
@@ -112,10 +116,13 @@ public:
     AsrResult transcribe(const std::string& audio_path,
                          const std::string& language = "auto") override;
     AsrResult transcribe_memory(const uint8_t* data, size_t size,
-                                const std::string& language = "auto") override;
+                                const std::string& language = "auto",
+                                const std::string& filename_hint = "",
+                                bool suppress_early_eos = false) override;
     AsrResult transcribe_pcm(const float* samples, int num_samples,
                              int sample_rate = 16000,
-                             const std::string& language = "auto") override;
+                             const std::string& language = "auto",
+                             bool suppress_early_eos = false) override;
     bool is_available() const override;
     std::string name() const override { return "native-asr"; }
 

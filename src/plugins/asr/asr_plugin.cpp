@@ -263,7 +263,9 @@ AsrResult NativeAsrPlugin::transcribe(const std::string& audio_path,
 // ============================================================================
 
 AsrResult AsrPlugin::transcribe_memory(const uint8_t* data, size_t size,
-                                        const std::string& language) {
+                                        const std::string& language,
+                                        const std::string& filename_hint,
+                                        bool /*suppress_early_eos*/) {
     // 默认: 写临时文件, 调用 transcribe(path)
     auto now = std::chrono::steady_clock::now().time_since_epoch().count();
     std::string tmp_path = "tmp/asr_mem_" + std::to_string(now) + "_" +
@@ -288,7 +290,8 @@ AsrResult AsrPlugin::transcribe_memory(const uint8_t* data, size_t size,
 // ============================================================================
 
 AsrResult AsrPlugin::transcribe_pcm(const float* /*samples*/, int /*num_samples*/,
-                                     int /*sample_rate*/, const std::string& /*language*/) {
+                                     int /*sample_rate*/, const std::string& /*language*/,
+                                     bool /*suppress_early_eos*/) {
     AsrResult r;
     r.error_code = 99;
     r.error_message = "transcribe_pcm not supported by this plugin";
@@ -300,7 +303,9 @@ AsrResult AsrPlugin::transcribe_pcm(const float* /*samples*/, int /*num_samples*
 // ============================================================================
 
 AsrResult NativeAsrPlugin::transcribe_memory(const uint8_t* data, size_t size,
-                                              const std::string& language) {
+                                              const std::string& language,
+                                              const std::string& filename_hint,
+                                              bool suppress_early_eos) {
     AsrResult result;
 
     if (!is_available()) {
@@ -309,11 +314,11 @@ AsrResult NativeAsrPlugin::transcribe_memory(const uint8_t* data, size_t size,
         return result;
     }
 
-    // 在内存中解析 WAV — 零磁盘 I/O
+    // 在内存中解析音频 — 支持 WAV/MP3/M4A/OGG/FLAC 等
     audio::AudioData wav;
-    if (!audio::load_wav_from_memory(data, size, wav)) {
+    if (!audio::load_audio_from_memory(data, size, wav, filename_hint)) {
         result.error_code = 2;
-        result.error_message = "Failed to parse audio data in memory (need PCM16 WAV)";
+        result.error_message = "Failed to parse audio data (supported: WAV/MP3/M4A/OGG/FLAC)";
         return result;
     }
 
@@ -322,7 +327,8 @@ AsrResult NativeAsrPlugin::transcribe_memory(const uint8_t* data, size_t size,
     auto t0 = std::chrono::steady_clock::now();
 
     std::string text = engine_->transcribe(wav.samples.data(), (int)wav.samples.size(),
-                                            wav.sample_rate);
+                                            wav.sample_rate, 0.0f, 448,
+                                            suppress_early_eos);
 
     auto t1 = std::chrono::steady_clock::now();
     float elapsed_s = std::chrono::duration<float>(t1 - t0).count();
@@ -351,7 +357,8 @@ AsrResult NativeAsrPlugin::transcribe_memory(const uint8_t* data, size_t size,
 // ============================================================================
 
 AsrResult NativeAsrPlugin::transcribe_pcm(const float* samples, int num_samples,
-                                           int sample_rate, const std::string& language) {
+                                           int sample_rate, const std::string& language,
+                                           bool suppress_early_eos) {
     AsrResult result;
 
     if (!is_available()) {
@@ -370,7 +377,8 @@ AsrResult NativeAsrPlugin::transcribe_pcm(const float* samples, int num_samples,
 
     auto t0 = std::chrono::steady_clock::now();
 
-    std::string text = engine_->transcribe(samples, num_samples, sample_rate);
+    std::string text = engine_->transcribe(samples, num_samples, sample_rate,
+                                            0.0f, 448, suppress_early_eos);
 
     auto t1 = std::chrono::steady_clock::now();
     float elapsed_s = std::chrono::duration<float>(t1 - t0).count();

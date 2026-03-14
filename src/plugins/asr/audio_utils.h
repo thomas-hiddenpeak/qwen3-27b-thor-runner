@@ -33,6 +33,12 @@ bool load_wav(const std::string& path, AudioData& out);
 // 从内存读取 WAV (用于 HTTP API 接收的音频数据)
 bool load_wav_from_memory(const uint8_t* data, size_t size, AudioData& out);
 
+// 从内存读取任意音频格式 (WAV/MP3/M4A/OGG/FLAC 等)
+// 优先尝试 WAV 解析, 失败则通过 ffmpeg 转码为 PCM16
+// filename_hint 用于保留文件扩展名 (ffmpeg 格式探测)
+bool load_audio_from_memory(const uint8_t* data, size_t size, AudioData& out,
+                            const std::string& filename_hint = "");
+
 // 简单重采样 (线性插值, 无需高质量)
 // 用于 non-16kHz 输入重采样到 16kHz
 void resample(const std::vector<float>& in, int in_sr,

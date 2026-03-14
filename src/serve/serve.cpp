@@ -6,6 +6,7 @@
 
 #include "serve.h"
 #include "../engine/vision.h"
+#include "../plugins/asr/audio_utils.h"
 #include <iostream>
 #include <sstream>
 #include <fstream>
@@ -142,13 +143,10 @@ static int clamp_max_output_tokens(int requested, int cap) {
 static const char* DEFAULT_SYSTEM_PROMPT =
     "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
 
-// 语音对话默认 system prompt — 引导 LLM 输出适合 TTS 的文本 + 每句情感标注
+// 语音对话默认 system prompt — 引导 LLM 输出适合 TTS 的文本
+// 不含情感标注 (只有 CustomVoice 需要, 通过 config 的 voice_system_prompt 配置)
 static const char* DEFAULT_VOICE_SYSTEM_PROMPT =
     "你是一个语音助手，回答将通过语音播放。\n"
-    "\n"
-    "【格式】每句话前用方括号标注贴合句意的情感，如：\n"
-    "[温柔]你好啊。[开心]今天天气真不错！[认真]我来帮你看看。\n"
-    "举例可选：平静、温柔、开心、兴奋、惊讶、认真、俏皮、安慰、关切、鼓励、好奇、轻松、热情、自信\n"
     "\n"
     "【规则】\n"
     "1. 不用 Markdown、特殊符号，数字用中文读法";
@@ -1397,6 +1395,8 @@ ServeConfig ServeConfig::merge_args(const ServeConfig& base, int argc, char** ar
         else if (arg == "--model-name" && i + 1 < argc) cfg.model_name = argv[++i];
         else if (arg == "--timeout" && i + 1 < argc) cfg.timeout_s = std::stoi(argv[++i]);
         else if (arg == "--max-output-tokens" && i + 1 < argc) cfg.max_output_tokens_cap = std::stoi(argv[++i]);
+        else if (arg == "--voice-max-turns" && i + 1 < argc) cfg.voice_max_turns = std::stoi(argv[++i]);
+        else if (arg == "--voice-max-output-tokens" && i + 1 < argc) cfg.voice_max_output_tokens = std::stoi(argv[++i]);
         else if (arg == "--voice-system-prompt" && i + 1 < argc) cfg.voice_system_prompt = argv[++i];
     }
     return cfg;
@@ -1426,6 +1426,8 @@ ServeConfig ServeConfig::from_file(const std::string& path) {
         else if (key == "model_name") cfg.model_name = val;
         else if (key == "timeout")    cfg.timeout_s = std::stoi(val);
         else if (key == "max_output_tokens") cfg.max_output_tokens_cap = std::stoi(val);
+        else if (key == "voice_max_turns") cfg.voice_max_turns = std::stoi(val);
+        else if (key == "voice_max_output_tokens") cfg.voice_max_output_tokens = std::stoi(val);
         else if (key == "voice_system_prompt") {
             // Support \n escape for multi-line prompts in config
             std::string parsed;
@@ -1442,6 +1444,8 @@ ServeConfig ServeConfig::from_file(const std::string& path) {
     }
     // 保存 config 文件中的初始值作为 reset 基准
     cfg.voice_system_prompt_default = cfg.voice_system_prompt;
+    cfg.voice_max_turns_default = cfg.voice_max_turns;
+    cfg.voice_max_output_tokens_default = cfg.voice_max_output_tokens;
     return cfg;
 }
 
@@ -1456,6 +1460,8 @@ void ServeConfig::print() const {
     printf("│  Model Name:    %-26s │\n", model_name.c_str());
     printf("│  Timeout:       %-6d s                     │\n", timeout_s);
     printf("│  Max Output:    %-6d tok                   │\n", max_output_tokens_cap);
+    printf("│  Voice Turns:   %-6d                       │\n", voice_max_turns);
+    printf("│  Voice Tokens:  %-6d                       │\n", voice_max_output_tokens);
     if (!voice_system_prompt.empty())
         printf("│  Voice Prompt:  %.38s │\n", voice_system_prompt.c_str());
     printf("└─────────────────────────────────────────────┘\n");
@@ -1640,7 +1646,15 @@ void ServeApp::accept_loop() {
             active_workers_.fetch_add(1);
             fprintf(stderr, "[Serve] spawning thread for fd=%d...\n", client_fd);
             std::thread([this, client_fd, protocol]() {
-                handle_connection(client_fd, protocol);
+                try {
+                    handle_connection(client_fd, protocol);
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "[Serve] EXCEPTION in connection handler fd=%d: %s\n", client_fd, e.what());
+                    close(client_fd);
+                } catch (...) {
+                    fprintf(stderr, "[Serve] UNKNOWN EXCEPTION in connection handler fd=%d\n", client_fd);
+                    close(client_fd);
+                }
                 active_workers_.fetch_sub(1);
             }).detach();
             fprintf(stderr, "[Serve] thread spawned for fd=%d\n", client_fd);
@@ -1746,6 +1760,40 @@ void ServeApp::handle_connection(int client_fd, int protocol) {
             handle_voice_clone_voices(req, client_fd);
         } else if (req.path == "/v1/voice_clone/delete" && req.method == "POST") {
             handle_voice_clone_delete(req, client_fd);
+        } else if (req.method == "GET" && req.path.rfind("/v1/recordings/", 0) == 0) {
+            // GET /v1/recordings/{filename} — 下载录音文件
+            std::string filename = req.path.substr(strlen("/v1/recordings/"));
+            // 安全检查: 只允许文件名，不允许路径遍历
+            if (filename.empty() || filename.find('/') != std::string::npos
+                || filename.find("..") != std::string::npos) {
+                HttpResponse resp;
+                resp.status_code = 400;
+                resp.status_text = "Bad Request";
+                resp.body = "{\"error\":\"invalid filename\"}";
+                send_response(client_fd, resp);
+            } else {
+                std::string filepath = "tmp/recordings/" + filename;
+                std::ifstream f(filepath, std::ios::binary | std::ios::ate);
+                if (!f) {
+                    HttpResponse resp;
+                    resp.status_code = 404;
+                    resp.status_text = "Not Found";
+                    resp.body = "{\"error\":\"file not found\"}";
+                    send_response(client_fd, resp);
+                } else {
+                    auto size = f.tellg();
+                    f.seekg(0);
+                    std::string data((size_t)size, '\0');
+                    f.read(data.data(), size);
+                    f.close();
+                    HttpResponse resp;
+                    resp.status_code = 200;
+                    resp.status_text = "OK";
+                    resp.content_type = "audio/wav";
+                    resp.body = std::move(data);
+                    send_response(client_fd, resp);
+                }
+            }
         } else if (req.method == "GET" && (req.path == "/" || req.path.rfind("/examples/", 0) == 0)) {
             handle_static_file(req, client_fd);
         } else {
@@ -1766,15 +1814,31 @@ HttpRequest ServeApp::parse_request(int client_fd) {
 
     fprintf(stderr, "[Serve] parse_request fd=%d: reading headers...\n", client_fd);
 
+    // 设置 header 读取超时 (10秒), 防止空连接阻塞线程
+    struct timeval tv;
+    tv.tv_sec = 10;
+    tv.tv_usec = 0;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     // 读取 HTTP 头部
     std::string raw;
     char buf[4096];
     while (true) {
         ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
-        if (n <= 0) break;
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                fprintf(stderr, "[Serve] parse_request fd=%d: header read timeout (10s)\n", client_fd);
+            }
+            break;
+        }
         raw.append(buf, n);
         if (raw.find("\r\n\r\n") != std::string::npos) break;
     }
+
+    // 恢复无限超时 (body 读取和后续操作可能需要更久)
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     fprintf(stderr, "[Serve] parse_request fd=%d: headers received, raw=%zu bytes\n", client_fd, raw.size());
 
@@ -1856,7 +1920,12 @@ void ServeApp::send_response(int client_fd, const HttpResponse& resp) {
     oss << resp.body;
 
     auto str = oss.str();
-    send(client_fd, str.c_str(), str.size(), 0);
+    size_t sent = 0;
+    while (sent < str.size()) {
+        ssize_t n = send(client_fd, str.data() + sent, str.size() - sent, MSG_NOSIGNAL);
+        if (n <= 0) break;
+        sent += static_cast<size_t>(n);
+    }
 }
 
 bool ServeApp::send_sse_event(int client_fd, const std::string& data) {
@@ -3694,14 +3763,18 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
     std::string language = form.fields.count("language") ? form.fields["language"] : "auto";
     std::string response_format = form.fields.count("response_format") ?
                                   form.fields["response_format"] : "json";
+    bool suppress_early_eos = form.fields.count("suppress_early_eos") &&
+                              (form.fields["suppress_early_eos"] == "true" ||
+                               form.fields["suppress_early_eos"] == "1");
 
-    fprintf(stderr, "[Serve] ASR: received %zu bytes audio (%s), language=%s\n",
-            audio_data.size(), audio_filename.c_str(), language.c_str());
+    fprintf(stderr, "[Serve] ASR: received %zu bytes audio (%s), language=%s%s\n",
+            audio_data.size(), audio_filename.c_str(), language.c_str(),
+            suppress_early_eos ? ", suppress_early_eos=true" : "");
 
     // 调用 ASR 插件 (直接内存解析, 无临时文件 I/O)
     auto result = asr_plugin_->transcribe_memory(
         reinterpret_cast<const uint8_t*>(audio_data.data()),
-        audio_data.size(), language);
+        audio_data.size(), language, audio_filename, suppress_early_eos);
 
     if (result.error_code != 0) {
         HttpResponse resp;
@@ -3955,9 +4028,11 @@ void ServeApp::handle_voice_clone_register(const HttpRequest& req, int client_fd
 
     // Find audio file
     const std::string* audio_data = nullptr;
+    std::string audio_fn;
     for (const auto& f : form.files) {
         if (f.field_name == "file" || f.field_name == "audio") {
             audio_data = &f.data;
+            audio_fn = f.filename;
             break;
         }
     }
@@ -4012,10 +4087,21 @@ void ServeApp::handle_voice_clone_register(const HttpRequest& req, int client_fd
         }
     }
 
+    // WAV 解析失败, 尝试 ffmpeg 转码
+    if (pcm.empty() || sample_rate == 0) {
+        audio::AudioData decoded;
+        if (audio::load_audio_from_memory(
+                reinterpret_cast<const uint8_t*>(audio_data->data()),
+                audio_data->size(), decoded, audio_fn)) {
+            pcm = std::move(decoded.samples);
+            sample_rate = decoded.sample_rate;
+        }
+    }
+
     if (pcm.empty() || sample_rate == 0) {
         HttpResponse resp;
         resp.status_code = 400;
-        resp.body = "{\"error\":\"Failed to parse audio file (WAV 16-bit or 32-bit float required)\"}";
+        resp.body = "{\"error\":\"Failed to parse audio file (supported: WAV/MP3/M4A/OGG/FLAC)\"}";
         send_response(client_fd, resp);
         close(client_fd);
         return;
@@ -4249,6 +4335,67 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
     double total_energy_sum = 0;
     int total_speech_samples = 0;
 
+    // 流式 ASR: 说话过程中定期识别, 发送中间结果 (参考 Qwen3-ASR 官方 streaming 方案)
+    constexpr float STREAMING_ASR_CHUNK_S = 2.0f;  // 每 2 秒触发一次识别
+    float streaming_asr_next_s = STREAMING_ASR_CHUNK_S;
+
+    // ASR→LLM 开关: 关闭时 ASR 仍运行但不触发 LLM 生成
+    bool asr_to_llm = true;
+
+    // ---- 服务端录音 (完整会话音频) ----
+    std::vector<int16_t> recording_buffer;  // stream.start → stream.stop 全程录音
+    int recording_sample_rate = 16000;
+    std::chrono::steady_clock::time_point recording_start_time;
+
+    // 保存录音到 WAV 文件
+    auto save_recording_wav = [&]() -> std::string {
+        if (recording_buffer.empty()) return "";
+        // 创建 tmp/recordings/ 目录
+        std::string dir = "tmp/recordings";
+        std::filesystem::create_directories(dir);
+        // 生成文件名: recording_YYYYMMDD_HHMMSS.wav
+        auto now = std::chrono::system_clock::now();
+        auto t = std::chrono::system_clock::to_time_t(now);
+        struct tm tm_buf;
+        localtime_r(&t, &tm_buf);
+        char fname[64];
+        snprintf(fname, sizeof(fname), "recording_%04d%02d%02d_%02d%02d%02d.wav",
+                 tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+        std::string path = dir + "/" + fname;
+        // 写 WAV 文件
+        int sr = recording_sample_rate;
+        int data_bytes = (int)recording_buffer.size() * 2;
+        std::ofstream f(path, std::ios::binary);
+        if (!f) {
+            fprintf(stderr, "[WS] Failed to create recording file: %s\n", path.c_str());
+            return "";
+        }
+        // WAV header (44 bytes)
+        auto write16 = [&](uint16_t v) { f.write((char*)&v, 2); };
+        auto write32 = [&](uint32_t v) { f.write((char*)&v, 4); };
+        f.write("RIFF", 4);
+        write32(36 + data_bytes);
+        f.write("WAVE", 4);
+        f.write("fmt ", 4);
+        write32(16);         // chunk size
+        write16(1);          // PCM
+        write16(1);          // mono
+        write32(sr);         // sample rate
+        write32(sr * 2);     // byte rate
+        write16(2);          // block align
+        write16(16);         // bits per sample
+        f.write("data", 4);
+        write32(data_bytes);
+        f.write((const char*)recording_buffer.data(), data_bytes);
+        f.close();
+        float dur_s = (float)recording_buffer.size() / sr;
+        float size_mb = data_bytes / 1048576.0f;
+        fprintf(stderr, "[WS] Recording saved: %s (%.1fs, %.1f MB, %d Hz)\n",
+                path.c_str(), dur_s, size_mb, sr);
+        return path;
+    };
+
     // ---- Worker thread for ASR + LLM + TTS ----
     std::thread worker_thread;
 
@@ -4264,8 +4411,18 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                                      voice_copy = std::move(voice_copy),
                                      instruct_copy = std::move(instruct_copy),
                                      lang_copy = std::move(lang_copy), tts_copy]() {
+          try {
             ws_voice_generate(text, chat_history, voice_copy, instruct_copy, tts_copy,
                               safe_send_text, safe_send_binary, generating, interrupted, lang_copy);
+          } catch (const std::exception& e) {
+            fprintf(stderr, "[WS] EXCEPTION in generate worker: %s\n", e.what());
+            safe_send_text("{\"type\":\"error\",\"message\":\"Internal error\"}");
+            generating = false;
+          } catch (...) {
+            fprintf(stderr, "[WS] UNKNOWN EXCEPTION in generate worker\n");
+            safe_send_text("{\"type\":\"error\",\"message\":\"Internal error\"}");
+            generating = false;
+          }
         });
     };
 
@@ -4277,10 +4434,12 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
         if (worker_thread.joinable()) worker_thread.join();
         generating = true;
         interrupted = false;
+        bool do_llm = asr_to_llm;  // capture current value
         worker_thread = std::thread([&, audio = std::move(audio), sr,
                                      voice_copy = std::move(voice_copy),
                                      instruct_copy = std::move(instruct_copy),
-                                     lang_copy = std::move(lang_copy), tts_copy]() {
+                                     lang_copy = std::move(lang_copy), tts_copy, do_llm]() {
+          try {
             if (interrupted) { generating = false; return; }
 
             // ASR
@@ -4293,7 +4452,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                     float_pcm[i] = audio[i] / 32768.0f;
 
                 auto result = asr_plugin_->transcribe_pcm(
-                    float_pcm.data(), (int)float_pcm.size(), sr, "auto");
+                    float_pcm.data(), (int)float_pcm.size(), sr, "auto", true);
 
                 if (result.error_code == 0 && !result.text.empty()) {
                     int char_count = 0;
@@ -4318,14 +4477,33 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             safe_send_text("{\"type\":\"asr\",\"text\":\"" + json_escape(asr_text) + "\"}");
             if (interrupted) { generating = false; return; }
 
+            // ASR→LLM 开关: 关闭时只做 ASR, 不触发 LLM 生成
+            if (!do_llm) {
+                safe_send_text("{\"type\":\"asr.done\"}");
+                generating = false;
+                return;
+            }
+
             ws_voice_generate(asr_text, chat_history, voice_copy, instruct_copy, tts_copy,
                               safe_send_text, safe_send_binary, generating, interrupted, lang_copy);
+          } catch (const std::exception& e) {
+            fprintf(stderr, "[WS] EXCEPTION in voice worker: %s\n", e.what());
+            safe_send_text("{\"type\":\"error\",\"message\":\"Internal error\"}");
+            generating = false;
+          } catch (...) {
+            fprintf(stderr, "[WS] UNKNOWN EXCEPTION in voice worker\n");
+            safe_send_text("{\"type\":\"error\",\"message\":\"Internal error\"}");
+            generating = false;
+          }
         });
     };
 
     safe_send_text("{\"type\":\"session.created\"}");
 
     // ---- 主循环: poll-based, 保持响应性 ----
+    auto last_activity = std::chrono::steady_clock::now();
+    constexpr int WS_PING_INTERVAL_S = 15;  // 每 15 秒发一次 ping
+
     while (running_ && conn_alive) {
         struct pollfd pfd;
         pfd.fd = client_fd;
@@ -4333,8 +4511,23 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
         int ret = ::poll(&pfd, 1, 100);
 
         if (ret < 0) break;
-        if (ret == 0) continue;
+        if (ret == 0) {
+            // 无数据: 检查是否需要发心跳 ping
+            auto now = std::chrono::steady_clock::now();
+            float idle_s = std::chrono::duration<float>(now - last_activity).count();
+            if (idle_s >= WS_PING_INTERVAL_S) {
+                std::lock_guard<std::mutex> lock(send_mutex);
+                if (!ws_send_frame(client_fd, WS_OP_PING, nullptr, 0)) {
+                    conn_alive = false;
+                    break;
+                }
+                last_activity = now;
+            }
+            continue;
+        }
         if (!(pfd.revents & POLLIN)) break;
+
+        last_activity = std::chrono::steady_clock::now();
 
         uint8_t opcode;
         std::vector<uint8_t> payload;
@@ -4358,13 +4551,17 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
         }
 
         // ---- Binary frame: 流式 PCM 音频数据 ----
-        if (opcode == WS_OP_BINARY && streaming_audio && !generating) {
+        // 始终接收音频 (即使 generating), 保持麦克风持续运行
+        if (opcode == WS_OP_BINARY && streaming_audio) {
             size_t num_samples = payload.size() / 2;
             if (num_samples == 0) continue;
 
             const int16_t* samples = reinterpret_cast<const int16_t*>(payload.data());
             size_t prev_size = pcm_buffer.size();
             pcm_buffer.insert(pcm_buffer.end(), samples, samples + num_samples);
+
+            // 服务端录音: 累积全部音频
+            recording_buffer.insert(recording_buffer.end(), samples, samples + num_samples);
 
             double energy_sum = 0;
             for (size_t i = 0; i < num_samples; i++) {
@@ -4392,13 +4589,33 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             float total_duration_s = (float)pcm_buffer.size() / stream_sample_rate;
             float silence_duration_ms = (float)silence_samples * 1000.0f / stream_sample_rate;
 
+            // 流式 ASR: 说话过程中定期识别累积音频, 发送中间结果
+            // generating 时跳过 (ASR 引擎 mutex 会阻塞事件循环)
+            if (!generating && speech_detected && total_duration_s >= streaming_asr_next_s
+                && asr_plugin_ && asr_plugin_->is_available()) {
+                std::vector<float> float_pcm(pcm_buffer.size());
+                for (size_t i = 0; i < pcm_buffer.size(); i++)
+                    float_pcm[i] = pcm_buffer[i] / 32768.0f;
+
+                auto partial = asr_plugin_->transcribe_pcm(
+                    float_pcm.data(), (int)float_pcm.size(), stream_sample_rate, "auto", true);
+
+                if (partial.error_code == 0 && !partial.text.empty()) {
+                    fprintf(stderr, "[WS] Streaming ASR (%.1fs): \"%s\"\n",
+                            total_duration_s, partial.text.substr(0, 80).c_str());
+                    safe_send_text("{\"type\":\"asr.partial\",\"text\":\"" +
+                                   json_escape(partial.text) + "\"}");
+                }
+                streaming_asr_next_s = total_duration_s + STREAMING_ASR_CHUNK_S;
+            }
+
             bool vad_triggered = speech_detected &&
                                  silence_duration_ms >= VAD_SILENCE_MS &&
                                  total_duration_s >= (VAD_MIN_SPEECH_MS / 1000.0f);
             bool timeout = total_duration_s >= VAD_MAX_DURATION_S;
 
             if (vad_triggered || timeout) {
-                streaming_audio = false;
+                // 不关闭 streaming_audio — 麦克风持续运行
                 safe_send_text("{\"type\":\"stream.vad\"}");
 
                 float avg_rms = (pcm_buffer.size() > 0)
@@ -4409,12 +4626,28 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 if (avg_rms < VAD_MIN_SPEECH_ENERGY) {
                     fprintf(stderr, "[WS] Rejected audio: avg_rms=%.4f speech_ratio=%.1f%% (too quiet)\n",
                             avg_rms, speech_ratio * 100);
+                    // 重置 VAD 状态, 继续下一段
                     pcm_buffer.clear();
+                    pcm_buffer.reserve(stream_sample_rate * 10);
                     silence_samples = 0;
                     speech_detected = false;
                     total_energy_sum = 0;
                     total_speech_samples = 0;
-                    safe_send_text("{\"type\":\"error\",\"message\":\"未检测到有效语音\"}");
+                    streaming_asr_next_s = STREAMING_ASR_CHUNK_S;
+                    continue;
+                }
+
+                if (generating) {
+                    // 上一轮还在生成, 丢弃当前段, 重置 VAD 等下一段
+                    fprintf(stderr, "[WS] VAD during generation, dropping segment (%.1fs)\n",
+                            (float)pcm_buffer.size() / stream_sample_rate);
+                    pcm_buffer.clear();
+                    pcm_buffer.reserve(stream_sample_rate * 10);
+                    silence_samples = 0;
+                    speech_detected = false;
+                    total_energy_sum = 0;
+                    total_speech_samples = 0;
+                    streaming_asr_next_s = STREAMING_ASR_CHUNK_S;
                     continue;
                 }
 
@@ -4430,10 +4663,12 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 // 启动 ASR + 生成 (worker thread)
                 auto audio_copy = std::move(pcm_buffer);
                 pcm_buffer.clear();
+                pcm_buffer.reserve(stream_sample_rate * 10);
                 silence_samples = 0;
                 speech_detected = false;
                 total_energy_sum = 0;
                 total_speech_samples = 0;
+                streaming_asr_next_s = STREAMING_ASR_CHUNK_S;
                 start_voice_input(std::move(audio_copy), stream_sample_rate, voice, tts_instruct, tts_enabled, tts_language);
             }
             continue;
@@ -4485,16 +4720,32 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 float tts_rep = (float)json_get_number(msg, "tts_rep_penalty", 1.05);
                 tts_plugin_->set_sampling(tts_temp, tts_topk, tts_topp, tts_rep);
             }
-            fprintf(stderr, "[WS] config updated: voice=%s tts=%s lang=%s fd=%d\n",
+            // Voice chat limits (per-session override)
+            if (msg.find("\"voice_max_turns\"") != std::string::npos) {
+                int vmt = json_get_int(msg, "voice_max_turns", config_.voice_max_turns);
+                if (vmt >= 1 && vmt <= 100) config_.voice_max_turns = vmt;
+            }
+            if (msg.find("\"voice_max_output_tokens\"") != std::string::npos) {
+                int vmot = json_get_int(msg, "voice_max_output_tokens", config_.voice_max_output_tokens);
+                if (vmot >= 10 && vmot <= 4096) config_.voice_max_output_tokens = vmot;
+            }
+            // ASR→LLM 开关
+            if (msg.find("\"asr_to_llm\"") != std::string::npos) {
+                asr_to_llm = json_get_bool(msg, "asr_to_llm", true);
+            }
+            fprintf(stderr, "[WS] config updated: voice=%s tts=%s lang=%s turns=%d tokens=%d asr_to_llm=%d fd=%d\n",
                     voice.empty() ? "(empty)" : voice.c_str(),
                     tts_enabled ? "on" : "off",
                     tts_language.empty() ? "auto" : tts_language.c_str(),
-                    client_fd);
-            // 返回当前系统提示词 (供 WebUI 初始化)
+                    config_.voice_max_turns, config_.voice_max_output_tokens,
+                    (int)asr_to_llm, client_fd);
+            // 返回当前配置 (供 WebUI 初始化)
             {
                 const std::string& sp = config_.voice_system_prompt.empty()
                     ? std::string(DEFAULT_VOICE_SYSTEM_PROMPT) : config_.voice_system_prompt;
-                safe_send_text("{\"type\":\"config.updated\",\"system_prompt\":\"" + json_escape(sp) + "\"}");
+                safe_send_text("{\"type\":\"config.updated\",\"system_prompt\":\"" + json_escape(sp) + "\""
+                    ",\"voice_max_turns\":" + std::to_string(config_.voice_max_turns) +
+                    ",\"voice_max_output_tokens\":" + std::to_string(config_.voice_max_output_tokens) + "}");
             }
 
         } else if (event_type == "chat") {
@@ -4510,7 +4761,8 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             }
 
         } else if (event_type == "stream.start") {
-            if (!generating) {
+            // 始终允许开启流式录音 (即使 generating 中也接收音频)
+            {
                 streaming_audio = true;
                 pcm_buffer.clear();
                 pcm_buffer.reserve(stream_sample_rate * 10);
@@ -4518,9 +4770,15 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 speech_detected = false;
                 total_energy_sum = 0;
                 total_speech_samples = 0;
+                streaming_asr_next_s = STREAMING_ASR_CHUNK_S;
                 stream_sample_rate = json_get_int(msg, "sample_rate", 16000);
                 if (stream_sample_rate < 8000) stream_sample_rate = 8000;
                 if (stream_sample_rate > 48000) stream_sample_rate = 48000;
+                // 开始服务端录音
+                recording_buffer.clear();
+                recording_buffer.reserve(stream_sample_rate * 60);  // 预分配 1 分钟
+                recording_sample_rate = stream_sample_rate;
+                recording_start_time = std::chrono::steady_clock::now();
                 safe_send_text("{\"type\":\"stream.started\"}");
                 fprintf(stderr, "[WS] Audio stream started, rate=%d fd=%d\n",
                         stream_sample_rate, client_fd);
@@ -4541,6 +4799,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                         speech_detected = false;
                         total_energy_sum = 0;
                         total_speech_samples = 0;
+                        streaming_asr_next_s = STREAMING_ASR_CHUNK_S;
                         safe_send_text("{\"type\":\"stream.stopped\"}");
                         continue;
                     }
@@ -4554,6 +4813,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                     speech_detected = false;
                     total_energy_sum = 0;
                     total_speech_samples = 0;
+                    streaming_asr_next_s = STREAMING_ASR_CHUNK_S;
                     start_voice_input(std::move(audio_copy), stream_sample_rate, voice, tts_instruct, tts_enabled, tts_language);
                 } else {
                     fprintf(stderr, "[WS] Stream stopped, too short (%.1fs)\n", audio_dur);
@@ -4563,7 +4823,17 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                     speech_detected = false;
                     total_energy_sum = 0;
                     total_speech_samples = 0;
+                    streaming_asr_next_s = STREAMING_ASR_CHUNK_S;
                 }
+            }
+            // 保存服务端录音
+            {
+                std::string rec_path = save_recording_wav();
+                if (!rec_path.empty()) {
+                    safe_send_text("{\"type\":\"recording.saved\",\"path\":\"" +
+                                   json_escape(rec_path) + "\"}");
+                }
+                recording_buffer.clear();
             }
             safe_send_text("{\"type\":\"stream.stopped\"}");
 
@@ -4587,6 +4857,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                                          instruct_copy = tts_instruct,
                                          tts_copy = tts_enabled,
                                          lang_copy = tts_language]() {
+              try {
                 auto audio_bytes = base64_decode(audio_b64);
                 if (audio_bytes.empty()) {
                     safe_send_text("{\"type\":\"error\",\"message\":\"Invalid audio data\"}");
@@ -4610,6 +4881,15 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
 
                 ws_voice_generate(result.text, chat_history, voice_copy, instruct_copy, tts_copy,
                                   safe_send_text, safe_send_binary, generating, interrupted, lang_copy);
+              } catch (const std::exception& e) {
+                fprintf(stderr, "[WS] EXCEPTION in audio worker: %s\n", e.what());
+                safe_send_text("{\"type\":\"error\",\"message\":\"Internal error\"}");
+                generating = false;
+              } catch (...) {
+                fprintf(stderr, "[WS] UNKNOWN EXCEPTION in audio worker\n");
+                safe_send_text("{\"type\":\"error\",\"message\":\"Internal error\"}");
+                generating = false;
+              }
             });
 
         } else if (event_type == "interrupt" || event_type == "tts.stop") {
@@ -4629,6 +4909,14 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
     // 清理
     conn_alive = false;
     interrupted = true;
+    // 连接断开时保存未保存的录音
+    if (!recording_buffer.empty()) {
+        std::string rec_path = save_recording_wav();
+        if (!rec_path.empty()) {
+            fprintf(stderr, "[WS] Recording saved on disconnect: %s\n", rec_path.c_str());
+        }
+        recording_buffer.clear();
+    }
     if (worker_thread.joinable()) worker_thread.join();
 
     fprintf(stderr, "[WS] Voice session ended fd=%d\n", client_fd);
@@ -4659,8 +4947,9 @@ void ServeApp::ws_voice_generate(const std::string& user_text,
 
     chat_history.push_back({"user", user_text});
 
-    // 保留最近 10 轮
-    while (chat_history.size() > 20) {
+    // 保留最近 N 轮 (voice_max_turns, 每轮 2 条消息)
+    const size_t max_messages = (size_t)config_.voice_max_turns * 2;
+    while (chat_history.size() > max_messages) {
         chat_history.erase(chat_history.begin());
     }
 
@@ -4680,7 +4969,7 @@ void ServeApp::ws_voice_generate(const std::string& user_text,
     InferRequest infer_req;
     infer_req.request_id     = next_request_id();
     infer_req.prompt_tokens  = std::move(prompt_tokens);
-    infer_req.max_new_tokens = 150;
+    infer_req.max_new_tokens = config_.voice_max_output_tokens;
     infer_req.temperature    = 0.7f;
     infer_req.top_p          = 0.8f;
     infer_req.top_k          = 20;
@@ -4924,11 +5213,18 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
     double total_energy_sum = 0;
     int total_samples_counted = 0;
 
+    // 流式 ASR: 说话过程中定期识别, 发送中间结果
+    constexpr float RT_STREAMING_ASR_CHUNK_S = 2.0f;
+    float rt_streaming_asr_next_s = RT_STREAMING_ASR_CHUNK_S;
+
     // ---- 生成控制 ----
     std::atomic<bool> generating{false};
     std::atomic<bool> interrupted{false};
     std::atomic<bool> conn_alive{true};
     std::mutex send_mutex;
+
+    // ASR→LLM 开关 (默认开启)
+    bool rt_asr_to_llm = true;
 
     auto send_json = [&](const std::string& json) -> bool {
         if (!conn_alive) return false;
@@ -4952,7 +5248,7 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
     };
 
     // ---- 处理函数: ASR → LLM → TTS (在工作线程中运行) ----
-    auto process_voice_input = [&](std::vector<int16_t> audio, int sr) {
+    auto process_voice_input = [&](std::vector<int16_t> audio, int sr, bool do_llm) {
         if (interrupted) { generating = false; return; }
 
         // --- ASR ---
@@ -4963,7 +5259,7 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
                 float_pcm[i] = audio[i] / 32768.0f;
 
             auto result = asr_plugin_->transcribe_pcm(
-                float_pcm.data(), (int)float_pcm.size(), sr);
+                float_pcm.data(), (int)float_pcm.size(), sr, "auto", true);
             asr_text = result.text;
             // 去除前后空白
             while (!asr_text.empty() && (asr_text.front() == ' ' || asr_text.front() == '\n'))
@@ -4980,6 +5276,13 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
 
         send_json("{\"type\":\"input.transcription\",\"text\":\"" + json_escape(asr_text) + "\"}");
         if (interrupted) { generating = false; return; }
+
+        // ASR→LLM 开关: 关闭时只做 ASR, 不触发 LLM 生成
+        if (!do_llm) {
+            send_json("{\"type\":\"asr.done\"}");
+            generating = false;
+            return;
+        }
 
         // --- LLM + TTS ---
         process_text_input(asr_text, chat_history, voice, tts_instruct,
@@ -5061,6 +5364,7 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
                     total_energy_sum = 0;
                     total_samples_counted = 0;
                     silence_samples = 0;
+                    rt_streaming_asr_next_s = RT_STREAMING_ASR_CHUNK_S;
                     send_json("{\"type\":\"input.speech_started\"}");
                 }
                 silence_samples = 0;
@@ -5072,6 +5376,26 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
                 pcm_buffer.insert(pcm_buffer.end(), samples, samples + num_samples);
                 total_energy_sum += energy_sum;
                 total_samples_counted += (int)num_samples;
+
+                // 流式 ASR: 定期识别累积音频, 发送中间结果
+                float total_s = (float)pcm_buffer.size() / client_sample_rate;
+                if (total_s >= rt_streaming_asr_next_s
+                    && asr_plugin_ && asr_plugin_->is_available()) {
+                    std::vector<float> float_pcm(pcm_buffer.size());
+                    for (size_t i = 0; i < pcm_buffer.size(); i++)
+                        float_pcm[i] = pcm_buffer[i] / 32768.0f;
+
+                    auto partial = asr_plugin_->transcribe_pcm(
+                        float_pcm.data(), (int)float_pcm.size(), client_sample_rate, "auto", true);
+
+                    if (partial.error_code == 0 && !partial.text.empty()) {
+                        fprintf(stderr, "[RT] Streaming ASR (%.1fs): \"%s\"\n",
+                                total_s, partial.text.substr(0, 80).c_str());
+                        send_json("{\"type\":\"input.transcription.partial\",\"text\":\"" +
+                                   json_escape(partial.text) + "\"}");
+                    }
+                    rt_streaming_asr_next_s = total_s + RT_STREAMING_ASR_CHUNK_S;
+                }
 
                 // 检查静音超时 → 语音结束
                 int silence_ms = silence_samples * 1000 / client_sample_rate;
@@ -5101,8 +5425,16 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
                     auto audio_copy = std::move(pcm_buffer);
                     pcm_buffer.clear();
                     int sr = client_sample_rate;
-                    worker_thread = std::thread([&, audio_copy, sr]() {
-                        process_voice_input(std::move(audio_copy), sr);
+                    worker_thread = std::thread([&, audio_copy, sr, do_llm = rt_asr_to_llm]() {
+                      try {
+                        process_voice_input(std::move(audio_copy), sr, do_llm);
+                      } catch (const std::exception& e) {
+                        fprintf(stderr, "[RT] EXCEPTION in voice worker: %s\n", e.what());
+                        generating = false;
+                      } catch (...) {
+                        fprintf(stderr, "[RT] UNKNOWN EXCEPTION in voice worker\n");
+                        generating = false;
+                      }
                     });
                 }
             }
@@ -5146,10 +5478,14 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
                 if (!inst.empty()) tts_instruct = inst;
                 int sr = get_int("sample_rate");
                 if (sr > 0) client_sample_rate = sr;
-                fprintf(stderr, "[RT] Config: voice=%s instruct=%s sample_rate=%d\n",
+                // ASR→LLM 开关
+                if (text.find("\"asr_to_llm\"") != std::string::npos) {
+                    rt_asr_to_llm = json_get_bool(text, "asr_to_llm", true);
+                }
+                fprintf(stderr, "[RT] Config: voice=%s instruct=%s sample_rate=%d asr_to_llm=%d\n",
                         voice.c_str(),
                         tts_instruct.empty() ? "(default)" : tts_instruct.c_str(),
-                        client_sample_rate);
+                        client_sample_rate, (int)rt_asr_to_llm);
             }
             else if (msg_type == "text") {
                 auto input_text = get_str("text");
@@ -5158,7 +5494,15 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
                     generating = true;
                     interrupted = false;
                     worker_thread = std::thread([&, input_text]() {
+                      try {
                         process_text(input_text);
+                      } catch (const std::exception& e) {
+                        fprintf(stderr, "[RT] EXCEPTION in text worker: %s\n", e.what());
+                        generating = false;
+                      } catch (...) {
+                        fprintf(stderr, "[RT] UNKNOWN EXCEPTION in text worker\n");
+                        generating = false;
+                      }
                     });
                 }
             }
@@ -5200,7 +5544,8 @@ void ServeApp::process_text_input(
     }
 
     chat_history.push_back({"user", user_text});
-    while (chat_history.size() > 20) chat_history.erase(chat_history.begin());
+    const size_t max_messages = (size_t)config_.voice_max_turns * 2;
+    while (chat_history.size() > max_messages) chat_history.erase(chat_history.begin());
 
     std::vector<std::pair<std::string, std::string>> messages;
     const std::string& voice_prompt = config_.voice_system_prompt.empty()
@@ -5213,7 +5558,7 @@ void ServeApp::process_text_input(
     InferRequest infer_req;
     infer_req.request_id     = next_request_id();
     infer_req.prompt_tokens  = std::move(prompt_tokens);
-    infer_req.max_new_tokens = 150;
+    infer_req.max_new_tokens = config_.voice_max_output_tokens;
     infer_req.temperature    = 0.7f;
     infer_req.top_p          = 0.8f;
     infer_req.top_k          = 20;

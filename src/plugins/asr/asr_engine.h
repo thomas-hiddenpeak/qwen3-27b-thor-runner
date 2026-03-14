@@ -35,15 +35,18 @@ public:
 
     // 转录: PCM 浮点 → 文本
     // samples: 单声道 float32, sample_rate: 采样率 (自动重采样到 16kHz)
+    // suppress_early_eos: 根据音频时长抑制过早 EOS, 防止停顿导致截断
     std::string transcribe(const float* samples, int num_samples,
                            int sample_rate = 16000,
                            float temperature = 0.0f,
-                           int max_new_tokens = 448);
+                           int max_new_tokens = 448,
+                           bool suppress_early_eos = false);
 
     // 转录: WAV 文件路径 → 文本
     std::string transcribe_file(const std::string& wav_path,
                                 float temperature = 0.0f,
-                                int max_new_tokens = 448);
+                                int max_new_tokens = 448,
+                                bool suppress_early_eos = false);
 
     bool is_loaded() const { return loaded_; }
     const ASRConfig& config() const { return config_; }
