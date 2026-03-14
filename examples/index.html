@@ -609,6 +609,91 @@ body {
 
 .hint { font-size: 11px; color: var(--text2); margin-top: 4px; }
 
+/* ======== Speaker Badge (ASR results) ======== */
+.asr-speaker {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-right: 6px;
+  background: rgba(108,138,255,0.15);
+  color: var(--primary);
+  vertical-align: middle;
+}
+.asr-speaker.unknown {
+  background: rgba(156,160,171,0.15);
+  color: var(--text2);
+}
+
+/* ======== Speaker List ======== */
+.speaker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.speaker-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 8px;
+  background: var(--surface2);
+  border-radius: 5px;
+  font-size: 12px;
+}
+.speaker-item .speaker-name {
+  font-weight: 500;
+  color: var(--text);
+}
+.speaker-item button {
+  background: none;
+  border: none;
+  color: var(--error);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 4px;
+  opacity: 0.6;
+  transition: opacity 0.15s;
+}
+.speaker-item button:hover { opacity: 1; }
+.speaker-empty {
+  font-size: 12px;
+  color: var(--text2);
+  text-align: center;
+  padding: 8px 0;
+}
+
+/* ======== File Transcription Result ======== */
+.transcription-result {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 300px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.transcription-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text2);
+}
+.transcription-meta span {
+  background: var(--surface);
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
 /* ======== ASR Monitor Panel ======== */
 .asr-monitor {
   border-bottom: 1px solid var(--border);
@@ -945,7 +1030,104 @@ body {
       </div>
     </div>
 
-    <!-- Section 6: 语音合成 -->
+    <!-- Section 6: 说话人管理 -->
+    <div class="panel-section" id="speakerMgmtSection" style="display:none">
+      <div class="panel-header" onclick="togglePanel('speakerMgmtBody')">
+        <span>👤 说话人管理</span>
+        <span class="toggle-icon" id="speakerMgmtBody_icon">▾</span>
+      </div>
+      <div class="panel-body" id="speakerMgmtBody">
+        <div class="speaker-list" id="speakerList">
+          <div class="speaker-empty" id="speakerEmpty">暂无已注册说话人</div>
+        </div>
+
+        <hr class="divider">
+
+        <div class="form-group">
+          <label class="form-label">注册说话人</label>
+          <input type="text" id="spkRegName" placeholder="说话人名称">
+        </div>
+        <div class="form-group">
+          <label class="form-label">音频文件</label>
+          <div class="clone-audio-actions">
+            <label class="btn btn-secondary btn-sm" style="cursor:pointer;margin:0;">
+              📁 选择文件
+              <input type="file" id="spkRegAudio" accept="audio/*" style="display:none;" onchange="onSpkFileSelected(this)">
+            </label>
+            <button class="btn btn-secondary btn-sm" id="spkRecordBtn" onclick="toggleSpkRecord()">🎙 录音</button>
+          </div>
+          <div id="spkFileInfo" class="hint"></div>
+          <div id="spkRecordingStatus" style="font-size:12px;color:var(--recording);margin-top:4px;display:none;">
+            ● 正在录音... <span id="spkRecordTime">0s</span>
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="registerSpeaker()">
+          ✨ 注册说话人
+        </button>
+        <div id="spkRegStatus" class="hint" style="margin-top:4px;"></div>
+
+        <hr class="divider">
+
+        <button class="btn-danger btn-sm" onclick="clearAllSpeakers()" style="width:100%;text-align:center;padding:6px;">
+          🗑 清空所有说话人
+        </button>
+      </div>
+    </div>
+
+    <!-- Section 7: 录音转写 -->
+    <div class="panel-section" id="fileTranscribeSection" style="display:none">
+      <div class="panel-header" onclick="togglePanel('fileTranscribeBody')">
+        <span>📄 录音转写</span>
+        <span class="toggle-icon" id="fileTranscribeBody_icon">▾</span>
+      </div>
+      <div class="panel-body" id="fileTranscribeBody">
+        <div class="form-group">
+          <label class="form-label">音频文件</label>
+          <label class="btn btn-secondary btn-sm" style="cursor:pointer;margin:0;display:inline-flex;">
+            📁 选择文件
+            <input type="file" id="transcribeAudioFile" accept="audio/*" style="display:none;" onchange="onTranscribeFileSelected(this)">
+          </label>
+          <div id="transcribeFileInfo" class="hint"></div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">选项</label>
+          <div style="display:flex;gap:12px;font-size:12px;">
+            <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
+              <input type="checkbox" id="transcribePunctuate" checked> 标点恢复
+            </label>
+            <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
+              <input type="checkbox" id="transcribeSpeaker" checked> 说话人识别
+            </label>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">响应格式</label>
+          <select id="transcribeFormat">
+            <option value="verbose_json">详细 JSON</option>
+            <option value="json">简洁 JSON</option>
+            <option value="text">纯文本</option>
+          </select>
+        </div>
+
+        <button class="btn btn-primary" id="transcribeBtn" onclick="transcribeFile()">
+          🔍 开始转写
+        </button>
+
+        <div class="hint" id="transcribeStatus" style="margin-top:4px;"></div>
+
+        <div id="transcribeResult" style="display:none;">
+          <div class="transcription-result" id="transcribeResultText"></div>
+          <div class="transcription-meta" id="transcribeResultMeta"></div>
+          <div style="margin-top:6px;">
+            <button class="btn btn-secondary btn-sm" onclick="copyTranscribeResult()">📋 复制</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Section 8: 语音合成 -->
     <div class="panel-section">
       <div class="panel-header" onclick="togglePanel('ttsSynthBody')">
         <span>🔊 语音合成</span>
@@ -1016,7 +1198,7 @@ body {
       </div>
     </div>
 
-    <!-- Section 7: 合成历史 -->
+    <!-- Section 9: 合成历史 -->
     <div class="panel-section" id="ttsHistoryCard" style="display:none">
       <div class="panel-header" onclick="togglePanel('ttsHistoryBody')">
         <span>📜 合成历史</span>
@@ -1122,7 +1304,7 @@ function toggleAsrMonitor() {
   if (icon) icon.classList.toggle('collapsed');
 }
 
-function addAsrLogEntry(text, isPartial) {
+function addAsrLogEntry(text, isPartial, speaker) {
   if (!text) return;
   const list = document.getElementById('asrLogList');
   const empty = document.getElementById('asrLogEmpty');
@@ -1139,13 +1321,19 @@ function addAsrLogEntry(text, isPartial) {
 
   const div = document.createElement('div');
   div.className = 'asr-log-entry' + (isPartial ? ' partial' : '');
-  div.innerHTML = '<span class="asr-time">[' + timeStr + ']</span><span class="asr-text">' + escapeHtml(text) + '</span>';
+  let html = '<span class="asr-time">[' + timeStr + ']</span>';
+  if (speaker && !isPartial) {
+    const isUnknown = speaker.startsWith('Speaker_');
+    html += '<span class="asr-speaker' + (isUnknown ? ' unknown' : '') + '">' + escapeHtml(speaker) + '</span>';
+  }
+  html += '<span class="asr-text">' + escapeHtml(text) + '</span>';
+  div.innerHTML = html;
   list.appendChild(div);
 
   if (isPartial) {
     asrPartialDiv = div;
   } else {
-    asrLogEntries.push({time: timeStr, text: text});
+    asrLogEntries.push({time: timeStr, text: text, speaker: speaker || ''});
     updateAsrCount();
   }
 
@@ -1176,7 +1364,8 @@ function saveAsrLog() {
   let content = 'ASR 识别记录 — ' + new Date().toLocaleString('zh-CN') + '\n';
   content += '='.repeat(50) + '\n\n';
   for (const e of asrLogEntries) {
-    content += '[' + e.time + '] ' + e.text + '\n';
+    const spkTag = e.speaker ? ' <' + e.speaker + '>' : '';
+    content += '[' + e.time + ']' + spkTag + ' ' + e.text + '\n';
   }
   const blob = new Blob([content], {type: 'text/plain;charset=utf-8'});
   const url = URL.createObjectURL(blob);
@@ -1230,6 +1419,19 @@ async function fetchTtsInfo() {
     const resp = await fetch(API_BASE + '/v1/tts/info');
     if (!resp.ok) return;
     const info = await resp.json();
+
+    // ASR / Speaker encoder can be available even without TTS
+    hasAsr = info.has_asr || false;
+    const asrBtn = document.getElementById('cloneAsrBtn');
+    if (asrBtn) {
+      asrBtn.disabled = !hasAsr;
+      asrBtn.title = hasAsr ? '自动识别参考音频文本' : 'ASR 未加载 (需配置 asr_enabled=true)';
+    }
+    const hasEncoder = info.has_speaker_encoder || false;
+    document.getElementById('speakerMgmtSection').style.display = hasEncoder ? '' : 'none';
+    if (hasEncoder) fetchSpeakerList();
+    document.getElementById('fileTranscribeSection').style.display = hasAsr ? '' : 'none';
+
     if (!info.enabled) return;
 
     ttsModelType = info.model_type || 'custom_voice';
@@ -1264,16 +1466,10 @@ async function fetchTtsInfo() {
     // voiceSelectGroup visibility is managed by updateVoiceSelects()
     document.getElementById('synthVoiceGroup').style.display = hasVoices ? '' : 'none';
 
-    // ASR availability
-    hasAsr = info.has_asr || false;
-    const asrBtn = document.getElementById('cloneAsrBtn');
-    if (asrBtn) {
-      asrBtn.disabled = !hasAsr;
-      asrBtn.title = hasAsr ? '自动识别参考音频文本' : 'ASR 未加载 (需配置 asr_enabled=true)';
-    }
+    // ASR clone button availability (uses hasAsr set above)
+    // (already set at the top of fetchTtsInfo)
 
     // Voice clone section
-    const hasEncoder = info.has_speaker_encoder || false;
     document.getElementById('voiceCloneSection').style.display = (isClone || hasEncoder) ? '' : 'none';
 
     // Clone voices
@@ -1726,9 +1922,10 @@ function handleEvent(msg) {
       break;
 
     case 'asr':
-      addAsrLogEntry(msg.text, false);
+      addAsrLogEntry(msg.text, false, msg.speaker);
       if (document.getElementById('asrToLlmToggle').checked) {
-        addMessage('user', msg.text, null, 'ASR 识别');
+        const meta = msg.speaker ? 'ASR 识别 · ' + msg.speaker : 'ASR 识别';
+        addMessage('user', msg.text, null, meta);
       }
       break;
 
@@ -2482,6 +2679,307 @@ async function deleteCloneVoice() {
   } catch (err) {
     setTtsStatus('删除请求失败: ' + err.message, 'error');
   }
+}
+
+// ============================================================================
+// Speaker Management (CAM++ 说话人识别)
+// ============================================================================
+let spkAudioBlob = null;
+let spkAudioFilename = 'speaker.wav';
+let spkMediaStream = null;
+let spkMediaRecorder = null;
+let spkAudioChunks = [];
+let spkRecordInterval = null;
+
+async function fetchSpeakerList() {
+  try {
+    const resp = await fetch(API_BASE + '/v1/speakers');
+    if (!resp.ok) return;
+    const json = await resp.json();
+    renderSpeakerList(json.speakers || []);
+  } catch (e) {
+    console.warn('Failed to fetch speakers:', e);
+  }
+}
+
+function renderSpeakerList(speakers) {
+  const list = document.getElementById('speakerList');
+  const empty = document.getElementById('speakerEmpty');
+  // 清空已有条目 (保留 empty 提示)
+  list.querySelectorAll('.speaker-item').forEach(el => el.remove());
+
+  if (speakers.length === 0) {
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+  for (const name of speakers) {
+    const item = document.createElement('div');
+    item.className = 'speaker-item';
+    item.innerHTML = '<span class="speaker-name">👤 ' + escapeHtml(name) + '</span>' +
+      '<button onclick="deleteSpeaker(\'' + escapeHtml(name).replace(/'/g, "\\'") + '\')" title="删除">✕</button>';
+    list.appendChild(item);
+  }
+}
+
+function onSpkFileSelected(input) {
+  const file = input.files[0];
+  if (file) {
+    document.getElementById('spkFileInfo').textContent =
+      '已选择: ' + file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)';
+    spkAudioBlob = file;
+    spkAudioFilename = file.name || 'speaker.wav';
+  }
+}
+
+async function toggleSpkRecord() {
+  const btn = document.getElementById('spkRecordBtn');
+  const statusDiv = document.getElementById('spkRecordingStatus');
+
+  if (spkMediaRecorder && spkMediaRecorder.state === 'recording') {
+    spkMediaRecorder.stop();
+    btn.textContent = '🎙 录音';
+    btn.style.background = '';
+    statusDiv.style.display = 'none';
+    if (spkRecordInterval) { clearInterval(spkRecordInterval); spkRecordInterval = null; }
+    if (spkMediaStream) { spkMediaStream.getTracks().forEach(t => t.stop()); spkMediaStream = null; }
+    return;
+  }
+
+  try {
+    spkMediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    spkMediaRecorder = new MediaRecorder(spkMediaStream, { mimeType: 'audio/webm' });
+    spkAudioChunks = [];
+
+    spkMediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) spkAudioChunks.push(e.data);
+    };
+
+    spkMediaRecorder.onstop = async () => {
+      const webmBlob = new Blob(spkAudioChunks, { type: 'audio/webm' });
+      const ctx = new AudioContext({ sampleRate: 16000 });
+      const arrayBuf = await webmBlob.arrayBuffer();
+      const decoded = await ctx.decodeAudioData(arrayBuf);
+      const channelData = decoded.getChannelData(0);
+      const wavBuf = new ArrayBuffer(44 + channelData.length * 2);
+      const view = new DataView(wavBuf);
+      const sr = decoded.sampleRate;
+      const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+      writeStr(0, 'RIFF'); view.setUint32(4, 36 + channelData.length * 2, true); writeStr(8, 'WAVE');
+      writeStr(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+      view.setUint32(24, sr, true); view.setUint32(28, sr * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+      writeStr(36, 'data'); view.setUint32(40, channelData.length * 2, true);
+      for (let i = 0; i < channelData.length; i++) {
+        const s = Math.max(-1, Math.min(1, channelData[i]));
+        view.setInt16(44 + i * 2, s * 32767, true);
+      }
+      spkAudioBlob = new Blob([wavBuf], { type: 'audio/wav' });
+      spkAudioFilename = 'recording.wav';
+      document.getElementById('spkFileInfo').textContent =
+        '录音完成: ' + (spkAudioBlob.size / 1024).toFixed(1) + ' KB, ' +
+        decoded.duration.toFixed(1) + 's';
+      ctx.close();
+    };
+
+    spkMediaRecorder.start();
+    btn.textContent = '⏹ 停止录音';
+    btn.style.background = 'var(--recording)';
+    statusDiv.style.display = 'block';
+    let sec = 0;
+    spkRecordInterval = setInterval(() => {
+      sec++;
+      document.getElementById('spkRecordTime').textContent = sec + 's';
+    }, 1000);
+  } catch (err) {
+    document.getElementById('spkRegStatus').textContent = '麦克风权限被拒绝: ' + err.message;
+    document.getElementById('spkRegStatus').style.color = 'var(--error)';
+  }
+}
+
+async function registerSpeaker() {
+  const name = document.getElementById('spkRegName').value.trim();
+  const statusEl = document.getElementById('spkRegStatus');
+
+  if (!name) {
+    statusEl.textContent = '请输入说话人名称';
+    statusEl.style.color = 'var(--error)';
+    return;
+  }
+  if (!spkAudioBlob) {
+    statusEl.textContent = '请选择音频文件或录音';
+    statusEl.style.color = 'var(--error)';
+    return;
+  }
+
+  statusEl.textContent = '正在注册...';
+  statusEl.style.color = 'var(--text2)';
+
+  try {
+    const formData = new FormData();
+    formData.append('name', name);
+    formData.append('file', spkAudioBlob, spkAudioFilename);
+
+    const resp = await fetch(API_BASE + '/v1/speakers/register', {
+      method: 'POST',
+      body: formData
+    });
+
+    const json = await resp.json();
+    if (json.success) {
+      statusEl.textContent = '✅ 说话人 "' + name + '" 注册成功！';
+      statusEl.style.color = 'var(--success)';
+      document.getElementById('spkRegName').value = '';
+      document.getElementById('spkFileInfo').textContent = '';
+      spkAudioBlob = null;
+      fetchSpeakerList();
+    } else {
+      statusEl.textContent = '❌ 注册失败: ' + (json.error || 'unknown error');
+      statusEl.style.color = 'var(--error)';
+    }
+  } catch (err) {
+    statusEl.textContent = '❌ 请求失败: ' + err.message;
+    statusEl.style.color = 'var(--error)';
+  }
+}
+
+async function deleteSpeaker(name) {
+  if (!confirm('确认删除说话人 "' + name + '"?')) return;
+
+  try {
+    const resp = await fetch(API_BASE + '/v1/speakers/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name })
+    });
+    const json = await resp.json();
+    if (json.success) {
+      fetchSpeakerList();
+    }
+  } catch (err) {
+    console.warn('Delete speaker failed:', err);
+  }
+}
+
+async function clearAllSpeakers() {
+  if (!confirm('确认清空所有已注册的说话人?')) return;
+
+  try {
+    const resp = await fetch(API_BASE + '/v1/speakers/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'all' })
+    });
+    const json = await resp.json();
+    if (json.success) {
+      fetchSpeakerList();
+    }
+  } catch (err) {
+    console.warn('Clear speakers failed:', err);
+  }
+}
+
+// ============================================================================
+// File Transcription (录音转写)
+// ============================================================================
+let transcribeAudioBlob = null;
+let transcribeAudioFilename = 'audio.wav';
+
+function onTranscribeFileSelected(input) {
+  const file = input.files[0];
+  if (file) {
+    document.getElementById('transcribeFileInfo').textContent =
+      '已选择: ' + file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)';
+    transcribeAudioBlob = file;
+    transcribeAudioFilename = file.name || 'audio.wav';
+  }
+}
+
+async function transcribeFile() {
+  const statusEl = document.getElementById('transcribeStatus');
+  const resultDiv = document.getElementById('transcribeResult');
+
+  if (!transcribeAudioBlob) {
+    statusEl.textContent = '请先选择音频文件';
+    statusEl.style.color = 'var(--error)';
+    return;
+  }
+
+  statusEl.textContent = '正在转写...';
+  statusEl.style.color = 'var(--text2)';
+  resultDiv.style.display = 'none';
+
+  const btn = document.getElementById('transcribeBtn');
+  btn.disabled = true;
+
+  try {
+    const formData = new FormData();
+    formData.append('file', transcribeAudioBlob, transcribeAudioFilename);
+    formData.append('language', 'auto');
+
+    const format = document.getElementById('transcribeFormat').value;
+    formData.append('response_format', format);
+
+    if (document.getElementById('transcribePunctuate').checked) {
+      formData.append('punctuate', 'true');
+    }
+    if (document.getElementById('transcribeSpeaker').checked) {
+      formData.append('speaker', 'true');
+    }
+
+    const resp = await fetch(API_BASE + '/v1/audio/transcriptions', {
+      method: 'POST',
+      body: formData
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      let errMsg;
+      try { errMsg = JSON.parse(errText).error.message; } catch { errMsg = 'HTTP ' + resp.status; }
+      throw new Error(errMsg);
+    }
+
+    const contentType = resp.headers.get('content-type') || '';
+
+    if (format === 'text' || contentType.includes('text/plain')) {
+      const text = await resp.text();
+      document.getElementById('transcribeResultText').textContent = text;
+      document.getElementById('transcribeResultMeta').innerHTML = '';
+      statusEl.textContent = '✅ 转写完成';
+      statusEl.style.color = 'var(--success)';
+    } else {
+      const json = await resp.json();
+      const displayText = json.text_with_punc || json.text || '';
+      document.getElementById('transcribeResultText').textContent = displayText;
+
+      let metaHtml = '';
+      if (json.language) metaHtml += '<span>语言: ' + escapeHtml(json.language) + '</span>';
+      if (json.duration != null) metaHtml += '<span>时长: ' + json.duration.toFixed(1) + 's</span>';
+      if (json.speaker) metaHtml += '<span>说话人: ' + escapeHtml(json.speaker) + '</span>';
+      if (json.speaker_similarity != null) metaHtml += '<span>相似度: ' + json.speaker_similarity.toFixed(3) + '</span>';
+      document.getElementById('transcribeResultMeta').innerHTML = metaHtml;
+
+      statusEl.textContent = '✅ 转写完成';
+      statusEl.style.color = 'var(--success)';
+    }
+
+    resultDiv.style.display = 'block';
+  } catch (err) {
+    statusEl.textContent = '❌ 转写失败: ' + err.message;
+    statusEl.style.color = 'var(--error)';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function copyTranscribeResult() {
+  const text = document.getElementById('transcribeResultText').textContent;
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = event.target;
+    const orig = btn.textContent;
+    btn.textContent = '✅ 已复制';
+    setTimeout(() => btn.textContent = orig, 1500);
+  });
 }
 
 // ============================================================================

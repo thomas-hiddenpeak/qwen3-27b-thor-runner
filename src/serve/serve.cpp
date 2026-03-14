@@ -4010,7 +4010,11 @@ void ServeApp::handle_tts_info(const HttpRequest& /*req*/, int client_fd) {
     HttpResponse resp;
 
     if (!tts_plugin_ || !tts_plugin_->is_available()) {
-        resp.body = "{\"enabled\":false}";
+        // TTS disabled, but still report ASR/speaker encoder status for standalone use
+        resp.body = "{\"enabled\":false"
+                    ",\"has_asr\":" + std::string((asr_plugin_ && asr_plugin_->is_available()) ? "true" : "false") +
+                    ",\"has_speaker_encoder\":" + std::string(speaker_encoder_ ? "true" : "false") +
+                    "}";
         send_response(client_fd, resp);
         close(client_fd);
         return;
