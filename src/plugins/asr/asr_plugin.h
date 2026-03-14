@@ -47,11 +47,48 @@ struct AsrConfig {
 // ASR 转录结果
 // ============================================================================
 struct AsrResult {
-    std::string text;              // 转录文本
+    // ─── 基础 ───
+    std::string text;              // 转录文本 (无标点)
     std::string language;          // 检测到的语言
     float       duration_s = 0;    // 音频时长 (秒)
     int         error_code = 0;    // 0 = 成功
     std::string error_message;     // 错误信息
+
+    // ─── Phase 4: 标点恢复 ───
+    std::string text_with_punc;    // 带标点文本
+
+    // ─── Phase 5: 时间戳 ───
+    struct WordInfo {
+        std::string word;
+        int   start_ms = -1;
+        int   end_ms   = -1;
+        float confidence = 0;
+        int   speaker_id = -1;    // Phase 6
+    };
+    std::vector<WordInfo> words;
+
+    // ─── Phase 6: 说话人分割 ───
+    struct SpeakerSegment {
+        int         start_ms = 0;
+        int         end_ms   = 0;
+        int         speaker_id = -1;
+        std::string speaker_name;
+        std::string text;
+    };
+    std::vector<SpeakerSegment> segments;
+
+    // ─── Phase 3: 关键词识别 ───
+    struct KeywordHit {
+        std::string keyword;
+        std::string action;
+        int   char_offset = 0;     // UTF-8 字符偏移
+        float confidence = 0;
+    };
+    std::vector<KeywordHit> keyword_hits;
+
+    // ─── Phase 7: 情感 (预留) ───
+    std::string emotion;           // "neutral"/"happy"/"sad"/...
+    float emotion_confidence = 0;
 };
 
 // ============================================================================
