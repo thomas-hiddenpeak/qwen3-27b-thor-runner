@@ -45,6 +45,7 @@ AsrConfig AsrConfig::from_file(const std::string& path) {
         else if (key == "asr_threads")    config.threads    = std::stoi(val);
         else if (key == "asr_extra_args") config.extra_args = val;
         else if (key == "asr_tmp_dir")    config.tmp_dir    = val;
+        else if (key == "asr_speaker_model") config.speaker_model = val;
     }
     return config;
 }
@@ -57,6 +58,8 @@ void AsrConfig::print() const {
     fprintf(stderr, "  model:      %s\n", model_path.c_str());
     fprintf(stderr, "  language:   %s\n", language.c_str());
     fprintf(stderr, "  threads:    %d\n", threads);
+    if (!speaker_model.empty())
+        fprintf(stderr, "  speaker:    %s\n", speaker_model.c_str());
     if (!extra_args.empty())
         fprintf(stderr, "  extra_args: %s\n", extra_args.c_str());
 }

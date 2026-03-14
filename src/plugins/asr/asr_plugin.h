@@ -38,6 +38,7 @@ struct AsrConfig {
     int         threads     = 4;      // CPU 线程数
     std::string extra_args;           // 额外 CLI 参数 (直接追加到命令行)
     std::string tmp_dir     = "tmp";  // 临时文件目录
+    std::string speaker_model;        // CAM++ 说话人编码器 safetensors 路径 (可选)
 
     static AsrConfig from_file(const std::string& path);
     void print() const;

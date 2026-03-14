@@ -16,6 +16,8 @@
 
 #include "../engine/backend.h"
 #include "../plugins/asr/asr_plugin.h"
+#include "../plugins/asr/speaker_encoder.h"
+#include "../plugins/asr/punctuation.h"
 #include "../plugins/tts/tts_plugin.h"
 #include <string>
 #include <thread>
@@ -163,6 +165,19 @@ private:
     void handle_voice_clone_voices(const HttpRequest& req, int client_fd);
     void handle_voice_clone_delete(const HttpRequest& req, int client_fd);
 
+    // ---- Speaker Registration API (说话人注册/识别) ----
+    void handle_speaker_register(const HttpRequest& req, int client_fd);
+    void handle_speaker_list(const HttpRequest& req, int client_fd);
+    void handle_speaker_delete(const HttpRequest& req, int client_fd);
+
+    // 说话人识别: 从 PCM 音频提取 embedding 并匹配
+    asr::SpeakerManager::MatchResult identify_speaker(
+        const float* samples, int num_samples, int sample_rate);
+
+    // 80-dim Mel 特征提取 (用于 CAM++ 说话人编码)
+    void compute_mel_80(const float* samples, int num_samples, int sample_rate,
+                        std::vector<float>& mel_out, int& num_frames);
+
     // ---- WebSocket 语音对话 ----
     void handle_websocket_voice(int client_fd, const HttpRequest& req);
     void ws_voice_generate(
@@ -239,6 +254,14 @@ private:
     InferenceBackend& backend_;
     std::unique_ptr<plugins::AsrPlugin> asr_plugin_;
     std::unique_ptr<plugins::TtsPlugin> tts_plugin_;
+
+    // 说话人识别 (CAM++ + SpeakerManager)
+    std::unique_ptr<asr::CamPlusSpeakerEncoder> speaker_encoder_;
+    asr::SpeakerManager speaker_manager_;
+    std::mutex speaker_mutex_;  // 保护 speaker_encoder_ + speaker_manager_
+
+    // 标点恢复
+    asr::PunctuationRestorer punctuation_restorer_;
     int ollama_fd_ = -1;
     int openai_fd_ = -1;
     std::atomic<bool> running_{false};

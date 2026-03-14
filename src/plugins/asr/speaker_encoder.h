@@ -620,6 +620,24 @@ public:
     // 列表
     int speaker_count() const { return (int)speakers_.size(); }
 
+    // 获取所有说话人名称
+    std::vector<std::string> speaker_names() const {
+        std::vector<std::string> names;
+        for (const auto& s : speakers_) names.push_back(s.name);
+        return names;
+    }
+
+    // 按名称删除说话人
+    bool remove_by_name(const std::string& name) {
+        for (auto it = speakers_.begin(); it != speakers_.end(); ++it) {
+            if (it->name == name) {
+                speakers_.erase(it);
+                return true;
+            }
+        }
+        return false;
+    }
+
     // 重置
     void clear() {
         speakers_.clear();

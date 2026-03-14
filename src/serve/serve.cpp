@@ -1486,6 +1486,35 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
                 tts_plugin_->name().c_str(),
                 tts_plugin_->is_available() ? "yes" : "no");
     }
+
+    // 加载 CAM++ 说话人编码器 (如果配置了 speaker_model 路径)
+    // 从 AsrConfig 获取路径: 由 main.cpp 传入配置
+    // 自动发现: 检查 ASR 模型同级目录下的 campplus 模型
+    if (asr_plugin_ && asr_plugin_->is_available()) {
+        // 通过环境变量或默认路径加载
+        std::string speaker_model_path;
+        const char* env_path = getenv("QWEN_SPEAKER_MODEL");
+        if (env_path) {
+            speaker_model_path = env_path;
+        } else {
+            // 默认路径: /home/rm01/models/dev/asr/campplus/campplus.safetensors
+            std::string default_path = "/home/rm01/models/dev/asr/campplus/campplus.safetensors";
+            std::ifstream test_file(default_path);
+            if (test_file.good()) speaker_model_path = default_path;
+        }
+
+        if (!speaker_model_path.empty()) {
+            speaker_encoder_ = std::make_unique<asr::CamPlusSpeakerEncoder>();
+            if (speaker_encoder_->load(speaker_model_path)) {
+                fprintf(stderr, "[Serve] Speaker encoder loaded: CAM++ (%s)\n",
+                        speaker_model_path.c_str());
+            } else {
+                fprintf(stderr, "[Serve] WARNING: Failed to load speaker encoder from %s\n",
+                        speaker_model_path.c_str());
+                speaker_encoder_.reset();
+            }
+        }
+    }
 }
 
 ServeApp::~ServeApp() {
@@ -1760,6 +1789,12 @@ void ServeApp::handle_connection(int client_fd, int protocol) {
             handle_voice_clone_voices(req, client_fd);
         } else if (req.path == "/v1/voice_clone/delete" && req.method == "POST") {
             handle_voice_clone_delete(req, client_fd);
+        } else if (req.path == "/v1/speakers/register" && req.method == "POST") {
+            handle_speaker_register(req, client_fd);
+        } else if (req.path == "/v1/speakers" && req.method == "GET") {
+            handle_speaker_list(req, client_fd);
+        } else if (req.path == "/v1/speakers/delete" && req.method == "POST") {
+            handle_speaker_delete(req, client_fd);
         } else if (req.method == "GET" && req.path.rfind("/v1/recordings/", 0) == 0) {
             // GET /v1/recordings/{filename} — 下载录音文件
             std::string filename = req.path.substr(strlen("/v1/recordings/"));
@@ -3766,10 +3801,16 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
     bool suppress_early_eos = form.fields.count("suppress_early_eos") &&
                               (form.fields["suppress_early_eos"] == "true" ||
                                form.fields["suppress_early_eos"] == "1");
+    bool punctuate = form.fields.count("punctuate") &&
+                     (form.fields["punctuate"] == "true" || form.fields["punctuate"] == "1");
+    bool identify_spk = form.fields.count("speaker") &&
+                        (form.fields["speaker"] == "true" || form.fields["speaker"] == "1");
 
-    fprintf(stderr, "[Serve] ASR: received %zu bytes audio (%s), language=%s%s\n",
+    fprintf(stderr, "[Serve] ASR: received %zu bytes audio (%s), language=%s%s%s%s\n",
             audio_data.size(), audio_filename.c_str(), language.c_str(),
-            suppress_early_eos ? ", suppress_early_eos=true" : "");
+            suppress_early_eos ? ", suppress_early_eos" : "",
+            punctuate ? ", punctuate" : "",
+            identify_spk ? ", speaker_id" : "");
 
     // 调用 ASR 插件 (直接内存解析, 无临时文件 I/O)
     auto result = asr_plugin_->transcribe_memory(
@@ -3787,19 +3828,56 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
         return;
     }
 
+    // 标点恢复
+    if (punctuate && !result.text.empty()) {
+        result.text_with_punc = punctuation_restorer_.restore(result.text);
+    }
+
+    // 说话人识别 (对整段音频做识别)
+    std::string speaker_name;
+    int speaker_id = -1;
+    float speaker_sim = 0;
+    if (identify_spk && speaker_encoder_ && speaker_manager_.speaker_count() > 0) {
+        // 解析音频到 PCM
+        audio::AudioData wav;
+        if (audio::load_audio_from_memory(
+                reinterpret_cast<const uint8_t*>(audio_data.data()),
+                audio_data.size(), wav, audio_filename)) {
+            auto spk = identify_speaker(wav.samples.data(), (int)wav.samples.size(), wav.sample_rate);
+            if (spk.speaker_id >= 0 && spk.similarity >= 0.65f) {
+                speaker_name = spk.name;
+                speaker_id = spk.speaker_id;
+                speaker_sim = spk.similarity;
+            }
+        }
+    }
+
     // 构建响应
     HttpResponse resp;
     if (response_format == "text") {
         resp.content_type = "text/plain";
-        resp.body = result.text;
+        resp.body = punctuate && !result.text_with_punc.empty() ?
+                    result.text_with_punc : result.text;
     } else if (response_format == "verbose_json") {
         resp.body = "{\"task\":\"transcribe\",\"language\":\"" +
                     json_escape(result.language) +
                     "\",\"duration\":" + std::to_string(result.duration_s) +
-                    ",\"text\":\"" + json_escape(result.text) + "\"}";
+                    ",\"text\":\"" + json_escape(result.text) + "\"";
+        if (!result.text_with_punc.empty())
+            resp.body += ",\"text_with_punc\":\"" + json_escape(result.text_with_punc) + "\"";
+        if (speaker_id >= 0)
+            resp.body += ",\"speaker\":\"" + json_escape(speaker_name) +
+                         "\",\"speaker_id\":" + std::to_string(speaker_id) +
+                         ",\"speaker_similarity\":" + std::to_string(speaker_sim);
+        resp.body += "}";
     } else {
         // 默认 json
-        resp.body = "{\"text\":\"" + json_escape(result.text) + "\"}";
+        resp.body = "{\"text\":\"" + json_escape(
+            punctuate && !result.text_with_punc.empty() ? result.text_with_punc : result.text
+        ) + "\"";
+        if (speaker_id >= 0)
+            resp.body += ",\"speaker\":\"" + json_escape(speaker_name) + "\"";
+        resp.body += "}";
     }
 
     send_response(client_fd, resp);
@@ -4203,6 +4281,231 @@ void ServeApp::handle_voice_clone_delete(const HttpRequest& req, int client_fd) 
 }
 
 // ============================================================================
+// Speaker Registration API — 说话人注册/识别/管理
+// ============================================================================
+
+// 80-dim Mel 特征提取 (用于 CAM++ 说话人编码)
+void ServeApp::compute_mel_80(const float* samples, int num_samples, int sample_rate,
+                               std::vector<float>& mel_out, int& num_frames) {
+    // CAM++ 期望 80-dim Fbank, 16kHz, 25ms 帧长, 10ms 帧移
+    audio::MelConfig mel_cfg;
+    mel_cfg.n_mels = 80;
+    mel_cfg.n_fft = 400;         // 25ms @ 16kHz
+    mel_cfg.hop_length = 160;    // 10ms @ 16kHz
+    mel_cfg.sample_rate = 16000;
+
+    // 如果不是 16kHz, 需要先重采样
+    if (sample_rate != 16000) {
+        std::vector<float> input_vec(samples, samples + num_samples);
+        std::vector<float> resampled;
+        audio::resample(input_vec, sample_rate, resampled, 16000);
+        audio::compute_mel(resampled.data(), (int)resampled.size(), mel_cfg, mel_out, num_frames);
+    } else {
+        audio::compute_mel(samples, num_samples, mel_cfg, mel_out, num_frames);
+    }
+
+    // compute_mel 输出 [n_mels, T], CAM++ extract() 需要 [T, 80]
+    // Transpose: [80, T] → [T, 80]
+    std::vector<float> transposed(mel_out.size());
+    for (int t = 0; t < num_frames; ++t)
+        for (int f = 0; f < 80; ++f)
+            transposed[t * 80 + f] = mel_out[f * num_frames + t];
+    mel_out = std::move(transposed);
+}
+
+// 说话人识别: 从 PCM 提取 embedding 并匹配
+asr::SpeakerManager::MatchResult ServeApp::identify_speaker(
+    const float* samples, int num_samples, int sample_rate) {
+    asr::SpeakerManager::MatchResult result;
+    result.speaker_id = -1;
+    result.name = "Unknown";
+
+    if (!speaker_encoder_) return result;
+
+    // 提取 80-dim Mel
+    std::vector<float> mel;
+    int num_frames = 0;
+    compute_mel_80(samples, num_samples, sample_rate, mel, num_frames);
+
+    if (num_frames < 10) return result;
+
+    // CAM++ 提取 192-dim embedding
+    std::lock_guard<std::mutex> lock(speaker_mutex_);
+    auto embedding = speaker_encoder_->extract(mel.data(), num_frames);
+    if (embedding.empty()) return result;
+
+    // 与已注册说话人匹配 (不自动注册)
+    result = speaker_manager_.identify(embedding, 0.65f, false);
+
+    return result;
+}
+
+// POST /v1/speakers/register — 注册说话人 (multipart: file=audio, name=string)
+void ServeApp::handle_speaker_register(const HttpRequest& req, int client_fd) {
+    if (!speaker_encoder_) {
+        HttpResponse resp;
+        resp.status_code = 501;
+        resp.body = "{\"error\":\"Speaker encoder not loaded (CAM++ model not found)\"}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    auto form = parse_multipart(req);
+
+    std::string audio_data;
+    std::string audio_filename;
+    for (auto& f : form.files) {
+        if (f.field_name == "file") {
+            audio_data = std::move(f.data);
+            audio_filename = f.filename;
+            break;
+        }
+    }
+
+    std::string speaker_name = form.fields.count("name") ? form.fields["name"] : "";
+
+    if (speaker_name.empty()) {
+        HttpResponse resp;
+        resp.status_code = 400;
+        resp.body = "{\"error\":\"'name' field is required\"}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    if (audio_data.empty()) {
+        HttpResponse resp;
+        resp.status_code = 400;
+        resp.body = "{\"error\":\"Audio file required. Use multipart/form-data with field 'file'\"}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    // 解析音频
+    audio::AudioData wav;
+    if (!audio::load_audio_from_memory(
+            reinterpret_cast<const uint8_t*>(audio_data.data()),
+            audio_data.size(), wav, audio_filename)) {
+        HttpResponse resp;
+        resp.status_code = 400;
+        resp.body = "{\"error\":\"Failed to parse audio data\"}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    // 提取 80-dim Mel 特征
+    std::vector<float> mel;
+    int num_frames = 0;
+    compute_mel_80(wav.samples.data(), (int)wav.samples.size(), wav.sample_rate, mel, num_frames);
+
+    if (num_frames < 10) {
+        HttpResponse resp;
+        resp.status_code = 400;
+        resp.body = "{\"error\":\"Audio too short for speaker registration (min ~0.5s)\"}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    // CAM++ 提取 192-dim embedding
+    std::lock_guard<std::mutex> lock(speaker_mutex_);
+    auto embedding = speaker_encoder_->extract(mel.data(), num_frames);
+
+    if (embedding.empty()) {
+        HttpResponse resp;
+        resp.status_code = 500;
+        resp.body = "{\"error\":\"Failed to extract speaker embedding\"}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    speaker_manager_.register_speaker(speaker_name, embedding);
+
+    fprintf(stderr, "[Speaker] Registered speaker '%s' (embedding_dim=%d, audio=%.1fs)\n",
+            speaker_name.c_str(), (int)embedding.size(),
+            (float)wav.samples.size() / wav.sample_rate);
+
+    HttpResponse resp;
+    resp.body = "{\"success\":true,\"name\":\"" + json_escape(speaker_name) +
+                "\",\"embedding_dim\":" + std::to_string(embedding.size()) +
+                ",\"total_speakers\":" + std::to_string(speaker_manager_.speaker_count()) + "}";
+    send_response(client_fd, resp);
+    close(client_fd);
+}
+
+// GET /v1/speakers — 列出已注册说话人
+void ServeApp::handle_speaker_list(const HttpRequest& /*req*/, int client_fd) {
+    std::lock_guard<std::mutex> lock(speaker_mutex_);
+
+    auto names = speaker_manager_.speaker_names();
+
+    HttpResponse resp;
+    resp.body = "{\"speakers\":[";
+    for (size_t i = 0; i < names.size(); ++i) {
+        if (i > 0) resp.body += ",";
+        resp.body += "\"" + json_escape(names[i]) + "\"";
+    }
+    resp.body += "],\"count\":" + std::to_string(names.size()) +
+                 ",\"encoder\":\"" + (speaker_encoder_ ? "cam++" : "none") + "\"}";
+
+    send_response(client_fd, resp);
+    close(client_fd);
+}
+
+// POST /v1/speakers/delete — 删除说话人 {"name": "..."}
+void ServeApp::handle_speaker_delete(const HttpRequest& req, int client_fd) {
+    std::string name;
+    auto pos = req.body.find("\"name\"");
+    if (pos != std::string::npos) {
+        auto colon = req.body.find(':', pos);
+        if (colon != std::string::npos) {
+            auto q1 = req.body.find('"', colon + 1);
+            if (q1 != std::string::npos) {
+                auto q2 = req.body.find('"', q1 + 1);
+                if (q2 != std::string::npos) {
+                    name = req.body.substr(q1 + 1, q2 - q1 - 1);
+                }
+            }
+        }
+    }
+
+    if (name.empty()) {
+        HttpResponse resp;
+        resp.status_code = 400;
+        resp.body = "{\"error\":\"'name' field is required\"}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(speaker_mutex_);
+
+    if (name == "all") {
+        speaker_manager_.clear();
+        HttpResponse resp;
+        resp.body = "{\"success\":true,\"deleted\":\"all\"}";
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    bool ok = speaker_manager_.remove_by_name(name);
+    HttpResponse resp;
+    if (ok) {
+        resp.body = "{\"success\":true,\"deleted\":\"" + json_escape(name) + "\"}";
+    } else {
+        resp.status_code = 404;
+        resp.body = "{\"error\":\"Speaker '" + json_escape(name) + "' not found\"}";
+    }
+    send_response(client_fd, resp);
+    close(client_fd);
+}
+
+// ============================================================================
 // 静态文件服务 (examples/ 目录)
 // ============================================================================
 
@@ -4445,12 +4748,12 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
 
             // ASR
             std::string asr_text;
+            std::vector<float> float_pcm(audio.size());
+            for (size_t i = 0; i < audio.size(); i++)
+                float_pcm[i] = audio[i] / 32768.0f;
+
             if (asr_plugin_ && asr_plugin_->is_available()) {
                 safe_send_text("{\"type\":\"status\",\"stage\":\"asr\"}");
-
-                std::vector<float> float_pcm(audio.size());
-                for (size_t i = 0; i < audio.size(); i++)
-                    float_pcm[i] = audio[i] / 32768.0f;
 
                 auto result = asr_plugin_->transcribe_pcm(
                     float_pcm.data(), (int)float_pcm.size(), sr, "auto", true);
@@ -4484,7 +4787,21 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                 return;
             }
 
-            safe_send_text("{\"type\":\"asr\",\"text\":\"" + json_escape(asr_text) + "\"}");
+            // 说话人识别: 如有 CAM++ 编码器且有已注册说话人, 匹配身份
+            std::string speaker_json;
+            if (speaker_encoder_ && speaker_manager_.speaker_count() > 0) {
+                auto spk = identify_speaker(float_pcm.data(), (int)float_pcm.size(), sr);
+                if (spk.speaker_id >= 0 && spk.similarity >= 0.65f) {
+                    speaker_json = ",\"speaker\":\"" + json_escape(spk.name) +
+                                   "\",\"speaker_id\":" + std::to_string(spk.speaker_id) +
+                                   ",\"speaker_similarity\":" + std::to_string(spk.similarity);
+                    fprintf(stderr, "[WS] Speaker identified: %s (sim=%.3f)\n",
+                            spk.name.c_str(), spk.similarity);
+                }
+            }
+
+            safe_send_text("{\"type\":\"asr\",\"text\":\"" + json_escape(asr_text) + "\"" +
+                           speaker_json + "}");
             if (interrupted) { generating = false; return; }
 
             // ASR→LLM 开关: 关闭时只做 ASR, 不触发 LLM 生成
@@ -5279,13 +5596,14 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
     auto process_voice_input = [&](std::vector<int16_t> audio, int sr, bool do_llm) {
         if (interrupted) { generating = false; return; }
 
+        // --- 转换 PCM ---
+        std::vector<float> float_pcm(audio.size());
+        for (size_t i = 0; i < audio.size(); i++)
+            float_pcm[i] = audio[i] / 32768.0f;
+
         // --- ASR ---
         std::string asr_text;
         if (asr_plugin_ && asr_plugin_->is_available()) {
-            std::vector<float> float_pcm(audio.size());
-            for (size_t i = 0; i < audio.size(); i++)
-                float_pcm[i] = audio[i] / 32768.0f;
-
             auto result = asr_plugin_->transcribe_pcm(
                 float_pcm.data(), (int)float_pcm.size(), sr, "auto", true);
             asr_text = result.text;
@@ -5302,7 +5620,19 @@ void ServeApp::handle_websocket_realtime(int client_fd, const HttpRequest& req) 
             return;
         }
 
-        send_json("{\"type\":\"input.transcription\",\"text\":\"" + json_escape(asr_text) + "\"}");
+        // 说话人识别
+        std::string speaker_json;
+        if (speaker_encoder_ && speaker_manager_.speaker_count() > 0) {
+            auto spk = identify_speaker(float_pcm.data(), (int)float_pcm.size(), sr);
+            if (spk.speaker_id >= 0 && spk.similarity >= 0.65f) {
+                speaker_json = ",\"speaker\":\"" + json_escape(spk.name) +
+                               "\",\"speaker_id\":" + std::to_string(spk.speaker_id) +
+                               ",\"speaker_similarity\":" + std::to_string(spk.similarity);
+            }
+        }
+
+        send_json("{\"type\":\"input.transcription\",\"text\":\"" + json_escape(asr_text) + "\"" +
+                  speaker_json + "}");
         if (interrupted) { generating = false; return; }
 
         // ASR→LLM 开关: 关闭时只做 ASR, 不触发 LLM 生成
