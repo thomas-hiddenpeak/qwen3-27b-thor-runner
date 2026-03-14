@@ -18,6 +18,7 @@
 #include "../plugins/asr/asr_plugin.h"
 #include "../plugins/asr/speaker_encoder.h"
 #include "../plugins/asr/punctuation.h"
+#include "../plugins/asr/vad_engine.h"
 #include "../plugins/tts/tts_plugin.h"
 #include <string>
 #include <thread>
@@ -259,6 +260,10 @@ private:
     std::unique_ptr<asr::CamPlusSpeakerEncoder> speaker_encoder_;
     asr::SpeakerManager speaker_manager_;
     std::mutex speaker_mutex_;  // 保护 speaker_encoder_ + speaker_manager_
+
+    // VAD 引擎 (FSMN, 用于文件转写说话人分割)
+    asr::VadEngine vad_engine_;
+    std::mutex vad_mutex_;  // 保护 vad_engine_ (detect_all 有状态)
 
     // 标点恢复
     asr::PunctuationRestorer punctuation_restorer_;

@@ -694,6 +694,48 @@ body {
   border-radius: 3px;
 }
 
+/* ======== Diarization Segments ======== */
+.diarization-segments {
+  margin-top: 8px;
+}
+.diarization-segment {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 6px 8px;
+  border-radius: 4px;
+  margin-bottom: 4px;
+  background: var(--surface);
+  border-left: 3px solid var(--primary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.diarization-segment .seg-time {
+  color: var(--text2);
+  font-size: 11px;
+  font-family: monospace;
+  min-width: 90px;
+  flex-shrink: 0;
+  padding-top: 1px;
+}
+.diarization-segment .seg-speaker {
+  font-weight: 600;
+  font-size: 12px;
+  min-width: 70px;
+  flex-shrink: 0;
+  color: var(--primary);
+}
+.diarization-segment .seg-text {
+  flex: 1;
+  word-break: break-word;
+}
+.diarization-segment:nth-child(even) {
+  border-left-color: var(--accent, #10b981);
+}
+.diarization-segment:nth-child(even) .seg-speaker {
+  color: var(--accent, #10b981);
+}
+
 /* ======== ASR Monitor Panel ======== */
 .asr-monitor {
   border-bottom: 1px solid var(--border);
@@ -2097,6 +2139,13 @@ function escapeHtml(s) {
   return div.innerHTML;
 }
 
+function formatTimestamp(seconds) {
+  if (seconds == null) return '0:00';
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return m + ':' + s.toString().padStart(2, '0');
+}
+
 function addMessage(role, content, audioUrl, meta) {
   const chatArea = document.getElementById('chatArea');
   const div = document.createElement('div');
@@ -2943,19 +2992,42 @@ async function transcribeFile() {
     if (format === 'text' || contentType.includes('text/plain')) {
       const text = await resp.text();
       document.getElementById('transcribeResultText').textContent = text;
+      document.getElementById('transcribeResultText').style.whiteSpace = 'pre-wrap';
       document.getElementById('transcribeResultMeta').innerHTML = '';
       statusEl.textContent = '✅ 转写完成';
       statusEl.style.color = 'var(--success)';
     } else {
       const json = await resp.json();
-      const displayText = json.text_with_punc || json.text || '';
-      document.getElementById('transcribeResultText').textContent = displayText;
+
+      // 检查是否有说话人分割段
+      if (json.segments && json.segments.length > 0) {
+        let segHtml = '<div class="diarization-segments">';
+        for (const seg of json.segments) {
+          const startTime = formatTimestamp(seg.start);
+          const endTime = formatTimestamp(seg.end);
+          const speaker = escapeHtml(seg.speaker || 'Unknown');
+          const text = escapeHtml(seg.text || '');
+          segHtml += '<div class="diarization-segment">' +
+            '<span class="seg-time">' + startTime + ' - ' + endTime + '</span>' +
+            '<span class="seg-speaker">' + speaker + '</span>' +
+            '<span class="seg-text">' + text + '</span>' +
+            '</div>';
+        }
+        segHtml += '</div>';
+        document.getElementById('transcribeResultText').innerHTML = segHtml;
+        document.getElementById('transcribeResultText').style.whiteSpace = 'normal';
+      } else {
+        const displayText = json.text_with_punc || json.text || '';
+        document.getElementById('transcribeResultText').textContent = displayText;
+        document.getElementById('transcribeResultText').style.whiteSpace = 'pre-wrap';
+      }
 
       let metaHtml = '';
       if (json.language) metaHtml += '<span>语言: ' + escapeHtml(json.language) + '</span>';
       if (json.duration != null) metaHtml += '<span>时长: ' + json.duration.toFixed(1) + 's</span>';
-      if (json.speaker) metaHtml += '<span>说话人: ' + escapeHtml(json.speaker) + '</span>';
-      if (json.speaker_similarity != null) metaHtml += '<span>相似度: ' + json.speaker_similarity.toFixed(3) + '</span>';
+      if (json.segments) metaHtml += '<span>段数: ' + json.segments.length + '</span>';
+      if (json.speaker && !json.segments) metaHtml += '<span>说话人: ' + escapeHtml(json.speaker) + '</span>';
+      if (json.speaker_similarity != null && !json.segments) metaHtml += '<span>相似度: ' + json.speaker_similarity.toFixed(3) + '</span>';
       document.getElementById('transcribeResultMeta').innerHTML = metaHtml;
 
       statusEl.textContent = '✅ 转写完成';

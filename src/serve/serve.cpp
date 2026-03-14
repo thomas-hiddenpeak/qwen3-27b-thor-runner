@@ -1508,6 +1508,19 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
             if (speaker_encoder_->load(speaker_model_path)) {
                 fprintf(stderr, "[Serve] Speaker encoder loaded: CAM++ (%s)\n",
                         speaker_model_path.c_str());
+
+                // 加载 FSMN-VAD 引擎 (用于文件转写说话人分割)
+                std::string vad_model_dir = "/home/rm01/models/dev/asr/fsmn_vad";
+                const char* env_vad = getenv("QWEN_VAD_MODEL");
+                if (env_vad) vad_model_dir = env_vad;
+                if (vad_engine_.load(vad_model_dir)) {
+                    fprintf(stderr, "[Serve] VAD engine loaded: FSMN (%s)\n",
+                            vad_model_dir.c_str());
+                } else {
+                    fprintf(stderr, "[Serve] WARNING: Failed to load VAD engine from %s "
+                            "(speaker diarization in file transcription will be disabled)\n",
+                            vad_model_dir.c_str());
+                }
             } else {
                 fprintf(stderr, "[Serve] WARNING: Failed to load speaker encoder from %s\n",
                         speaker_model_path.c_str());
@@ -3812,6 +3825,191 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             punctuate ? ", punctuate" : "",
             identify_spk ? ", speaker_id" : "");
 
+    // ========================================================================
+    // 说话人分割模式: VAD 切段 → 逐段 ASR + Speaker ID → segments 输出
+    // 跳过整段 ASR, 直接按段处理 (支持长音频)
+    // ========================================================================
+    if (identify_spk && speaker_encoder_ && vad_engine_.is_loaded()) {
+        // 解析音频到 PCM
+        audio::AudioData wav;
+        if (!audio::load_audio_from_memory(
+                reinterpret_cast<const uint8_t*>(audio_data.data()),
+                audio_data.size(), wav, audio_filename)) {
+            HttpResponse resp;
+            resp.status_code = 400;
+            resp.body = "{\"error\":{\"message\":\"Failed to decode audio for diarization\"}}";
+            send_response(client_fd, resp);
+            close(client_fd);
+            return;
+        }
+
+        float total_duration_s = (float)wav.samples.size() / wav.sample_rate;
+
+        fprintf(stderr, "[Serve] Diarization: audio decoded to %.1fs, %zu samples\n",
+                total_duration_s, wav.samples.size());
+
+        // 1. VAD 切分语音段 (使用更短的静音/段时长阈值, 适合说话人分割)
+        std::vector<asr::VadSegment> vad_segments;
+        {
+            std::lock_guard<std::mutex> lock(vad_mutex_);
+            // 暂时调整 VAD 参数
+            auto& cfg = vad_engine_.mutable_config();
+            int orig_max_end_silence = cfg.max_end_silence_time;
+            int orig_max_segment = cfg.max_single_segment_time;
+            cfg.max_end_silence_time = 300;     // 300ms 静音切分
+            cfg.max_single_segment_time = 30000; // 每段最长 30s (ASR 安全上限)
+            vad_segments = vad_engine_.detect_all(wav.samples.data(), (int)wav.samples.size());
+            cfg.max_end_silence_time = orig_max_end_silence;
+            cfg.max_single_segment_time = orig_max_segment;
+        }
+
+        fprintf(stderr, "[Serve] Diarization: %zu VAD segments from %.1fs audio\n",
+                vad_segments.size(), total_duration_s);
+
+        // 2. 逐段处理: ASR + Speaker ID
+        struct TransSegment {
+            int start_ms;
+            int end_ms;
+            std::string text;
+            std::string text_with_punc;
+            std::string speaker;
+            int speaker_id;
+            float speaker_sim;
+        };
+        std::vector<TransSegment> segments;
+
+        for (auto& vseg : vad_segments) {
+            if (vseg.pcm.empty() || vseg.end_ms - vseg.start_ms < 200) continue;
+
+            TransSegment ts;
+            ts.start_ms = vseg.start_ms;
+            ts.end_ms = vseg.end_ms;
+            ts.speaker_id = -1;
+            ts.speaker_sim = 0;
+
+            // ASR: 逐段转写
+            auto seg_result = asr_plugin_->transcribe_pcm(
+                vseg.pcm.data(), (int)vseg.pcm.size(), wav.sample_rate,
+                language, suppress_early_eos);
+
+            if (seg_result.error_code == 0 && !seg_result.text.empty()) {
+                ts.text = seg_result.text;
+                if (punctuate) {
+                    ts.text_with_punc = punctuation_restorer_.restore(ts.text);
+                }
+            }
+
+            // Speaker ID: 逐段识别
+            auto spk = identify_speaker(vseg.pcm.data(), (int)vseg.pcm.size(),
+                                        wav.sample_rate, true);
+            if (spk.speaker_id >= 0) {
+                ts.speaker = spk.name;
+                ts.speaker_id = spk.speaker_id;
+                ts.speaker_sim = spk.similarity;
+            } else {
+                ts.speaker = "Unknown";
+            }
+
+            if (!ts.text.empty()) {
+                segments.push_back(std::move(ts));
+            }
+        }
+
+        // 3. 合并相邻同说话人段 (间隔 < 500ms)
+        for (size_t i = 1; i < segments.size(); ) {
+            auto& prev = segments[i - 1];
+            auto& cur = segments[i];
+            if (cur.speaker_id == prev.speaker_id && cur.speaker_id >= 0 &&
+                cur.start_ms - prev.end_ms <= 500) {
+                prev.end_ms = cur.end_ms;
+                prev.text += cur.text;
+                if (punctuate && !cur.text_with_punc.empty()) {
+                    prev.text_with_punc += cur.text_with_punc;
+                }
+                segments.erase(segments.begin() + i);
+            } else {
+                ++i;
+            }
+        }
+
+        fprintf(stderr, "[Serve] Diarization: %zu segments after merge\n", segments.size());
+
+        // 4. 构建响应
+        HttpResponse resp;
+        if (segments.empty()) {
+            // 回退: 无有效 VAD 段, 做整段 ASR
+            auto fallback = asr_plugin_->transcribe_memory(
+                reinterpret_cast<const uint8_t*>(audio_data.data()),
+                audio_data.size(), language, audio_filename, suppress_early_eos);
+            std::string fallback_text = fallback.text;
+            if (punctuate && !fallback_text.empty()) {
+                fallback_text = punctuation_restorer_.restore(fallback_text);
+            }
+            resp.body = "{\"text\":\"" + json_escape(fallback_text) + "\"}";
+        } else if (response_format == "text") {
+            resp.content_type = "text/plain";
+            std::string body;
+            for (auto& s : segments) {
+                body += "[" + s.speaker + "] ";
+                body += punctuate && !s.text_with_punc.empty() ? s.text_with_punc : s.text;
+                body += "\n";
+            }
+            resp.body = body;
+        } else if (response_format == "verbose_json") {
+            // 完整 JSON: 包含 segments 数组 + 合并文本
+            std::string full_text;
+            for (auto& s : segments) {
+                full_text += punctuate && !s.text_with_punc.empty() ? s.text_with_punc : s.text;
+            }
+            resp.body = "{\"task\":\"transcribe\",\"language\":\"" +
+                        json_escape(language) +
+                        "\",\"duration\":" + std::to_string(total_duration_s) +
+                        ",\"text\":\"" + json_escape(full_text) + "\"";
+            if (punctuate) {
+                resp.body += ",\"text_with_punc\":\"" + json_escape(full_text) + "\"";
+            }
+            resp.body += ",\"segments\":[";
+            for (size_t i = 0; i < segments.size(); ++i) {
+                auto& s = segments[i];
+                if (i > 0) resp.body += ",";
+                resp.body += "{\"start\":" + std::to_string(s.start_ms / 1000.0f) +
+                             ",\"end\":" + std::to_string(s.end_ms / 1000.0f) +
+                             ",\"text\":\"" + json_escape(
+                                 punctuate && !s.text_with_punc.empty() ? s.text_with_punc : s.text
+                             ) + "\",\"speaker\":\"" + json_escape(s.speaker) +
+                             "\",\"speaker_id\":" + std::to_string(s.speaker_id) +
+                             ",\"speaker_similarity\":" + std::to_string(s.speaker_sim) + "}";
+            }
+            resp.body += "]}";
+        } else {
+            // 默认 json: segments 数组
+            std::string full_text;
+            for (auto& s : segments) {
+                full_text += punctuate && !s.text_with_punc.empty() ? s.text_with_punc : s.text;
+            }
+            resp.body = "{\"text\":\"" + json_escape(full_text) + "\"";
+            resp.body += ",\"segments\":[";
+            for (size_t i = 0; i < segments.size(); ++i) {
+                auto& s = segments[i];
+                if (i > 0) resp.body += ",";
+                resp.body += "{\"start\":" + std::to_string(s.start_ms / 1000.0f) +
+                             ",\"end\":" + std::to_string(s.end_ms / 1000.0f) +
+                             ",\"text\":\"" + json_escape(
+                                 punctuate && !s.text_with_punc.empty() ? s.text_with_punc : s.text
+                             ) + "\",\"speaker\":\"" + json_escape(s.speaker) + "\"}";
+            }
+            resp.body += "]}";
+        }
+
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
+
+    // ========================================================================
+    // 非分割模式: 整段 ASR + 可选整段 Speaker ID (原有逻辑)
+    // ========================================================================
+
     // 调用 ASR 插件 (直接内存解析, 无临时文件 I/O)
     auto result = asr_plugin_->transcribe_memory(
         reinterpret_cast<const uint8_t*>(audio_data.data()),
@@ -3833,17 +4031,15 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
         result.text_with_punc = punctuation_restorer_.restore(result.text);
     }
 
-    // 说话人识别 (对整段音频做识别)
+    // 说话人识别 (对整段音频做识别, 无 VAD 分割)
     std::string speaker_name;
     int speaker_id = -1;
     float speaker_sim = 0;
     if (identify_spk && speaker_encoder_) {
-        // 解析音频到 PCM
         audio::AudioData wav;
         if (audio::load_audio_from_memory(
                 reinterpret_cast<const uint8_t*>(audio_data.data()),
                 audio_data.size(), wav, audio_filename)) {
-            // auto_register=true: 未注册说话人自动标注为 Speaker_N
             auto spk = identify_speaker(wav.samples.data(), (int)wav.samples.size(), wav.sample_rate, true);
             if (spk.speaker_id >= 0) {
                 speaker_name = spk.name;

@@ -58,6 +58,7 @@ public:
         data_buf_start_frame_ = 0;
         speech_start_ms_ = -1;
         speech_end_ms_ = -1;
+        fbank_frame_pos_ = 0;
         // LFR cache
         lfr_cache_.clear();
         fsmn_cache_.clear();
@@ -122,6 +123,7 @@ public:
     }
 
     const VadConfig& config() const { return config_; }
+    VadConfig& mutable_config() { return config_; }
 
 private:
     VadConfig config_;
@@ -176,6 +178,14 @@ private:
     std::vector<float> mel_filterbank_;  // [n_mels, n_fft/2+1]
     int fbank_frame_pos_ = 0; // 已提取的帧位置 (in samples)
 
+    // ========== FFT (radix-2 Cooley-Tukey) ==========
+    int fft_size_ = 0;               // n_fft 向上取整到 2 的幂 (400→512)
+    std::vector<float> fft_re_;      // FFT 工作缓冲区 (实部)
+    std::vector<float> fft_im_;      // FFT 工作缓冲区 (虚部)
+    std::vector<float> twiddle_re_;  // 预计算旋转因子 [fft_size/2]
+    std::vector<float> twiddle_im_;  // 预计算旋转因子 [fft_size/2]
+    std::vector<int> bit_rev_;       // 位反转索引表 [fft_size]
+
     bool can_extract_frame() const {
         int window_size = config_.window_samples();
         return fbank_frame_pos_ + window_size <= (int)pcm_cache_.size();
@@ -190,36 +200,58 @@ private:
             init_fbank(n_fft);
         }
 
-        // 取一帧, 加窗
-        std::vector<float> frame(n_fft);
+        // 取一帧, 加窗, zero-pad 到 fft_size_
+        std::fill(fft_re_.begin(), fft_re_.end(), 0.0f);
+        std::fill(fft_im_.begin(), fft_im_.end(), 0.0f);
         for (int i = 0; i < n_fft; ++i) {
-            frame[i] = pcm_cache_[fbank_frame_pos_ + i] * hann_window_[i];
+            fft_re_[i] = pcm_cache_[fbank_frame_pos_ + i] * hann_window_[i];
         }
         fbank_frame_pos_ += hop;
 
-        // 简化 DFT (实数 → 频域幅度谱)
-        int n_freq = n_fft / 2 + 1;
-        std::vector<float> power_spec(n_freq);
-        for (int k = 0; k < n_freq; ++k) {
-            float re = 0, im = 0;
-            for (int n = 0; n < n_fft; ++n) {
-                float angle = -2.0f * M_PI * k * n / n_fft;
-                re += frame[n] * cosf(angle);
-                im += frame[n] * sinf(angle);
-            }
-            power_spec[k] = re * re + im * im;
-        }
+        // Radix-2 FFT (O(N log N) 替代朴素 O(N²) DFT)
+        fft_inplace(fft_re_.data(), fft_im_.data(), fft_size_);
 
-        // Mel 滤波
+        // Mel 滤波 (直接从 FFT 结果计算 power spectrum → mel)
+        int n_freq = fft_size_ / 2 + 1;  // 257
         std::vector<float> fbank(config_.n_mels);
         for (int m = 0; m < config_.n_mels; ++m) {
             float sum = 0;
             for (int k = 0; k < n_freq; ++k) {
-                sum += mel_filterbank_[m * n_freq + k] * power_spec[k];
+                float pwr = fft_re_[k] * fft_re_[k] + fft_im_[k] * fft_im_[k];
+                sum += mel_filterbank_[m * n_freq + k] * pwr;
             }
             fbank[m] = logf(std::max(sum, 1e-10f));
         }
         return fbank;
+    }
+
+    // Cooley-Tukey radix-2 in-place FFT (使用预计算位反转 + 旋转因子)
+    void fft_inplace(float* re, float* im, int n) {
+        // 位反转排列
+        for (int i = 0; i < n; ++i) {
+            int j = bit_rev_[i];
+            if (i < j) {
+                std::swap(re[i], re[j]);
+                std::swap(im[i], im[j]);
+            }
+        }
+        // 蝶形运算
+        for (int len = 2, tw_step = n / 2; len <= n; len <<= 1, tw_step >>= 1) {
+            int half = len >> 1;
+            for (int i = 0; i < n; i += len) {
+                for (int j = 0; j < half; ++j) {
+                    int tw_idx = j * tw_step;  // twiddle index into n/2 table
+                    float wr = twiddle_re_[tw_idx];
+                    float wi = twiddle_im_[tw_idx];
+                    float tre = re[i + j + half] * wr - im[i + j + half] * wi;
+                    float tim = re[i + j + half] * wi + im[i + j + half] * wr;
+                    re[i + j + half] = re[i + j] - tre;
+                    im[i + j + half] = im[i + j] - tim;
+                    re[i + j] += tre;
+                    im[i + j] += tim;
+                }
+            }
+        }
     }
 
     void init_fbank(int n_fft) {
@@ -229,8 +261,35 @@ private:
             hann_window_[i] = 0.54f - 0.46f * cosf(2.0f * M_PI * i / (n_fft - 1));
         }
 
-        // Mel filterbank
-        int n_freq = n_fft / 2 + 1;
+        // FFT: n_fft 向上取整到 2 的幂
+        fft_size_ = 1;
+        while (fft_size_ < n_fft) fft_size_ <<= 1;  // 400→512
+        fft_re_.resize(fft_size_);
+        fft_im_.resize(fft_size_);
+
+        // 预计算位反转表
+        int log2n = 0;
+        for (int t = fft_size_; t > 1; t >>= 1) ++log2n;
+        bit_rev_.resize(fft_size_);
+        for (int i = 0; i < fft_size_; ++i) {
+            int rev = 0;
+            for (int b = 0; b < log2n; ++b) {
+                if (i & (1 << b)) rev |= (1 << (log2n - 1 - b));
+            }
+            bit_rev_[i] = rev;
+        }
+
+        // 预计算旋转因子 W_N^k = exp(-2πik/N), k=0..N/2-1
+        twiddle_re_.resize(fft_size_ / 2);
+        twiddle_im_.resize(fft_size_ / 2);
+        for (int k = 0; k < fft_size_ / 2; ++k) {
+            float angle = -2.0f * (float)M_PI * k / fft_size_;
+            twiddle_re_[k] = cosf(angle);
+            twiddle_im_[k] = sinf(angle);
+        }
+
+        // Mel filterbank (基于 FFT 的频率分辨率)
+        int n_freq = fft_size_ / 2 + 1;  // 257 for fft_size_=512
         float fmin = 0, fmax = (float)config_.sample_rate / 2;
         auto hz_to_mel = [](float hz) { return 2595.0f * log10f(1.0f + hz / 700.0f); };
         auto mel_to_hz = [](float mel) { return 700.0f * (powf(10.0f, mel / 2595.0f) - 1.0f); };
@@ -242,7 +301,7 @@ private:
         }
 
         mel_filterbank_.resize(config_.n_mels * n_freq, 0);
-        float freq_step = (float)config_.sample_rate / n_fft;
+        float freq_step = (float)config_.sample_rate / fft_size_;  // 基于 FFT 大小
         for (int m = 0; m < config_.n_mels; ++m) {
             for (int k = 0; k < n_freq; ++k) {
                 float freq = k * freq_step;
@@ -462,9 +521,11 @@ private:
         seg.start_ms = std::max(0, start_ms);
         seg.end_ms = std::min(end_ms, (int)(pcm_cache_.size() * 1000 / config_.sample_rate));
 
-        int start_sample = seg.start_ms * config_.sample_rate / 1000;
-        int end_sample = std::min(seg.end_ms * config_.sample_rate / 1000,
-                                  (int)pcm_cache_.size());
+        // 使用 int64_t 避免 ms × sample_rate 溢出 (460s×16kHz = 7.36B > INT32_MAX)
+        int start_sample = (int)std::min((int64_t)seg.start_ms * config_.sample_rate / 1000,
+                                         (int64_t)pcm_cache_.size());
+        int end_sample = (int)std::min((int64_t)seg.end_ms * config_.sample_rate / 1000,
+                                       (int64_t)pcm_cache_.size());
         if (end_sample > start_sample) {
             seg.pcm.assign(pcm_cache_.begin() + start_sample,
                           pcm_cache_.begin() + end_sample);
