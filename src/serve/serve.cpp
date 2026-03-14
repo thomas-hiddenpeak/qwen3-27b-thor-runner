@@ -4338,6 +4338,7 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
     // 流式 ASR: 说话过程中定期识别, 发送中间结果 (参考 Qwen3-ASR 官方 streaming 方案)
     constexpr float STREAMING_ASR_CHUNK_S = 2.0f;  // 每 2 秒触发一次识别
     float streaming_asr_next_s = STREAMING_ASR_CHUNK_S;
+    size_t gen_audio_sample_count = 0;  // generating 期间的音频帧计数 (用于 audio.level 节流)
 
     // ASR→LLM 开关: 关闭时 ASR 仍运行但不触发 LLM 生成
     bool asr_to_llm = true;
@@ -4464,12 +4465,21 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
                             char_count++;
                         i += len;
                     }
-                    if (char_count >= 2) asr_text = result.text;
+                    if (char_count >= 2) {
+                        asr_text = result.text;
+                    } else {
+                        fprintf(stderr, "[WS] ASR filtered (char_count=%d): \"%s\"\n",
+                                char_count, result.text.c_str());
+                    }
+                } else {
+                    fprintf(stderr, "[WS] ASR returned empty (error_code=%d, samples=%d)\n",
+                            result.error_code, (int)audio.size());
                 }
             }
 
             if (asr_text.empty()) {
-                safe_send_text("{\"type\":\"error\",\"message\":\"未识别到有效语音内容\"}");
+                // 静默重置, 不向用户报错 (可能是噪声/回声触发了 VAD)
+                fprintf(stderr, "[WS] No valid ASR result, silently resetting\n");
                 generating = false;
                 return;
             }
@@ -4557,18 +4567,36 @@ void ServeApp::handle_websocket_voice(int client_fd, const HttpRequest& req) {
             if (num_samples == 0) continue;
 
             const int16_t* samples = reinterpret_cast<const int16_t*>(payload.data());
-            size_t prev_size = pcm_buffer.size();
-            pcm_buffer.insert(pcm_buffer.end(), samples, samples + num_samples);
 
-            // 服务端录音: 累积全部音频
+            // 服务端录音: 始终累积全部音频 (不受 generating 影响)
             recording_buffer.insert(recording_buffer.end(), samples, samples + num_samples);
 
+            // 计算当前帧能量 (用于 audio.level 显示)
             double energy_sum = 0;
             for (size_t i = 0; i < num_samples; i++) {
                 float s = samples[i] / 32768.0f;
                 energy_sum += s * s;
             }
             float rms = std::sqrt((float)(energy_sum / num_samples));
+
+            // generating 期间: 只发 audio.level, 跳过 pcm_buffer 累积和 VAD
+            // 防止 TTS 回声/环境噪声污染下一轮 ASR 输入
+            if (generating) {
+                // 发送音频电平 (每 100ms = 1600 samples @16kHz)
+                size_t prev_count = gen_audio_sample_count;
+                gen_audio_sample_count += num_samples;
+                if (gen_audio_sample_count / 1600 > prev_count / 1600) {
+                    char level_buf[64];
+                    snprintf(level_buf, sizeof(level_buf),
+                             "{\"type\":\"audio.level\",\"rms\":%.4f}", rms);
+                    safe_send_text(level_buf);
+                }
+                continue;
+            }
+            gen_audio_sample_count = 0;  // generating 结束后重置
+
+            size_t prev_size = pcm_buffer.size();
+            pcm_buffer.insert(pcm_buffer.end(), samples, samples + num_samples);
 
             if (rms > VAD_ENERGY_THRESHOLD) {
                 speech_detected = true;
