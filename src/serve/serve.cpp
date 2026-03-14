@@ -3837,14 +3837,15 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
     std::string speaker_name;
     int speaker_id = -1;
     float speaker_sim = 0;
-    if (identify_spk && speaker_encoder_ && speaker_manager_.speaker_count() > 0) {
+    if (identify_spk && speaker_encoder_) {
         // 解析音频到 PCM
         audio::AudioData wav;
         if (audio::load_audio_from_memory(
                 reinterpret_cast<const uint8_t*>(audio_data.data()),
                 audio_data.size(), wav, audio_filename)) {
-            auto spk = identify_speaker(wav.samples.data(), (int)wav.samples.size(), wav.sample_rate);
-            if (spk.speaker_id >= 0 && spk.similarity >= 0.65f) {
+            // auto_register=true: 未注册说话人自动标注为 Speaker_N
+            auto spk = identify_speaker(wav.samples.data(), (int)wav.samples.size(), wav.sample_rate, true);
+            if (spk.speaker_id >= 0) {
                 speaker_name = spk.name;
                 speaker_id = spk.speaker_id;
                 speaker_sim = spk.similarity;
@@ -4315,7 +4316,7 @@ void ServeApp::compute_mel_80(const float* samples, int num_samples, int sample_
 
 // 说话人识别: 从 PCM 提取 embedding 并匹配
 asr::SpeakerManager::MatchResult ServeApp::identify_speaker(
-    const float* samples, int num_samples, int sample_rate) {
+    const float* samples, int num_samples, int sample_rate, bool auto_register) {
     asr::SpeakerManager::MatchResult result;
     result.speaker_id = -1;
     result.name = "Unknown";
@@ -4334,8 +4335,8 @@ asr::SpeakerManager::MatchResult ServeApp::identify_speaker(
     auto embedding = speaker_encoder_->extract(mel.data(), num_frames);
     if (embedding.empty()) return result;
 
-    // 与已注册说话人匹配 (不自动注册)
-    result = speaker_manager_.identify(embedding, 0.65f, false);
+    // 与已注册说话人匹配
+    result = speaker_manager_.identify(embedding, 0.65f, auto_register);
 
     return result;
 }

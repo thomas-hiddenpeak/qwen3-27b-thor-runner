@@ -172,7 +172,7 @@ private:
 
     // 说话人识别: 从 PCM 音频提取 embedding 并匹配
     asr::SpeakerManager::MatchResult identify_speaker(
-        const float* samples, int num_samples, int sample_rate);
+        const float* samples, int num_samples, int sample_rate, bool auto_register = false);
 
     // 80-dim Mel 特征提取 (用于 CAM++ 说话人编码)
     void compute_mel_80(const float* samples, int num_samples, int sample_rate,
