@@ -3826,8 +3826,12 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             identify_spk ? ", speaker_id" : "");
 
     // ========================================================================
-    // 说话人分割模式: VAD 切段 → 逐段 ASR + Speaker ID → segments 输出
-    // 跳过整段 ASR, 直接按段处理 (支持长音频)
+    // 说话人分割模式 (v2): Speaker-first pipeline
+    //   Phase 1: Fine-grained VAD → short segments for accurate speaker ID
+    //   Phase 2: CAM++ speaker ID per segment
+    //   Phase 3: Group consecutive same-speaker segments into speaker turns
+    //   Phase 4: ASR each speaker turn with full context (up to ~100s)
+    //   Phase 5: Build output segments
     // ========================================================================
     if (identify_spk && speaker_encoder_ && vad_engine_.is_loaded()) {
         // 解析音频到 PCM
@@ -3845,28 +3849,132 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
 
         float total_duration_s = (float)wav.samples.size() / wav.sample_rate;
 
-        fprintf(stderr, "[Serve] Diarization: audio decoded to %.1fs, %zu samples\n",
+        fprintf(stderr, "[Serve] Diarization v2: audio decoded to %.1fs, %zu samples\n",
                 total_duration_s, wav.samples.size());
 
-        // 1. VAD 切分语音段 (使用更短的静音/段时长阈值, 适合说话人分割)
+        // Phase 1: Fine-grained VAD (short segments for accurate speaker ID)
         std::vector<asr::VadSegment> vad_segments;
         {
             std::lock_guard<std::mutex> lock(vad_mutex_);
-            // 暂时调整 VAD 参数
             auto& cfg = vad_engine_.mutable_config();
             int orig_max_end_silence = cfg.max_end_silence_time;
             int orig_max_segment = cfg.max_single_segment_time;
-            cfg.max_end_silence_time = 200;     // 200ms 静音切分 (更细粒度)
-            cfg.max_single_segment_time = 10000; // 每段最长 10s (ASR 最佳区间)
+            cfg.max_end_silence_time = 300;      // 300ms 静音切分 (细粒度说话人边界)
+            cfg.max_single_segment_time = 8000;   // 8s per segment (CAM++ 最佳区间)
             vad_segments = vad_engine_.detect_all(wav.samples.data(), (int)wav.samples.size());
             cfg.max_end_silence_time = orig_max_end_silence;
             cfg.max_single_segment_time = orig_max_segment;
         }
 
-        fprintf(stderr, "[Serve] Diarization: %zu VAD segments from %.1fs audio\n",
+        fprintf(stderr, "[Serve] Diarization v2: Phase 1 - %zu VAD segments from %.1fs audio\n",
                 vad_segments.size(), total_duration_s);
 
-        // 2. 逐段处理: ASR + Speaker ID
+        // Phase 2: Speaker ID per segment (skip silence & too-short segments)
+        struct SpkSegment {
+            int start_ms, end_ms;
+            int speaker_id;
+            std::string speaker_name;
+            float speaker_sim;
+            size_t vad_index;  // index into vad_segments for PCM retrieval
+        };
+        std::vector<SpkSegment> spk_segments;
+
+        for (size_t vi = 0; vi < vad_segments.size(); ++vi) {
+            auto& vseg = vad_segments[vi];
+            if (vseg.pcm.empty() || vseg.end_ms - vseg.start_ms < 200) continue;
+
+            // Skip low-energy segments
+            float rms = 0.0f;
+            for (size_t si = 0; si < vseg.pcm.size(); si++)
+                rms += vseg.pcm[si] * vseg.pcm[si];
+            rms = std::sqrt(rms / vseg.pcm.size());
+            if (rms < 0.005f) continue;
+
+            SpkSegment ss;
+            ss.start_ms = vseg.start_ms;
+            ss.end_ms = vseg.end_ms;
+            ss.vad_index = vi;
+
+            auto spk = identify_speaker(vseg.pcm.data(), (int)vseg.pcm.size(),
+                                        wav.sample_rate, true);
+            ss.speaker_id = spk.speaker_id;
+            ss.speaker_name = spk.speaker_id >= 0 ? spk.name : "Unknown";
+            ss.speaker_sim = spk.similarity;
+            spk_segments.push_back(ss);
+        }
+
+        fprintf(stderr, "[Serve] Diarization v2: Phase 2 - %zu speaker-labeled segments\n",
+                spk_segments.size());
+
+        // Phase 3: Group consecutive same-speaker segments into turns (max ~100s per turn)
+        struct SpeakerTurn {
+            int start_ms, end_ms;
+            int speaker_id;
+            std::string speaker_name;
+            float speaker_sim;
+            std::string text;
+            std::vector<size_t> vad_indices; // indices into vad_segments for PCM
+        };
+        std::vector<SpeakerTurn> turns;
+        const int max_turn_ms = 100000; // 100s max per turn (encoder limit ~115s)
+
+        for (auto& ss : spk_segments) {
+            bool extend = !turns.empty()
+                       && ss.speaker_id == turns.back().speaker_id
+                       && ss.speaker_id >= 0
+                       && ss.start_ms - turns.back().end_ms <= 1000
+                       && (ss.end_ms - turns.back().start_ms) <= max_turn_ms;
+            if (extend) {
+                turns.back().end_ms = ss.end_ms;
+                turns.back().vad_indices.push_back(ss.vad_index);
+            } else {
+                SpeakerTurn t;
+                t.start_ms = ss.start_ms;
+                t.end_ms = ss.end_ms;
+                t.speaker_id = ss.speaker_id;
+                t.speaker_name = ss.speaker_name;
+                t.speaker_sim = ss.speaker_sim;
+                t.vad_indices.push_back(ss.vad_index);
+                turns.push_back(std::move(t));
+            }
+        }
+
+        fprintf(stderr, "[Serve] Diarization v2: Phase 3 - %zu speaker turns\n", turns.size());
+
+        // Phase 4: ASR each speaker turn (concatenate VAD PCMs for clean speech)
+        for (size_t ti = 0; ti < turns.size(); ++ti) {
+            auto& turn = turns[ti];
+
+            // Concatenate only VAD segment PCMs (excludes silence/noise between segments)
+            std::vector<float> turn_pcm;
+            const int silence_pad = wav.sample_rate / 4; // 250ms silence between segments
+            for (size_t vi = 0; vi < turn.vad_indices.size(); ++vi) {
+                auto& vseg = vad_segments[turn.vad_indices[vi]];
+                if (vi > 0 && !turn_pcm.empty()) {
+                    // Insert brief silence between concatenated segments
+                    turn_pcm.resize(turn_pcm.size() + silence_pad, 0.0f);
+                }
+                turn_pcm.insert(turn_pcm.end(), vseg.pcm.begin(), vseg.pcm.end());
+            }
+
+            float turn_dur_s = (float)turn_pcm.size() / wav.sample_rate;
+            fprintf(stderr, "[Serve] Diarization v2: Phase 4 - turn %zu/%zu [%d-%d ms] "
+                    "(speech %.1fs from %zu segs) speaker=%s\n",
+                    ti + 1, turns.size(), turn.start_ms, turn.end_ms,
+                    turn_dur_s, turn.vad_indices.size(), turn.speaker_name.c_str());
+
+            if ((int)turn_pcm.size() < wav.sample_rate / 5) continue; // < 200ms, skip
+
+            auto seg_result = asr_plugin_->transcribe_pcm(
+                turn_pcm.data(), (int)turn_pcm.size(),
+                wav.sample_rate, language, true);
+
+            if (seg_result.error_code == 0 && !seg_result.text.empty()) {
+                turn.text = seg_result.text;
+            }
+        }
+
+        // Phase 5: Build output segments
         struct TransSegment {
             int start_ms;
             int end_ms;
@@ -3878,70 +3986,22 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
         };
         std::vector<TransSegment> segments;
 
-        for (size_t vi = 0; vi < vad_segments.size(); ++vi) {
-            auto& vseg = vad_segments[vi];
-            float seg_dur_s = (float)(vseg.end_ms - vseg.start_ms) / 1000.0f;
-            fprintf(stderr, "[Serve] Diarization seg %zu/%zu: [%d-%d ms] (%.1fs), pcm=%zu samples\n",
-                    vi + 1, vad_segments.size(), vseg.start_ms, vseg.end_ms,
-                    seg_dur_s, vseg.pcm.size());
-
-            if (vseg.pcm.empty() || vseg.end_ms - vseg.start_ms < 200) {
-                fprintf(stderr, "[Serve] Diarization seg %zu: skipped (too short or empty)\n", vi + 1);
-                continue;
-            }
-
-            // Skip low-energy segments (silence/noise) to avoid ASR hallucination
-            {
-                float rms = 0.0f;
-                for (size_t si = 0; si < vseg.pcm.size(); si++) {
-                    rms += vseg.pcm[si] * vseg.pcm[si];
-                }
-                rms = std::sqrt(rms / vseg.pcm.size());
-                if (rms < 0.005f) {
-                    fprintf(stderr, "[Serve] Diarization seg %zu: skipped (silence, RMS=%.4f)\n", vi + 1, rms);
-                    continue;
-                }
-            }
-
+        for (auto& turn : turns) {
+            if (turn.text.empty()) continue;
             TransSegment ts;
-            ts.start_ms = vseg.start_ms;
-            ts.end_ms = vseg.end_ms;
-            ts.speaker_id = -1;
-            ts.speaker_sim = 0;
-
-            // ASR: 逐段转写
-            auto seg_result = asr_plugin_->transcribe_pcm(
-                vseg.pcm.data(), (int)vseg.pcm.size(), wav.sample_rate,
-                language, suppress_early_eos);
-
-            fprintf(stderr, "[Serve] Diarization seg %zu: ASR error=%d, text='%s' (%zu chars)\n",
-                    vi + 1, seg_result.error_code, seg_result.text.substr(0, 80).c_str(),
-                    seg_result.text.size());
-
-            if (seg_result.error_code == 0 && !seg_result.text.empty()) {
-                ts.text = seg_result.text;
-                if (punctuate) {
-                    ts.text_with_punc = punctuation_restorer_.restore(ts.text);
-                }
+            ts.start_ms = turn.start_ms;
+            ts.end_ms = turn.end_ms;
+            ts.text = turn.text;
+            ts.speaker = turn.speaker_name;
+            ts.speaker_id = turn.speaker_id;
+            ts.speaker_sim = turn.speaker_sim;
+            if (punctuate) {
+                ts.text_with_punc = punctuation_restorer_.restore(ts.text);
             }
-
-            // Speaker ID: 逐段识别
-            auto spk = identify_speaker(vseg.pcm.data(), (int)vseg.pcm.size(),
-                                        wav.sample_rate, true);
-            if (spk.speaker_id >= 0) {
-                ts.speaker = spk.name;
-                ts.speaker_id = spk.speaker_id;
-                ts.speaker_sim = spk.similarity;
-            } else {
-                ts.speaker = "Unknown";
-            }
-
-            if (!ts.text.empty()) {
-                segments.push_back(std::move(ts));
-            }
+            segments.push_back(std::move(ts));
         }
 
-        // 3. 合并相邻同说话人段 (间隔 < 500ms)
+        // Merge adjacent same-speaker segments (gap < 500ms)
         for (size_t i = 1; i < segments.size(); ) {
             auto& prev = segments[i - 1];
             auto& cur = segments[i];
@@ -3958,7 +4018,7 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             }
         }
 
-        fprintf(stderr, "[Serve] Diarization: %zu segments after merge\n", segments.size());
+        fprintf(stderr, "[Serve] Diarization v2: %zu segments after merge\n", segments.size());
 
         // 4. 构建响应
         HttpResponse resp;

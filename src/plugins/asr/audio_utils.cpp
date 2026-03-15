@@ -324,27 +324,89 @@ static void fft_radix2(float* re, float* im, int n) {
     }
 }
 
-// Next power of 2 >= n
-static int next_pow2(int n) {
-    int p = 1;
-    while (p < n) p <<= 1;
-    return p;
-}
-
-// Real-valued DFT using radix-2 FFT (zero-padded to power of 2)
+// Bluestein FFT: exact N-point DFT for arbitrary N using O(N log N) radix-2 FFT.
+// Works by converting the DFT into a convolution via chirp-z transform:
+//   X[k] = w[k] * IFFT(FFT(a) * FFT(b))  where
+//   a[j] = x[j] * w[j],  w[j] = exp(-iπj²/N),  b is the conjugate chirp
+// The convolution is zero-padded to M ≥ 2N-1 (power of 2) for radix-2 FFT.
 void rdft(const float* x, int n, float* real_out, float* imag_out) {
-    int nfft = next_pow2(n);
-    // Use thread-local buffers to avoid per-call allocation
-    thread_local std::vector<float> re_buf, im_buf;
-    re_buf.assign(nfft, 0.0f);
-    im_buf.assign(nfft, 0.0f);
-    std::memcpy(re_buf.data(), x, n * sizeof(float));
-
-    fft_radix2(re_buf.data(), im_buf.data(), nfft);
-
     int half = n / 2 + 1;
-    std::memcpy(real_out, re_buf.data(), half * sizeof(float));
-    std::memcpy(imag_out, im_buf.data(), half * sizeof(float));
+
+    // Cached Bluestein tables (recomputed only when n changes)
+    thread_local int cached_n = 0;
+    thread_local int cached_M = 0;
+    thread_local std::vector<float> chirp_re, chirp_im;     // w[k] = exp(-iπk²/N), k=0..N-1
+    thread_local std::vector<float> B_re, B_im;             // FFT of conjugate chirp, length M
+
+    if (cached_n != n) {
+        // Compute chirp factors: w[k] = exp(-iπk²/N)
+        chirp_re.resize(n);
+        chirp_im.resize(n);
+        for (int k = 0; k < n; k++) {
+            // Use fmod to maintain precision for large k²
+            double angle = -M_PI * (double)((long long)k * k % (2 * (long long)n)) / (double)n;
+            chirp_re[k] = (float)std::cos(angle);
+            chirp_im[k] = (float)std::sin(angle);
+        }
+
+        // Pad size: M ≥ 2N-1, power of 2
+        int M = 1;
+        while (M < 2 * n - 1) M <<= 1;
+        cached_M = M;
+
+        // Build conjugate chirp sequence b[k]: b[k]=conj(w[k]) for k=0..N-1, b[M-k]=conj(w[k]) for k=1..N-1
+        B_re.assign(M, 0.0f);
+        B_im.assign(M, 0.0f);
+        B_re[0] = chirp_re[0];
+        B_im[0] = -chirp_im[0];
+        for (int k = 1; k < n; k++) {
+            B_re[k] = chirp_re[k];
+            B_im[k] = -chirp_im[k];
+            B_re[M - k] = chirp_re[k];
+            B_im[M - k] = -chirp_im[k];
+        }
+        // Precompute FFT of B
+        fft_radix2(B_re.data(), B_im.data(), M);
+
+        cached_n = n;
+    }
+
+    int M = cached_M;
+
+    // Build a[j] = x[j] * w[j], zero-padded to M
+    thread_local std::vector<float> A_re, A_im;
+    A_re.assign(M, 0.0f);
+    A_im.assign(M, 0.0f);
+    for (int j = 0; j < n; j++) {
+        A_re[j] = x[j] * chirp_re[j];
+        A_im[j] = x[j] * chirp_im[j];
+    }
+
+    // FFT(A)
+    fft_radix2(A_re.data(), A_im.data(), M);
+
+    // Pointwise multiply: C = FFT(A) * FFT(B)
+    for (int i = 0; i < M; i++) {
+        float re = A_re[i] * B_re[i] - A_im[i] * B_im[i];
+        float im = A_re[i] * B_im[i] + A_im[i] * B_re[i];
+        A_re[i] = re;
+        A_im[i] = im;
+    }
+
+    // IFFT: conjugate, FFT, conjugate, scale by 1/M
+    for (int i = 0; i < M; i++) A_im[i] = -A_im[i];
+    fft_radix2(A_re.data(), A_im.data(), M);
+    float inv_M = 1.0f / M;
+    for (int i = 0; i < M; i++) {
+        A_re[i] *= inv_M;
+        A_im[i] *= -inv_M;
+    }
+
+    // X[k] = w[k] * IFFT_result[k]
+    for (int k = 0; k < half; k++) {
+        real_out[k] = chirp_re[k] * A_re[k] - chirp_im[k] * A_im[k];
+        imag_out[k] = chirp_re[k] * A_im[k] + chirp_im[k] * A_re[k];
+    }
 }
 
 } // anonymous namespace
@@ -425,12 +487,30 @@ void compute_mel_cached(const float* samples, int num_samples,
     int n_mels = config.n_mels;
     int n_freqs = n_fft / 2 + 1;
 
-    // Zero-pad input to ensure at least one frame
-    int padded_len = std::max(num_samples, n_fft);
+    // Center-padded STFT (matching WhisperFeatureExtractor):
+    // Reflect-pad input by n_fft/2 on each side so each frame is centered
+    int pad_len = n_fft / 2;  // 200 for n_fft=400
+    int padded_len = num_samples + 2 * pad_len;
+    padded_len = std::max(padded_len, n_fft);
     std::vector<float> padded(padded_len, 0.0f);
-    std::memcpy(padded.data(), samples, num_samples * sizeof(float));
+
+    // Reflect padding: pad[i] = samples[|i - pad_len| reflected]
+    for (int i = 0; i < padded_len; i++) {
+        int src_idx = i - pad_len;
+        if (src_idx < 0) {
+            src_idx = -src_idx;  // reflect at start
+        } else if (src_idx >= num_samples) {
+            src_idx = 2 * num_samples - src_idx - 2;  // reflect at end
+        }
+        if (src_idx >= 0 && src_idx < num_samples) {
+            padded[i] = samples[src_idx];
+        }
+    }
 
     num_frames = (padded_len - n_fft) / hop + 1;
+
+    // WhisperFeatureExtractor drops the last frame: log_spec = log_spec[:, :-1]
+    if (num_frames > 1) num_frames--;
 
     // Compute STFT → power spectrum → mel
     std::vector<float> mel_spec(n_mels * num_frames, 0.0f);

@@ -247,8 +247,10 @@ void ASREngine::load_model(const std::string& model_dir) {
     decoder_->initialize(stream_);
 
     // 6. Allocate GPU buffers
-    // Max mel frames for ~120s audio at 16kHz: 120 * 100 + margin
-    max_mel_frames_ = 12000;
+    // Max mel frames: with center padding, T_max audio (120s) at 16kHz
+    // produces (T_max*16000 + n_fft - n_fft) / hop + 1 = T_max*100 + 1 frames.
+    // Add margin for rounding. 12100 frames supports up to ~120s audio.
+    max_mel_frames_ = 12100;
     cudaMalloc(&mel_gpu_, (size_t)config_.num_mel_bins * max_mel_frames_ * sizeof(__nv_bfloat16));
 
     // F32 staging buffer for GPU mel→BF16 conversion
@@ -299,7 +301,30 @@ void ASREngine::init_mel_cache() {
     cached_n_fft_ = 400;
     cached_n_mels_ = 128;
     cached_sample_rate_ = 16000;
-    cached_mel_fb_ = audio::build_mel_filterbank(cached_n_mels_, cached_n_fft_, cached_sample_rate_);
+
+    // Try loading precomputed mel filterbank from model directory
+    // (exported from WhisperFeatureExtractor with Slaney mel scale)
+    int n_freqs = cached_n_fft_ / 2 + 1;  // 201
+    int fb_size = cached_n_mels_ * n_freqs;
+    std::string fb_path = model_dir_ + "/mel_filters.bin";
+    FILE* f = fopen(fb_path.c_str(), "rb");
+    if (f) {
+        cached_mel_fb_.resize(fb_size);
+        size_t read = fread(cached_mel_fb_.data(), sizeof(float), fb_size, f);
+        fclose(f);
+        if ((int)read == fb_size) {
+            fprintf(stderr, "[ASR] Loaded precomputed mel filterbank from %s (%d values)\n",
+                    fb_path.c_str(), fb_size);
+        } else {
+            fprintf(stderr, "[ASR] WARNING: mel_filters.bin incomplete (%zu/%d), falling back to computed\n",
+                    read, fb_size);
+            cached_mel_fb_ = audio::build_mel_filterbank(cached_n_mels_, cached_n_fft_, cached_sample_rate_);
+        }
+    } else {
+        cached_mel_fb_ = audio::build_mel_filterbank(cached_n_mels_, cached_n_fft_, cached_sample_rate_);
+        fprintf(stderr, "[ASR] Using computed mel filterbank (no %s found)\n", fb_path.c_str());
+    }
+
     cached_hann_window_ = audio::build_hann_window(cached_n_fft_);
     fprintf(stderr, "[ASR] Mel filterbank cached: %d mels, %d FFT, %d Hz\n",
             cached_n_mels_, cached_n_fft_, cached_sample_rate_);
@@ -455,6 +480,34 @@ std::string ASREngine::transcribe(
            && current_pos < max_prompt_len_ + max_new_tokens) {
         output_tokens.push_back(next_token);
 
+        // Inline repetition check every 50 tokens — early stop on severe repetition
+        if (output_tokens.size() >= 50 && output_tokens.size() % 50 == 0) {
+            auto& ot = output_tokens;
+            int n = (int)ot.size();
+            bool found_rep = false;
+            // Check pattern lengths 1-32 for 5+ consecutive repeats in last 200 tokens
+            int check_start = std::max(0, n - 200);
+            for (int pl = 1; pl <= 32 && !found_rep; ++pl) {
+                for (int s = check_start; s + pl * 5 <= n && !found_rep; ++s) {
+                    int reps = 0;
+                    while (s + pl * (reps + 1) <= n) {
+                        bool match = true;
+                        for (int j = 0; j < pl; ++j) {
+                            if (ot[s + j] != ot[s + pl * (reps + 1) + j]) { match = false; break; }
+                        }
+                        if (!match) break;
+                        reps++;
+                    }
+                    if (reps >= 5) {
+                        fprintf(stderr, "[ASR] Inline repetition at %d tokens (pat=%d reps=%d), stopping.\n",
+                                n, pl, reps + 1);
+                        found_rep = true;
+                    }
+                }
+            }
+            if (found_rep) break;
+        }
+
         // Position IDs for decode step: [3, 1] all same position
         int step_pos[3] = {current_pos, current_pos, current_pos};
         cudaMemcpyAsync(position_ids_, step_pos, 3 * sizeof(int),
@@ -481,7 +534,37 @@ std::string ASREngine::transcribe(
     fprintf(stderr, "[ASR] Total: %.1f ms (encode %.0f + prefill %.0f + decode %.0f)\n",
             total_ms, encode_ms, prefill_ms, decode_ms);
 
-    // 10. Decode tokens to text — skip "language XXX <asr_text>" header
+    // 10. Detect and fix token repetitions (port from official qwen-asr)
+    // Look for patterns of 1-32 tokens repeating 5+ times consecutively
+    if (output_tokens.size() >= 10) {
+        for (int pat_len = 1; pat_len <= 32 && pat_len * 5 <= (int)output_tokens.size(); ++pat_len) {
+            for (int start = 0; start + pat_len * 5 <= (int)output_tokens.size(); ++start) {
+                int repeats = 0;
+                while (start + pat_len * (repeats + 1) <= (int)output_tokens.size()) {
+                    bool match = true;
+                    for (int j = 0; j < pat_len; ++j) {
+                        if (output_tokens[start + j] != output_tokens[start + pat_len * (repeats + 1) + j]) {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (!match) break;
+                    repeats++;
+                }
+                if (repeats >= 5) {
+                    int keep = start + pat_len; // keep only 1 occurrence
+                    fprintf(stderr, "[ASR] Repetition detected: pattern_len=%d repeats=%d, "
+                            "truncated %zu→%d tokens\n", pat_len, repeats + 1,
+                            output_tokens.size(), keep);
+                    output_tokens.resize(keep);
+                    goto rep_done;
+                }
+            }
+        }
+        rep_done:;
+    }
+
+    // 11. Decode tokens to text — skip "language XXX <asr_text>" header
     std::string result;
     if (!output_tokens.empty()) {
         // Debug: print token IDs
