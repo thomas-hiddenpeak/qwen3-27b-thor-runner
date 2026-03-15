@@ -689,10 +689,11 @@ void AudioEncoder::forward(
                                M_total, K_dim, d, stream);
         }
 
-        // Add sinusoidal PE: conv_buf_a[i, :] += pe[i % max_conv_time, :]
-        // PE is shared across chunks (position within chunk)
-        audio_ops::invoke_add_pe(conv_buf_a, pe_table_,
-                                  batch_count * cur_W, d, 0, stream);
+        // Add sinusoidal PE: each chunk independently uses PE[0..cur_W-1]
+        // Python: padded_embed = padded_embed + positional_embedding
+        //   where positional_embedding is [1, T_padded, d_model] broadcast across chunks
+        audio_ops::invoke_add_pe_chunked(conv_buf_a, pe_table_,
+                                         batch_count * cur_W, d, cur_W, stream);
 
         // Extract valid tokens to hidden_states buffer
         for (int bi = 0; bi < batch_count; bi++) {

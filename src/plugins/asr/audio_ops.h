@@ -92,6 +92,14 @@ void invoke_add_pe(__nv_bfloat16* hidden_states,
                    int pos_offset = 0,
                    cudaStream_t stream = 0);
 
+// Per-chunk PE: each chunk independently uses PE[0..chunk_len-1]
+// For total_tokens = num_chunks * chunk_len, token t uses PE[t % chunk_len]
+void invoke_add_pe_chunked(__nv_bfloat16* hidden_states,
+                           const __nv_bfloat16* pe_table,
+                           int total_tokens, int hidden_size,
+                           int chunk_len,
+                           cudaStream_t stream = 0);
+
 // MRoPE (Multimodal Rotary Position Embedding)
 // 半旋转 (d, d+D/2), interleaved section assignment
 // sections=[s0, s1, s2] 决定每个 freq pair 使用哪个 position 维度:

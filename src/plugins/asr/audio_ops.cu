@@ -324,6 +324,24 @@ __global__ void add_pe_kernel(
     hidden[idx] = float_to_bf16(h + p);
 }
 
+// Per-chunk PE: each chunk of chunk_len tokens independently uses PE[0..chunk_len-1]
+__global__ void add_pe_chunked_kernel(
+    __nv_bfloat16* __restrict__ hidden,
+    const __nv_bfloat16* __restrict__ pe_table,
+    int total_tokens, int hidden_size, int chunk_len)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = total_tokens * hidden_size;
+    if (idx >= total) return;
+
+    int t = idx / hidden_size;
+    int d = idx % hidden_size;
+    int pos_in_chunk = t % chunk_len;  // wrap position within each chunk
+    float h = bf16_to_float(hidden[idx]);
+    float p = bf16_to_float(pe_table[pos_in_chunk * hidden_size + d]);
+    hidden[idx] = float_to_bf16(h + p);
+}
+
 void invoke_add_pe(__nv_bfloat16* hidden_states,
                    const __nv_bfloat16* pe_table,
                    int seq_len, int hidden_size,
@@ -333,6 +351,18 @@ void invoke_add_pe(__nv_bfloat16* hidden_states,
     int block = 256;
     int grid = (total + block - 1) / block;
     add_pe_kernel<<<grid, block, 0, stream>>>(hidden_states, pe_table, seq_len, hidden_size, pos_offset);
+}
+
+void invoke_add_pe_chunked(__nv_bfloat16* hidden_states,
+                           const __nv_bfloat16* pe_table,
+                           int total_tokens, int hidden_size,
+                           int chunk_len,
+                           cudaStream_t stream) {
+    int total = total_tokens * hidden_size;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    add_pe_chunked_kernel<<<grid, block, 0, stream>>>(
+        hidden_states, pe_table, total_tokens, hidden_size, chunk_len);
 }
 
 // ============================================================================

@@ -1509,6 +1509,11 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
                 fprintf(stderr, "[Serve] Speaker encoder loaded: CAM++ (%s)\n",
                         speaker_model_path.c_str());
 
+                // Also load CPU version for diarization (GPU version has embedding quality issues)
+                if (cpu_speaker_encoder_.load(speaker_model_path)) {
+                    fprintf(stderr, "[Serve] CPU speaker encoder loaded for diarization\n");
+                }
+
                 // 加载 FSMN-VAD 引擎 (用于文件转写说话人分割)
                 std::string vad_model_dir = "/home/rm01/models/dev/asr/fsmn_vad";
                 const char* env_vad = getenv("QWEN_VAD_MODEL");
@@ -3870,6 +3875,9 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 vad_segments.size(), total_duration_s);
 
         // Phase 2: Speaker ID per segment (skip silence & too-short segments)
+        // Use a LOCAL SpeakerManager for diarization to avoid cross-request contamination
+        asr::SpeakerManager diar_spk_mgr;
+
         struct SpkSegment {
             int start_ms, end_ms;
             int speaker_id;
@@ -3895,16 +3903,29 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             ss.end_ms = vseg.end_ms;
             ss.vad_index = vi;
 
-            auto spk = identify_speaker(vseg.pcm.data(), (int)vseg.pcm.size(),
-                                        wav.sample_rate, true);
+            // Extract embedding using CPU encoder (GPU version has quality issues)
+            std::vector<float> mel;
+            int num_frames = 0;
+            compute_mel_80(vseg.pcm.data(), (int)vseg.pcm.size(), wav.sample_rate, mel, num_frames);
+            if (num_frames < 10) continue;
+
+            auto embedding = cpu_speaker_encoder_.extract(mel.data(), num_frames);
+            if (embedding.empty()) continue;
+
+            auto spk = diar_spk_mgr.identify(embedding, 0.65f, true);
             ss.speaker_id = spk.speaker_id;
             ss.speaker_name = spk.speaker_id >= 0 ? spk.name : "Unknown";
             ss.speaker_sim = spk.similarity;
+
+            fprintf(stderr, "[Serve] Phase 2: seg %zu [%d-%d ms] → %s (sim=%.3f, %s)\n",
+                    vi, ss.start_ms, ss.end_ms, ss.speaker_name.c_str(),
+                    ss.speaker_sim, spk.is_new ? "NEW" : "matched");
+
             spk_segments.push_back(ss);
         }
 
-        fprintf(stderr, "[Serve] Diarization v2: Phase 2 - %zu speaker-labeled segments\n",
-                spk_segments.size());
+        fprintf(stderr, "[Serve] Diarization v2: Phase 2 - %zu speaker-labeled segments, %d unique speakers\n",
+                spk_segments.size(), diar_spk_mgr.speaker_count());
 
         // Phase 3: Group consecutive same-speaker segments into turns (max ~100s per turn)
         struct SpeakerTurn {
@@ -4094,12 +4115,111 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
 
     // ========================================================================
     // 非分割模式: 整段 ASR + 可选整段 Speaker ID (原有逻辑)
+    // 长音频 (>100s) 自动 VAD 分段转录
     // ========================================================================
 
-    // 调用 ASR 插件 (直接内存解析, 无临时文件 I/O)
-    auto result = asr_plugin_->transcribe_memory(
+    // 首先解析音频到 PCM，判断时长
+    audio::AudioData wav_plain;
+    bool parsed_pcm = audio::load_audio_from_memory(
         reinterpret_cast<const uint8_t*>(audio_data.data()),
-        audio_data.size(), language, audio_filename, suppress_early_eos);
+        audio_data.size(), wav_plain, audio_filename);
+
+    float audio_duration_s = parsed_pcm ? (float)wav_plain.samples.size() / wav_plain.sample_rate : 0;
+
+    plugins::AsrResult result;
+
+    // 长音频: VAD 分段 → 分组 → 逐段转录 → 拼接
+    if (parsed_pcm && audio_duration_s > 100.0f && vad_engine_.is_loaded()) {
+        fprintf(stderr, "[Serve] Plain mode: long audio %.1fs, using VAD chunked transcription\n",
+                audio_duration_s);
+
+        // VAD 分段
+        std::vector<asr::VadSegment> vad_segs;
+        {
+            std::lock_guard<std::mutex> lock(vad_mutex_);
+            auto& cfg = vad_engine_.mutable_config();
+            int orig_silence = cfg.max_end_silence_time;
+            int orig_segment = cfg.max_single_segment_time;
+            cfg.max_end_silence_time = 500;       // 500ms 静音切分
+            cfg.max_single_segment_time = 15000;   // 15s per segment
+            vad_segs = vad_engine_.detect_all(wav_plain.samples.data(), (int)wav_plain.samples.size());
+            cfg.max_end_silence_time = orig_silence;
+            cfg.max_single_segment_time = orig_segment;
+        }
+
+        fprintf(stderr, "[Serve] Plain mode: %zu VAD segments\n", vad_segs.size());
+
+        // 分组: 连续 VAD 段合并为 ≤100s 的 chunk
+        struct Chunk {
+            std::vector<size_t> seg_indices;
+            int start_ms, end_ms;
+        };
+        std::vector<Chunk> chunks;
+        const int max_chunk_ms = 100000;
+
+        for (size_t i = 0; i < vad_segs.size(); ++i) {
+            auto& vs = vad_segs[i];
+            int dur = vs.end_ms - vs.start_ms;
+            if (dur < 200) continue; // skip very short segments
+
+            bool extend = !chunks.empty() &&
+                          (vs.end_ms - chunks.back().start_ms) <= max_chunk_ms;
+            if (extend) {
+                chunks.back().seg_indices.push_back(i);
+                chunks.back().end_ms = vs.end_ms;
+            } else {
+                Chunk c;
+                c.seg_indices.push_back(i);
+                c.start_ms = vs.start_ms;
+                c.end_ms = vs.end_ms;
+                chunks.push_back(std::move(c));
+            }
+        }
+
+        fprintf(stderr, "[Serve] Plain mode: %zu chunks from %zu VAD segments\n",
+                chunks.size(), vad_segs.size());
+
+        // 逐 chunk 转录
+        std::string full_text;
+        for (size_t ci = 0; ci < chunks.size(); ++ci) {
+            auto& chunk = chunks[ci];
+
+            // 拼接 VAD 段 PCM (段间插入 250ms 静音)
+            std::vector<float> chunk_pcm;
+            const int silence_pad = wav_plain.sample_rate / 4;
+            for (size_t vi = 0; vi < chunk.seg_indices.size(); ++vi) {
+                auto& vseg = vad_segs[chunk.seg_indices[vi]];
+                if (vi > 0 && !chunk_pcm.empty()) {
+                    chunk_pcm.resize(chunk_pcm.size() + silence_pad, 0.0f);
+                }
+                chunk_pcm.insert(chunk_pcm.end(), vseg.pcm.begin(), vseg.pcm.end());
+            }
+
+            if ((int)chunk_pcm.size() < wav_plain.sample_rate / 5) continue;
+
+            auto seg_result = asr_plugin_->transcribe_pcm(
+                chunk_pcm.data(), (int)chunk_pcm.size(),
+                wav_plain.sample_rate, language, true);
+
+            if (seg_result.error_code == 0 && !seg_result.text.empty()) {
+                full_text += seg_result.text;
+            }
+        }
+
+        result.text = full_text;
+        result.language = language;
+        result.duration_s = audio_duration_s;
+        if (result.text.empty()) {
+            result.error_code = 3;
+            result.error_message = "ASR transcription produced no text";
+        }
+    }
+    // 短音频: 直接整段转录
+    else {
+        result = asr_plugin_->transcribe_memory(
+            reinterpret_cast<const uint8_t*>(audio_data.data()),
+            audio_data.size(), language, audio_filename, suppress_early_eos);
+    }
 
     if (result.error_code != 0) {
         HttpResponse resp;
@@ -4571,33 +4691,149 @@ void ServeApp::handle_voice_clone_delete(const HttpRequest& req, int client_fd) 
 // Speaker Registration API — 说话人注册/识别/管理
 // ============================================================================
 
-// 80-dim Mel 特征提取 (用于 CAM++ 说话人编码)
+// 80-dim Kaldi-style fbank 特征提取 (用于 CAM++ 说话人编码)
+// FunASR CAM++ 期望 Kaldi fbank, NOT Whisper mel:
+//   1. PCM × 32768 缩放 (FunASR forward_fbank convention)
+//   2. pre-emphasis 0.97
+//   3. Hann window, no center padding
+//   4. power spectrum → mel filterbank (HTK, no Slaney normalization)
+//   5. log(energy) (natural log, no Whisper global normalization)
 void ServeApp::compute_mel_80(const float* samples, int num_samples, int sample_rate,
                                std::vector<float>& mel_out, int& num_frames) {
-    // CAM++ 期望 80-dim Fbank, 16kHz, 25ms 帧长, 10ms 帧移
-    audio::MelConfig mel_cfg;
-    mel_cfg.n_mels = 80;
-    mel_cfg.n_fft = 400;         // 25ms @ 16kHz
-    mel_cfg.hop_length = 160;    // 10ms @ 16kHz
-    mel_cfg.sample_rate = 16000;
+    const int n_fft = 400;       // 25ms @ 16kHz
+    const int hop = 160;         // 10ms @ 16kHz
+    const int n_mels = 80;
+    const int n_freqs = n_fft / 2 + 1;
+    const int target_sr = 16000;
 
-    // 如果不是 16kHz, 需要先重采样
-    if (sample_rate != 16000) {
+    // Resample if needed
+    std::vector<float> resampled_buf;
+    const float* pcm = samples;
+    int pcm_len = num_samples;
+    if (sample_rate != target_sr) {
         std::vector<float> input_vec(samples, samples + num_samples);
-        std::vector<float> resampled;
-        audio::resample(input_vec, sample_rate, resampled, 16000);
-        audio::compute_mel(resampled.data(), (int)resampled.size(), mel_cfg, mel_out, num_frames);
-    } else {
-        audio::compute_mel(samples, num_samples, mel_cfg, mel_out, num_frames);
+        audio::resample(input_vec, sample_rate, resampled_buf, target_sr);
+        pcm = resampled_buf.data();
+        pcm_len = (int)resampled_buf.size();
     }
 
-    // compute_mel 输出 [n_mels, T], CAM++ extract() 需要 [T, 80]
-    // Transpose: [80, T] → [T, 80]
-    std::vector<float> transposed(mel_out.size());
-    for (int t = 0; t < num_frames; ++t)
-        for (int f = 0; f < 80; ++f)
-            transposed[t * 80 + f] = mel_out[f * num_frames + t];
-    mel_out = std::move(transposed);
+    // Scale by 32768 (FunASR convention: float [-1,1] → PCM16 range)
+    std::vector<float> scaled(pcm_len);
+    for (int i = 0; i < pcm_len; i++)
+        scaled[i] = pcm[i] * 32768.0f;
+
+    // Pre-emphasis (coefficient 0.97)
+    for (int i = pcm_len - 1; i > 0; i--)
+        scaled[i] -= 0.97f * scaled[i - 1];
+    scaled[0] *= (1.0f - 0.97f);
+
+    // Compute number of frames (Kaldi snip_edges=True: no center padding)
+    num_frames = (pcm_len - n_fft) / hop + 1;
+    if (num_frames <= 0) { mel_out.clear(); return; }
+
+    // Build mel filterbank (HTK scale, NO Slaney normalization)
+    // Cache filterbank across calls
+    thread_local std::vector<float> mel_fb;
+    thread_local std::vector<float> hann_win;
+    thread_local bool fb_built = false;
+    if (!fb_built) {
+        // HTK mel filterbank
+        mel_fb.resize((size_t)n_mels * n_freqs, 0.0f);
+        auto hz_to_mel = [](float hz) { return 2595.0f * std::log10(1.0f + hz / 700.0f); };
+        auto mel_to_hz = [](float mel) { return 700.0f * (std::pow(10.0f, mel / 2595.0f) - 1.0f); };
+
+        float min_mel = hz_to_mel(0.0f);
+        float max_mel = hz_to_mel((float)target_sr / 2.0f);
+        std::vector<float> mel_points(n_mels + 2);
+        for (int i = 0; i < n_mels + 2; i++)
+            mel_points[i] = mel_to_hz(min_mel + (max_mel - min_mel) * i / (n_mels + 1));
+
+        for (int m = 0; m < n_mels; m++) {
+            float left = mel_points[m] * n_fft / target_sr;
+            float center = mel_points[m + 1] * n_fft / target_sr;
+            float right = mel_points[m + 2] * n_fft / target_sr;
+            for (int k = 0; k < n_freqs; k++) {
+                float fk = (float)k;
+                if (fk >= left && fk <= center)
+                    mel_fb[m * n_freqs + k] = (fk - left) / (center - left);
+                else if (fk > center && fk <= right)
+                    mel_fb[m * n_freqs + k] = (right - fk) / (right - center);
+            }
+            // NO Slaney normalization (unlike Whisper filterbank)
+        }
+
+        // Hann window
+        hann_win.resize(n_fft);
+        for (int i = 0; i < n_fft; i++)
+            hann_win[i] = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * i / n_fft));
+
+        fb_built = true;
+    }
+
+    // Precompute non-zero ranges for each mel bin
+    std::vector<int> mel_start(n_mels, n_freqs);
+    std::vector<int> mel_end(n_mels, 0);
+    for (int m = 0; m < n_mels; m++) {
+        for (int k = 0; k < n_freqs; k++) {
+            if (mel_fb[m * n_freqs + k] != 0.0f) {
+                if (k < mel_start[m]) mel_start[m] = k;
+                if (k + 1 > mel_end[m]) mel_end[m] = k + 1;
+            }
+        }
+    }
+
+    // STFT → power spectrum → mel → log
+    std::vector<float> mel_spec(n_mels * num_frames, 0.0f);
+    std::vector<float> frame(n_fft);
+
+    for (int t = 0; t < num_frames; t++) {
+        // Window
+        for (int i = 0; i < n_fft; i++)
+            frame[i] = scaled[t * hop + i] * hann_win[i];
+
+        // FFT (DFT for n_fft=400, cached twiddle factors)
+        thread_local std::vector<float> tw_re, tw_im;
+        thread_local bool tw_built = false;
+        if (!tw_built) {
+            tw_re.resize(n_freqs * n_fft);
+            tw_im.resize(n_freqs * n_fft);
+            for (int k = 0; k < n_freqs; k++) {
+                for (int n = 0; n < n_fft; n++) {
+                    double angle = -2.0 * M_PI * k * n / n_fft;
+                    tw_re[k * n_fft + n] = (float)std::cos(angle);
+                    tw_im[k * n_fft + n] = (float)std::sin(angle);
+                }
+            }
+            tw_built = true;
+        }
+
+        // Power spectrum via DFT
+        std::vector<float> power(n_freqs);
+        for (int k = 0; k < n_freqs; k++) {
+            float re = 0, im = 0;
+            const float* tw_r = &tw_re[k * n_fft];
+            const float* tw_i = &tw_im[k * n_fft];
+            for (int n = 0; n < n_fft; n++) {
+                re += frame[n] * tw_r[n];
+                im += frame[n] * tw_i[n];
+            }
+            power[k] = re * re + im * im;
+        }
+
+        // Mel filterbank + log (natural log, no global normalization)
+        for (int m = 0; m < n_mels; m++) {
+            float sum = 0;
+            for (int k = mel_start[m]; k < mel_end[m]; k++)
+                sum += mel_fb[m * n_freqs + k] * power[k];
+            mel_spec[m * num_frames + t] = std::log(std::max(sum, 1.175494e-38f));
+        }
+    }
+
+    // Transpose [80, T] → [T, 80] for CAM++ extract()
+    mel_out.resize(n_mels * num_frames);
+    for (int t = 0; t < num_frames; t++)
+        for (int f = 0; f < n_mels; f++)
+            mel_out[t * n_mels + f] = mel_spec[f * num_frames + t];
 }
 
 // 说话人识别: 从 PCM 提取 embedding 并匹配
