@@ -11,12 +11,17 @@
 #include <iostream>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <spawn.h>
 #include <fcntl.h>
+#include <cerrno>
 #include <thread>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+extern "C" { extern char** environ; }
 
 namespace qwen_thor {
 namespace audio {
@@ -146,9 +151,13 @@ bool load_audio_from_memory(const uint8_t* data, size_t size, AudioData& out,
     size_t written = 0;
     while (written < size) {
         ssize_t n = write(tmp_fd, data + written, size - written);
-        if (n <= 0) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
         written += n;
     }
+    fsync(tmp_fd);
     close(tmp_fd);
 
     if (written != size) {
@@ -157,69 +166,77 @@ bool load_audio_from_memory(const uint8_t* data, size_t size, AudioData& out,
         return false;
     }
 
-    fprintf(stderr, "[audio] temp file: %s (%zu bytes)\n", tmp_path.c_str(), size);
+    fprintf(stderr, "[audio] temp file: %s (written=%zu/%zu bytes)\n", tmp_path.c_str(), written, size);
 
-    // ffmpeg 转码: 输入临时文件, 输出 pipe:1
-    int stdout_pipe[2];
-    if (pipe(stdout_pipe) != 0) {
-        std::cerr << "[audio] pipe() failed" << std::endl;
+    // 验证临时文件大小
+    {
+        struct stat st;
+        if (stat(tmp_path.c_str(), &st) == 0) {
+            fprintf(stderr, "[audio] temp file on disk: %ld bytes\n", (long)st.st_size);
+        }
+    }
+
+    // ffmpeg 转码: 使用 posix_spawn (避免 fork 后 CUDA/ATS 环境问题)
+    std::string out_path = tmp_path + ".pcm";
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addclose(&actions, STDIN_FILENO);
+
+    // 关闭所有继承的 FD (3-1023), 防止 CUDA/ATS FD 干扰 ffmpeg
+    for (int fd = 3; fd < 1024; fd++) {
+        posix_spawn_file_actions_addclose(&actions, fd);
+    }
+
+    // stderr 不重定向, 让 ffmpeg 错误输出到服务器 stderr
+    std::string ffmpeg_log = tmp_path + ".ffmpeg.log";
+
+    const char* argv[] = {
+        "ffmpeg", "-nostdin", "-y", "-v", "warning",
+        "-i", tmp_path.c_str(),
+        "-f", "s16le", "-acodec", "pcm_s16le",
+        "-ac", "1", "-ar", "16000",
+        out_path.c_str(), nullptr
+    };
+
+    pid_t pid;
+    int spawn_ret = posix_spawn(&pid, "/usr/bin/ffmpeg", &actions, nullptr,
+                                 const_cast<char**>(argv), environ);
+    posix_spawn_file_actions_destroy(&actions);
+
+    if (spawn_ret != 0) {
+        fprintf(stderr, "[audio] posix_spawn failed: %s\n", strerror(spawn_ret));
         unlink(tmp_path.c_str());
         return false;
     }
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        std::cerr << "[audio] fork() failed" << std::endl;
-        close(stdout_pipe[0]); close(stdout_pipe[1]);
-        unlink(tmp_path.c_str());
-        return false;
-    }
-
-    if (pid == 0) {
-        // 子进程: ffmpeg
-        close(stdout_pipe[0]);
-        dup2(stdout_pipe[1], STDOUT_FILENO);
-        close(stdout_pipe[1]);
-        // 将 ffmpeg stderr 输出到父进程 stderr (便于诊断)
-        // stdin 关闭, ffmpeg 从文件读取
-        close(STDIN_FILENO);
-
-        execlp("ffmpeg", "ffmpeg",
-               "-i", tmp_path.c_str(),
-               "-f", "s16le",
-               "-acodec", "pcm_s16le",
-               "-ac", "1",
-               "-ar", "16000",
-               "pipe:1",
-               nullptr);
-        _exit(127);
-    }
-
-    // 父进程
-    close(stdout_pipe[1]);
-
-    // 读取 ffmpeg stdout (PCM16 raw data)
-    std::vector<uint8_t> pcm_buf;
-    pcm_buf.reserve(size * 4);
-    uint8_t tmp[8192];
-    while (true) {
-        ssize_t n = read(stdout_pipe[0], tmp, sizeof(tmp));
-        if (n <= 0) break;
-        pcm_buf.insert(pcm_buf.end(), tmp, tmp + n);
-    }
-    close(stdout_pipe[0]);
-
-    // 等待 ffmpeg 退出
+    // 等待 ffmpeg 完成
     int status = 0;
-    waitpid(pid, &status, 0);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
 
-    // 清理临时文件
+    int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (exit_code != 0) {
+        fprintf(stderr, "[audio] ffmpeg exited with code %d\n", exit_code);
+    }
+
+    // 清理输入临时文件
     unlink(tmp_path.c_str());
 
-    if (pcm_buf.empty()) {
-        std::cerr << "[audio] ffmpeg produced no output (exit status=" << WEXITSTATUS(status) << ")" << std::endl;
+    // 读取输出 PCM 文件
+    std::ifstream pcm_file(out_path, std::ios::binary | std::ios::ate);
+    if (!pcm_file.is_open() || pcm_file.tellg() <= 0) {
+        std::cerr << "[audio] ffmpeg produced no output (exit_code=" << exit_code << ")" << std::endl;
+        unlink(out_path.c_str());
         return false;
     }
+
+    size_t pcm_size = pcm_file.tellg();
+    pcm_file.seekg(0);
+
+    std::vector<uint8_t> pcm_buf(pcm_size);
+    pcm_file.read(reinterpret_cast<char*>(pcm_buf.data()), pcm_size);
+    pcm_file.close();
+    unlink(out_path.c_str());
 
     // 解析 raw PCM16 mono 16kHz
     int num_samples = pcm_buf.size() / 2;

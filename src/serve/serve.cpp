@@ -1504,7 +1504,7 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
         }
 
         if (!speaker_model_path.empty()) {
-            speaker_encoder_ = std::make_unique<asr::CamPlusSpeakerEncoder>();
+            speaker_encoder_ = std::make_unique<asr::GpuSpeakerEncoder>();
             if (speaker_encoder_->load(speaker_model_path)) {
                 fprintf(stderr, "[Serve] Speaker encoder loaded: CAM++ (%s)\n",
                         speaker_model_path.c_str());
@@ -3857,7 +3857,7 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             int orig_max_end_silence = cfg.max_end_silence_time;
             int orig_max_segment = cfg.max_single_segment_time;
             cfg.max_end_silence_time = 300;     // 300ms 静音切分
-            cfg.max_single_segment_time = 30000; // 每段最长 30s (ASR 安全上限)
+            cfg.max_single_segment_time = 15000; // 每段最长 15s (ASR 可靠上限)
             vad_segments = vad_engine_.detect_all(wav.samples.data(), (int)wav.samples.size());
             cfg.max_end_silence_time = orig_max_end_silence;
             cfg.max_single_segment_time = orig_max_segment;
@@ -3878,8 +3878,17 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
         };
         std::vector<TransSegment> segments;
 
-        for (auto& vseg : vad_segments) {
-            if (vseg.pcm.empty() || vseg.end_ms - vseg.start_ms < 200) continue;
+        for (size_t vi = 0; vi < vad_segments.size(); ++vi) {
+            auto& vseg = vad_segments[vi];
+            float seg_dur_s = (float)(vseg.end_ms - vseg.start_ms) / 1000.0f;
+            fprintf(stderr, "[Serve] Diarization seg %zu/%zu: [%d-%d ms] (%.1fs), pcm=%zu samples\n",
+                    vi + 1, vad_segments.size(), vseg.start_ms, vseg.end_ms,
+                    seg_dur_s, vseg.pcm.size());
+
+            if (vseg.pcm.empty() || vseg.end_ms - vseg.start_ms < 200) {
+                fprintf(stderr, "[Serve] Diarization seg %zu: skipped (too short or empty)\n", vi + 1);
+                continue;
+            }
 
             TransSegment ts;
             ts.start_ms = vseg.start_ms;
@@ -3891,6 +3900,10 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             auto seg_result = asr_plugin_->transcribe_pcm(
                 vseg.pcm.data(), (int)vseg.pcm.size(), wav.sample_rate,
                 language, suppress_early_eos);
+
+            fprintf(stderr, "[Serve] Diarization seg %zu: ASR error=%d, text='%s' (%zu chars)\n",
+                    vi + 1, seg_result.error_code, seg_result.text.substr(0, 80).c_str(),
+                    seg_result.text.size());
 
             if (seg_result.error_code == 0 && !seg_result.text.empty()) {
                 ts.text = seg_result.text;

@@ -17,6 +17,7 @@
 #include "../engine/backend.h"
 #include "../plugins/asr/asr_plugin.h"
 #include "../plugins/asr/speaker_encoder.h"
+#include "../plugins/asr/speaker_encoder_gpu.h"
 #include "../plugins/asr/punctuation.h"
 #include "../plugins/asr/vad_engine.h"
 #include "../plugins/tts/tts_plugin.h"
@@ -257,7 +258,7 @@ private:
     std::unique_ptr<plugins::TtsPlugin> tts_plugin_;
 
     // 说话人识别 (CAM++ + SpeakerManager)
-    std::unique_ptr<asr::CamPlusSpeakerEncoder> speaker_encoder_;
+    std::unique_ptr<asr::GpuSpeakerEncoder> speaker_encoder_;
     asr::SpeakerManager speaker_manager_;
     std::mutex speaker_mutex_;  // 保护 speaker_encoder_ + speaker_manager_
 
