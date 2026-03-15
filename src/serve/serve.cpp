@@ -3856,8 +3856,8 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             auto& cfg = vad_engine_.mutable_config();
             int orig_max_end_silence = cfg.max_end_silence_time;
             int orig_max_segment = cfg.max_single_segment_time;
-            cfg.max_end_silence_time = 300;     // 300ms 静音切分
-            cfg.max_single_segment_time = 15000; // 每段最长 15s (ASR 可靠上限)
+            cfg.max_end_silence_time = 200;     // 200ms 静音切分 (更细粒度)
+            cfg.max_single_segment_time = 10000; // 每段最长 10s (ASR 最佳区间)
             vad_segments = vad_engine_.detect_all(wav.samples.data(), (int)wav.samples.size());
             cfg.max_end_silence_time = orig_max_end_silence;
             cfg.max_single_segment_time = orig_max_segment;
@@ -3888,6 +3888,19 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             if (vseg.pcm.empty() || vseg.end_ms - vseg.start_ms < 200) {
                 fprintf(stderr, "[Serve] Diarization seg %zu: skipped (too short or empty)\n", vi + 1);
                 continue;
+            }
+
+            // Skip low-energy segments (silence/noise) to avoid ASR hallucination
+            {
+                float rms = 0.0f;
+                for (size_t si = 0; si < vseg.pcm.size(); si++) {
+                    rms += vseg.pcm[si] * vseg.pcm[si];
+                }
+                rms = std::sqrt(rms / vseg.pcm.size());
+                if (rms < 0.005f) {
+                    fprintf(stderr, "[Serve] Diarization seg %zu: skipped (silence, RMS=%.4f)\n", vi + 1, rms);
+                    continue;
+                }
             }
 
             TransSegment ts;

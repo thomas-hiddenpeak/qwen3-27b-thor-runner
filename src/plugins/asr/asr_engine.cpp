@@ -489,13 +489,15 @@ std::string ASREngine::transcribe(
         for (auto id : output_tokens) fprintf(stderr, " %d", id);
         fprintf(stderr, "\n");
 
-        // Find <asr_text> marker (token 151704) and only decode tokens after it
+        // Find LAST <asr_text> marker (token 151704) and only decode tokens after it.
+        // The model may output a double header pattern for no-speech segments:
+        //   11528 2240 151704 151644 11528 2240 151704
+        // Using the last marker skips the spurious "language None" prefix.
         static constexpr int ASR_TEXT_TOKEN = 151704;
         size_t text_start = 0;
         for (size_t i = 0; i < output_tokens.size(); i++) {
             if (output_tokens[i] == ASR_TEXT_TOKEN) {
-                text_start = i + 1;
-                break;
+                text_start = i + 1;  // keep updating → ends on last occurrence
             }
         }
 

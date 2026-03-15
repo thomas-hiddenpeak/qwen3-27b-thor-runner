@@ -380,8 +380,13 @@ AsrResult NativeAsrPlugin::transcribe_pcm(const float* samples, int num_samples,
 
     auto t0 = std::chrono::steady_clock::now();
 
+    // Limit max_new_tokens proportionally to audio duration to reduce hallucination.
+    // ~3 tokens/s for Chinese speech is a generous upper bound.
+    float audio_dur_s = (float)num_samples / (float)sample_rate;
+    int max_tokens = std::min(448, std::max(20, (int)(audio_dur_s * 4.0f)));
+
     std::string text = engine_->transcribe(samples, num_samples, sample_rate,
-                                            0.0f, 448, suppress_early_eos);
+                                            0.0f, max_tokens, suppress_early_eos);
 
     auto t1 = std::chrono::steady_clock::now();
     float elapsed_s = std::chrono::duration<float>(t1 - t0).count();
