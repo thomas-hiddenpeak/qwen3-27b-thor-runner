@@ -4303,7 +4303,7 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             v4_segments = std::move(merged);
         }
 
-        // 标点恢复 (v4 pipeline 默认启用)
+        // 标点恢复 (v4 pipeline — per-segment 规则, 每段独立加标点)
         for (auto& seg : v4_segments)
             if (!seg.text.empty())
                 seg.text = punctuation_restorer_.restore(seg.text);

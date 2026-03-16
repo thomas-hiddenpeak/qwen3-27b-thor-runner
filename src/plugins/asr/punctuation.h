@@ -49,11 +49,9 @@ public:
                 continue;
             }
 
-            // 句末处理 (不强制加句号 — segment 可能是话轮中断)
+            // 句末处理
             if (i == n - 1) {
-                // 末字本身是语气词, 不需要额外标点
                 if (is_filler(chars[i])) break;
-                // 检查是否为疑问句
                 if (has_question_marker(chars, last_punc_pos + 1, n)) {
                     result += "\xef\xbc\x9f"; // ？
                 } else if (has_exclamation_marker(chars, last_punc_pos + 1, n)) {
@@ -66,27 +64,27 @@ public:
 
             int since_punc = i - last_punc_pos;
 
-            // --- 语气词/口语标记 后断句 (高优先级) ---
-            // "嗯/啊/对/哦/哈/呢/吧/呀/哎/喔" 后接非语气词 → 逗号
-            // 但不拆 "对不对/是不是" 等固定反复结构
-            if (since_punc >= 2 && is_filler(chars[i]) &&
-                i + 1 < n && !is_filler(chars[i + 1]) && !is_punctuation(chars[i + 1])) {
-                // 防止拆开 "对不对/是不是"
-                bool in_reduplicate = false;
-                if (i + 2 < n && chars[i + 1] == "\xe4\xb8\x8d") { // "X不X" 结构
-                    if (chars[i + 2] == chars[i]) in_reduplicate = true;
-                }
-                if (!in_reduplicate) {
-                    result += "\xef\xbc\x8c"; // ，
+            // --- "对不对/是不是/是吧/对吧/好吧" → ？ (反问/确认) ---
+            if (since_punc >= 3 && i + 1 < n) {
+                if (is_discourse_marker(chars, i, n)) {
+                    result += "\xef\xbc\x9f"; // ？
                     last_punc_pos = i;
                     continue;
                 }
             }
 
-            // "对不对/是不是/是吧/对吧/好吧" 模式后断句
-            if (since_punc >= 3 && i + 1 < n) {
-                if (is_discourse_marker(chars, i, n)) {
-                    result += "\xef\xbc\x8c"; // ，
+            // --- 语气词/填充词后断句 (高优先级) ---
+            if (since_punc >= 1 && is_filler(chars[i]) &&
+                i + 1 < n && !is_filler(chars[i + 1]) && !is_punctuation(chars[i + 1])) {
+                // 防止拆开 "对不对/是不是"
+                bool in_reduplicate = false;
+                if (i + 2 < n && chars[i + 1] == "\xe4\xb8\x8d") { // "X不X"
+                    if (chars[i + 2] == chars[i]) in_reduplicate = true;
+                }
+                if (!in_reduplicate) {
+                    // 决定标点: 短句(嗯独立) → 。, 长句末尾有问句 → ？, 其他 → ，
+                    std::string punc = select_clause_end(chars, last_punc_pos + 1, i + 1, since_punc);
+                    result += punc;
                     last_punc_pos = i;
                     continue;
                 }
@@ -94,14 +92,16 @@ public:
 
             // --- 连接词前断句 (中优先级) ---
             if (since_punc >= 6 && i + 2 < n && is_conjunction_ahead(chars, i + 1, n)) {
-                result += "\xef\xbc\x8c"; // ，
+                std::string punc = select_clause_end(chars, last_punc_pos + 1, i + 1, since_punc);
+                result += punc;
                 last_punc_pos = i;
                 continue;
             }
 
             // --- 虚词后断句 (低优先级, 需 ≥12 字距) ---
             if (since_punc >= 12 && is_safe_particle_break(chars, i, n)) {
-                result += "\xef\xbc\x8c"; // ，
+                std::string punc = select_clause_end(chars, last_punc_pos + 1, i + 1, since_punc);
+                result += punc;
                 last_punc_pos = i;
                 continue;
             }
@@ -226,48 +226,34 @@ private:
     // ---- 疑问词检测 ----
     static bool has_question_marker(const std::vector<std::string>& chars,
                                     int from, int to) {
-        // 常见疑问词/语气词
-        static const char* q_words[] = {
+        int len = to - from;
+        if (len <= 0) return false;
+
+        // 常见句尾疑问语气词 (只检查末尾 3 字)
+        static const char* q_tail[] = {
             "\xe5\x90\x97",     // 吗
             "\xe5\x91\xa2",     // 呢
-            "\xe4\xb9\x88",     // 么 (什么)
-            "\xe5\x93\xaa",     // 哪
             "\xe8\xb0\x81",     // 谁
-            "\xe5\x87\xa0",     // 几
-            "\xe5\xa4\x9a\xe5\xb0\x91", // 多少
-            "\xe5\x93\xaa\xe9\x87\x8c", // 哪里
-            "\xe5\x93\xaa\xe4\xb8\xaa", // 哪个
-            "\xe5\x93\xaa\xe4\xba\x9b", // 哪些
-            "\xe5\x93\xaa\xe5\x84\xbf", // 哪儿
         };
-        static const char* q_prefixes[] = {
-            "\xe4\xbb\x80\xe4\xb9\x88", // 什么
-            "\xe6\x80\x8e\xe4\xb9\x88", // 怎么
-            "\xe4\xb8\xba\xe4\xbb\x80\xe4\xb9\x88", // 为什么
-            "\xe6\x98\xaf\xe5\x90\xa6",  // 是否
-        };
-
-        // 检查末尾疑问词
-        for (auto q : q_words) {
-            std::string qs(q);
-            auto qc = split_utf8(qs);
-            if ((int)qc.size() <= to - from) {
-                bool match = true;
-                for (int j = 0; j < (int)qc.size(); ++j) {
-                    if (chars[to - (int)qc.size() + j] != qc[j]) {
-                        match = false;
-                        break;
-                    }
-                }
-                if (match) return true;
+        for (auto q : q_tail) {
+            for (int j = std::max(from, to - 3); j < to; ++j) {
+                if (chars[j] == q) return true;
             }
         }
 
-        // 检查句首疑问前缀
-        std::string joined;
-        for (int i = from; i < to; ++i) joined += chars[i];
-        for (auto q : q_prefixes) {
-            if (joined.find(q) != std::string::npos) return true;
+        // "怎么/怎样" 类疑问前缀: 只在短句 (≤8字) 或出现在末尾 6 字内时触发
+        static const char* q_near_end[] = {
+            "\xe4\xbb\x80\xe4\xb9\x88", // 什么
+            "\xe6\x80\x8e\xe4\xb9\x88", // 怎么
+            "\xe6\x80\x8e\xe6\xa0\xb7", // 怎样
+            "\xe4\xb8\xba\xe4\xbb\x80\xe4\xb9\x88", // 为什么
+        };
+        // 只在末尾 6 字范围内搜索疑问前缀, 避免 "什么什么东西..." 误判
+        int search_from = (len <= 8) ? from : std::max(from, to - 6);
+        std::string tail_text;
+        for (int i = search_from; i < to; ++i) tail_text += chars[i];
+        for (auto q : q_near_end) {
+            if (tail_text.find(q) != std::string::npos) return true;
         }
 
         return false;
@@ -391,6 +377,42 @@ private:
         // "嘛" 后断
         if (chars[pos] == "\xe5\x98\x9b") return true;
         return false;
+    }
+
+    // ---- 子句末尾标点选择 ----
+    // 根据子句内容选择 ？/。/，
+    //   from: 子句起始 (含), to: 子句结束 (不含), since_punc: 距上一标点字数
+    static std::string select_clause_end(const std::vector<std::string>& chars,
+                                          int from, int to, int since_punc) {
+        // 1. 子句是纯填充词 (嗯/哦/啊, 1-2字) → 。
+        if (since_punc <= 2) {
+            bool all_filler = true;
+            for (int j = from; j < to; ++j) {
+                if (!is_filler(chars[j])) { all_filler = false; break; }
+            }
+            if (all_filler) return "\xe3\x80\x82"; // 。
+        }
+
+        // 2. 子句含疑问词 → ？
+        if (has_question_marker(chars, from, to)) {
+            return "\xef\xbc\x9f"; // ？
+        }
+
+        // 3. 子句已够长(≥8字)且末字为了/的/吧/嘛/呢 → 。(完整句)
+        if (since_punc >= 8) {
+            // 末字 (to-1) 如果是语气词, 检查是否表示完整句
+            const std::string& last = chars[to - 1];
+            if (last == "\xe4\xba\x86" ||   // 了
+                last == "\xe7\x9a\x84" ||   // 的
+                last == "\xe5\x98\x9b" ||   // 嘛
+                last == "\xe5\x91\xa2" ||   // 呢
+                last == "\xe5\x90\xa7") {   // 吧
+                return "\xe3\x80\x82"; // 。
+            }
+        }
+
+        // 4. 默认: 逗号
+        return "\xef\xbc\x8c"; // ，
     }
 
     // ---- 自然断点检测 (20字保底用, 宽松匹配) ----
