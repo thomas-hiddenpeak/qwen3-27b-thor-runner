@@ -4075,37 +4075,9 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             }
         }
 
-        // Phase 4: 每个 aligned word 分配 speaker (时间重叠匹配)
-        for (auto& aw : aligned_words) {
-            if (aw.start_ms < 0) continue;
-            int word_mid_ms = (aw.start_ms + aw.end_ms) / 2;
-            int best_overlap = 0;
-            int best_spk = -1;
-            std::string best_name = "Unknown";
-            for (auto& si : spk_intervals) {
-                // 计算 word [start, end] 与 speaker interval [start, end] 的重叠
-                int overlap_start = std::max(aw.start_ms, si.start_ms);
-                int overlap_end = std::min(aw.end_ms, si.end_ms);
-                int overlap = overlap_end - overlap_start;
-                if (overlap > best_overlap) {
-                    best_overlap = overlap;
-                    best_spk = si.speaker_id;
-                    best_name = si.speaker_name;
-                }
-                // 备选: 中点落在区间内
-                if (overlap <= 0 && word_mid_ms >= si.start_ms && word_mid_ms < si.end_ms &&
-                    best_spk < 0) {
-                    best_spk = si.speaker_id;
-                    best_name = si.speaker_name;
-                }
-            }
-            aw.confidence = (best_spk >= 0) ? 0.9f : 0.3f;
-            // 把 speaker_id 编码到 AlignedWord (复用 confidence 传递是不够的, 需要扩展)
-            // 这里直接构建 WordInfo 结果
-        }
-
-        // Phase 5: 构建输出 — words 数组 + speaker segments
-        // 5a: 构建标注了 speaker 的 word 列表
+        // ================================================================
+        // Phase 4: Word → Speaker 分配 (3 层策略)
+        // ================================================================
         struct WordWithSpeaker {
             std::string word;
             int start_ms, end_ms;
@@ -4113,6 +4085,78 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             std::string speaker_name;
         };
         std::vector<WordWithSpeaker> word_list;
+        word_list.reserve(aligned_words.size());
+
+        // 4a-pre: 零时长聚集重分布 — 修复 ForcedAligner chunk 边界对齐失败
+        // 检测 ≥5 个连续 start_ms==end_ms 的词, 含前方大间隙词, 均匀重分布
+        {
+            size_t idx = 0;
+            while (idx < aligned_words.size()) {
+                if (aligned_words[idx].start_ms >= 0 &&
+                    aligned_words[idx].start_ms == aligned_words[idx].end_ms) {
+                    int cluster_ts = aligned_words[idx].start_ms;
+                    size_t zero_start = idx;
+                    while (idx < aligned_words.size() &&
+                           aligned_words[idx].start_ms >= 0 &&
+                           aligned_words[idx].start_ms == aligned_words[idx].end_ms &&
+                           std::abs(aligned_words[idx].start_ms - cluster_ts) <= 200) {
+                        ++idx;
+                    }
+                    size_t cluster_size = idx - zero_start;
+                    if (cluster_size >= 5) {
+                        // 向前扩展: 前一个词若与更前词间隙>5s, 说明被错放到 chunk 边界
+                        size_t ext_start = zero_start;
+                        while (ext_start > 0) {
+                            if (aligned_words[ext_start - 1].start_ms < 0) break;
+                            int gap_before = 0;
+                            if (ext_start >= 2)
+                                gap_before = aligned_words[ext_start - 1].start_ms -
+                                             aligned_words[ext_start - 2].end_ms;
+                            if (gap_before > 5000) { --ext_start; } else break;
+                        }
+                        size_t total = idx - ext_start;
+                        // 左锚点: ext_start 前最后一个正常词的 end_ms
+                        int bound_left = std::max(0, cluster_ts - (int)total * 200);
+                        for (int j = (int)ext_start - 1; j >= 0; --j) {
+                            if (aligned_words[j].start_ms >= 0 &&
+                                aligned_words[j].end_ms > aligned_words[j].start_ms) {
+                                bound_left = aligned_words[j].end_ms;
+                                break;
+                            }
+                        }
+                        int bound_right = cluster_ts;
+                        int range = bound_right - bound_left;
+                        if (range < (int)total * 60) {
+                            bound_right = bound_left + (int)total * 150;
+                        }
+                        int step = std::max(60, (bound_right - bound_left) / (int)total);
+                        for (size_t j = ext_start; j < idx; ++j) {
+                            aligned_words[j].start_ms = bound_left + (int)(j - ext_start) * step;
+                            aligned_words[j].end_ms = aligned_words[j].start_ms + std::min(step, 100);
+                        }
+                        fprintf(stderr, "[Serve] v4 4a-pre: redistributed %zu words @%dms → [%d-%d ms] step=%d\n",
+                                total, cluster_ts, bound_left, aligned_words[idx-1].end_ms, step);
+                    }
+                } else { ++idx; }
+            }
+        }
+
+        // 4a: 零时长词时间戳平滑 — 在相邻词之间分摊时间 (处理散落的个别零时长词)
+        for (size_t i = 0; i < aligned_words.size(); ++i) {
+            auto& aw = aligned_words[i];
+            if (aw.start_ms >= 0 && aw.start_ms == aw.end_ms) {
+                int left = (i > 0 && aligned_words[i-1].end_ms > 0) ? aligned_words[i-1].end_ms : aw.start_ms;
+                int right = (i + 1 < aligned_words.size() && aligned_words[i+1].start_ms > 0)
+                            ? aligned_words[i+1].start_ms : aw.start_ms;
+                if (right > aw.start_ms) {
+                    aw.end_ms = std::min(right, aw.start_ms + 80);
+                } else if (aw.start_ms > left) {
+                    aw.start_ms = std::max(left, aw.end_ms - 80);
+                }
+            }
+        }
+
+        // 4b: 主分配 — overlap > 0 或 midpoint 落在 interval 内
         for (auto& aw : aligned_words) {
             WordWithSpeaker wws;
             wws.word = aw.word;
@@ -4120,9 +4164,10 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             wws.end_ms = aw.end_ms;
             wws.speaker_id = -1;
             wws.speaker_name = "Unknown";
-            if (aw.start_ms >= 0) {
+            if (aw.start_ms >= 0 && !spk_intervals.empty()) {
                 int word_mid = (aw.start_ms + aw.end_ms) / 2;
                 int best_overlap = 0;
+                // 策略1: 最大重叠
                 for (auto& si : spk_intervals) {
                     int os = std::max(aw.start_ms, si.start_ms);
                     int oe = std::min(aw.end_ms, si.end_ms);
@@ -4132,17 +4177,47 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                         wws.speaker_id = si.speaker_id;
                         wws.speaker_name = si.speaker_name;
                     }
-                    if (overlap <= 0 && word_mid >= si.start_ms && word_mid < si.end_ms &&
-                        wws.speaker_id < 0) {
-                        wws.speaker_id = si.speaker_id;
-                        wws.speaker_name = si.speaker_name;
+                }
+                // 策略2: midpoint 落在 interval 内
+                if (wws.speaker_id < 0) {
+                    for (auto& si : spk_intervals) {
+                        if (word_mid >= si.start_ms && word_mid < si.end_ms) {
+                            wws.speaker_id = si.speaker_id;
+                            wws.speaker_name = si.speaker_name;
+                            break;
+                        }
+                    }
+                }
+                // 策略3: nearest-neighbor — 找距离 word 最近的 interval
+                if (wws.speaker_id < 0) {
+                    int min_dist = INT_MAX;
+                    for (auto& si : spk_intervals) {
+                        int dist = 0;
+                        if (word_mid < si.start_ms) dist = si.start_ms - word_mid;
+                        else if (word_mid > si.end_ms) dist = word_mid - si.end_ms;
+                        if (dist < min_dist) {
+                            min_dist = dist;
+                            wws.speaker_id = si.speaker_id;
+                            wws.speaker_name = si.speaker_name;
+                        }
                     }
                 }
             }
             word_list.push_back(wws);
         }
 
-        // 5b: 从 word_list 生成 speaker segments (连续同 speaker 合并)
+        // 4c: 统计未分配 word (应为 0)
+        {
+            int unknown_count = 0;
+            for (auto& w : word_list) if (w.speaker_id < 0) unknown_count++;
+            if (unknown_count > 0)
+                fprintf(stderr, "[Serve] v4 Phase 4: WARNING %d/%zu words still Unknown\n",
+                        unknown_count, word_list.size());
+        }
+
+        // ================================================================
+        // Phase 5: 构建 speaker segments
+        // ================================================================
         struct V4Segment {
             int start_ms, end_ms;
             int speaker_id;
@@ -4150,13 +4225,15 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             std::string text;
         };
         std::vector<V4Segment> v4_segments;
+
+        // 5a: 连续同 speaker 合并 (gap ≤ 5s 容忍)
         for (auto& w : word_list) {
             bool extend = !v4_segments.empty() &&
                           w.speaker_id == v4_segments.back().speaker_id &&
                           w.speaker_id >= 0 &&
-                          w.start_ms - v4_segments.back().end_ms <= 2000; // 2s gap tolerance
+                          w.start_ms - v4_segments.back().end_ms <= 5000;
             if (extend) {
-                v4_segments.back().end_ms = w.end_ms;
+                v4_segments.back().end_ms = std::max(v4_segments.back().end_ms, w.end_ms);
                 v4_segments.back().text += w.word;
             } else {
                 V4Segment seg;
@@ -4167,6 +4244,57 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 seg.text = w.word;
                 v4_segments.push_back(std::move(seg));
             }
+        }
+
+        // 5b: 短段吸收 — 极短段 (≤3字) 合并到前后的大段
+        for (int pass = 0; pass < 2; ++pass) {
+            std::vector<V4Segment> merged;
+            for (size_t i = 0; i < v4_segments.size(); ++i) {
+                auto& seg = v4_segments[i];
+                int char_count = 0;
+                for (size_t j = 0; j < seg.text.size(); ) {
+                    unsigned char c = seg.text[j];
+                    if (c < 0x80) { ++j; } else if (c < 0xE0) { j += 2; } else if (c < 0xF0) { j += 3; } else { j += 4; }
+                    ++char_count;
+                }
+                // 短段 (≤3字符且时长<2s) 尝试合并到同 speaker 邻段
+                if (char_count <= 3 && (seg.end_ms - seg.start_ms) < 2000) {
+                    // 优先合并到前一段 (同 speaker)
+                    if (!merged.empty() &&
+                        seg.start_ms - merged.back().end_ms <= 5000 &&
+                        (seg.speaker_id == merged.back().speaker_id || seg.speaker_id < 0)) {
+                        merged.back().end_ms = std::max(merged.back().end_ms, seg.end_ms);
+                        merged.back().text += seg.text;
+                        continue;
+                    }
+                    // 否则合并到下一段 (同 speaker)
+                    if (i + 1 < v4_segments.size() &&
+                        v4_segments[i+1].start_ms - seg.end_ms <= 5000 &&
+                        (seg.speaker_id == v4_segments[i+1].speaker_id || seg.speaker_id < 0)) {
+                        v4_segments[i+1].start_ms = std::min(v4_segments[i+1].start_ms, seg.start_ms);
+                        v4_segments[i+1].text = seg.text + v4_segments[i+1].text;
+                        continue;
+                    }
+                }
+                merged.push_back(seg);
+            }
+            v4_segments = std::move(merged);
+        }
+
+        // 5c: 相邻同 speaker 二次合并 (短段吸收可能引入新的连续同 speaker)
+        {
+            std::vector<V4Segment> merged;
+            for (auto& seg : v4_segments) {
+                if (!merged.empty() &&
+                    seg.speaker_id == merged.back().speaker_id &&
+                    seg.start_ms - merged.back().end_ms <= 8000) {
+                    merged.back().end_ms = std::max(merged.back().end_ms, seg.end_ms);
+                    merged.back().text += seg.text;
+                } else {
+                    merged.push_back(seg);
+                }
+            }
+            v4_segments = std::move(merged);
         }
 
         // 标点恢复 (v4 pipeline 默认启用)
