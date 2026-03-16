@@ -38,7 +38,6 @@ public:
         int n = (int)chars.size();
         if (n == 0) return text;
 
-        // 跟踪上一个标点位置
         int last_punc_pos = -1;
 
         for (int i = 0; i < n; ++i) {
@@ -50,10 +49,12 @@ public:
                 continue;
             }
 
-            // 句末处理
+            // 句末处理 (不强制加句号 — segment 可能是话轮中断)
             if (i == n - 1) {
+                // 末字本身是语气词, 不需要额外标点
+                if (is_filler(chars[i])) break;
                 // 检查是否为疑问句
-                if (has_question_marker(chars, 0, n)) {
+                if (has_question_marker(chars, last_punc_pos + 1, n)) {
                     result += "\xef\xbc\x9f"; // ？
                 } else if (has_exclamation_marker(chars, last_punc_pos + 1, n)) {
                     result += "\xef\xbc\x81"; // ！
@@ -63,9 +64,50 @@ public:
                 break;
             }
 
-            // 逗号插入: 连续 >15 字无标点, 在自然断点处
             int since_punc = i - last_punc_pos;
-            if (since_punc >= 15 && is_natural_break(chars, i, n)) {
+
+            // --- 语气词/口语标记 后断句 (高优先级) ---
+            // "嗯/啊/对/哦/哈/呢/吧/呀/哎/喔" 后接非语气词 → 逗号
+            // 但不拆 "对不对/是不是" 等固定反复结构
+            if (since_punc >= 2 && is_filler(chars[i]) &&
+                i + 1 < n && !is_filler(chars[i + 1]) && !is_punctuation(chars[i + 1])) {
+                // 防止拆开 "对不对/是不是"
+                bool in_reduplicate = false;
+                if (i + 2 < n && chars[i + 1] == "\xe4\xb8\x8d") { // "X不X" 结构
+                    if (chars[i + 2] == chars[i]) in_reduplicate = true;
+                }
+                if (!in_reduplicate) {
+                    result += "\xef\xbc\x8c"; // ，
+                    last_punc_pos = i;
+                    continue;
+                }
+            }
+
+            // "对不对/是不是/是吧/对吧/好吧" 模式后断句
+            if (since_punc >= 3 && i + 1 < n) {
+                if (is_discourse_marker(chars, i, n)) {
+                    result += "\xef\xbc\x8c"; // ，
+                    last_punc_pos = i;
+                    continue;
+                }
+            }
+
+            // --- 连接词前断句 (中优先级) ---
+            if (since_punc >= 6 && i + 2 < n && is_conjunction_ahead(chars, i + 1, n)) {
+                result += "\xef\xbc\x8c"; // ，
+                last_punc_pos = i;
+                continue;
+            }
+
+            // --- 虚词后断句 (低优先级, 需 ≥12 字距) ---
+            if (since_punc >= 12 && is_safe_particle_break(chars, i, n)) {
+                result += "\xef\xbc\x8c"; // ，
+                last_punc_pos = i;
+                continue;
+            }
+
+            // --- 长句保底 (≥20 字无标点, 在任何自然点断) ---
+            if (since_punc >= 20 && is_natural_break(chars, i, n)) {
                 result += "\xef\xbc\x8c"; // ，
                 last_punc_pos = i;
             }
@@ -249,12 +291,52 @@ private:
         return false;
     }
 
-    // ---- 自然断点检测 (用于逗号插入) ----
-    static bool is_natural_break(const std::vector<std::string>& chars,
-                                  int pos, int n) {
-        if (pos + 1 >= n) return false;
+    // ---- 语气词/填充词检测 ----
+    static bool is_filler(const std::string& c) {
+        static const char* fillers[] = {
+            "\xe5\x97\xaf",     // 嗯
+            "\xe5\x95\x8a",     // 啊
+            "\xe5\xaf\xb9",     // 对
+            "\xe5\x93\xa6",     // 哦
+            "\xe5\x93\x88",     // 哈
+            "\xe5\x91\xa2",     // 呢
+            "\xe5\x90\xa7",     // 吧
+            "\xe5\x91\x80",     // 呀
+            "\xe5\x93\x8e",     // 哎
+            "\xe5\x96\x94",     // 喔
+            "\xe5\x97\xaf",     // 嗯
+        };
+        for (auto f : fillers) {
+            if (c == f) return true;
+        }
+        return false;
+    }
 
-        // 1. 转折/连接词前: 但是/然后/所以/因为/如果/虽然/不过/以及/或者/而且
+    // ---- 话语标记检测 (pos 是末字位置) ----
+    static bool is_discourse_marker(const std::vector<std::string>& chars, int pos, int n) {
+        if (pos + 1 >= n) return false;
+        // "对不对" at pos-2..pos
+        if (pos >= 2) {
+            if (chars[pos-2] == "\xe5\xaf\xb9" && chars[pos-1] == "\xe4\xb8\x8d" && chars[pos] == "\xe5\xaf\xb9") return true;
+            // "是不是"
+            if (chars[pos-2] == "\xe6\x98\xaf" && chars[pos-1] == "\xe4\xb8\x8d" && chars[pos] == "\xe6\x98\xaf") return true;
+        }
+        // "是吧/对吧/好吧" at pos-1..pos
+        if (pos >= 1) {
+            if (chars[pos] == "\xe5\x90\xa7") {
+                if (chars[pos-1] == "\xe6\x98\xaf" || chars[pos-1] == "\xe5\xaf\xb9" || chars[pos-1] == "\xe5\xa5\xbd") return true;
+            }
+            // "对呀/是呀"
+            if (chars[pos] == "\xe5\x91\x80") {
+                if (chars[pos-1] == "\xe5\xaf\xb9" || chars[pos-1] == "\xe6\x98\xaf") return true;
+            }
+        }
+        return false;
+    }
+
+    // ---- 连接词前瞻检测 ----
+    static bool is_conjunction_ahead(const std::vector<std::string>& chars, int pos, int n) {
+        if (pos + 1 >= n) return false;
         static const char* conjunctions[][2] = {
             {"\xe4\xbd\x86", "\xe6\x98\xaf"},   // 但是
             {"\xe7\x84\xb6", "\xe5\x90\x8e"},   // 然后
@@ -265,22 +347,63 @@ private:
             {"\xe4\xb8\x8d", "\xe8\xbf\x87"},   // 不过
             {"\xe8\x80\x8c", "\xe4\xb8\x94"},   // 而且
             {"\xe6\x88\x96", "\xe8\x80\x85"},   // 或者
+            {"\xe5\xb0\xb1", "\xe6\x98\xaf"},   // 就是
+            {"\xe4\xb9\x9f", "\xe5\xb0\xb1"},   // 也就
+            {"\xe5\x8f\xaf", "\xe6\x98\xaf"},   // 可是
+            {"\xe5\x8f\xaf", "\xe8\x83\xbd"},   // 可能
         };
         for (auto& conj : conjunctions) {
-            if (pos + 2 < n && chars[pos + 1] == conj[0] && chars[pos + 2] == conj[1]) {
-                return true;
-            }
+            if (chars[pos] == conj[0] && chars[pos + 1] == conj[1]) return true;
         }
+        return false;
+    }
 
-        // 2. 在 "的" / "了" / "过" 后面做逗号
-        static const char* particles[] = {
-            "\xe7\x9a\x84",     // 的
-            "\xe4\xba\x86",     // 了
-            "\xe8\xbf\x87",     // 过
-        };
-        for (auto p : particles) {
-            if (chars[pos] == p) return true;
+    // ---- 安全虚词断点 (避免 "的话" 等固定搭配) ----
+    static bool is_safe_particle_break(const std::vector<std::string>& chars, int pos, int n) {
+        // "了" 后断, 但不拆 "了解/了不起"
+        if (chars[pos] == "\xe4\xba\x86") {
+            if (pos + 1 < n) {
+                // "了解/了不" → 不断
+                if (chars[pos+1] == "\xe8\xa7\xa3" || chars[pos+1] == "\xe4\xb8\x8d") return false;
+            }
+            return true;
         }
+        // "的" 后断, 但不拆 "的话/的时候/的人/的事/的命"
+        if (chars[pos] == "\xe7\x9a\x84") {
+            if (pos + 1 < n) {
+                if (chars[pos+1] == "\xe8\xaf\x9d") return false;  // 的话
+                if (chars[pos+1] == "\xe4\xba\xba") return false;  // 的人
+                if (chars[pos+1] == "\xe4\xba\x8b") return false;  // 的事
+                if (chars[pos+1] == "\xe5\x91\xbd") return false;  // 的命
+            }
+            if (pos + 2 < n) {
+                if (chars[pos+1] == "\xe6\x97\xb6" && chars[pos+2] == "\xe5\x80\x99") return false;  // 的时候
+            }
+            return true;
+        }
+        // "过" 后断, 但不拆 "过来/过去/过程"
+        if (chars[pos] == "\xe8\xbf\x87") {
+            if (pos + 1 < n) {
+                if (chars[pos+1] == "\xe6\x9d\xa5" || chars[pos+1] == "\xe5\x8e\xbb" || chars[pos+1] == "\xe7\xa8\x8b") return false;
+            }
+            return true;
+        }
+        // "嘛" 后断
+        if (chars[pos] == "\xe5\x98\x9b") return true;
+        return false;
+    }
+
+    // ---- 自然断点检测 (20字保底用, 宽松匹配) ----
+    static bool is_natural_break(const std::vector<std::string>& chars,
+                                  int pos, int n) {
+        if (pos + 1 >= n) return false;
+
+        // 连接词前
+        if (is_conjunction_ahead(chars, pos + 1, n)) return true;
+        // 语气词后
+        if (is_filler(chars[pos])) return true;
+        // 安全虚词断点
+        if (is_safe_particle_break(chars, pos, n)) return true;
 
         return false;
     }

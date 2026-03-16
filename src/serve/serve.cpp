@@ -3879,6 +3879,12 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
         fprintf(stderr, "[Serve] v4 pipeline: audio %.1fs, %zu samples\n",
                 total_duration_s, wav.samples.size());
 
+        // 每次请求清空说话人注册 (避免跨请求的 embedding 累积干扰)
+        {
+            std::lock_guard<std::mutex> lock(speaker_mutex_);
+            speaker_manager_.clear();
+        }
+
         auto v4_t0 = std::chrono::steady_clock::now();
         auto phase_t0 = v4_t0;
 
