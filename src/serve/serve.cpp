@@ -4437,11 +4437,6 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                     auto& ci = char_infos[i];
                     int wi = ci.word_idx >= 0 ? ci.word_idx : -1;
 
-                    // 更新时间范围
-                    if (wi >= 0) {
-                        cur.end_ms = std::max(cur.end_ms, word_list[wi].end_ms);
-                    }
-
                     // 检查是否需要在此处切段
                     bool split_here = false;
                     if (ci.is_punc && is_sentence_end(ci.ch) && i + 1 < char_infos.size()) {
@@ -4459,62 +4454,10 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                         }
                     }
 
-                    // speaker 变化 (无标点处): 在此切段, 但把标点留给当前段
+                    // speaker 变化 (无标点处): 立即切段。
+                    // 这里不再回退到历史标点/逗号处切分，否则会把旧 speaker 的文本/时间错误转移到新 speaker。
                     if (!split_here && !ci.is_punc && wi >= 0 &&
                         word_list[wi].speaker_id != cur.speaker_id) {
-                        // 回退: 在上一个句末标点/逗号处切 (优先 。？！, 其次 ，)
-                        size_t last_sent_end = std::string::npos;
-                        size_t last_comma = std::string::npos;
-                        for (size_t k = cur.text.size(); k > 0; ) {
-                            unsigned char c = (unsigned char)cur.text[k-1];
-                            // 找 3 字节 UTF-8 标点
-                            if (k >= 3) {
-                                std::string maybe = cur.text.substr(k - 3, 3);
-                                if (is_sentence_end(maybe)) {
-                                    last_sent_end = k;
-                                    break;
-                                }
-                                if (last_comma == std::string::npos &&
-                                    maybe == "\xef\xbc\x8c") { // ，
-                                    last_comma = k;
-                                }
-                            }
-                            // step back one UTF-8 char
-                            if (c < 0x80) --k;
-                            else if (c >= 0xC0) --k;  // start byte
-                            else { // continuation byte, keep going
-                                while (k > 0 && ((unsigned char)cur.text[k-1] & 0xC0) == 0x80) --k;
-                                if (k > 0) --k;
-                            }
-                        }
-
-                        if (last_sent_end != std::string::npos) {
-                            // 在句末标点处切: 标点之前归当前段, 标点之后移到新段
-                            std::string overflow = cur.text.substr(last_sent_end);
-                            cur.text = cur.text.substr(0, last_sent_end);
-                            if (!cur.text.empty()) v4_segments.push_back(cur);
-                            cur = V4Segment();
-                            cur.speaker_id = word_list[wi].speaker_id;
-                            cur.speaker_name = word_list[wi].speaker_name;
-                            cur.start_ms = word_list[wi].start_ms;
-                            cur.end_ms = word_list[wi].end_ms;
-                            cur.text = overflow + ci.ch;
-                            continue;
-                        }
-                        // 退而求其次: 在最近逗号处切
-                        if (last_comma != std::string::npos) {
-                            std::string overflow = cur.text.substr(last_comma);
-                            cur.text = cur.text.substr(0, last_comma);
-                            if (!cur.text.empty()) v4_segments.push_back(cur);
-                            cur = V4Segment();
-                            cur.speaker_id = word_list[wi].speaker_id;
-                            cur.speaker_name = word_list[wi].speaker_name;
-                            cur.start_ms = word_list[wi].start_ms;
-                            cur.end_ms = word_list[wi].end_ms;
-                            cur.text = overflow + ci.ch;
-                            continue;
-                        }
-                        // 没有句末标点 — 直接在 speaker 变化处切
                         if (!cur.text.empty()) v4_segments.push_back(cur);
                         cur = V4Segment();
                         cur.speaker_id = word_list[wi].speaker_id;
@@ -4527,6 +4470,9 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
 
                     // 加入当前段
                     cur.text += ci.ch;
+                    if (wi >= 0) {
+                        cur.end_ms = std::max(cur.end_ms, word_list[wi].end_ms);
+                    }
 
                     // 如果句末标点 + speaker 变化: 当前段结束
                     if (split_here) {
@@ -4590,11 +4536,13 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 // 检查: 是否为短 segment (<5s) 且前后被同一 speaker 包围?
                 bool is_island = dur_ms < 5000 && seg.speaker_id >= 0 &&
                                  !smoothed.empty() && i + 1 < v4_segments.size();
-                bool prev_same = is_island && smoothed.back().speaker_id == seg.speaker_id;
-                bool next_same = is_island && v4_segments[i+1].speaker_id == seg.speaker_id;
+                bool surrounded = is_island &&
+                                  smoothed.back().speaker_id >= 0 &&
+                                  smoothed.back().speaker_id == v4_segments[i+1].speaker_id &&
+                                  smoothed.back().speaker_id != seg.speaker_id;
 
-                if (prev_same && next_same) {
-                    // 前后都是相同 speaker — 合并到前一段
+                if (surrounded) {
+                    // 当前短段是噪声 island, 吸收到前一段；下一段会在后续 pass 中与前一段重新并上
                     smoothed.back().end_ms = std::max(smoothed.back().end_ms, seg.end_ms);
                     smoothed.back().text += seg.text;
                     ++island_merged;
@@ -4606,7 +4554,20 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             if (island_merged > 0) {
                 fprintf(stderr, "[Serve] v4 Phase 6.5: smoothed %d speaker islands\n", island_merged);
             }
-            v4_segments = std::move(smoothed);
+
+            // 吸收 island 后再做一次相邻同 speaker 合并，避免残留同 speaker 碎段。
+            std::vector<V4Segment> merged;
+            for (auto& seg : smoothed) {
+                if (!merged.empty() &&
+                    seg.speaker_id == merged.back().speaker_id &&
+                    seg.start_ms - merged.back().end_ms <= 5000) {
+                    merged.back().end_ms = std::max(merged.back().end_ms, seg.end_ms);
+                    merged.back().text += seg.text;
+                } else {
+                    merged.push_back(seg);
+                }
+            }
+            v4_segments = std::move(merged);
         }
 
         // ================================================================
@@ -4651,6 +4612,14 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 fprintf(stderr, "[Serve] v4 Phase 6.55: removed %d oral redundancies\n", oral_removed);
             }
         }
+
+        // 最终输出前按时间排序，避免 speaker 切段回退/吸收造成的非单调顺序影响前端展示与人工校对。
+        std::stable_sort(v4_segments.begin(), v4_segments.end(),
+                         [](const V4Segment& a, const V4Segment& b) {
+                             if (a.start_ms != b.start_ms) return a.start_ms < b.start_ms;
+                             if (a.end_ms != b.end_ms) return a.end_ms < b.end_ms;
+                             return a.speaker_id < b.speaker_id;
+                         });
 
         fprintf(stderr, "[Serve] v4 pipeline done: %zu segments, %zu words, total %.1fs\n",
                 v4_segments.size(), word_list.size(),
