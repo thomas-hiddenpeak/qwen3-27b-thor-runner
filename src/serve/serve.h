@@ -20,6 +20,7 @@
 #include "../plugins/asr/speaker_encoder_gpu.h"
 #include "../plugins/asr/punctuation.h"
 #include "../plugins/asr/vad_engine.h"
+#include "../plugins/asr/aligner_engine.h"
 #include "../plugins/tts/tts_plugin.h"
 #include <string>
 #include <thread>
@@ -269,6 +270,10 @@ private:
 
     // 标点恢复
     asr::PunctuationRestorer punctuation_restorer_;
+
+    // 强制对齐 (Qwen3-ForcedAligner-0.6B, 字级时间戳)
+    asr::AlignerEngine aligner_engine_;
+    std::mutex aligner_mutex_;  // 保护 aligner_engine_ (单线程模型推理)
     int ollama_fd_ = -1;
     int openai_fd_ = -1;
     std::atomic<bool> running_{false};

@@ -1533,6 +1533,24 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
             }
         }
     }
+
+    // 加载 ForcedAligner (Qwen3-ForcedAligner-0.6B)
+    if (asr_plugin_ && asr_plugin_->is_available()) {
+        std::string aligner_model = "/home/rm01/models/dev/asr/Qwen/Qwen3-ForcedAligner-0.6B";
+        const char* env_aligner = getenv("QWEN_ALIGNER_MODEL");
+        if (env_aligner) aligner_model = env_aligner;
+
+        std::ifstream test_cfg(aligner_model + "/config.json");
+        if (test_cfg.good()) {
+            test_cfg.close();
+            if (aligner_engine_.load_model(aligner_model)) {
+                fprintf(stderr, "[Serve] ForcedAligner loaded: %s\n", aligner_model.c_str());
+            } else {
+                fprintf(stderr, "[Serve] WARNING: Failed to load ForcedAligner from %s\n",
+                        aligner_model.c_str());
+            }
+        }
+    }
 }
 
 ServeApp::~ServeApp() {
@@ -3823,12 +3841,374 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                      (form.fields["punctuate"] == "true" || form.fields["punctuate"] == "1");
     bool identify_spk = form.fields.count("speaker") &&
                         (form.fields["speaker"] == "true" || form.fields["speaker"] == "1");
+    // OpenAI-compatible: timestamp_granularities[]=word 或 timestamp_granularities=word
+    bool want_word_timestamps = false;
+    {
+        auto it = form.fields.find("timestamp_granularities[]");
+        if (it == form.fields.end()) it = form.fields.find("timestamp_granularities");
+        if (it != form.fields.end() && it->second.find("word") != std::string::npos)
+            want_word_timestamps = true;
+    }
 
-    fprintf(stderr, "[Serve] ASR: received %zu bytes audio (%s), language=%s%s%s%s\n",
+    fprintf(stderr, "[Serve] ASR: received %zu bytes audio (%s), language=%s%s%s%s%s\n",
             audio_data.size(), audio_filename.c_str(), language.c_str(),
             suppress_early_eos ? ", suppress_early_eos" : "",
             punctuate ? ", punctuate" : "",
-            identify_spk ? ", speaker_id" : "");
+            identify_spk ? ", speaker_id" : "",
+            want_word_timestamps ? ", word_timestamps" : "");
+
+    // ========================================================================
+    // v4 管线: ASR-first + ForcedAligner + CAM++ speaker attribution
+    //   Phase 1: 解析音频 + 整段 ASR → 高质量全文
+    //   Phase 2: ForcedAligner → 字级时间戳
+    //   Phase 3: Fine-grained VAD + CAM++ → 每 VAD 段说话人 ID
+    //   Phase 4: 对齐时间戳 × 说话人标签 → 每字分配 speaker
+    //   Phase 5: 按 speaker 连续段生成输出 segments
+    // ========================================================================
+    if (identify_spk && want_word_timestamps && aligner_engine_.is_loaded() &&
+        speaker_encoder_ && vad_engine_.is_loaded()) {
+        // Phase 1a: 解析音频到 PCM
+        audio::AudioData wav;
+        if (!audio::load_audio_from_memory(
+                reinterpret_cast<const uint8_t*>(audio_data.data()),
+                audio_data.size(), wav, audio_filename)) {
+            HttpResponse resp;
+            resp.status_code = 400;
+            resp.body = "{\"error\":{\"message\":\"Failed to decode audio\"}}";
+            send_response(client_fd, resp);
+            close(client_fd);
+            return;
+        }
+
+        float total_duration_s = (float)wav.samples.size() / wav.sample_rate;
+        fprintf(stderr, "[Serve] v4 pipeline: audio %.1fs, %zu samples\n",
+                total_duration_s, wav.samples.size());
+
+        // Phase 1b: 整段 ASR (≤100s 分段, plain mode)
+        std::string full_text;
+        if (total_duration_s > 100.0f) {
+            // VAD 分段 → 分组为 ≤100s chunk → 逐段转录
+            std::vector<asr::VadSegment> vad_segs_asr;
+            {
+                std::lock_guard<std::mutex> lock(vad_mutex_);
+                auto& cfg = vad_engine_.mutable_config();
+                int orig_silence = cfg.max_end_silence_time;
+                int orig_segment = cfg.max_single_segment_time;
+                cfg.max_end_silence_time = 500;
+                cfg.max_single_segment_time = 15000;
+                vad_segs_asr = vad_engine_.detect_all(wav.samples.data(), (int)wav.samples.size());
+                cfg.max_end_silence_time = orig_silence;
+                cfg.max_single_segment_time = orig_segment;
+            }
+
+            // 分组为 ≤100s chunks
+            struct AsrChunk { std::vector<size_t> seg_indices; int start_ms, end_ms; };
+            std::vector<AsrChunk> asr_chunks;
+            for (size_t i = 0; i < vad_segs_asr.size(); ++i) {
+                auto& vs = vad_segs_asr[i];
+                if (vs.end_ms - vs.start_ms < 200) continue;
+                bool extend = !asr_chunks.empty() &&
+                              (vs.end_ms - asr_chunks.back().start_ms) <= 100000;
+                if (extend) {
+                    asr_chunks.back().seg_indices.push_back(i);
+                    asr_chunks.back().end_ms = vs.end_ms;
+                } else {
+                    AsrChunk c; c.seg_indices.push_back(i);
+                    c.start_ms = vs.start_ms; c.end_ms = vs.end_ms;
+                    asr_chunks.push_back(std::move(c));
+                }
+            }
+
+            for (auto& chunk : asr_chunks) {
+                std::vector<float> chunk_pcm;
+                const int silence_pad = wav.sample_rate / 4;
+                for (size_t vi = 0; vi < chunk.seg_indices.size(); ++vi) {
+                    auto& vseg = vad_segs_asr[chunk.seg_indices[vi]];
+                    if (vi > 0 && !chunk_pcm.empty())
+                        chunk_pcm.resize(chunk_pcm.size() + silence_pad, 0.0f);
+                    chunk_pcm.insert(chunk_pcm.end(), vseg.pcm.begin(), vseg.pcm.end());
+                }
+                if ((int)chunk_pcm.size() < wav.sample_rate / 5) continue;
+                auto seg_result = asr_plugin_->transcribe_pcm(
+                    chunk_pcm.data(), (int)chunk_pcm.size(), wav.sample_rate, language, true);
+                if (seg_result.error_code == 0 && !seg_result.text.empty())
+                    full_text += seg_result.text;
+            }
+        } else {
+            auto result = asr_plugin_->transcribe_pcm(
+                wav.samples.data(), (int)wav.samples.size(), wav.sample_rate, language, true);
+            if (result.error_code == 0) full_text = result.text;
+        }
+
+        if (full_text.empty()) {
+            HttpResponse resp;
+            resp.status_code = 500;
+            resp.body = "{\"error\":{\"message\":\"ASR transcription produced no text\"}}";
+            send_response(client_fd, resp);
+            close(client_fd);
+            return;
+        }
+
+        fprintf(stderr, "[Serve] v4 Phase 1: ASR text = %zu chars\n", full_text.size());
+
+        // Phase 2: ForcedAligner → 字级时间戳
+        std::vector<asr::AlignedWord> aligned_words;
+        {
+            const int max_align_samples = wav.sample_rate * 180;
+            if ((int)wav.samples.size() <= max_align_samples) {
+                std::lock_guard<std::mutex> lock(aligner_mutex_);
+                aligned_words = aligner_engine_.align(
+                    wav.samples.data(), (int)wav.samples.size(),
+                    wav.sample_rate, full_text, "Chinese");
+            } else {
+                // 分段对齐 (150s 段, 留 30s 余量)
+                const int seg_samples = wav.sample_rate * 150;
+                auto all_chars = asr::AlignerEngine::tokenize_for_align(full_text);
+                int total_chars = (int)all_chars.size();
+                int total_samples = (int)wav.samples.size();
+                int num_segs = (total_samples + seg_samples - 1) / seg_samples;
+                int chars_per_seg = (total_chars + num_segs - 1) / num_segs;
+                int char_offset = 0;
+                for (int si = 0; si < num_segs && char_offset < total_chars; ++si) {
+                    int sample_start = si * seg_samples;
+                    int sample_end = std::min(sample_start + seg_samples, total_samples);
+                    int seg_chars = std::min(chars_per_seg, total_chars - char_offset);
+                    std::string seg_text;
+                    for (int ci = char_offset; ci < char_offset + seg_chars; ++ci)
+                        seg_text += all_chars[ci];
+                    int offset_ms = (int)((float)sample_start / wav.sample_rate * 1000);
+                    std::vector<asr::AlignedWord> seg_aligned;
+                    {
+                        std::lock_guard<std::mutex> lock(aligner_mutex_);
+                        seg_aligned = aligner_engine_.align(
+                            wav.samples.data() + sample_start, sample_end - sample_start,
+                            wav.sample_rate, seg_text, "Chinese");
+                    }
+                    for (auto& w : seg_aligned) {
+                        w.start_ms += offset_ms;
+                        w.end_ms += offset_ms;
+                        aligned_words.push_back(w);
+                    }
+                    char_offset += seg_chars;
+                }
+            }
+        }
+
+        fprintf(stderr, "[Serve] v4 Phase 2: %zu words aligned\n", aligned_words.size());
+
+        // Phase 3: Fine-grained VAD + CAM++ → 每 VAD 段说话人 ID
+        struct SpkInterval {
+            int start_ms, end_ms;
+            int speaker_id;
+            std::string speaker_name;
+        };
+        std::vector<SpkInterval> spk_intervals;
+        {
+            std::vector<asr::VadSegment> vad_segments;
+            {
+                std::lock_guard<std::mutex> lock(vad_mutex_);
+                auto& cfg = vad_engine_.mutable_config();
+                int orig_silence = cfg.max_end_silence_time;
+                int orig_segment = cfg.max_single_segment_time;
+                cfg.max_end_silence_time = 300;
+                cfg.max_single_segment_time = 8000;
+                vad_segments = vad_engine_.detect_all(wav.samples.data(), (int)wav.samples.size());
+                cfg.max_end_silence_time = orig_silence;
+                cfg.max_single_segment_time = orig_segment;
+            }
+
+            asr::SpeakerManager diar_spk_mgr;
+
+            for (size_t vi = 0; vi < vad_segments.size(); ++vi) {
+                auto& vseg = vad_segments[vi];
+                if (vseg.pcm.empty() || vseg.end_ms - vseg.start_ms < 200) continue;
+
+                float rms = 0.0f;
+                for (float s : vseg.pcm) rms += s * s;
+                rms = std::sqrt(rms / vseg.pcm.size());
+                if (rms < 0.005f) continue;
+
+                std::vector<float> mel;
+                int num_frames = 0;
+                compute_mel_80(vseg.pcm.data(), (int)vseg.pcm.size(), wav.sample_rate, mel, num_frames);
+                if (num_frames < 10) continue;
+
+                auto embedding = cpu_speaker_encoder_.extract(mel.data(), num_frames);
+                if (embedding.empty()) continue;
+
+                auto spk = diar_spk_mgr.identify(embedding, 0.65f, true);
+
+                SpkInterval si;
+                si.start_ms = vseg.start_ms;
+                si.end_ms = vseg.end_ms;
+                si.speaker_id = spk.speaker_id;
+                si.speaker_name = spk.speaker_id >= 0 ? spk.name : "Unknown";
+                spk_intervals.push_back(si);
+            }
+
+            fprintf(stderr, "[Serve] v4 Phase 3: %zu speaker intervals, %d unique speakers\n",
+                    spk_intervals.size(), diar_spk_mgr.speaker_count());
+        }
+
+        // Phase 4: 每个 aligned word 分配 speaker (时间重叠匹配)
+        for (auto& aw : aligned_words) {
+            if (aw.start_ms < 0) continue;
+            int word_mid_ms = (aw.start_ms + aw.end_ms) / 2;
+            int best_overlap = 0;
+            int best_spk = -1;
+            std::string best_name = "Unknown";
+            for (auto& si : spk_intervals) {
+                // 计算 word [start, end] 与 speaker interval [start, end] 的重叠
+                int overlap_start = std::max(aw.start_ms, si.start_ms);
+                int overlap_end = std::min(aw.end_ms, si.end_ms);
+                int overlap = overlap_end - overlap_start;
+                if (overlap > best_overlap) {
+                    best_overlap = overlap;
+                    best_spk = si.speaker_id;
+                    best_name = si.speaker_name;
+                }
+                // 备选: 中点落在区间内
+                if (overlap <= 0 && word_mid_ms >= si.start_ms && word_mid_ms < si.end_ms &&
+                    best_spk < 0) {
+                    best_spk = si.speaker_id;
+                    best_name = si.speaker_name;
+                }
+            }
+            aw.confidence = (best_spk >= 0) ? 0.9f : 0.3f;
+            // 把 speaker_id 编码到 AlignedWord (复用 confidence 传递是不够的, 需要扩展)
+            // 这里直接构建 WordInfo 结果
+        }
+
+        // Phase 5: 构建输出 — words 数组 + speaker segments
+        // 5a: 构建标注了 speaker 的 word 列表
+        struct WordWithSpeaker {
+            std::string word;
+            int start_ms, end_ms;
+            int speaker_id;
+            std::string speaker_name;
+        };
+        std::vector<WordWithSpeaker> word_list;
+        for (auto& aw : aligned_words) {
+            WordWithSpeaker wws;
+            wws.word = aw.word;
+            wws.start_ms = aw.start_ms;
+            wws.end_ms = aw.end_ms;
+            wws.speaker_id = -1;
+            wws.speaker_name = "Unknown";
+            if (aw.start_ms >= 0) {
+                int word_mid = (aw.start_ms + aw.end_ms) / 2;
+                int best_overlap = 0;
+                for (auto& si : spk_intervals) {
+                    int os = std::max(aw.start_ms, si.start_ms);
+                    int oe = std::min(aw.end_ms, si.end_ms);
+                    int overlap = oe - os;
+                    if (overlap > best_overlap) {
+                        best_overlap = overlap;
+                        wws.speaker_id = si.speaker_id;
+                        wws.speaker_name = si.speaker_name;
+                    }
+                    if (overlap <= 0 && word_mid >= si.start_ms && word_mid < si.end_ms &&
+                        wws.speaker_id < 0) {
+                        wws.speaker_id = si.speaker_id;
+                        wws.speaker_name = si.speaker_name;
+                    }
+                }
+            }
+            word_list.push_back(wws);
+        }
+
+        // 5b: 从 word_list 生成 speaker segments (连续同 speaker 合并)
+        struct V4Segment {
+            int start_ms, end_ms;
+            int speaker_id;
+            std::string speaker_name;
+            std::string text;
+        };
+        std::vector<V4Segment> v4_segments;
+        for (auto& w : word_list) {
+            bool extend = !v4_segments.empty() &&
+                          w.speaker_id == v4_segments.back().speaker_id &&
+                          w.speaker_id >= 0 &&
+                          w.start_ms - v4_segments.back().end_ms <= 2000; // 2s gap tolerance
+            if (extend) {
+                v4_segments.back().end_ms = w.end_ms;
+                v4_segments.back().text += w.word;
+            } else {
+                V4Segment seg;
+                seg.start_ms = w.start_ms;
+                seg.end_ms = w.end_ms;
+                seg.speaker_id = w.speaker_id;
+                seg.speaker_name = w.speaker_name;
+                seg.text = w.word;
+                v4_segments.push_back(std::move(seg));
+            }
+        }
+
+        // 标点恢复 (per segment)
+        if (punctuate) {
+            for (auto& seg : v4_segments)
+                if (!seg.text.empty())
+                    seg.text = punctuation_restorer_.restore(seg.text);
+        }
+
+        fprintf(stderr, "[Serve] v4 Phase 5: %zu segments, %zu words\n",
+                v4_segments.size(), word_list.size());
+
+        // 构建响应
+        HttpResponse resp;
+        std::string out_text;
+        for (auto& seg : v4_segments) out_text += seg.text;
+
+        if (response_format == "text") {
+            resp.content_type = "text/plain";
+            for (auto& seg : v4_segments) {
+                resp.body += "[" + seg.speaker_name + "] " + seg.text + "\n";
+            }
+        } else if (response_format == "verbose_json") {
+            resp.body = "{\"task\":\"transcribe\",\"language\":\"" + json_escape(language) +
+                        "\",\"duration\":" + std::to_string(total_duration_s) +
+                        ",\"text\":\"" + json_escape(out_text) + "\"";
+            // words
+            resp.body += ",\"words\":[";
+            for (size_t i = 0; i < word_list.size(); ++i) {
+                auto& w = word_list[i];
+                if (i > 0) resp.body += ",";
+                resp.body += "{\"word\":\"" + json_escape(w.word) +
+                             "\",\"start\":" + std::to_string(w.start_ms / 1000.0f) +
+                             ",\"end\":" + std::to_string(w.end_ms / 1000.0f) +
+                             ",\"speaker\":\"" + json_escape(w.speaker_name) + "\"}";
+            }
+            resp.body += "]";
+            // segments
+            resp.body += ",\"segments\":[";
+            for (size_t i = 0; i < v4_segments.size(); ++i) {
+                auto& s = v4_segments[i];
+                if (i > 0) resp.body += ",";
+                resp.body += "{\"start\":" + std::to_string(s.start_ms / 1000.0f) +
+                             ",\"end\":" + std::to_string(s.end_ms / 1000.0f) +
+                             ",\"text\":\"" + json_escape(s.text) +
+                             "\",\"speaker\":\"" + json_escape(s.speaker_name) +
+                             "\",\"speaker_id\":" + std::to_string(s.speaker_id) + "}";
+            }
+            resp.body += "]}";
+        } else {
+            resp.body = "{\"text\":\"" + json_escape(out_text) + "\"";
+            resp.body += ",\"segments\":[";
+            for (size_t i = 0; i < v4_segments.size(); ++i) {
+                auto& s = v4_segments[i];
+                if (i > 0) resp.body += ",";
+                resp.body += "{\"start\":" + std::to_string(s.start_ms / 1000.0f) +
+                             ",\"end\":" + std::to_string(s.end_ms / 1000.0f) +
+                             ",\"text\":\"" + json_escape(s.text) +
+                             "\",\"speaker\":\"" + json_escape(s.speaker_name) + "\"}";
+            }
+            resp.body += "]}";
+        }
+
+        send_response(client_fd, resp);
+        close(client_fd);
+        return;
+    }
 
     // ========================================================================
     // 说话人分割模式 (v2): Speaker-first pipeline
@@ -4237,6 +4617,75 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
         result.text_with_punc = punctuation_restorer_.restore(result.text);
     }
 
+    // 强制对齐: 获取字级时间戳
+    std::vector<asr::AlignedWord> aligned_words;
+    if (want_word_timestamps && aligner_engine_.is_loaded() && !result.text.empty() && parsed_pcm) {
+        // ForcedAligner 限制 ~180s, 超长音频按段对齐
+        const int max_align_samples = wav_plain.sample_rate * 180;
+        if ((int)wav_plain.samples.size() <= max_align_samples) {
+            // 短音频: 整段对齐
+            std::lock_guard<std::mutex> lock(aligner_mutex_);
+            aligned_words = aligner_engine_.align(
+                wav_plain.samples.data(), (int)wav_plain.samples.size(),
+                wav_plain.sample_rate, result.text, "Chinese");
+            fprintf(stderr, "[Serve] ForcedAligner: %zu words aligned from %.1fs audio\n",
+                    aligned_words.size(), audio_duration_s);
+        } else {
+            // 长音频: 按 150s 段切分对齐 (留 30s 余量)
+            const int seg_samples = wav_plain.sample_rate * 150;
+            // 先按字分割文本, 然后按比例分配到音频段
+            auto all_chars = asr::AlignerEngine::tokenize_for_align(result.text);
+            int total_chars = (int)all_chars.size();
+            int total_samples = (int)wav_plain.samples.size();
+            int num_segs = (total_samples + seg_samples - 1) / seg_samples;
+            int chars_per_seg = (total_chars + num_segs - 1) / num_segs;
+
+            int char_offset = 0;
+            for (int si = 0; si < num_segs && char_offset < total_chars; ++si) {
+                int sample_start = si * seg_samples;
+                int sample_end = std::min(sample_start + seg_samples, total_samples);
+                int seg_chars = std::min(chars_per_seg, total_chars - char_offset);
+
+                // 重建该段文本
+                std::string seg_text;
+                for (int ci = char_offset; ci < char_offset + seg_chars; ++ci)
+                    seg_text += all_chars[ci];
+
+                float offset_s = (float)sample_start / wav_plain.sample_rate;
+                int offset_ms = (int)(offset_s * 1000);
+
+                std::vector<asr::AlignedWord> seg_aligned;
+                {
+                    std::lock_guard<std::mutex> lock(aligner_mutex_);
+                    seg_aligned = aligner_engine_.align(
+                        wav_plain.samples.data() + sample_start,
+                        sample_end - sample_start,
+                        wav_plain.sample_rate, seg_text, "Chinese");
+                }
+
+                // 加上时间偏移
+                for (auto& w : seg_aligned) {
+                    w.start_ms += offset_ms;
+                    w.end_ms += offset_ms;
+                    aligned_words.push_back(w);
+                }
+
+                char_offset += seg_chars;
+            }
+            fprintf(stderr, "[Serve] ForcedAligner: %zu words aligned from %.1fs audio (%d segments)\n",
+                    aligned_words.size(), audio_duration_s, num_segs);
+        }
+
+        // 填充 result.words
+        result.words.resize(aligned_words.size());
+        for (size_t i = 0; i < aligned_words.size(); ++i) {
+            result.words[i].word = aligned_words[i].word;
+            result.words[i].start_ms = aligned_words[i].start_ms;
+            result.words[i].end_ms = aligned_words[i].end_ms;
+            result.words[i].confidence = aligned_words[i].confidence;
+        }
+    }
+
     // 说话人识别 (对整段音频做识别, 无 VAD 分割)
     std::string speaker_name;
     int speaker_id = -1;
@@ -4272,6 +4721,17 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             resp.body += ",\"speaker\":\"" + json_escape(speaker_name) +
                          "\",\"speaker_id\":" + std::to_string(speaker_id) +
                          ",\"speaker_similarity\":" + std::to_string(speaker_sim);
+        if (!result.words.empty()) {
+            resp.body += ",\"words\":[";
+            for (size_t i = 0; i < result.words.size(); ++i) {
+                auto& w = result.words[i];
+                if (i > 0) resp.body += ",";
+                resp.body += "{\"word\":\"" + json_escape(w.word) +
+                             "\",\"start\":" + std::to_string(w.start_ms / 1000.0f) +
+                             ",\"end\":" + std::to_string(w.end_ms / 1000.0f) + "}";
+            }
+            resp.body += "]";
+        }
         resp.body += "}";
     } else {
         // 默认 json
@@ -4280,6 +4740,17 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
         ) + "\"";
         if (speaker_id >= 0)
             resp.body += ",\"speaker\":\"" + json_escape(speaker_name) + "\"";
+        if (!result.words.empty()) {
+            resp.body += ",\"words\":[";
+            for (size_t i = 0; i < result.words.size(); ++i) {
+                auto& w = result.words[i];
+                if (i > 0) resp.body += ",";
+                resp.body += "{\"word\":\"" + json_escape(w.word) +
+                             "\",\"start\":" + std::to_string(w.start_ms / 1000.0f) +
+                             ",\"end\":" + std::to_string(w.end_ms / 1000.0f) + "}";
+            }
+            resp.body += "]";
+        }
         resp.body += "}";
     }
 
