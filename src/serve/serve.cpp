@@ -4555,6 +4555,43 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             }
         }
 
+        // ================================================================
+        // Phase 6.5: 说话人时序平滑 (P1) — 消除噪声 speaker island
+        // ================================================================
+        // 规则: 若某 segment 时长 < 5s 且被相同 speaker 前后包围 → 合并到前后
+        // 目的: 消除极短的说话人片段 (通常是噪声或识别错误)
+        // 示例: [Speaker_0: 30s] → [Speaker_3: 1.5s] → [Speaker_0: 40s]
+        //       变为: [Speaker_0: 71.5s]
+        {
+            std::vector<V4Segment> smoothed;
+            int island_merged = 0;
+
+            for (size_t i = 0; i < v4_segments.size(); ++i) {
+                auto& seg = v4_segments[i];
+                int dur_ms = seg.end_ms - seg.start_ms;
+
+                // 检查: 是否为短 segment (<5s) 且前后被同一 speaker 包围?
+                bool is_island = dur_ms < 5000 && seg.speaker_id >= 0 &&
+                                 !smoothed.empty() && i + 1 < v4_segments.size();
+                bool prev_same = is_island && smoothed.back().speaker_id == seg.speaker_id;
+                bool next_same = is_island && v4_segments[i+1].speaker_id == seg.speaker_id;
+
+                if (prev_same && next_same) {
+                    // 前后都是相同 speaker — 合并到前一段
+                    smoothed.back().end_ms = std::max(smoothed.back().end_ms, seg.end_ms);
+                    smoothed.back().text += seg.text;
+                    ++island_merged;
+                } else {
+                    smoothed.push_back(seg);
+                }
+            }
+
+            if (island_merged > 0) {
+                fprintf(stderr, "[Serve] v4 Phase 6.5: smoothed %d speaker islands\n", island_merged);
+            }
+            v4_segments = std::move(smoothed);
+        }
+
         fprintf(stderr, "[Serve] v4 pipeline done: %zu segments, %zu words, total %.1fs\n",
                 v4_segments.size(), word_list.size(),
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - v4_t0).count());
