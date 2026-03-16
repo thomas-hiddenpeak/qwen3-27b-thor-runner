@@ -1509,11 +1509,6 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
                 fprintf(stderr, "[Serve] Speaker encoder loaded: CAM++ (%s)\n",
                         speaker_model_path.c_str());
 
-                // Also load CPU version for diarization (GPU version has embedding quality issues)
-                if (cpu_speaker_encoder_.load(speaker_model_path)) {
-                    fprintf(stderr, "[Serve] CPU speaker encoder loaded for diarization\n");
-                }
-
                 // 加载 FSMN-VAD 引擎 (用于文件转写说话人分割)
                 std::string vad_model_dir = "/home/rm01/models/dev/asr/fsmn_vad";
                 const char* env_vad = getenv("QWEN_VAD_MODEL");
@@ -3884,6 +3879,9 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
         fprintf(stderr, "[Serve] v4 pipeline: audio %.1fs, %zu samples\n",
                 total_duration_s, wav.samples.size());
 
+        auto v4_t0 = std::chrono::steady_clock::now();
+        auto phase_t0 = v4_t0;
+
         // Phase 1b: 整段 ASR (≤100s 分段, plain mode)
         std::string full_text;
         if (total_duration_s > 100.0f) {
@@ -3949,7 +3947,10 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             return;
         }
 
-        fprintf(stderr, "[Serve] v4 Phase 1: ASR text = %zu chars\n", full_text.size());
+        fprintf(stderr, "[Serve] v4 Phase 1: ASR text = %zu chars (%.1fs)\n",
+                full_text.size(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - phase_t0).count());
+        phase_t0 = std::chrono::steady_clock::now();
 
         // Phase 2: ForcedAligner → 字级时间戳
         std::vector<asr::AlignedWord> aligned_words;
@@ -3994,7 +3995,10 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             }
         }
 
-        fprintf(stderr, "[Serve] v4 Phase 2: %zu words aligned\n", aligned_words.size());
+        fprintf(stderr, "[Serve] v4 Phase 2: %zu words aligned (%.1fs)\n",
+                aligned_words.size(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - phase_t0).count());
+        phase_t0 = std::chrono::steady_clock::now();
 
         // Phase 3: Fine-grained VAD + CAM++ → 每 VAD 段说话人 ID
         struct SpkInterval {
@@ -4019,35 +4023,39 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
 
             asr::SpeakerManager diar_spk_mgr;
 
-            for (size_t vi = 0; vi < vad_segments.size(); ++vi) {
-                auto& vseg = vad_segments[vi];
-                if (vseg.pcm.empty() || vseg.end_ms - vseg.start_ms < 200) continue;
+            {
+                std::lock_guard<std::mutex> spk_lock(speaker_mutex_);
+                for (size_t vi = 0; vi < vad_segments.size(); ++vi) {
+                    auto& vseg = vad_segments[vi];
+                    if (vseg.pcm.empty() || vseg.end_ms - vseg.start_ms < 200) continue;
 
-                float rms = 0.0f;
-                for (float s : vseg.pcm) rms += s * s;
-                rms = std::sqrt(rms / vseg.pcm.size());
-                if (rms < 0.005f) continue;
+                    float rms = 0.0f;
+                    for (float s : vseg.pcm) rms += s * s;
+                    rms = std::sqrt(rms / vseg.pcm.size());
+                    if (rms < 0.005f) continue;
 
-                std::vector<float> mel;
-                int num_frames = 0;
-                compute_mel_80(vseg.pcm.data(), (int)vseg.pcm.size(), wav.sample_rate, mel, num_frames);
-                if (num_frames < 10) continue;
+                    std::vector<float> mel;
+                    int num_frames = 0;
+                    compute_mel_80(vseg.pcm.data(), (int)vseg.pcm.size(), wav.sample_rate, mel, num_frames);
+                    if (num_frames < 10) continue;
 
-                auto embedding = cpu_speaker_encoder_.extract(mel.data(), num_frames);
-                if (embedding.empty()) continue;
+                    auto embedding = speaker_encoder_->extract(mel.data(), num_frames);
+                    if (embedding.empty()) continue;
 
-                auto spk = diar_spk_mgr.identify(embedding, 0.65f, true);
+                    auto spk = diar_spk_mgr.identify(embedding, 0.65f, true);
 
-                SpkInterval si;
-                si.start_ms = vseg.start_ms;
-                si.end_ms = vseg.end_ms;
-                si.speaker_id = spk.speaker_id;
-                si.speaker_name = spk.speaker_id >= 0 ? spk.name : "Unknown";
-                spk_intervals.push_back(si);
+                    SpkInterval si;
+                    si.start_ms = vseg.start_ms;
+                    si.end_ms = vseg.end_ms;
+                    si.speaker_id = spk.speaker_id;
+                    si.speaker_name = spk.speaker_id >= 0 ? spk.name : "Unknown";
+                    spk_intervals.push_back(si);
+                }
             }
 
-            fprintf(stderr, "[Serve] v4 Phase 3: %zu speaker intervals, %d unique speakers\n",
-                    spk_intervals.size(), diar_spk_mgr.speaker_count());
+            fprintf(stderr, "[Serve] v4 Phase 3: %zu speaker intervals, %d unique speakers (%.1fs)\n",
+                    spk_intervals.size(), diar_spk_mgr.speaker_count(),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - phase_t0).count());
         }
 
         // Phase 4: 每个 aligned word 分配 speaker (时间重叠匹配)
@@ -4151,8 +4159,9 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                     seg.text = punctuation_restorer_.restore(seg.text);
         }
 
-        fprintf(stderr, "[Serve] v4 Phase 5: %zu segments, %zu words\n",
-                v4_segments.size(), word_list.size());
+        fprintf(stderr, "[Serve] v4 pipeline done: %zu segments, %zu words, total %.1fs\n",
+                v4_segments.size(), word_list.size(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - v4_t0).count());
 
         // 构建响应
         HttpResponse resp;
@@ -4283,13 +4292,17 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             ss.end_ms = vseg.end_ms;
             ss.vad_index = vi;
 
-            // Extract embedding using CPU encoder (GPU version has quality issues)
+            // Extract embedding using GPU encoder
             std::vector<float> mel;
             int num_frames = 0;
             compute_mel_80(vseg.pcm.data(), (int)vseg.pcm.size(), wav.sample_rate, mel, num_frames);
             if (num_frames < 10) continue;
 
-            auto embedding = cpu_speaker_encoder_.extract(mel.data(), num_frames);
+            std::vector<float> embedding;
+            {
+                std::lock_guard<std::mutex> spk_lock(speaker_mutex_);
+                embedding = speaker_encoder_->extract(mel.data(), num_frames);
+            }
             if (embedding.empty()) continue;
 
             auto spk = diar_spk_mgr.identify(embedding, 0.65f, true);

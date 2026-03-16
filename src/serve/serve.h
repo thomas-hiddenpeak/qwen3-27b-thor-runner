@@ -260,7 +260,6 @@ private:
 
     // 说话人识别 (CAM++ + SpeakerManager)
     std::unique_ptr<asr::GpuSpeakerEncoder> speaker_encoder_;
-    asr::CamPlusSpeakerEncoder cpu_speaker_encoder_;  // CPU 版本用于 diarization
     asr::SpeakerManager speaker_manager_;
     std::mutex speaker_mutex_;  // 保护 speaker_encoder_ + speaker_manager_
 

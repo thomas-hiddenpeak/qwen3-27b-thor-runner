@@ -248,6 +248,8 @@ void ScratchPool::free() {
 GpuSpeakerEncoder::GpuSpeakerEncoder() = default;
 
 GpuSpeakerEncoder::~GpuSpeakerEncoder() {
+    scratch_.free();
+    if (stream_) cudaStreamDestroy(stream_);
     if (cublas_) cublasDestroy(cublas_);
     for (auto& kv : gpu_tensors_) {
         if (kv.second) cudaFree(kv.second);
@@ -280,8 +282,31 @@ bool GpuSpeakerEncoder::load(const std::string& safetensors_path) {
     }
 
     loaded_ = true;
-    fprintf(stderr, "[SpeakerGPU] CAM++ loaded to GPU: %zu tensors, %.1f MB\n",
-            gpu_tensors_.size(), total_bytes / (1024.0f * 1024.0f));
+
+    // Create persistent stream + pre-allocate scratch for typical VAD segments (≤10s → ~1000 frames)
+    cudaStreamCreate(&stream_);
+    ensure_scratch(1000);
+
+    fprintf(stderr, "[SpeakerGPU] CAM++ loaded to GPU: %zu tensors, %.1f MB, scratch %.1f MB\n",
+            gpu_tensors_.size(), total_bytes / (1024.0f * 1024.0f),
+            scratch_.total_bytes / (1024.0f * 1024.0f));
+    return true;
+}
+
+// Ensure scratch pool is large enough for T frames (auto-grow, never shrink)
+bool GpuSpeakerEncoder::ensure_scratch(int T) {
+    if (T <= scratch_max_T_) return true;  // already large enough
+    scratch_.free();
+    int T2 = (T + 2*2 - 1*(5-1) - 1) / 2 + 1;
+    int max_fcm_spatial = 32 * 80 * T;
+    int max_block_spatial = 1024 * T2;
+    int max_spatial = std::max(max_fcm_spatial, max_block_spatial);
+    if (!scratch_.alloc(std::max(T, T2), max_spatial)) {
+        fprintf(stderr, "[SpeakerGPU] scratch realloc failed for T=%d\n", T);
+        scratch_max_T_ = 0;
+        return false;
+    }
+    scratch_max_T_ = T;
     return true;
 }
 
@@ -350,26 +375,20 @@ void GpuSpeakerEncoder::gpu_res_block(const float* d_input, float* d_output,
 std::vector<float> GpuSpeakerEncoder::extract(const float* mel_80xT, int T) {
     if (!loaded_ || T < 10) return {};
 
-    // Create a dedicated stream to avoid interference with the main inference engine
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
+    // Ensure persistent scratch is large enough (auto-grows if needed)
+    if (!ensure_scratch(T)) return {};
 
-    // Ensure cuBLAS uses the same stream as our kernels
-    cublasSetStream(cublas_, stream);
+    // Use persistent stream_
+    cublasSetStream(cublas_, stream_);
 
     // Compute dimensions
     int T2 = (T + 2*2 - 1*(5-1) - 1) / 2 + 1;  // after TDNN stride=2
 
-    // Allocate scratch pool
-    int max_fcm_spatial = 32 * 80 * T;     // FCM conv1 output
-    int max_block_spatial = 1024 * T2;     // Block2 max concat
-    int max_spatial = std::max(max_fcm_spatial, max_block_spatial);
+    // Reset concat buffer index for this call
+    scratch_.which_concat = 0;
 
-    ScratchPool sp;
-    if (!sp.alloc(std::max(T, T2), max_spatial)) {
-        fprintf(stderr, "[SpeakerGPU] scratch alloc failed\n");
-        return {};
-    }
+    // Reference persistent scratch
+    ScratchPool& sp = scratch_;
 
 
     // 1. Transpose mel [T, 80] → [80, T] and upload
@@ -380,17 +399,17 @@ std::vector<float> GpuSpeakerEncoder::extract(const float* mel_80xT, int T) {
 
     // Use sp.a as input buffer
     float* d_x = sp.a;
-    cudaMemcpyAsync(d_x, transposed.data(), 80 * T * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_x, transposed.data(), 80 * T * sizeof(float), cudaMemcpyHostToDevice, stream_);
 
     // ======================== FCM ========================
     // conv1: [1, 80, T] → [32, 80, T]
     int H = 80;
     int conv1_size = 32 * H * T;
     float* d_fcm = sp.b;  // FCM output goes to b
-    conv2d_kernel<<<div_ceil(conv1_size, BLOCK), BLOCK, 0, stream>>>(
+    conv2d_kernel<<<div_ceil(conv1_size, BLOCK), BLOCK, 0, stream_>>>(
         d_x, get_gpu("head.conv1.weight"), d_fcm,
         1, H, T, 32, H, T, 3, 1, 1, 1, 1);
-    bn_relu_kernel<<<div_ceil(conv1_size, BLOCK), BLOCK, 0, stream>>>(
+    bn_relu_kernel<<<div_ceil(conv1_size, BLOCK), BLOCK, 0, stream_>>>(
         d_fcm, d_fcm,
         get_gpu("head.bn1.weight"), get_gpu("head.bn1.bias"),
         get_gpu("head.bn1.running_mean"), get_gpu("head.bn1.running_var"),
@@ -398,26 +417,26 @@ std::vector<float> GpuSpeakerEncoder::extract(const float* mel_80xT, int T) {
 
     // layer1[0]: stride=2 → H: 80→40
     // Input: d_fcm (sp.b), output: d_x (sp.a), scratch: sp.c, sp.d
-    gpu_res_block(d_fcm, d_x, 32, H, T, "head.layer1.0", 2, sp.c, sp.d, stream);
+    gpu_res_block(d_fcm, d_x, 32, H, T, "head.layer1.0", 2, sp.c, sp.d, stream_);
     H = (H + 2 - 3) / 2 + 1;  // = 40
 
     // layer1[1]: stride=1
-    gpu_res_block(d_x, d_fcm, 32, H, T, "head.layer1.1", 1, sp.c, sp.d, stream);
+    gpu_res_block(d_x, d_fcm, 32, H, T, "head.layer1.1", 1, sp.c, sp.d, stream_);
 
     // layer2[0]: stride=2 → H: 40→20
-    gpu_res_block(d_fcm, d_x, 32, H, T, "head.layer2.0", 2, sp.c, sp.d, stream);
+    gpu_res_block(d_fcm, d_x, 32, H, T, "head.layer2.0", 2, sp.c, sp.d, stream_);
     H = (H + 2 - 3) / 2 + 1;  // = 20
 
     // layer2[1]: stride=1
-    gpu_res_block(d_x, d_fcm, 32, H, T, "head.layer2.1", 1, sp.c, sp.d, stream);
+    gpu_res_block(d_x, d_fcm, 32, H, T, "head.layer2.1", 1, sp.c, sp.d, stream_);
 
     // conv2: stride_h=2 → H: 20→10
     int H2 = (H + 2 - 3) / 2 + 1;  // = 10
     int conv2_size = 32 * H2 * T;
-    conv2d_kernel<<<div_ceil(conv2_size, BLOCK), BLOCK, 0, stream>>>(
+    conv2d_kernel<<<div_ceil(conv2_size, BLOCK), BLOCK, 0, stream_>>>(
         d_fcm, get_gpu("head.conv2.weight"), d_x,
         32, H, T, 32, H2, T, 3, 2, 1, 1, 1);
-    bn_relu_kernel<<<div_ceil(conv2_size, BLOCK), BLOCK, 0, stream>>>(
+    bn_relu_kernel<<<div_ceil(conv2_size, BLOCK), BLOCK, 0, stream_>>>(
         d_x, d_x,
         get_gpu("head.bn2.weight"), get_gpu("head.bn2.bias"),
         get_gpu("head.bn2.running_mean"), get_gpu("head.bn2.running_var"),
@@ -430,10 +449,10 @@ std::vector<float> GpuSpeakerEncoder::extract(const float* mel_80xT, int T) {
     // Conv1d(320→128, k=5, s=2, p=2)
     int tdnn_size = 128 * T2;
     float* d_tdnn = sp.b;
-    conv1d_kernel<<<div_ceil(tdnn_size, BLOCK), BLOCK, 0, stream>>>(
+    conv1d_kernel<<<div_ceil(tdnn_size, BLOCK), BLOCK, 0, stream_>>>(
         d_x, get_gpu("xvector.tdnn.linear.weight"), get_gpu("xvector.tdnn.linear.bias"),
         d_tdnn, feat_dim, T, 128, T2, 5, 2, 2, 1);
-    bn_relu_kernel<<<div_ceil(tdnn_size, BLOCK), BLOCK, 0, stream>>>(
+    bn_relu_kernel<<<div_ceil(tdnn_size, BLOCK), BLOCK, 0, stream_>>>(
         d_tdnn, d_tdnn,
         get_gpu("xvector.tdnn.nonlinear.batchnorm.weight"),
         get_gpu("xvector.tdnn.nonlinear.batchnorm.bias"),
@@ -443,40 +462,40 @@ std::vector<float> GpuSpeakerEncoder::extract(const float* mel_80xT, int T) {
 
     // Copy TDNN output into concat buffer 0
     cudaMemcpyAsync(sp.cur_concat(), d_tdnn, 128 * T2 * sizeof(float),
-                    cudaMemcpyDeviceToDevice, stream);
+                    cudaMemcpyDeviceToDevice, stream_);
 
     // ======================== DenseTDNN Blocks ========================
     int cur_dim = 128;
 
     // Block 1: 12 layers, dilation=1
-    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block1", 12, 1, stream);
+    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block1", 12, 1, stream_);
     cur_dim += 12 * 32;  // = 512
 
     // Transit 1: BN → ReLU → Conv1d(512→256)
-    gpu_transit(sp, cur_dim, T2, "xvector.transit1", cur_dim / 2, stream);
+    gpu_transit(sp, cur_dim, T2, "xvector.transit1", cur_dim / 2, stream_);
     cur_dim /= 2;  // = 256
 
     // Block 2: 24 layers, dilation=2
-    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block2", 24, 2, stream);
+    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block2", 24, 2, stream_);
     cur_dim += 24 * 32;  // = 1024
 
     // Transit 2
-    gpu_transit(sp, cur_dim, T2, "xvector.transit2", cur_dim / 2, stream);
+    gpu_transit(sp, cur_dim, T2, "xvector.transit2", cur_dim / 2, stream_);
     cur_dim /= 2;  // = 512
 
     // Block 3: 16 layers, dilation=2
-    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block3", 16, 2, stream);
+    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block3", 16, 2, stream_);
     cur_dim += 16 * 32;  // = 1024
 
     // Transit 3
-    gpu_transit(sp, cur_dim, T2, "xvector.transit3", cur_dim / 2, stream);
+    gpu_transit(sp, cur_dim, T2, "xvector.transit3", cur_dim / 2, stream_);
     cur_dim /= 2;  // = 512
 
     // ======================== Out nonlinear: BN + ReLU ========================
     int embed_channels = cur_dim;  // 512
     float* d_final = sp.cur_concat();
     int out_size = embed_channels * T2;
-    bn_relu_kernel<<<div_ceil(out_size, BLOCK), BLOCK, 0, stream>>>(
+    bn_relu_kernel<<<div_ceil(out_size, BLOCK), BLOCK, 0, stream_>>>(
         d_final, d_final,
         get_gpu("xvector.out_nonlinear.batchnorm.weight"),
         get_gpu("xvector.out_nonlinear.batchnorm.bias"),
@@ -486,7 +505,7 @@ std::vector<float> GpuSpeakerEncoder::extract(const float* mel_80xT, int T) {
 
     // ======================== StatsPool ========================
     float* d_pooled = sp.a;  // reuse scratch.a
-    stats_pool_kernel<<<div_ceil(embed_channels, BLOCK), BLOCK, 0, stream>>>(
+    stats_pool_kernel<<<div_ceil(embed_channels, BLOCK), BLOCK, 0, stream_>>>(
         d_final, d_pooled, embed_channels, T2);
 
     // ======================== Dense: GEMV(1024→192) ========================
@@ -502,22 +521,20 @@ std::vector<float> GpuSpeakerEncoder::extract(const float* mel_80xT, int T) {
     }
 
     // BN (no affine)
-    bn_no_affine_kernel<<<1, BLOCK, 0, stream>>>(
+    bn_no_affine_kernel<<<1, BLOCK, 0, stream_>>>(
         d_emb, d_emb,
         get_gpu("xvector.dense.nonlinear.batchnorm.running_mean"),
         get_gpu("xvector.dense.nonlinear.batchnorm.running_var"),
         emb_size);
 
     // L2 normalize
-    l2_normalize_kernel<<<1, 1, 0, stream>>>(d_emb, emb_size);
+    l2_normalize_kernel<<<1, 1, 0, stream_>>>(d_emb, emb_size);
 
     // Copy result back
-    cudaStreamSynchronize(stream);
+    cudaStreamSynchronize(stream_);
     std::vector<float> result(emb_size);
     cudaMemcpy(result.data(), d_emb, emb_size * sizeof(float), cudaMemcpyDeviceToHost);
 
-    sp.free();
-    cudaStreamDestroy(stream);
     return result;
 }
 

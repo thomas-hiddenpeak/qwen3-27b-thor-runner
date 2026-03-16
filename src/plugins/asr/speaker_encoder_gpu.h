@@ -72,6 +72,14 @@ private:
     cublasHandle_t cublas_ = nullptr;
     bool loaded_ = false;
 
+    // Persistent resources (avoid per-call alloc/free)
+    ScratchPool scratch_;
+    cudaStream_t stream_ = nullptr;
+    int scratch_max_T_ = 0;
+
+    // Ensure scratch is large enough for T frames
+    bool ensure_scratch(int T);
+
     const float* get_gpu(const std::string& name) const;
     TensorMap load_safetensors(const std::string& path);
 

@@ -347,11 +347,11 @@ private:
 
     std::string read_line(int timeout_ms) {
         std::string line;
-        char buf[1];
-        int elapsed = 0;
+        char buf[4096];
+        int idle_ms = 0;
         const int poll_interval = 10;
 
-        while (elapsed < timeout_ms) {
+        while (idle_ms < timeout_ms) {
             fd_set fds;
             FD_ZERO(&fds);
             FD_SET(from_child_, &fds);
@@ -361,14 +361,19 @@ private:
 
             int ret = select(from_child_ + 1, &fds, nullptr, nullptr, &tv);
             if (ret > 0 && FD_ISSET(from_child_, &fds)) {
-                ssize_t n = read(from_child_, buf, 1);
+                ssize_t n = ::read(from_child_, buf, sizeof(buf));
                 if (n <= 0) return "";
-                if (buf[0] == '\n') return line;
-                line += buf[0];
+                idle_ms = 0;  // 收到数据, 重置空闲计时器
+                for (ssize_t i = 0; i < n; ++i) {
+                    if (buf[i] == '\n') return line;
+                    line += buf[i];
+                }
             } else if (ret < 0) {
+                if (errno == EINTR) continue;
                 return "";
+            } else {
+                idle_ms += poll_interval;  // 仅在真正空闲时累加
             }
-            elapsed += poll_interval;
         }
         return "";
     }
