@@ -4038,34 +4038,35 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
 
             asr::SpeakerManager diar_spk_mgr;
 
-            {
-                std::lock_guard<std::mutex> spk_lock(speaker_mutex_);
-                for (size_t vi = 0; vi < vad_segments.size(); ++vi) {
-                    auto& vseg = vad_segments[vi];
-                    if (vseg.pcm.empty() || vseg.end_ms - vseg.start_ms < 200) continue;
+            for (size_t vi = 0; vi < vad_segments.size(); ++vi) {
+                auto& vseg = vad_segments[vi];
+                if (vseg.pcm.empty() || vseg.end_ms - vseg.start_ms < 200) continue;
 
-                    float rms = 0.0f;
-                    for (float s : vseg.pcm) rms += s * s;
-                    rms = std::sqrt(rms / vseg.pcm.size());
-                    if (rms < 0.005f) continue;
+                float rms = 0.0f;
+                for (float s : vseg.pcm) rms += s * s;
+                rms = std::sqrt(rms / vseg.pcm.size());
+                if (rms < 0.005f) continue;
 
-                    std::vector<float> mel;
-                    int num_frames = 0;
-                    compute_mel_80(vseg.pcm.data(), (int)vseg.pcm.size(), wav.sample_rate, mel, num_frames);
-                    if (num_frames < 10) continue;
+                std::vector<float> mel;
+                int num_frames = 0;
+                compute_mel_80(vseg.pcm.data(), (int)vseg.pcm.size(), wav.sample_rate, mel, num_frames);
+                if (num_frames < 10) continue;
 
-                    auto embedding = speaker_encoder_->extract(mel.data(), num_frames);
-                    if (embedding.empty()) continue;
-
-                    auto spk = diar_spk_mgr.identify(embedding, 0.65f, true);
-
-                    SpkInterval si;
-                    si.start_ms = vseg.start_ms;
-                    si.end_ms = vseg.end_ms;
-                    si.speaker_id = spk.speaker_id;
-                    si.speaker_name = spk.speaker_id >= 0 ? spk.name : "Unknown";
-                    spk_intervals.push_back(si);
+                std::vector<float> embedding;
+                {
+                    std::lock_guard<std::mutex> spk_lock(speaker_mutex_);
+                    embedding = speaker_encoder_->extract(mel.data(), num_frames);
                 }
+                if (embedding.empty()) continue;
+
+                auto spk = diar_spk_mgr.identify(embedding, 0.65f, true);
+
+                SpkInterval si;
+                si.start_ms = vseg.start_ms;
+                si.end_ms = vseg.end_ms;
+                si.speaker_id = spk.speaker_id;
+                si.speaker_name = spk.speaker_id >= 0 ? spk.name : "Unknown";
+                spk_intervals.push_back(si);
             }
 
             fprintf(stderr, "[Serve] v4 Phase 3: %zu speaker intervals, %d unique speakers (%.1fs)\n",

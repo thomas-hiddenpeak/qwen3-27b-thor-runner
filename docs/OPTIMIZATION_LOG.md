@@ -5115,4 +5115,66 @@ Decode 无影响: P=17 47.1 tok/s, P=2048 15.7 tok/s (与基线一致).
 总增量: max_tokens=2048 时 ~8 MB, 对 128 GB 系统无影响.
 
 **文件**: `src/engine/light_ops.cu`, `src/engine/light_ops.h`,
+
+---
+
+## ASR V4 优化验证与下一阶段 (2026-03-16)
+
+### 质量回归验证（真实场景）
+
+测试音频: `tests/assets/asrTest.m4a`（748s，多人讨论）
+
+- 并行前基线输出: `tmp/asr_baseline.json`
+- 并行后输出: `tmp/asr_current2.json`
+- 质量对比结果: `tmp/asr_quality_regression_check.txt`
+
+结果:
+- 文本长度: 2265 vs 2265
+- 文本相似度: **1.000000**
+- 段数: 22 vs 22
+- 说话人集合: `Speaker_0..3` 一致
+
+结论: **无质量回退**（文本与说话人分配保持一致）。
+
+### 下一阶段优化：Phase 3 缩小 speaker 锁粒度
+
+优化目标:
+- 减少 `speaker_mutex_` 临界区，提升并发请求下的可扩展性。
+- 保持算法逻辑不变，不改变输出语义。
+
+改动:
+- 原实现: 整个 VAD segment 循环都在 `speaker_mutex_` 内（含 RMS、Mel 计算、本地聚类）。
+- 新实现: 仅 `speaker_encoder_->extract()` 在 `speaker_mutex_` 内，
+  其余 CPU 预处理与 `diar_spk_mgr.identify()` 移到锁外。
+
+代码位置:
+- `src/serve/serve.cpp`（v4 pipeline Phase 3）
+
+### 实测（同参数）
+
+请求参数: `speaker=true`, `timestamp_granularities[]=word`, `clean=true`
+
+- 优化前总耗时: `tmp/asr_current2_time.txt` → 127s
+- 优化后总耗时: `tmp/asr_current3_time.txt` → 128s
+- 优化后复测: `tmp/asr_current3_b_time.txt` → 128s
+
+Phase 日志（优化后）:
+- `v4 Phase 3`: 29.9s
+- `v4 Phase 2+3 parallel`: 29.9s
+- `v4 pipeline done`: 126.3s
+
+说明:
+- 单请求端到端耗时变化在噪声范围内（~1s）。
+- 该优化的主要收益预期在**并发场景**（减少锁竞争），非单请求绝对延迟。
+
+### 稳定性补充
+
+同版本双跑对比（`tmp/asr_current3.json` vs `tmp/asr_current3_b.json`）:
+- 文本相似度: **1.000000**
+- 文本完全一致: true
+- 段数/说话人集合一致
+
+报告: `tmp/asr_quality_stability_check.txt`
+
+**文件**: `src/serve/serve.cpp`, `docs/OPTIMIZATION_LOG.md`
 `src/engine/layer.cu`, `src/engine/layer.h`
