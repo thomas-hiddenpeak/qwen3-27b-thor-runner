@@ -23,7 +23,10 @@ __global__ void preemphasis_kernel(const float* __restrict__ pcm,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_samples) return;
     float prev = (i > 0) ? pcm[i - 1] : 0.0f;
-    out[i] = scale * (pcm[i] - coeff * prev);
+    float val = pcm[i] - coeff * prev;
+    // 首样本: 匹配 CPU compute_mel_80 的 scaled[0] *= (1-coeff) 行为
+    if (i == 0) val = pcm[0] * (1.0f - coeff);
+    out[i] = scale * val;
 }
 
 // Frame extraction + windowing + zero-pad
@@ -121,10 +124,10 @@ GpuMelExtractor::~GpuMelExtractor() {
 bool GpuMelExtractor::init(const GpuMelConfig& config) {
     cfg_ = config;
 
-    // FFT size: pad to next power of 2
-    fft_size_ = 1;
-    while (fft_size_ < cfg_.n_fft) fft_size_ <<= 1;  // 400 → 512
-    n_freqs_ = fft_size_ / 2 + 1;  // 257
+    // FFT size: use n_fft directly (cuFFT supports non-power-of-2)
+    // 不做零填充, 保持 n_fft=400 → n_freqs=201, 与 CPU compute_mel_80 完全一致
+    fft_size_ = cfg_.n_fft;  // 400
+    n_freqs_ = fft_size_ / 2 + 1;  // 201
 
     // Create CUDA stream + cuBLAS
     cudaStreamCreate(&stream_);
