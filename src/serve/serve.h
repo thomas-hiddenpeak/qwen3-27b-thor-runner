@@ -20,6 +20,8 @@
 #include "../plugins/asr/speaker_encoder_gpu.h"
 #include "../plugins/asr/punctuation.h"
 #include "../plugins/asr/vad_engine.h"
+#include "../plugins/asr/vad_gpu.h"
+#include "../plugins/asr/mel_gpu.h"
 #include "../plugins/asr/aligner_engine.h"
 #include "../plugins/tts/tts_plugin.h"
 #include <string>
@@ -265,7 +267,11 @@ private:
 
     // VAD 引擎 (FSMN, 用于文件转写说话人分割)
     asr::VadEngine vad_engine_;
+    asr::GpuVadEngine gpu_vad_engine_;  // GPU 加速版
     std::mutex vad_mutex_;  // 保护 vad_engine_ (detect_all 有状态)
+
+    // GPU Mel 特征提取 (cuFFT, 替代 CPU O(N²) DFT)
+    asr::GpuMelExtractor gpu_mel_;
 
     // 标点恢复
     asr::PunctuationRestorer punctuation_restorer_;

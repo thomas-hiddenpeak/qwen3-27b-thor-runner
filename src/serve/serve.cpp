@@ -1511,6 +1511,10 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
                 fprintf(stderr, "[Serve] Speaker encoder loaded: CAM++ (%s)\n",
                         speaker_model_path.c_str());
 
+                // GPU Mel 特征提取 (cuFFT, 替代 CPU O(N²) DFT)
+                gpu_mel_.init();
+                fprintf(stderr, "[Serve] GPU Mel extractor initialized (cuFFT)\n");
+
                 // 加载 FSMN-VAD 引擎 (用于文件转写说话人分割)
                 std::string vad_model_dir = "/home/rm01/models/dev/asr/fsmn_vad";
                 const char* env_vad = getenv("QWEN_VAD_MODEL");
@@ -1518,6 +1522,11 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
                 if (vad_engine_.load(vad_model_dir)) {
                     fprintf(stderr, "[Serve] VAD engine loaded: FSMN (%s)\n",
                             vad_model_dir.c_str());
+
+                    // GPU VAD: 加载 FSMN 权重到 GPU (batch GEMM + cuFFT 加速)
+                    if (gpu_vad_engine_.load(vad_model_dir)) {
+                        fprintf(stderr, "[Serve] GPU VAD engine loaded (cuFFT + batch GEMM)\n");
+                    }
                 } else {
                     fprintf(stderr, "[Serve] WARNING: Failed to load VAD engine from %s "
                             "(speaker diarization in file transcription will be disabled)\n",
@@ -4023,34 +4032,71 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
 
         // Phase 3 在主线程并发执行 (与 Phase 2 重叠)
         {
-            std::vector<asr::VadSegment> vad_segments;
-            {
+            auto phase3_t0 = std::chrono::steady_clock::now();
+
+            // Step 3a: VAD — 优先使用 GPU, 回退 CPU
+            struct VadResult { int start_ms; int end_ms; };
+            std::vector<VadResult> vad_results;
+            auto vad_t0 = std::chrono::steady_clock::now();
+
+            if (gpu_vad_engine_.is_loaded()) {
+                // GPU VAD: batch FSMN + cuFFT, 全部帧一次性推理
+                auto gpu_segs = gpu_vad_engine_.detect_all(
+                    wav.samples.data(), (int)wav.samples.size(), 300, 8000);
+                for (auto& gs : gpu_segs)
+                    vad_results.push_back({gs.start_ms, gs.end_ms});
+            } else {
+                // CPU VAD fallback
                 std::lock_guard<std::mutex> lock(vad_mutex_);
                 auto& cfg = vad_engine_.mutable_config();
                 int orig_silence = cfg.max_end_silence_time;
                 int orig_segment = cfg.max_single_segment_time;
                 cfg.max_end_silence_time = 300;
                 cfg.max_single_segment_time = 8000;
-                vad_segments = vad_engine_.detect_all(wav.samples.data(), (int)wav.samples.size());
+                auto vad_segments = vad_engine_.detect_all(wav.samples.data(), (int)wav.samples.size());
                 cfg.max_end_silence_time = orig_silence;
                 cfg.max_single_segment_time = orig_segment;
+                for (auto& vs : vad_segments)
+                    vad_results.push_back({vs.start_ms, vs.end_ms});
             }
 
-            asr::SpeakerManager diar_spk_mgr;
+            double vad_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - vad_t0).count();
 
-            for (size_t vi = 0; vi < vad_segments.size(); ++vi) {
-                auto& vseg = vad_segments[vi];
-                if (vseg.pcm.empty() || vseg.end_ms - vseg.start_ms < 200) continue;
+            // Step 3b: Mel + CAM++ speaker embedding
+            asr::SpeakerManager diar_spk_mgr;
+            auto mel_t0 = std::chrono::steady_clock::now();
+            int mel_segments = 0;
+
+            for (size_t vi = 0; vi < vad_results.size(); ++vi) {
+                auto& vr = vad_results[vi];
+                if (vr.end_ms - vr.start_ms < 200) continue;
+
+                // 从原始 PCM 切片 (避免数据拷贝)
+                int64_t start_sample = (int64_t)vr.start_ms * wav.sample_rate / 1000;
+                int64_t end_sample = (int64_t)vr.end_ms * wav.sample_rate / 1000;
+                start_sample = std::max((int64_t)0, std::min(start_sample, (int64_t)wav.samples.size()));
+                end_sample = std::max(start_sample, std::min(end_sample, (int64_t)wav.samples.size()));
+                int seg_samples = (int)(end_sample - start_sample);
+                if (seg_samples < 1600) continue;  // < 100ms
+
+                const float* seg_pcm = wav.samples.data() + start_sample;
 
                 float rms = 0.0f;
-                for (float s : vseg.pcm) rms += s * s;
-                rms = std::sqrt(rms / vseg.pcm.size());
+                for (int i = 0; i < seg_samples; ++i) rms += seg_pcm[i] * seg_pcm[i];
+                rms = std::sqrt(rms / seg_samples);
                 if (rms < 0.005f) continue;
 
+                // GPU Mel 提取 (cuFFT)
                 std::vector<float> mel;
                 int num_frames = 0;
-                compute_mel_80(vseg.pcm.data(), (int)vseg.pcm.size(), wav.sample_rate, mel, num_frames);
+                if (gpu_mel_.is_initialized()) {
+                    num_frames = gpu_mel_.compute(seg_pcm, seg_samples, mel);
+                } else {
+                    compute_mel_80(seg_pcm, seg_samples, wav.sample_rate, mel, num_frames);
+                }
                 if (num_frames < 10) continue;
+                ++mel_segments;
 
                 std::vector<float> embedding;
                 {
@@ -4062,16 +4108,25 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 auto spk = diar_spk_mgr.identify(embedding, 0.65f, true);
 
                 SpkInterval si;
-                si.start_ms = vseg.start_ms;
-                si.end_ms = vseg.end_ms;
+                si.start_ms = vr.start_ms;
+                si.end_ms = vr.end_ms;
                 si.speaker_id = spk.speaker_id;
                 si.speaker_name = spk.speaker_id >= 0 ? spk.name : "Unknown";
                 spk_intervals.push_back(si);
             }
 
-            fprintf(stderr, "[Serve] v4 Phase 3: %zu speaker intervals, %d unique speakers (%.1fs)\n",
+            double mel_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - mel_t0).count();
+            double phase3_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - phase3_t0).count();
+
+            fprintf(stderr, "[Serve] v4 Phase 3: %zu speaker intervals, %d unique speakers (%.1fs) "
+                    "[VAD %.0fms, Mel+CAM++ %.0fms (%d segs), %s VAD, %s Mel]\n",
                     spk_intervals.size(), diar_spk_mgr.speaker_count(),
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - phase_t0).count());
+                    phase3_ms / 1000.0,
+                    vad_ms, mel_ms, mel_segments,
+                    gpu_vad_engine_.is_loaded() ? "GPU" : "CPU",
+                    gpu_mel_.is_initialized() ? "GPU" : "CPU");
 
             // Phase 3b: 二次聚类 — 合并过于相似的说话人
             if (diar_spk_mgr.speaker_count() > 1) {
@@ -4710,7 +4765,22 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
 
         // Phase 1: Fine-grained VAD (short segments for accurate speaker ID)
         std::vector<asr::VadSegment> vad_segments;
-        {
+        if (gpu_vad_engine_.is_loaded()) {
+            // GPU VAD: batch FSMN + cuFFT
+            auto gpu_segs = gpu_vad_engine_.detect_all(
+                wav.samples.data(), (int)wav.samples.size(), 300, 8000);
+            for (auto& gs : gpu_segs) {
+                asr::VadSegment vs;
+                vs.start_ms = gs.start_ms;
+                vs.end_ms = gs.end_ms;
+                int64_t s0 = (int64_t)gs.start_ms * wav.sample_rate / 1000;
+                int64_t s1 = (int64_t)gs.end_ms * wav.sample_rate / 1000;
+                s0 = std::max((int64_t)0, std::min(s0, (int64_t)wav.samples.size()));
+                s1 = std::max(s0, std::min(s1, (int64_t)wav.samples.size()));
+                vs.pcm.assign(wav.samples.data() + s0, wav.samples.data() + s1);
+                vad_segments.push_back(std::move(vs));
+            }
+        } else {
             std::lock_guard<std::mutex> lock(vad_mutex_);
             auto& cfg = vad_engine_.mutable_config();
             int orig_max_end_silence = cfg.max_end_silence_time;
@@ -4757,7 +4827,11 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             // Extract embedding using GPU encoder
             std::vector<float> mel;
             int num_frames = 0;
-            compute_mel_80(vseg.pcm.data(), (int)vseg.pcm.size(), wav.sample_rate, mel, num_frames);
+            if (gpu_mel_.is_initialized()) {
+                num_frames = gpu_mel_.compute(vseg.pcm.data(), (int)vseg.pcm.size(), mel);
+            } else {
+                compute_mel_80(vseg.pcm.data(), (int)vseg.pcm.size(), wav.sample_rate, mel, num_frames);
+            }
             if (num_frames < 10) continue;
 
             std::vector<float> embedding;
