@@ -646,10 +646,113 @@ public:
         return {};
     }
 
+    // 按 ID 获取名称和 embedding
+    std::pair<std::string, std::vector<float>> get_embedding_by_id(int id) const {
+        for (const auto& s : speakers_) {
+            if (s.id == id) return {s.name, s.embedding};
+        }
+        return {};
+    }
+
     // 重置
     void clear() {
         speakers_.clear();
         next_id_ = 0;
+    }
+
+    // 二次聚类: 碎片吸收策略
+    // 只将观测次数少的 "碎片" 说话人吸收到最近的 "确立" 说话人
+    // 不合并两个确立说话人, 避免过度合并
+    // 返回 old_id → new_id 映射
+    std::unordered_map<int, int> merge_similar(float merge_threshold = 0.55f,
+                                                int min_established = 5) {
+        std::unordered_map<int, int> id_map;
+        for (auto& s : speakers_) id_map[s.id] = s.id; // identity
+
+        // 打印 pairwise 相似度矩阵 (诊断)
+        if (speakers_.size() > 1) {
+            fprintf(stderr, "[SpeakerMerge] pairwise similarity (fragment absorption, "
+                    "threshold=%.2f, min_established=%d):\n",
+                    merge_threshold, min_established);
+            for (size_t i = 0; i < speakers_.size(); ++i) {
+                const char* tag_i = speakers_[i].seen_count >= min_established ? "E" : "F";
+                for (size_t j = i + 1; j < speakers_.size(); ++j) {
+                    const char* tag_j = speakers_[j].seen_count >= min_established ? "E" : "F";
+                    float sim = CamPlusSpeakerEncoder::cosine_similarity(
+                        speakers_[i].embedding, speakers_[j].embedding);
+                    fprintf(stderr, "  %s[%s]↔%s[%s]: %.3f (seen %d,%d)\n",
+                        speakers_[i].name.c_str(), tag_i,
+                        speakers_[j].name.c_str(), tag_j,
+                        sim, speakers_[i].seen_count, speakers_[j].seen_count);
+                }
+            }
+        }
+
+        // 分离确立说话人与碎片说话人
+        std::vector<size_t> established_idx, fragment_idx;
+        for (size_t i = 0; i < speakers_.size(); ++i) {
+            if (speakers_[i].seen_count >= min_established)
+                established_idx.push_back(i);
+            else
+                fragment_idx.push_back(i);
+        }
+        fprintf(stderr, "[SpeakerMerge] %zu established, %zu fragments\n",
+                established_idx.size(), fragment_idx.size());
+
+        if (established_idx.empty()) return id_map; // 没有确立说话人, 无法吸收
+
+        // 对每个碎片说话人, 找最近的确立说话人
+        std::vector<size_t> to_remove;
+        for (size_t fi : fragment_idx) {
+            float best_sim = -1;
+            size_t best_ei = 0;
+            for (size_t ei : established_idx) {
+                float sim = CamPlusSpeakerEncoder::cosine_similarity(
+                    speakers_[fi].embedding, speakers_[ei].embedding);
+                if (sim > best_sim) {
+                    best_sim = sim;
+                    best_ei = ei;
+                }
+            }
+
+            if (best_sim >= merge_threshold) {
+                fprintf(stderr, "[SpeakerMerge] absorb %s (seen %d) → %s (sim %.3f)\n",
+                        speakers_[fi].name.c_str(), speakers_[fi].seen_count,
+                        speakers_[best_ei].name.c_str(), best_sim);
+                // 更新 id_map
+                int old_id = speakers_[fi].id;
+                int new_id = speakers_[best_ei].id;
+                for (auto& [k, v] : id_map) {
+                    if (v == old_id) v = new_id;
+                }
+                // 加权平均 embedding
+                auto& si = speakers_[best_ei];
+                auto& sj = speakers_[fi];
+                float wi = (float)si.seen_count;
+                float wj = (float)sj.seen_count;
+                float total = wi + wj;
+                for (size_t k = 0; k < si.embedding.size() && k < sj.embedding.size(); ++k) {
+                    si.embedding[k] = (wi * si.embedding[k] + wj * sj.embedding[k]) / total;
+                }
+                float norm = 0;
+                for (float v : si.embedding) norm += v * v;
+                norm = sqrtf(norm + 1e-12f);
+                for (float& v : si.embedding) v /= norm;
+                si.seen_count = (int)total;
+                to_remove.push_back(fi);
+            } else {
+                fprintf(stderr, "[SpeakerMerge] keep %s (seen %d, best sim %.3f < %.2f)\n",
+                        speakers_[fi].name.c_str(), speakers_[fi].seen_count,
+                        best_sim, merge_threshold);
+            }
+        }
+
+        // 删除被吸收的说话人 (从后往前)
+        std::sort(to_remove.rbegin(), to_remove.rend());
+        for (size_t idx : to_remove)
+            speakers_.erase(speakers_.begin() + idx);
+
+        return id_map;
     }
 
 private:

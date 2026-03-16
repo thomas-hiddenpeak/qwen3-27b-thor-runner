@@ -19,6 +19,7 @@
 #include <queue>
 #include <random>
 #include <cctype>
+#include <map>
 #include <filesystem>
 
 // stb_image for decoding JPEG/PNG
@@ -4062,6 +4063,37 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             fprintf(stderr, "[Serve] v4 Phase 3: %zu speaker intervals, %d unique speakers (%.1fs)\n",
                     spk_intervals.size(), diar_spk_mgr.speaker_count(),
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - phase_t0).count());
+
+            // Phase 3b: 二次聚类 — 合并过于相似的说话人
+            if (diar_spk_mgr.speaker_count() > 1) {
+                auto id_map = diar_spk_mgr.merge_similar(0.55f, 5);
+                // 更新 spk_intervals 的 speaker_id 和 speaker_name
+                int remapped = 0;
+                for (auto& si : spk_intervals) {
+                    auto it = id_map.find(si.speaker_id);
+                    if (it != id_map.end() && it->second != si.speaker_id) {
+                        si.speaker_id = it->second;
+                        ++remapped;
+                    }
+                    // 更新 speaker_name
+                    auto emb = diar_spk_mgr.get_embedding_by_id(si.speaker_id);
+                    if (!emb.first.empty()) si.speaker_name = emb.first;
+                }
+                // 重编号: 让 speaker_id 从 0 连续递增
+                std::map<int, int> renumber;
+                int next_num = 0;
+                for (auto& si : spk_intervals) {
+                    if (renumber.find(si.speaker_id) == renumber.end()) {
+                        renumber[si.speaker_id] = next_num++;
+                    }
+                    si.speaker_id = renumber[si.speaker_id];
+                    si.speaker_name = "Speaker_" + std::to_string(si.speaker_id);
+                }
+                if (remapped > 0) {
+                    fprintf(stderr, "[Serve] v4 Phase 3b: merged → %d speakers (%d intervals remapped)\n",
+                            (int)renumber.size(), remapped);
+                }
+            }
 
             // 自动注册 diarization 说话人到全局 speaker_manager_
             for (auto& name : diar_spk_mgr.speaker_names()) {
