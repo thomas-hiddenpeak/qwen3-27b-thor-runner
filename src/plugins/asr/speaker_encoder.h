@@ -638,6 +638,14 @@ public:
         return false;
     }
 
+    // 按名称获取 embedding
+    std::vector<float> get_embedding(const std::string& name) const {
+        for (const auto& s : speakers_) {
+            if (s.name == name) return s.embedding;
+        }
+        return {};
+    }
+
     // 重置
     void clear() {
         speakers_.clear();

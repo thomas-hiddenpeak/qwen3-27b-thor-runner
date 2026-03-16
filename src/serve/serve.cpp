@@ -4056,6 +4056,23 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             fprintf(stderr, "[Serve] v4 Phase 3: %zu speaker intervals, %d unique speakers (%.1fs)\n",
                     spk_intervals.size(), diar_spk_mgr.speaker_count(),
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - phase_t0).count());
+
+            // 自动注册 diarization 说话人到全局 speaker_manager_
+            for (auto& name : diar_spk_mgr.speaker_names()) {
+                // 避免重复注册 (全局里已有同名则跳过)
+                bool exists = false;
+                for (auto& gn : speaker_manager_.speaker_names()) {
+                    if (gn == name) { exists = true; break; }
+                }
+                if (!exists) {
+                    // 从 diar_spk_mgr 提取该说话人的 embedding 并注册
+                    auto emb = diar_spk_mgr.get_embedding(name);
+                    if (!emb.empty()) {
+                        speaker_manager_.register_speaker(name, emb);
+                        fprintf(stderr, "[Serve] v4: auto-registered speaker '%s' to global manager\n", name.c_str());
+                    }
+                }
+            }
         }
 
         // Phase 4: 每个 aligned word 分配 speaker (时间重叠匹配)
@@ -4152,12 +4169,10 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             }
         }
 
-        // 标点恢复 (per segment)
-        if (punctuate) {
-            for (auto& seg : v4_segments)
-                if (!seg.text.empty())
-                    seg.text = punctuation_restorer_.restore(seg.text);
-        }
+        // 标点恢复 (v4 pipeline 默认启用)
+        for (auto& seg : v4_segments)
+            if (!seg.text.empty())
+                seg.text = punctuation_restorer_.restore(seg.text);
 
         fprintf(stderr, "[Serve] v4 pipeline done: %zu segments, %zu words, total %.1fs\n",
                 v4_segments.size(), word_list.size(),
