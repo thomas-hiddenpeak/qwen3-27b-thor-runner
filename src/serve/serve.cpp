@@ -4303,10 +4303,225 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             v4_segments = std::move(merged);
         }
 
-        // 标点恢复 (v4 pipeline — per-segment 规则, 每段独立加标点)
-        for (auto& seg : v4_segments)
-            if (!seg.text.empty())
-                seg.text = punctuation_restorer_.restore(seg.text);
+        // ================================================================
+        // Phase 6: 全文标点恢复 → 按 speaker + 句子边界重新分段
+        // ================================================================
+        // 旧方案: per-segment 独立加标点 → 跨段断句严重
+        // 新方案: 全文拼接 → 一次标点恢复 → 按 speaker 和 。？！ 重新切段
+        {
+            // 6a: 拼接全文, 建立 char→word 映射
+            std::string full_text;
+            // word_char_map[i] = word_list index for the i-th UTF-8 char in full_text
+            std::vector<int> word_char_map;
+            for (size_t wi = 0; wi < word_list.size(); ++wi) {
+                const auto& w = word_list[wi];
+                for (size_t j = 0; j < w.word.size(); ) {
+                    unsigned char c = (unsigned char)w.word[j];
+                    int clen = (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+                    full_text += w.word.substr(j, clen);
+                    word_char_map.push_back((int)wi);
+                    j += clen;
+                }
+            }
+
+            // 6b: 全文标点恢复
+            std::string punctuated = punctuation_restorer_.restore(full_text);
+
+            // 6c: 对齐 — 遍历标点后文本, 将原始字符映射回 word_list
+            // 标点后的每个字符: 如果是原始字符则推进原始指针, 如果是新增标点则标记为标点
+            struct CharInfo {
+                std::string ch;
+                int word_idx;       // -1 = inserted punctuation
+                bool is_punc;
+            };
+            std::vector<CharInfo> char_infos;
+            {
+                // split both into UTF-8 chars
+                auto split_u8 = [](const std::string& s) {
+                    std::vector<std::string> out;
+                    for (size_t i = 0; i < s.size(); ) {
+                        unsigned char c = (unsigned char)s[i];
+                        int len = (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+                        out.push_back(s.substr(i, len));
+                        i += len;
+                    }
+                    return out;
+                };
+                auto orig_chars = split_u8(full_text);
+                auto punc_chars = split_u8(punctuated);
+
+                size_t oi = 0; // original char index
+                for (size_t pi = 0; pi < punc_chars.size(); ++pi) {
+                    if (oi < orig_chars.size() && punc_chars[pi] == orig_chars[oi]) {
+                        // original char — map to word
+                        char_infos.push_back({punc_chars[pi], word_char_map[oi], false});
+                        ++oi;
+                    } else {
+                        // inserted punctuation — inherit from last original char
+                        int inherit_wi = (char_infos.empty()) ? 0 :
+                            (char_infos.back().word_idx >= 0) ? char_infos.back().word_idx : 0;
+                        char_infos.push_back({punc_chars[pi], inherit_wi, true});
+                    }
+                }
+            }
+
+            // 6d: 重建 segments — 在 speaker 变化 或 句末标点(。？！) 处切段
+            auto is_sentence_end = [](const std::string& c) {
+                return c == "\xe3\x80\x82" || c == "\xef\xbc\x9f" || c == "\xef\xbc\x81"; // 。？！
+            };
+
+            v4_segments.clear();
+            if (!char_infos.empty()) {
+                // 找第一个有效 word_idx
+                int first_wi = 0;
+                for (auto& ci : char_infos) {
+                    if (ci.word_idx >= 0) { first_wi = ci.word_idx; break; }
+                }
+
+                V4Segment cur;
+                cur.speaker_id = word_list[first_wi].speaker_id;
+                cur.speaker_name = word_list[first_wi].speaker_name;
+                cur.start_ms = word_list[first_wi].start_ms;
+                cur.end_ms = word_list[first_wi].end_ms;
+
+                for (size_t i = 0; i < char_infos.size(); ++i) {
+                    auto& ci = char_infos[i];
+                    int wi = ci.word_idx >= 0 ? ci.word_idx : -1;
+
+                    // 更新时间范围
+                    if (wi >= 0) {
+                        cur.end_ms = std::max(cur.end_ms, word_list[wi].end_ms);
+                    }
+
+                    // 检查是否需要在此处切段
+                    bool split_here = false;
+                    if (ci.is_punc && is_sentence_end(ci.ch) && i + 1 < char_infos.size()) {
+                        // 句末标点 — 检查后续文字的 speaker
+                        int next_wi = -1;
+                        for (size_t j = i + 1; j < char_infos.size(); ++j) {
+                            if (char_infos[j].word_idx >= 0) {
+                                next_wi = char_infos[j].word_idx;
+                                break;
+                            }
+                        }
+                        if (next_wi >= 0 && word_list[next_wi].speaker_id != cur.speaker_id) {
+                            // speaker 变化 + 句末标点: 必须切
+                            split_here = true;
+                        }
+                    }
+
+                    // speaker 变化 (无标点处): 在此切段, 但把标点留给当前段
+                    if (!split_here && !ci.is_punc && wi >= 0 &&
+                        word_list[wi].speaker_id != cur.speaker_id) {
+                        // 回退: 在上一个句末标点/逗号处切 (优先 。？！, 其次 ，)
+                        size_t last_sent_end = std::string::npos;
+                        size_t last_comma = std::string::npos;
+                        for (size_t k = cur.text.size(); k > 0; ) {
+                            unsigned char c = (unsigned char)cur.text[k-1];
+                            // 找 3 字节 UTF-8 标点
+                            if (k >= 3) {
+                                std::string maybe = cur.text.substr(k - 3, 3);
+                                if (is_sentence_end(maybe)) {
+                                    last_sent_end = k;
+                                    break;
+                                }
+                                if (last_comma == std::string::npos &&
+                                    maybe == "\xef\xbc\x8c") { // ，
+                                    last_comma = k;
+                                }
+                            }
+                            // step back one UTF-8 char
+                            if (c < 0x80) --k;
+                            else if (c >= 0xC0) --k;  // start byte
+                            else { // continuation byte, keep going
+                                while (k > 0 && ((unsigned char)cur.text[k-1] & 0xC0) == 0x80) --k;
+                                if (k > 0) --k;
+                            }
+                        }
+
+                        if (last_sent_end != std::string::npos) {
+                            // 在句末标点处切: 标点之前归当前段, 标点之后移到新段
+                            std::string overflow = cur.text.substr(last_sent_end);
+                            cur.text = cur.text.substr(0, last_sent_end);
+                            if (!cur.text.empty()) v4_segments.push_back(cur);
+                            cur = V4Segment();
+                            cur.speaker_id = word_list[wi].speaker_id;
+                            cur.speaker_name = word_list[wi].speaker_name;
+                            cur.start_ms = word_list[wi].start_ms;
+                            cur.end_ms = word_list[wi].end_ms;
+                            cur.text = overflow + ci.ch;
+                            continue;
+                        }
+                        // 退而求其次: 在最近逗号处切
+                        if (last_comma != std::string::npos) {
+                            std::string overflow = cur.text.substr(last_comma);
+                            cur.text = cur.text.substr(0, last_comma);
+                            if (!cur.text.empty()) v4_segments.push_back(cur);
+                            cur = V4Segment();
+                            cur.speaker_id = word_list[wi].speaker_id;
+                            cur.speaker_name = word_list[wi].speaker_name;
+                            cur.start_ms = word_list[wi].start_ms;
+                            cur.end_ms = word_list[wi].end_ms;
+                            cur.text = overflow + ci.ch;
+                            continue;
+                        }
+                        // 没有句末标点 — 直接在 speaker 变化处切
+                        if (!cur.text.empty()) v4_segments.push_back(cur);
+                        cur = V4Segment();
+                        cur.speaker_id = word_list[wi].speaker_id;
+                        cur.speaker_name = word_list[wi].speaker_name;
+                        cur.start_ms = word_list[wi].start_ms;
+                        cur.end_ms = word_list[wi].end_ms;
+                        cur.text = ci.ch;
+                        continue;
+                    }
+
+                    // 加入当前段
+                    cur.text += ci.ch;
+
+                    // 如果句末标点 + speaker 变化: 当前段结束
+                    if (split_here) {
+                        if (!cur.text.empty()) v4_segments.push_back(cur);
+                        // 新段从下一个字符开始
+                        int next_wi = -1;
+                        for (size_t j = i + 1; j < char_infos.size(); ++j) {
+                            if (char_infos[j].word_idx >= 0) {
+                                next_wi = char_infos[j].word_idx;
+                                break;
+                            }
+                        }
+                        cur = V4Segment();
+                        if (next_wi >= 0) {
+                            cur.speaker_id = word_list[next_wi].speaker_id;
+                            cur.speaker_name = word_list[next_wi].speaker_name;
+                            cur.start_ms = word_list[next_wi].start_ms;
+                            cur.end_ms = word_list[next_wi].end_ms;
+                        }
+                    }
+                }
+                // 最后一段
+                if (!cur.text.empty()) v4_segments.push_back(cur);
+            }
+
+            // 6e: 后处理 — 段末标点修正
+            for (auto& seg : v4_segments) {
+                if (seg.text.empty()) continue;
+                // 检查末尾 3 字节是否是句末标点
+                bool ends_sent = false;
+                if (seg.text.size() >= 3) {
+                    std::string last3 = seg.text.substr(seg.text.size() - 3);
+                    ends_sent = (last3 == "\xe3\x80\x82" || last3 == "\xef\xbc\x9f" || last3 == "\xef\xbc\x81");
+                }
+                if (!ends_sent) {
+                    // 如果末尾是逗号, 替换为句号; 否则追加句号
+                    if (seg.text.size() >= 3 && seg.text.substr(seg.text.size() - 3) == "\xef\xbc\x8c") {
+                        seg.text.replace(seg.text.size() - 3, 3, "\xe3\x80\x82"); // ，→。
+                    } else {
+                        seg.text += "\xe3\x80\x82"; // 。
+                    }
+                }
+            }
+        }
 
         fprintf(stderr, "[Serve] v4 pipeline done: %zu segments, %zu words, total %.1fs\n",
                 v4_segments.size(), word_list.size(),
