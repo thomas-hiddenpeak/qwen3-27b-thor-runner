@@ -3837,6 +3837,8 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                      (form.fields["punctuate"] == "true" || form.fields["punctuate"] == "1");
     bool identify_spk = form.fields.count("speaker") &&
                         (form.fields["speaker"] == "true" || form.fields["speaker"] == "1");
+    bool clean_oral = form.fields.count("clean") &&
+                      (form.fields["clean"] == "true" || form.fields["clean"] == "1");
     // OpenAI-compatible: timestamp_granularities[]=word 或 timestamp_granularities=word
     bool want_word_timestamps = false;
     {
@@ -4590,6 +4592,49 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 fprintf(stderr, "[Serve] v4 Phase 6.5: smoothed %d speaker islands\n", island_merged);
             }
             v4_segments = std::move(smoothed);
+        }
+
+        // ================================================================
+        // Phase 6.55: 口语规范化 (P2) — 去除冗余 oral 短语 (可选)
+        // ================================================================
+        // 规则: 若 clean=true, 去除常见口语冗余词
+        // 示例冗余: "我想说", "你知道吗", "就是", "然后呢", "对吧", "这样的话"
+        if (clean_oral) {
+            // 常见口语冗余词库
+            static const std::vector<std::string> oral_patterns = {
+                "\xe6\x88\x91\xe6\x83\xb3\xe8\xaf\xb4",  // 我想说
+                "\xe4\xbd\xa0\xe7\x9f\xa5\xe9\x81\x93\xe5\x90\x97",  // 你知道吗
+                "\xef\xbc\x8c\xe5\x92\x8b",  // ，咋
+                "\xef\xbc\x8c\xe5\xb0\xb1\xe6\x98\xaf",  // ，就是
+                "\xe7\x84\xb6\xe5\x90\x8e\xe5\x91\xa2",  // 然后呢
+                "\xe5\xaf\xb9\xe5\x90\xa7",  // 对吧
+                "\xe8\xbf\x99\xe6\xa0\xb7\xe7\x9a\x84\xe8\xaf\x9d",  // 这样的话
+                "\xef\xbc\x8c\xe6\x80\x8e\xe6\xa0\xb7",  // ，怎样
+                "\xef\xbc\x8c\xe8\xae\xb2",  // ，讲
+                "\xe7\xad\x89\xe7\xad\x89",  // 等等
+                "\xe4\xb9\x9f\xe6\x98\xaf\xef\xbc\x8c",  // 也是，
+                "\xef\xbc\x8c\xe6\x9c\x89\xe4\xb8\x00",  // ，有一
+                "\xe8\xbf\x99\xe4\xb8\xaa\xe8\xaf\xb8",  // 这个诸
+                "\xef\xbc\x8c\xe5\x9c\xa8\xe4\xba\x8e",  // ，在于
+                "\xe7\xb1\xbb\xe4\xba\x8b",  // 类事
+                "\xef\xbc\x8c\xe5\x8f\xab\xe4\xbb\x80\xe4\xb9\x88",  // ，叫什么
+            };
+            
+            int oral_removed = 0;
+            for (auto& seg : v4_segments) {
+                std::string orig_len = std::to_string(seg.text.size());
+                for (const auto& pattern : oral_patterns) {
+                    size_t pos = 0;
+                    while ((pos = seg.text.find(pattern, pos)) != std::string::npos) {
+                        seg.text.erase(pos, pattern.size());
+                        ++oral_removed;
+                    }
+                }
+            }
+            
+            if (oral_removed > 0) {
+                fprintf(stderr, "[Serve] v4 Phase 6.55: removed %d oral redundancies\n", oral_removed);
+            }
         }
 
         fprintf(stderr, "[Serve] v4 pipeline done: %zu segments, %zu words, total %.1fs\n",
