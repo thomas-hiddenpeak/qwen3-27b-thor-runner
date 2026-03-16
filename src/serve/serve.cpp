@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cerrno>
 #include <thread>
+#include <future>
 #include <queue>
 #include <random>
 #include <cctype>
@@ -3961,13 +3962,28 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - phase_t0).count());
         phase_t0 = std::chrono::steady_clock::now();
 
-        // Phase 2: ForcedAligner → 字级时间戳
+        // ================================================================
+        // Phase 2 & 3 (P3优化): 并行执行 ForcedAligner || VAD+CAM++
+        // Phase 2 使用 aligner_mutex_, Phase 3 使用 vad_mutex_/speaker_mutex_
+        // 两者资源独立，可以真正并发
+        // ================================================================
+        struct SpkInterval {
+            int start_ms, end_ms;
+            int speaker_id;
+            std::string speaker_name;
+        };
         std::vector<asr::AlignedWord> aligned_words;
-        {
+        std::vector<SpkInterval> spk_intervals;
+        int phase3_speaker_count = 0;
+        auto phase2_t0 = std::chrono::steady_clock::now();
+
+        // Phase 2 在后台线程执行
+        auto phase2_future = std::async(std::launch::async, [&]() -> std::vector<asr::AlignedWord> {
+            std::vector<asr::AlignedWord> words;
             const int max_align_samples = wav.sample_rate * 180;
             if ((int)wav.samples.size() <= max_align_samples) {
                 std::lock_guard<std::mutex> lock(aligner_mutex_);
-                aligned_words = aligner_engine_.align(
+                words = aligner_engine_.align(
                     wav.samples.data(), (int)wav.samples.size(),
                     wav.sample_rate, full_text, "Chinese");
             } else {
@@ -3997,25 +4013,15 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                     for (auto& w : seg_aligned) {
                         w.start_ms += offset_ms;
                         w.end_ms += offset_ms;
-                        aligned_words.push_back(w);
+                        words.push_back(w);
                     }
                     char_offset += seg_chars;
                 }
             }
-        }
+            return words;
+        });
 
-        fprintf(stderr, "[Serve] v4 Phase 2: %zu words aligned (%.1fs)\n",
-                aligned_words.size(),
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - phase_t0).count());
-        phase_t0 = std::chrono::steady_clock::now();
-
-        // Phase 3: Fine-grained VAD + CAM++ → 每 VAD 段说话人 ID
-        struct SpkInterval {
-            int start_ms, end_ms;
-            int speaker_id;
-            std::string speaker_name;
-        };
-        std::vector<SpkInterval> spk_intervals;
+        // Phase 3 在主线程并发执行 (与 Phase 2 重叠)
         {
             std::vector<asr::VadSegment> vad_segments;
             {
@@ -4114,6 +4120,14 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 }
             }
         }
+
+        // 等待 Phase 2 后台线程完成并获取结果
+        aligned_words = phase2_future.get();
+        fprintf(stderr, "[Serve] v4 Phase 2+3 parallel: %zu words aligned, "
+            "%zu speaker intervals (%.1fs total)\n",
+            aligned_words.size(), spk_intervals.size(),
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - phase2_t0).count());
+        phase_t0 = std::chrono::steady_clock::now();
 
         // ================================================================
         // Phase 4: Word → Speaker 分配 (3 层策略)
