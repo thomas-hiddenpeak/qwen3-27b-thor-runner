@@ -660,12 +660,13 @@ public:
         next_id_ = 0;
     }
 
-    // 二次聚类: 碎片吸收策略
-    // 只将观测次数少的 "碎片" 说话人吸收到最近的 "确立" 说话人
-    // 不合并两个确立说话人, 避免过度合并
+    // 二次聚类: 碎片吸收 + 已确立合并
+    // 1) 将观测次数少的 "碎片" 说话人吸收到最近的 "确立" 说话人
+    // 2) 如果 established_merge_threshold > 0, 合并相似度极高的已确立说话人对
     // 返回 old_id → new_id 映射
     std::unordered_map<int, int> merge_similar(float merge_threshold = 0.55f,
-                                                int min_established = 5) {
+                                                int min_established = 5,
+                                                float established_merge_threshold = -1.0f) {
         std::unordered_map<int, int> id_map;
         for (auto& s : speakers_) id_map[s.id] = s.id; // identity
 
@@ -751,6 +752,57 @@ public:
         std::sort(to_remove.rbegin(), to_remove.rend());
         for (size_t idx : to_remove)
             speakers_.erase(speakers_.begin() + idx);
+
+        // Pass 2: 已确立↔已确立合并 (处理高阈值 identify 导致的过度分裂)
+        if (established_merge_threshold > 0) {
+            bool merged_any = true;
+            while (merged_any) {
+                merged_any = false;
+                float best_sim = -1;
+                size_t best_i = 0, best_j = 0;
+                for (size_t i = 0; i < speakers_.size(); ++i) {
+                    if (speakers_[i].seen_count < min_established) continue;
+                    for (size_t j = i + 1; j < speakers_.size(); ++j) {
+                        if (speakers_[j].seen_count < min_established) continue;
+                        float sim = CamPlusSpeakerEncoder::cosine_similarity(
+                            speakers_[i].embedding, speakers_[j].embedding);
+                        if (sim > best_sim) {
+                            best_sim = sim;
+                            best_i = i;
+                            best_j = j;
+                        }
+                    }
+                }
+                if (best_sim >= established_merge_threshold) {
+                    // 合并 seen_count 较小的到较大的
+                    size_t keep = best_i, absorb = best_j;
+                    if (speakers_[keep].seen_count < speakers_[absorb].seen_count)
+                        std::swap(keep, absorb);
+                    fprintf(stderr, "[SpeakerMerge] merge established %s (seen %d) → %s (seen %d, sim %.3f)\n",
+                            speakers_[absorb].name.c_str(), speakers_[absorb].seen_count,
+                            speakers_[keep].name.c_str(), speakers_[keep].seen_count, best_sim);
+                    int old_id = speakers_[absorb].id;
+                    int new_id = speakers_[keep].id;
+                    for (auto& [k, v] : id_map) {
+                        if (v == old_id) v = new_id;
+                    }
+                    // 加权平均 embedding
+                    auto& si = speakers_[keep];
+                    auto& sj = speakers_[absorb];
+                    float wi = (float)si.seen_count, wj = (float)sj.seen_count;
+                    float total = wi + wj;
+                    for (size_t k = 0; k < si.embedding.size() && k < sj.embedding.size(); ++k)
+                        si.embedding[k] = (wi * si.embedding[k] + wj * sj.embedding[k]) / total;
+                    float norm = 0;
+                    for (float v : si.embedding) norm += v * v;
+                    norm = sqrtf(norm + 1e-12f);
+                    for (float& v : si.embedding) v /= norm;
+                    si.seen_count = (int)total;
+                    speakers_.erase(speakers_.begin() + absorb);
+                    merged_any = true;
+                }
+            }
+        }
 
         return id_map;
     }

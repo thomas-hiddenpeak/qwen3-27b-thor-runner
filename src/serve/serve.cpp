@@ -21,6 +21,7 @@
 #include <random>
 #include <cctype>
 #include <map>
+#include <set>
 #include <filesystem>
 
 // stb_image for decoding JPEG/PNG
@@ -1512,7 +1513,9 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
                         speaker_model_path.c_str());
 
                 // GPU Mel 特征提取 (cuFFT, 替代 CPU O(N²) DFT)
-                gpu_mel_.init();
+                asr::GpuMelConfig mel_cfg;
+                // 保持 Hann 窗口 (模型训练时的窗口类型不确定, Hann 给出更好的 speaker 分离)
+                gpu_mel_.init(mel_cfg);
                 fprintf(stderr, "[Serve] GPU Mel extractor initialized (cuFFT)\n");
 
                 // 加载 FSMN-VAD 引擎 (用于文件转写说话人分割)
@@ -4065,10 +4068,10 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             double vad_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - vad_t0).count();
 
-            // Step 3b: Mel + CAM++ speaker embedding (在线 identify)
-            asr::SpeakerManager diar_spk_mgr;
+            // Step 3b: Mel + CAM++ speaker embedding (CMVN + 1.5s chunking + Spectral Clustering)
             auto mel_t0 = std::chrono::steady_clock::now();
             int mel_segments = 0;
+            std::vector<std::vector<float>> seg_embeddings;  // 存储所有 segment embedding
 
             for (size_t vi = 0; vi < vad_results.size(); ++vi) {
                 auto& vr = vad_results[vi];
@@ -4100,6 +4103,10 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 if (num_frames < 10) continue;
                 ++mel_segments;
 
+                // NOTE: 不做 per-segment CMVN — CAM++ 内部 BatchNorm 已处理归一化,
+                // per-segment mean subtraction 反而抹掉说话人频带特征差异。
+
+                // 直接从全段 mel 提取 embedding (无 chunking — 避免 averaging 损失)
                 std::vector<float> embedding;
                 {
                     std::lock_guard<std::mutex> spk_lock(speaker_mutex_);
@@ -4107,32 +4114,354 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 }
                 if (embedding.empty()) continue;
 
-                auto spk = diar_spk_mgr.identify(embedding, 0.65f, true);
+                // 检查 NaN (CAM++ 对极端输入可能产生 NaN)
+                bool has_nan = false;
+                for (float v : embedding) {
+                    if (std::isnan(v) || std::isinf(v)) { has_nan = true; break; }
+                }
+                if (has_nan) {
+                    fprintf(stderr, "[Serve] WARNING: NaN embedding at VAD seg %zu (%.1f-%.1fs, %d frames), skipping\n",
+                            vi, (float)vr.start_ms/1000, (float)vr.end_ms/1000, num_frames);
+                    continue;
+                }
+
+                seg_embeddings.push_back(embedding);
 
                 SpkInterval si;
                 si.start_ms = vr.start_ms;
                 si.end_ms = vr.end_ms;
-                si.speaker_id = spk.speaker_id;
-                si.speaker_name = spk.speaker_id >= 0 ? spk.name : "Unknown";
+                si.speaker_id = 0;  // 稍后由 spectral clustering 分配
+                si.speaker_name = "Unknown";
                 spk_intervals.push_back(si);
             }
 
-            // Phase 3b: 二次聚类 — 合并过于相似的说话人
-            if (diar_spk_mgr.speaker_count() > 1) {
-                auto id_map = diar_spk_mgr.merge_similar(0.55f, 5);
-                // 更新 spk_intervals 的 speaker_id 和 speaker_name
-                int remapped = 0;
-                for (auto& si : spk_intervals) {
-                    auto it = id_map.find(si.speaker_id);
-                    if (it != id_map.end() && it->second != si.speaker_id) {
-                        si.speaker_id = it->second;
-                        ++remapped;
+            // Phase 3b: Spectral Clustering (FunASR 策略)
+            // 构建余弦相似度矩阵 → p-pruning → Laplacian → eigengap → k-means
+            if (seg_embeddings.size() == spk_intervals.size() && seg_embeddings.size() >= 2) {
+                const int n_segs = (int)seg_embeddings.size();
+                const int emb_dim = (int)seg_embeddings[0].size();
+
+                // 1. 计算余弦相似度矩阵 N×N
+                std::vector<float> sim_matrix(n_segs * n_segs, 0.0f);
+                for (int i = 0; i < n_segs; ++i) {
+                    sim_matrix[i * n_segs + i] = 1.0f;
+                    for (int j = i + 1; j < n_segs; ++j) {
+                        float dot = 0;
+                        for (int k = 0; k < emb_dim; ++k)
+                            dot += seg_embeddings[i][k] * seg_embeddings[j][k];
+                        sim_matrix[i * n_segs + j] = dot;
+                        sim_matrix[j * n_segs + i] = dot;
                     }
-                    // 更新 speaker_name
-                    auto emb = diar_spk_mgr.get_embedding_by_id(si.speaker_id);
-                    if (!emb.first.empty()) si.speaker_name = emb.first;
                 }
-                // 重编号: 让 speaker_id 从 0 连续递增
+
+                // 2. p-pruning: 每行只保留 top-p 个最大值, 其余设为 0
+                int p = std::max(3, n_segs / 10);  // FunASR 默认 ~ N/10
+                p = std::min(p, n_segs - 1);
+                for (int i = 0; i < n_segs; ++i) {
+                    // 找第 p+1 大的值作为阈值
+                    std::vector<float> row_vals;
+                    for (int j = 0; j < n_segs; ++j) {
+                        if (j != i) row_vals.push_back(sim_matrix[i * n_segs + j]);
+                    }
+                    std::sort(row_vals.rbegin(), row_vals.rend());
+                    float threshold = (p < (int)row_vals.size()) ? row_vals[p] : -2.0f;
+                    for (int j = 0; j < n_segs; ++j) {
+                        if (j != i && sim_matrix[i * n_segs + j] < threshold)
+                            sim_matrix[i * n_segs + j] = 0;
+                    }
+                }
+
+                // 3. 对称化: W = max(S, S^T) 保留更多连接 (而非 (S+S^T)/2)
+                for (int i = 0; i < n_segs; ++i) {
+                    for (int j = i + 1; j < n_segs; ++j) {
+                        float val = std::max(sim_matrix[i * n_segs + j],
+                                            sim_matrix[j * n_segs + i]);
+                        val = std::max(0.0f, val);
+                        sim_matrix[i * n_segs + j] = val;
+                        sim_matrix[j * n_segs + i] = val;
+                    }
+                }
+
+                // 检查孤立节点: 如果 row sum = 0 (p-pruning 断开), 连接到最相似邻居
+                for (int i = 0; i < n_segs; ++i) {
+                    float row_sum = 0;
+                    for (int j = 0; j < n_segs; ++j)
+                        if (j != i) row_sum += sim_matrix[i * n_segs + j];
+                    if (row_sum < 1e-12f) {
+                        // 找最相似的邻居 (在原始 embedding 空间)
+                        float best = -2; int best_j = 0;
+                        for (int j = 0; j < n_segs; ++j) {
+                            if (j == i) continue;
+                            float dot = 0;
+                            for (int k = 0; k < emb_dim; ++k)
+                                dot += seg_embeddings[i][k] * seg_embeddings[j][k];
+                            if (dot > best) { best = dot; best_j = j; }
+                        }
+                        sim_matrix[i * n_segs + best_j] = std::max(0.01f, best);
+                        sim_matrix[best_j * n_segs + i] = std::max(0.01f, best);
+                    }
+                }
+
+                // 4. 计算 normalized Laplacian 的特征值 (用于 eigengap)
+                // D = diag(row sums), L_sym = I - D^{-1/2} W D^{-1/2}
+                std::vector<float> D(n_segs, 0.0f);
+                for (int i = 0; i < n_segs; ++i) {
+                    for (int j = 0; j < n_segs; ++j)
+                        D[i] += sim_matrix[i * n_segs + j];
+                }
+                std::vector<float> D_inv_sqrt(n_segs);
+                for (int i = 0; i < n_segs; ++i)
+                    D_inv_sqrt[i] = (D[i] > 1e-12f) ? 1.0f / sqrtf(D[i]) : 0.0f;
+
+                // L_sym = I - D^{-1/2} W D^{-1/2}
+                // 对于特征值分解, 我们计算 D^{-1/2} W D^{-1/2} (特征值是 1-λ_L)
+                std::vector<float> Lsym(n_segs * n_segs, 0.0f);
+                for (int i = 0; i < n_segs; ++i)
+                    for (int j = 0; j < n_segs; ++j)
+                        Lsym[i * n_segs + j] = D_inv_sqrt[i] * sim_matrix[i * n_segs + j] * D_inv_sqrt[j];
+
+                // 5. Power iteration 提取 top eigenvalues (最多 max_k=8)
+                const int max_k = 8;
+                int actual_max = std::min(max_k, n_segs);
+                std::vector<std::vector<float>> eigenvectors(actual_max, std::vector<float>(n_segs, 0));
+                std::vector<float> eigenvalues(actual_max, 0);
+
+                // 简化版: 用 QR iteration 提取 top-k 特征向量
+                // 这里用幂迭代 + deflation
+                std::vector<float> Lwork = Lsym;  // 工作副本
+                for (int k = 0; k < actual_max; ++k) {
+                    // 随机初始化
+                    std::vector<float> v(n_segs);
+                    for (int i = 0; i < n_segs; ++i) v[i] = (float)(i + k * 7 + 1);
+                    float vnorm = 0;
+                    for (float x : v) vnorm += x * x;
+                    vnorm = sqrtf(vnorm);
+                    for (float& x : v) x /= vnorm;
+
+                    // 幂迭代 (200 次)
+                    for (int iter = 0; iter < 200; ++iter) {
+                        std::vector<float> Av(n_segs, 0);
+                        for (int i = 0; i < n_segs; ++i)
+                            for (int j = 0; j < n_segs; ++j)
+                                Av[i] += Lwork[i * n_segs + j] * v[j];
+                        float norm = 0;
+                        for (float x : Av) norm += x * x;
+                        norm = sqrtf(norm + 1e-12f);
+                        for (int i = 0; i < n_segs; ++i) v[i] = Av[i] / norm;
+                    }
+
+                    // 计算特征值 = v^T A v
+                    float lambda = 0;
+                    for (int i = 0; i < n_segs; ++i) {
+                        float Av_i = 0;
+                        for (int j = 0; j < n_segs; ++j)
+                            Av_i += Lwork[i * n_segs + j] * v[j];
+                        lambda += v[i] * Av_i;
+                    }
+                    eigenvalues[k] = lambda;
+                    eigenvectors[k] = v;
+
+                    // Deflation: A = A - lambda * v * v^T
+                    for (int i = 0; i < n_segs; ++i)
+                        for (int j = 0; j < n_segs; ++j)
+                            Lwork[i * n_segs + j] -= lambda * v[i] * v[j];
+                }
+
+                // 6. NME (Normalized Maximum Eigengap) — FunASR 策略
+                // gap[k] / (k+1) 归一化避免偏向小 k
+                int optimal_k = 2;
+                float max_nme = 0;
+                for (int k = 0; k + 1 < actual_max; ++k) {
+                    float gap = eigenvalues[k] - eigenvalues[k + 1];
+                    if (eigenvalues[k] < 0.01f) continue;
+                    float nme = gap / (k + 1);
+                    if (nme > max_nme) {
+                        max_nme = nme;
+                        optimal_k = k + 1;
+                    }
+                }
+                optimal_k = std::max(2, std::min(optimal_k, 8));
+                
+                // 长音频启发式: 说话人同性别时 embedding 差异小, eigengap 容易低估 k
+                // > 5 min + > 50 段 → 至少 3 人; > 20 min + > 100 段 → 至少 4 人
+                int min_k_heuristic = 2;
+                float total_dur_sec = 0;
+                for (auto& si : spk_intervals)
+                    total_dur_sec += (si.end_ms - si.start_ms) / 1000.0f;
+                if (total_dur_sec > 1200 && n_segs > 100) min_k_heuristic = 4;
+                else if (total_dur_sec > 300 && n_segs > 50) min_k_heuristic = 3;
+                if (optimal_k < min_k_heuristic) {
+                    fprintf(stderr, "[Serve] Phase 3b: duration heuristic bumps k %d→%d (%.0fs, %d segs)\n",
+                            optimal_k, min_k_heuristic, total_dur_sec, n_segs);
+                    optimal_k = min_k_heuristic;
+                }
+
+                fprintf(stderr, "[Serve] Phase 3b spectral: eigenvalues:");
+                for (int k = 0; k < actual_max; ++k)
+                    fprintf(stderr, " %.3f", eigenvalues[k]);
+                fprintf(stderr, " → k=%d (nme=%.4f)\n", optimal_k, max_nme);
+
+                // 日志: 所有 NME 候选
+                fprintf(stderr, "[Serve] Phase 3b NME candidates:");
+                for (int k = 0; k + 1 < actual_max; ++k) {
+                    float gap = eigenvalues[k] - eigenvalues[k + 1];
+                    float nme = (eigenvalues[k] > 0.01f) ? gap / (k + 1) : 0;
+                    fprintf(stderr, " k=%d(%.4f)", k + 1, nme);
+                }
+                fprintf(stderr, "\n");
+
+                // 7. 取前 optimal_k 个特征向量做行归一化, 然后 k-means
+                // 构建 N × optimal_k 矩阵
+                std::vector<float> features(n_segs * optimal_k);
+                for (int i = 0; i < n_segs; ++i) {
+                    float row_norm = 0;
+                    for (int k = 0; k < optimal_k; ++k) {
+                        features[i * optimal_k + k] = eigenvectors[k][i];
+                        row_norm += eigenvectors[k][i] * eigenvectors[k][i];
+                    }
+                    row_norm = sqrtf(row_norm + 1e-12f);
+                    for (int k = 0; k < optimal_k; ++k)
+                        features[i * optimal_k + k] /= row_norm;
+                }
+
+                // K-means on spectral features (10 轮)
+                // 初始化: 取分散最远的 k 个点
+                std::vector<std::vector<float>> centroids(optimal_k, std::vector<float>(optimal_k, 0));
+                std::vector<int> labels(n_segs, 0);
+
+                // k-means++ 初始化
+                centroids[0].assign(features.begin(), features.begin() + optimal_k);
+                for (int c = 1; c < optimal_k; ++c) {
+                    float best_d = -1;
+                    int best_i = 0;
+                    for (int i = 0; i < n_segs; ++i) {
+                        float min_d = 1e30f;
+                        for (int prev = 0; prev < c; ++prev) {
+                            float d = 0;
+                            for (int j = 0; j < optimal_k; ++j) {
+                                float diff = features[i * optimal_k + j] - centroids[prev][j];
+                                d += diff * diff;
+                            }
+                            min_d = std::min(min_d, d);
+                        }
+                        if (min_d > best_d) {
+                            best_d = min_d;
+                            best_i = i;
+                        }
+                    }
+                    for (int j = 0; j < optimal_k; ++j)
+                        centroids[c][j] = features[best_i * optimal_k + j];
+                }
+
+                for (int iter = 0; iter < 10; ++iter) {
+                    // Assign
+                    int changed = 0;
+                    for (int i = 0; i < n_segs; ++i) {
+                        float best_d = 1e30f;
+                        int best_c = 0;
+                        for (int c = 0; c < optimal_k; ++c) {
+                            float d = 0;
+                            for (int j = 0; j < optimal_k; ++j) {
+                                float diff = features[i * optimal_k + j] - centroids[c][j];
+                                d += diff * diff;
+                            }
+                            if (d < best_d) {
+                                best_d = d;
+                                best_c = c;
+                            }
+                        }
+                        if (best_c != labels[i]) ++changed;
+                        labels[i] = best_c;
+                    }
+
+                    // Update centroids
+                    for (int c = 0; c < optimal_k; ++c) {
+                        std::fill(centroids[c].begin(), centroids[c].end(), 0.0f);
+                    }
+                    std::vector<int> cnt(optimal_k, 0);
+                    for (int i = 0; i < n_segs; ++i) {
+                        cnt[labels[i]]++;
+                        for (int j = 0; j < optimal_k; ++j)
+                            centroids[labels[i]][j] += features[i * optimal_k + j];
+                    }
+                    for (int c = 0; c < optimal_k; ++c) {
+                        if (cnt[c] > 0) {
+                            for (int j = 0; j < optimal_k; ++j)
+                                centroids[c][j] /= cnt[c];
+                        }
+                    }
+
+                    if (changed == 0) break;
+                }
+
+                // 8. 后处理: 日志打印 cluster centroid 间相似度 (不做 merge, 信任 spectral clustering)
+                // 计算 cluster embedding centroids (在原始 embedding 空间)
+                std::vector<std::vector<float>> cluster_emb(optimal_k, std::vector<float>(emb_dim, 0));
+                std::vector<int> cluster_cnt(optimal_k, 0);
+                for (int i = 0; i < n_segs; ++i) {
+                    cluster_cnt[labels[i]]++;
+                    for (int j = 0; j < emb_dim; ++j)
+                        cluster_emb[labels[i]][j] += seg_embeddings[i][j];
+                }
+                for (int c = 0; c < optimal_k; ++c) {
+                    if (cluster_cnt[c] > 0) {
+                        for (int j = 0; j < emb_dim; ++j)
+                            cluster_emb[c][j] /= cluster_cnt[c];
+                        float norm = 0;
+                        for (float v : cluster_emb[c]) norm += v * v;
+                        norm = sqrtf(norm + 1e-12f);
+                        for (float& v : cluster_emb[c]) v /= norm;
+                    }
+                }
+
+                // 日志: cluster centroid 间余弦相似度
+                fprintf(stderr, "[Serve] Phase 3b: cluster centroid similarities:\n");
+                for (int i = 0; i < optimal_k; ++i) {
+                    for (int j = i + 1; j < optimal_k; ++j) {
+                        float sim = 0;
+                        for (int k = 0; k < emb_dim; ++k)
+                            sim += cluster_emb[i][k] * cluster_emb[j][k];
+                        fprintf(stderr, "  c%d-c%d: %.3f", i, j, sim);
+                    }
+                }
+                fprintf(stderr, "\n");
+
+                // 日志: embedding 相似度全局统计
+                {
+                    float min_sim = 2, max_sim = -2;
+                    double sum_sim = 0;
+                    int cnt = 0, nan_cnt = 0;
+                    for (int i = 0; i < n_segs; ++i) {
+                        for (int j = i + 1; j < n_segs; ++j) {
+                            float dot = 0;
+                            for (int k = 0; k < emb_dim; ++k)
+                                dot += seg_embeddings[i][k] * seg_embeddings[j][k];
+                            if (std::isnan(dot) || std::isinf(dot)) { ++nan_cnt; continue; }
+                            if (dot < min_sim) min_sim = dot;
+                            if (dot > max_sim) max_sim = dot;
+                            sum_sim += dot;
+                            ++cnt;
+                        }
+                    }
+                    fprintf(stderr, "[Serve] Phase 3b: embedding sim stats: min=%.3f max=%.3f avg=%.3f (N=%d, nan_pairs=%d)\n",
+                            min_sim, max_sim, cnt > 0 ? (float)(sum_sim / cnt) : 0.0f, n_segs, nan_cnt);
+                }
+
+                // 直接分配 spectral clustering labels (不做 merge_by_cos)
+                for (int i = 0; i < n_segs; ++i)
+                    spk_intervals[i].speaker_id = labels[i];
+
+                // Phase 3b 分布日志
+                {
+                    std::map<int, int> dist;
+                    for (auto& si : spk_intervals) dist[si.speaker_id]++;
+                    fprintf(stderr, "[Serve] Phase 3b distribution:");
+                    for (auto& [id, cnt] : dist)
+                        fprintf(stderr, " spk%d=%d(%.0f%%)", id, cnt, 100.0f * cnt / n_segs);
+                    fprintf(stderr, "\n");
+                }
+
+                // 重编号 speaker_id + 按出现顺序排列
                 std::map<int, int> renumber;
                 int next_num = 0;
                 for (auto& si : spk_intervals) {
@@ -4143,12 +4472,6 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                     si.speaker_name = "Speaker_" + std::to_string(si.speaker_id);
                 }
                 phase3_speaker_count = next_num;
-                if (remapped > 0) {
-                    fprintf(stderr, "[Serve] v4 Phase 3b: merged → %d speakers (%d intervals remapped)\n",
-                            (int)renumber.size(), remapped);
-                }
-            } else {
-                phase3_speaker_count = diar_spk_mgr.speaker_count();
             }
 
             double mel_ms = std::chrono::duration<double, std::milli>(
@@ -4164,16 +4487,35 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                     gpu_vad_engine_.is_loaded() ? "GPU" : "CPU",
                     gpu_mel_.is_initialized() ? "GPU" : "CPU");
 
-            // 自动注册 diarization 说话人到全局 speaker_manager_
-            for (auto& name : diar_spk_mgr.speaker_names()) {
-                bool exists = false;
-                for (auto& gn : speaker_manager_.speaker_names()) {
-                    if (gn == name) { exists = true; break; }
+            // 自动注册 diarization 说话人到全局 speaker_manager_ (用 spectral clustering 结果)
+            if (!seg_embeddings.empty() && seg_embeddings.size() == spk_intervals.size()) {
+                std::map<int, std::vector<float>> cluster_centroids;
+                std::map<int, int> cluster_counts;
+                int edim = (int)seg_embeddings[0].size();
+                for (size_t i = 0; i < spk_intervals.size(); ++i) {
+                    int id = spk_intervals[i].speaker_id;
+                    if (cluster_centroids.find(id) == cluster_centroids.end()) {
+                        cluster_centroids[id].assign(edim, 0.0f);
+                        cluster_counts[id] = 0;
+                    }
+                    cluster_counts[id]++;
+                    for (int j = 0; j < edim; ++j)
+                        cluster_centroids[id][j] += seg_embeddings[i][j];
                 }
-                if (!exists) {
-                    auto emb = diar_spk_mgr.get_embedding(name);
-                    if (!emb.empty()) {
-                        speaker_manager_.register_speaker(name, emb);
+                for (auto& [id, c] : cluster_centroids) {
+                    float cnt = (float)cluster_counts[id];
+                    for (float& v : c) v /= cnt;
+                    float norm = 0;
+                    for (float v : c) norm += v * v;
+                    norm = sqrtf(norm + 1e-12f);
+                    for (float& v : c) v /= norm;
+                    std::string name = "Speaker_" + std::to_string(id);
+                    bool exists = false;
+                    for (auto& gn : speaker_manager_.speaker_names()) {
+                        if (gn == name) { exists = true; break; }
+                    }
+                    if (!exists) {
+                        speaker_manager_.register_speaker(name, c);
                         fprintf(stderr, "[Serve] v4: auto-registered speaker '%s' to global manager\n", name.c_str());
                     }
                 }
@@ -4497,7 +4839,23 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
 
                     // 检查是否需要在此处切段
                     bool split_here = false;
-                    if (ci.is_punc && is_sentence_end(ci.ch) && i + 1 < char_infos.size()) {
+                    // 句末标点检查: 原始标点或插入标点均可触发 (ASR 输出可能已有标点)
+                    bool is_sent_end = is_sentence_end(ci.ch) && i + 1 < char_infos.size();
+                    // 逗号也可用于长段切分
+                    bool is_comma = (ci.ch == "\xef\xbc\x8c") && i + 1 < char_infos.size(); // ，
+
+                    // 计算当前段的 UTF-8 字符数 (用于字符计数的切分条件)
+                    int cur_char_count = 0;
+                    {
+                        for (size_t ci2 = 0; ci2 < cur.text.size(); ) {
+                            unsigned char uc = (unsigned char)cur.text[ci2];
+                            int cl = (uc < 0x80) ? 1 : (uc < 0xE0) ? 2 : (uc < 0xF0) ? 3 : 4;
+                            ci2 += cl;
+                            cur_char_count++;
+                        }
+                    }
+
+                    if (is_sent_end || is_comma) {
                         // 句末标点 — 检查后续文字的 speaker
                         int next_wi = -1;
                         for (size_t j = i + 1; j < char_infos.size(); ++j) {
@@ -4506,8 +4864,18 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                                 break;
                             }
                         }
-                        if (next_wi >= 0 && word_list[next_wi].speaker_id != cur.speaker_id) {
+                        if (is_sent_end && next_wi >= 0 && word_list[next_wi].speaker_id != cur.speaker_id) {
                             // speaker 变化 + 句末标点: 必须切
+                            split_here = true;
+                        }
+                        // 同说话人长段: 段时长超 10s 或文本超 30 字时在句末标点处切分
+                        if (!split_here && is_sent_end &&
+                            ((cur.end_ms - cur.start_ms) > 10000 || cur_char_count > 30)) {
+                            split_here = true;
+                        }
+                        // 较长段: 段时长超 15s 或文本超 40 字时, 在逗号处也可切分
+                        if (!split_here && is_comma &&
+                            ((cur.end_ms - cur.start_ms) > 15000 || cur_char_count > 40)) {
                             split_here = true;
                         }
                     }
@@ -4554,6 +4922,28 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 }
                 // 最后一段
                 if (!cur.text.empty()) v4_segments.push_back(cur);
+            }
+
+            // DEBUG: Phase 6d 段数统计
+            {
+                int same_spk_splits = 0, spk_change_splits = 0;
+                int max_dur = 0;
+                for (auto& seg : v4_segments) {
+                    int dur = seg.end_ms - seg.start_ms;
+                    if (dur > max_dur) max_dur = dur;
+                }
+                fprintf(stderr, "[Serve] v4 Phase 6d: %zu segments, max_dur=%dms\n",
+                        v4_segments.size(), max_dur);
+                // Show top 5 longest
+                std::vector<std::pair<int,int>> dur_idx;
+                for (int i = 0; i < (int)v4_segments.size(); ++i)
+                    dur_idx.push_back({v4_segments[i].end_ms - v4_segments[i].start_ms, i});
+                std::sort(dur_idx.rbegin(), dur_idx.rend());
+                for (int k = 0; k < std::min(5, (int)dur_idx.size()); ++k) {
+                    auto& seg = v4_segments[dur_idx[k].second];
+                    fprintf(stderr, "  [%d] %dms, spk=%d, %zu chars\n",
+                            dur_idx[k].second, dur_idx[k].first, seg.speaker_id, seg.text.size());
+                }
             }
 
             // 6e: 后处理 — 段末标点修正
@@ -4614,13 +5004,21 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             }
 
             // 吸收 island 后再做一次相邻同 speaker 合并，避免残留同 speaker 碎段。
+            // 仅合并短碎段 — 若两段都 >5s 则保持句子级分段; 结果不得超 30s
             std::vector<V4Segment> merged;
             for (auto& seg : smoothed) {
                 if (!merged.empty() &&
                     seg.speaker_id == merged.back().speaker_id &&
                     seg.start_ms - merged.back().end_ms <= 2000) {
-                    merged.back().end_ms = std::max(merged.back().end_ms, seg.end_ms);
-                    merged.back().text += seg.text;
+                    int prev_dur = merged.back().end_ms - merged.back().start_ms;
+                    int cur_dur = seg.end_ms - seg.start_ms;
+                    int merged_dur = std::max(merged.back().end_ms, seg.end_ms) - merged.back().start_ms;
+                    if ((prev_dur <= 5000 || cur_dur <= 5000) && merged_dur <= 30000) {
+                        merged.back().end_ms = std::max(merged.back().end_ms, seg.end_ms);
+                        merged.back().text += seg.text;
+                    } else {
+                        merged.push_back(seg);
+                    }
                 } else {
                     merged.push_back(seg);
                 }
@@ -4844,7 +5242,7 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             }
             if (embedding.empty()) continue;
 
-            auto spk = diar_spk_mgr.identify(embedding, 0.65f, true);
+            auto spk = diar_spk_mgr.identify(embedding, 0.78f, true);
             ss.speaker_id = spk.speaker_id;
             ss.speaker_name = spk.speaker_id >= 0 ? spk.name : "Unknown";
             ss.speaker_sim = spk.similarity;
