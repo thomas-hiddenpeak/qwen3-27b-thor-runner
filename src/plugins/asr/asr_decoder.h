@@ -108,8 +108,11 @@ private:
     __nv_bfloat16* workspace_ = nullptr;
     size_t workspace_size_ = 0;
 
-    // Token ID for decode step (managed memory)
+    // Token ID for decode step (device memory, write via cudaMemcpy)
     int* token_id_gpu_ = nullptr;
+
+    // cuBLAS pre-allocated workspace (prevents internal cudaMalloc)
+    void* cublas_workspace_ = nullptr;
 
     bool initialized_ = false;
 

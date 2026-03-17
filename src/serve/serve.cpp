@@ -3936,6 +3936,7 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 }
             }
 
+            int chunk_idx = 0;
             for (auto& chunk : asr_chunks) {
                 std::vector<float> chunk_pcm;
                 const int silence_pad = wav.sample_rate / 4;
@@ -3950,6 +3951,7 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                     chunk_pcm.data(), (int)chunk_pcm.size(), wav.sample_rate, language, true);
                 if (seg_result.error_code == 0 && !seg_result.text.empty())
                     full_text += seg_result.text;
+                chunk_idx++;
             }
         } else {
             auto result = asr_plugin_->transcribe_pcm(
@@ -4063,7 +4065,7 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             double vad_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - vad_t0).count();
 
-            // Step 3b: Mel + CAM++ speaker embedding
+            // Step 3b: Mel + CAM++ speaker embedding (在线 identify)
             asr::SpeakerManager diar_spk_mgr;
             auto mel_t0 = std::chrono::steady_clock::now();
             int mel_segments = 0;
@@ -4115,19 +4117,6 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 spk_intervals.push_back(si);
             }
 
-            double mel_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - mel_t0).count();
-            double phase3_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - phase3_t0).count();
-
-            fprintf(stderr, "[Serve] v4 Phase 3: %zu speaker intervals, %d unique speakers (%.1fs) "
-                    "[VAD %.0fms, Mel+CAM++ %.0fms (%d segs), %s VAD, %s Mel]\n",
-                    spk_intervals.size(), diar_spk_mgr.speaker_count(),
-                    phase3_ms / 1000.0,
-                    vad_ms, mel_ms, mel_segments,
-                    gpu_vad_engine_.is_loaded() ? "GPU" : "CPU",
-                    gpu_mel_.is_initialized() ? "GPU" : "CPU");
-
             // Phase 3b: 二次聚类 — 合并过于相似的说话人
             if (diar_spk_mgr.speaker_count() > 1) {
                 auto id_map = diar_spk_mgr.merge_similar(0.55f, 5);
@@ -4153,21 +4142,35 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                     si.speaker_id = renumber[si.speaker_id];
                     si.speaker_name = "Speaker_" + std::to_string(si.speaker_id);
                 }
+                phase3_speaker_count = next_num;
                 if (remapped > 0) {
                     fprintf(stderr, "[Serve] v4 Phase 3b: merged → %d speakers (%d intervals remapped)\n",
                             (int)renumber.size(), remapped);
                 }
+            } else {
+                phase3_speaker_count = diar_spk_mgr.speaker_count();
             }
+
+            double mel_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - mel_t0).count();
+            double phase3_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - phase3_t0).count();
+
+            fprintf(stderr, "[Serve] v4 Phase 3: %zu speaker intervals, %d unique speakers (%.1fs) "
+                    "[VAD %.0fms, Mel+CAM++ %.0fms (%d segs), %s VAD, %s Mel]\n",
+                    spk_intervals.size(), phase3_speaker_count,
+                    phase3_ms / 1000.0,
+                    vad_ms, mel_ms, mel_segments,
+                    gpu_vad_engine_.is_loaded() ? "GPU" : "CPU",
+                    gpu_mel_.is_initialized() ? "GPU" : "CPU");
 
             // 自动注册 diarization 说话人到全局 speaker_manager_
             for (auto& name : diar_spk_mgr.speaker_names()) {
-                // 避免重复注册 (全局里已有同名则跳过)
                 bool exists = false;
                 for (auto& gn : speaker_manager_.speaker_names()) {
                     if (gn == name) { exists = true; break; }
                 }
                 if (!exists) {
-                    // 从 diar_spk_mgr 提取该说话人的 embedding 并注册
                     auto emb = diar_spk_mgr.get_embedding(name);
                     if (!emb.empty()) {
                         speaker_manager_.register_speaker(name, emb);
@@ -4336,12 +4339,12 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
         };
         std::vector<V4Segment> v4_segments;
 
-        // 5a: 连续同 speaker 合并 (gap ≤ 5s 容忍)
+        // 5a: 连续同 speaker 合并 (gap ≤ 2s 容忍)
         for (auto& w : word_list) {
             bool extend = !v4_segments.empty() &&
                           w.speaker_id == v4_segments.back().speaker_id &&
                           w.speaker_id >= 0 &&
-                          w.start_ms - v4_segments.back().end_ms <= 5000;
+                          w.start_ms - v4_segments.back().end_ms <= 2000;
             if (extend) {
                 v4_segments.back().end_ms = std::max(v4_segments.back().end_ms, w.end_ms);
                 v4_segments.back().text += w.word;
@@ -4371,7 +4374,7 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 if (char_count <= 3 && (seg.end_ms - seg.start_ms) < 2000) {
                     // 优先合并到前一段 (同 speaker)
                     if (!merged.empty() &&
-                        seg.start_ms - merged.back().end_ms <= 5000 &&
+                        seg.start_ms - merged.back().end_ms <= 2000 &&
                         (seg.speaker_id == merged.back().speaker_id || seg.speaker_id < 0)) {
                         merged.back().end_ms = std::max(merged.back().end_ms, seg.end_ms);
                         merged.back().text += seg.text;
@@ -4379,7 +4382,7 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                     }
                     // 否则合并到下一段 (同 speaker)
                     if (i + 1 < v4_segments.size() &&
-                        v4_segments[i+1].start_ms - seg.end_ms <= 5000 &&
+                        v4_segments[i+1].start_ms - seg.end_ms <= 2000 &&
                         (seg.speaker_id == v4_segments[i+1].speaker_id || seg.speaker_id < 0)) {
                         v4_segments[i+1].start_ms = std::min(v4_segments[i+1].start_ms, seg.start_ms);
                         v4_segments[i+1].text = seg.text + v4_segments[i+1].text;
@@ -4397,7 +4400,7 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             for (auto& seg : v4_segments) {
                 if (!merged.empty() &&
                     seg.speaker_id == merged.back().speaker_id &&
-                    seg.start_ms - merged.back().end_ms <= 8000) {
+                    seg.start_ms - merged.back().end_ms <= 3000) {
                     merged.back().end_ms = std::max(merged.back().end_ms, seg.end_ms);
                     merged.back().text += seg.text;
                 } else {
@@ -4588,8 +4591,8 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 auto& seg = v4_segments[i];
                 int dur_ms = seg.end_ms - seg.start_ms;
 
-                // 检查: 是否为短 segment (<5s) 且前后被同一 speaker 包围?
-                bool is_island = dur_ms < 5000 && seg.speaker_id >= 0 &&
+                // 检查: 是否为短 segment (<3s) 且前后被同一 speaker 包围?
+                bool is_island = dur_ms < 3000 && seg.speaker_id >= 0 &&
                                  !smoothed.empty() && i + 1 < v4_segments.size();
                 bool surrounded = is_island &&
                                   smoothed.back().speaker_id >= 0 &&
@@ -4615,7 +4618,7 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             for (auto& seg : smoothed) {
                 if (!merged.empty() &&
                     seg.speaker_id == merged.back().speaker_id &&
-                    seg.start_ms - merged.back().end_ms <= 5000) {
+                    seg.start_ms - merged.back().end_ms <= 2000) {
                     merged.back().end_ms = std::max(merged.back().end_ms, seg.end_ms);
                     merged.back().text += seg.text;
                 } else {

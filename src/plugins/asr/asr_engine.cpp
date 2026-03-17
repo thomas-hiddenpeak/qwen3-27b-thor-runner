@@ -270,8 +270,8 @@ void ASREngine::load_model(const std::string& model_dir) {
     // Position IDs for MRoPE [3, max_seq]
     cudaMalloc(&position_ids_, 3 * max_decoder_seq * sizeof(int));
 
-    // Token ID for decode step (managed memory, GPU argmax writes here)
-    cudaMallocManaged(&token_id_gpu_, sizeof(int));
+    // Token ID for decode step (device memory + cudaMemcpy, no managed memory)
+    cudaMalloc(&token_id_gpu_, sizeof(int));
 
     // Pre-allocated prompt token buffer (avoids per-call cudaMalloc/Free)
     cudaMalloc(&prompt_tokens_gpu_, max_prompt_len_ * sizeof(int));
@@ -341,6 +341,13 @@ std::string ASREngine::transcribe(
     if (!loaded_) {
         fprintf(stderr, "[ASR] ERROR: model not loaded\n");
         return "";
+    }
+
+    // Check for lingering CUDA errors from previous chunk
+    cudaError_t prev_err = cudaGetLastError();
+    if (prev_err != cudaSuccess) {
+        fprintf(stderr, "[ASR] WARNING: pre-existing CUDA error: %s\n",
+                cudaGetErrorString(prev_err));
     }
 
     auto t0 = std::chrono::steady_clock::now();
@@ -471,8 +478,9 @@ std::string ASREngine::transcribe(
         audio_ops::invoke_suppress_eos(logits_, IM_END, ENDOFTEXT, stream_);
     }
     audio_ops::invoke_argmax(logits_, token_id_gpu_, config_.vocab_size, stream_);
+    int next_token;
+    cudaMemcpyAsync(&next_token, token_id_gpu_, sizeof(int), cudaMemcpyDeviceToHost, stream_);
     cudaStreamSynchronize(stream_);
-    int next_token = *token_id_gpu_;
     int current_pos = prompt_len;
 
     while (next_token != IM_END && next_token != ENDOFTEXT
@@ -520,8 +528,8 @@ std::string ASREngine::transcribe(
             audio_ops::invoke_suppress_eos(logits_, IM_END, ENDOFTEXT, stream_);
         }
         audio_ops::invoke_argmax(logits_, token_id_gpu_, config_.vocab_size, stream_);
+        cudaMemcpyAsync(&next_token, token_id_gpu_, sizeof(int), cudaMemcpyDeviceToHost, stream_);
         cudaStreamSynchronize(stream_);
-        next_token = *token_id_gpu_;
         current_pos++;
     }
 

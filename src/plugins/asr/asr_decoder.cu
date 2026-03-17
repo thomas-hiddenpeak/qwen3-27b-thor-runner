@@ -57,6 +57,7 @@ TextDecoder::~TextDecoder() {
     }
     if (workspace_) cudaFree(workspace_);
     if (token_id_gpu_) cudaFree(token_id_gpu_);
+    if (cublas_workspace_) cudaFree(cublas_workspace_);
     if (cublas_handle_) cublasDestroy(cublas_handle_);
 }
 
@@ -114,8 +115,13 @@ void TextDecoder::initialize(cudaStream_t stream) {
     cudaMalloc(&workspace_, workspace_size_ * sizeof(__nv_bfloat16));
     cudaMemset(workspace_, 0, workspace_size_ * sizeof(__nv_bfloat16));
 
-    // Token ID for decode step (managed memory for CPU/GPU access)
-    cudaMallocManaged(&token_id_gpu_, sizeof(int));
+    // Token ID for decode step (device memory + cudaMemcpy, no managed memory)
+    cudaMalloc(&token_id_gpu_, sizeof(int));
+
+    // Pre-allocate cuBLAS workspace (prevents internal cudaMalloc during decode)
+    size_t cublas_ws_size = 4 * 1024 * 1024;  // 4 MB
+    cudaMalloc(&cublas_workspace_, cublas_ws_size);
+    cublasSetWorkspace(cublas_handle_, cublas_workspace_, cublas_ws_size);
 
     cache_seq_len_ = 0;
     initialized_ = true;
@@ -380,9 +386,9 @@ void TextDecoder::forward_decode(
 
     int h = config_.decoder_hidden_size;
 
-    // Embed the token
+    // Embed the token (cudaMemcpyAsync avoids managed memory ATS faults)
     __nv_bfloat16* hidden_states = workspace_;
-    *token_id_gpu_ = token_id;
+    cudaMemcpyAsync(token_id_gpu_, &token_id, sizeof(int), cudaMemcpyHostToDevice, stream);
     audio_ops::invoke_embedding_lookup(hidden_states, token_id_gpu_,
                                         embed_tokens_w_, 1, h, stream);
 
