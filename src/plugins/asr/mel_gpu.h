@@ -27,7 +27,9 @@ struct GpuMelConfig {
     int sample_rate = 16000;
     float pre_emphasis = 0.97f;   // Pre-emphasis coefficient (0 = disabled)
     bool scale_32768   = true;    // FunASR convention: float [-1,1] → PCM16 range
-    enum class WindowType { HANN, HAMMING } window = WindowType::HANN;
+    float low_freq     = 20.0f;   // Kaldi default low frequency for mel filterbank
+    bool pad_to_power_of_two = true;  // Kaldi default: zero-pad to power of 2 for FFT
+    enum class WindowType { HANN, HAMMING, POVEY } window = WindowType::POVEY;
 };
 
 class GpuMelExtractor {

@@ -391,11 +391,25 @@ std::vector<float> GpuSpeakerEncoder::extract(const float* mel_80xT, int T) {
     ScratchPool& sp = scratch_;
 
 
-    // 1. Transpose mel [T, 80] → [80, T] and upload
+    // 1. CMN (Cepstral Mean Normalization): subtract per-bin mean across time
+    //    This matches FunASR CAMPPlus extract_feature: feature - feature.mean(dim=0)
+    std::vector<float> mel_cmn(80 * T);
+    float bin_mean[80] = {};
+    for (int t = 0; t < T; ++t)
+        for (int f = 0; f < 80; ++f)
+            bin_mean[f] += mel_80xT[t * 80 + f];
+    float inv_T = 1.0f / T;
+    for (int f = 0; f < 80; ++f)
+        bin_mean[f] *= inv_T;
+    for (int t = 0; t < T; ++t)
+        for (int f = 0; f < 80; ++f)
+            mel_cmn[t * 80 + f] = mel_80xT[t * 80 + f] - bin_mean[f];
+
+    // 2. Transpose mel [T, 80] → [80, T] and upload
     std::vector<float> transposed(80 * T);
     for (int t = 0; t < T; ++t)
         for (int f = 0; f < 80; ++f)
-            transposed[f * T + t] = mel_80xT[t * 80 + f];
+            transposed[f * T + t] = mel_cmn[t * 80 + f];
 
     // Use sp.a as input buffer
     float* d_x = sp.a;

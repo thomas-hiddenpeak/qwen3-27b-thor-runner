@@ -48,11 +48,25 @@ public:
     std::vector<float> extract(const float* mel_80xT, int T) {
         if (!loaded_ || T < 10) return {};
 
+        // 0. CMN (Cepstral Mean Normalization): subtract per-bin mean across time
+        //    Matches FunASR CAMPPlus extract_feature: feature - feature.mean(dim=0)
+        std::vector<float> mel_cmn(80 * T);
+        float bin_mean[80] = {};
+        for (int t = 0; t < T; ++t)
+            for (int f = 0; f < 80; ++f)
+                bin_mean[f] += mel_80xT[t * 80 + f];
+        float inv_T = 1.0f / T;
+        for (int f = 0; f < 80; ++f)
+            bin_mean[f] *= inv_T;
+        for (int t = 0; t < T; ++t)
+            for (int f = 0; f < 80; ++f)
+                mel_cmn[t * 80 + f] = mel_80xT[t * 80 + f] - bin_mean[f];
+
         // 1. Transpose: mel [T, 80] → [80, T]
         std::vector<float> input(80 * T);
         for (int t = 0; t < T; ++t)
             for (int f = 0; f < 80; ++f)
-                input[f * T + t] = mel_80xT[t * 80 + f];
+                input[f * T + t] = mel_cmn[t * 80 + f];
 
         // 2. FCM (Frequency Convolutional Module)
         // Order: conv1 → bn1 → relu → layer1 → layer2 → conv2 → bn2 → relu

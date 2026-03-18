@@ -124,10 +124,14 @@ GpuMelExtractor::~GpuMelExtractor() {
 bool GpuMelExtractor::init(const GpuMelConfig& config) {
     cfg_ = config;
 
-    // FFT size: use n_fft directly (cuFFT supports non-power-of-2)
-    // 不做零填充, 保持 n_fft=400 → n_freqs=201, 与 CPU compute_mel_80 完全一致
-    fft_size_ = cfg_.n_fft;  // 400
-    n_freqs_ = fft_size_ / 2 + 1;  // 201
+    // FFT size: pad to next power of 2 if configured (Kaldi default)
+    if (cfg_.pad_to_power_of_two) {
+        fft_size_ = 1;
+        while (fft_size_ < cfg_.n_fft) fft_size_ <<= 1;
+    } else {
+        fft_size_ = cfg_.n_fft;
+    }
+    n_freqs_ = fft_size_ / 2 + 1;
 
     // Create CUDA stream + cuBLAS
     cudaStreamCreate(&stream_);
@@ -144,7 +148,11 @@ bool GpuMelExtractor::init(const GpuMelConfig& config) {
 
 void GpuMelExtractor::build_window() {
     std::vector<float> win(cfg_.n_fft);
-    if (cfg_.window == GpuMelConfig::WindowType::HANN) {
+    if (cfg_.window == GpuMelConfig::WindowType::POVEY) {
+        // Povey = symmetric Hann^0.85 (Kaldi default for speaker verification)
+        for (int i = 0; i < cfg_.n_fft; ++i)
+            win[i] = std::pow(0.5f - 0.5f * cosf(2.0f * (float)M_PI * i / (cfg_.n_fft - 1)), 0.85f);
+    } else if (cfg_.window == GpuMelConfig::WindowType::HANN) {
         for (int i = 0; i < cfg_.n_fft; ++i)
             win[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / cfg_.n_fft));
     } else {
@@ -161,16 +169,17 @@ void GpuMelExtractor::build_mel_filterbank() {
     auto hz_to_mel = [](float hz) { return 2595.0f * std::log10(1.0f + hz / 700.0f); };
     auto mel_to_hz = [](float mel) { return 700.0f * (std::pow(10.0f, mel / 2595.0f) - 1.0f); };
 
-    float min_mel = hz_to_mel(0.0f);
+    float min_mel = hz_to_mel(cfg_.low_freq);
     float max_mel = hz_to_mel((float)cfg_.sample_rate / 2.0f);
     std::vector<float> mel_points(cfg_.n_mels + 2);
     for (int i = 0; i < cfg_.n_mels + 2; ++i)
         mel_points[i] = mel_to_hz(min_mel + (max_mel - min_mel) * i / (cfg_.n_mels + 1));
 
     for (int m = 0; m < cfg_.n_mels; ++m) {
-        float left   = mel_points[m] * cfg_.n_fft / cfg_.sample_rate;
-        float center = mel_points[m + 1] * cfg_.n_fft / cfg_.sample_rate;
-        float right  = mel_points[m + 2] * cfg_.n_fft / cfg_.sample_rate;
+        // Use fft_size_ (padded) for frequency bin resolution, not n_fft
+        float left   = mel_points[m] * fft_size_ / cfg_.sample_rate;
+        float center = mel_points[m + 1] * fft_size_ / cfg_.sample_rate;
+        float right  = mel_points[m + 2] * fft_size_ / cfg_.sample_rate;
         for (int k = 0; k < n_freqs_; ++k) {
             float fk = (float)k;
             if (fk >= left && fk <= center)
