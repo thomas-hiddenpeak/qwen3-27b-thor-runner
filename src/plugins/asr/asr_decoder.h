@@ -94,6 +94,41 @@ public:
 
     int current_seq_len() const { return cache_seq_len_; }
 
+    // ========================================================================
+    // Batch decode: B sequences decode simultaneously using cuBLAS GEMM
+    // ========================================================================
+
+    // Allocate batch KV cache and workspace (call once, idempotent)
+    void initialize_batch(int max_batch_size, cudaStream_t stream = 0);
+
+    // Reset batch state for a new set of B sequences
+    void reset_batch(int batch_size);
+
+    // Prefill single item in batch (redirects KV writes to batch_k/v_cache_[idx])
+    // Call for each item 0..batch_size-1 before batch decode
+    void forward_prefill_batch_item(int batch_idx,
+                                     const __nv_bfloat16* input_embeds,
+                                     const int* position_ids,
+                                     int seq_len,
+                                     __nv_bfloat16* logits_out,
+                                     cudaStream_t stream = 0);
+
+    // Batch decode: process active_batch_size tokens simultaneously via GEMM
+    // token_ids: [active_batch_size] on GPU
+    // position_ids: [3, active_batch_size] on GPU
+    // logits_out: [active_batch_size, vocab_size] on GPU
+    void forward_decode_batch(const int* token_ids,
+                              const int* position_ids,
+                              int active_batch_size,
+                              __nv_bfloat16* logits_out,
+                              cudaStream_t stream = 0);
+
+    // Batch accessors
+    int batch_seq_len(int idx) const { return batch_seq_lens_[idx]; }
+    void set_batch_seq_len(int idx, int len) { batch_seq_lens_[idx] = len; }
+    void increment_batch_seq_lens(const std::vector<bool>& finished);
+    bool batch_initialized() const { return batch_initialized_; }
+
 private:
     ASRConfig config_;
     int max_seq_len_;
@@ -144,11 +179,37 @@ private:
         __nv_bfloat16* workspace_base,
         cudaStream_t stream);
 
-    // 单层 decoder forward (decode 路径, T=1)
+    // 单層 decoder forward (decode 路径, T=1)
     void decoder_layer_forward_decode(
         int layer_idx,
         __nv_bfloat16* hidden_states,    // [1, hidden_size], in-place
         const int* position_ids,          // [3, 1]
+        __nv_bfloat16* workspace_base,
+        cudaStream_t stream);
+
+    // ========================================================================
+    // Batch decode private members
+    // ========================================================================
+    int max_batch_size_ = 0;
+    int cur_batch_size_ = 0;
+    std::vector<int> batch_seq_lens_;    // [cur_batch_size_] per-seq cache lengths
+
+    // Batch KV caches: [num_layers], each [max_batch, max_seq, kv_heads, head_dim]
+    std::vector<__nv_bfloat16*> batch_k_cache_;
+    std::vector<__nv_bfloat16*> batch_v_cache_;
+
+    // Batch workspace
+    __nv_bfloat16* batch_workspace_ = nullptr;
+    size_t batch_workspace_size_ = 0;
+
+    bool batch_initialized_ = false;
+
+    // Per-layer batch decode
+    void decoder_layer_forward_decode_batch(
+        int layer_idx,
+        __nv_bfloat16* hidden_states,    // [B, hidden_size], in-place
+        const int* position_ids,          // [3, B]
+        int B,
         __nv_bfloat16* workspace_base,
         cudaStream_t stream);
 };

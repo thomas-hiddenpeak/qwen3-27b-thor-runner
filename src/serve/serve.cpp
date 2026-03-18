@@ -3962,12 +3962,13 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             }
 
             int chunk_idx = 0;
+            // Build all chunk PCMs first
+            std::vector<std::vector<float>> all_chunk_pcms;
             for (auto& chunk : asr_chunks) {
                 std::vector<float> chunk_pcm;
                 const int silence_pad = wav.sample_rate / 4;
                 for (size_t vi = 0; vi < chunk.seg_indices.size(); ++vi) {
                     auto& vr = vad_ranges[chunk.seg_indices[vi]];
-                    // Slice PCM from original samples using timestamps
                     int s = (int)((int64_t)vr.start_ms * wav.sample_rate / 1000);
                     int e = (int)((int64_t)vr.end_ms * wav.sample_rate / 1000);
                     if (s < 0) s = 0;
@@ -3977,12 +3978,29 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                     chunk_pcm.insert(chunk_pcm.end(),
                                      wav.samples.begin() + s, wav.samples.begin() + e);
                 }
-                if ((int)chunk_pcm.size() < wav.sample_rate / 5) continue;
-                auto seg_result = asr_plugin_->transcribe_pcm(
-                    chunk_pcm.data(), (int)chunk_pcm.size(), wav.sample_rate, language, true);
-                if (seg_result.error_code == 0 && !seg_result.text.empty())
-                    full_text += seg_result.text;
-                chunk_idx++;
+                if ((int)chunk_pcm.size() >= wav.sample_rate / 5)
+                    all_chunk_pcms.push_back(std::move(chunk_pcm));
+            }
+
+            // Try batch transcribe (GEMV→GEMM, B× throughput)
+            auto* native_plugin = dynamic_cast<plugins::NativeAsrPlugin*>(asr_plugin_.get());
+            if (native_plugin && all_chunk_pcms.size() >= 2) {
+                std::vector<plugins::NativeAsrPlugin::PcmChunk> pcm_chunks;
+                for (auto& pcm : all_chunk_pcms)
+                    pcm_chunks.push_back({pcm.data(), (int)pcm.size()});
+                auto batch_results = native_plugin->transcribe_batch_pcm(
+                    pcm_chunks, wav.sample_rate, language, true);
+                for (auto& r : batch_results)
+                    if (r.error_code == 0 && !r.text.empty())
+                        full_text += r.text;
+            } else {
+                // Fallback: sequential transcribe
+                for (auto& chunk_pcm : all_chunk_pcms) {
+                    auto seg_result = asr_plugin_->transcribe_pcm(
+                        chunk_pcm.data(), (int)chunk_pcm.size(), wav.sample_rate, language, true);
+                    if (seg_result.error_code == 0 && !seg_result.text.empty())
+                        full_text += seg_result.text;
+                }
             }
         } else {
             auto result = asr_plugin_->transcribe_pcm(
@@ -5847,12 +5865,12 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
         fprintf(stderr, "[Serve] Plain mode: %zu chunks from %zu VAD segments\n",
                 chunks.size(), vad_segs.size());
 
-        // 逐 chunk 转录
+        // 逐 chunk 转录 → batch transcribe if possible
         std::string full_text;
+        // Build all chunk PCMs first
+        std::vector<std::vector<float>> all_plain_pcms;
         for (size_t ci = 0; ci < chunks.size(); ++ci) {
             auto& chunk = chunks[ci];
-
-            // 拼接 VAD 段 PCM (段间插入 250ms 静音)
             std::vector<float> chunk_pcm;
             const int silence_pad = wav_plain.sample_rate / 4;
             for (size_t vi = 0; vi < chunk.seg_indices.size(); ++vi) {
@@ -5862,15 +5880,27 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 }
                 chunk_pcm.insert(chunk_pcm.end(), vseg.pcm.begin(), vseg.pcm.end());
             }
+            if ((int)chunk_pcm.size() >= wav_plain.sample_rate / 5)
+                all_plain_pcms.push_back(std::move(chunk_pcm));
+        }
 
-            if ((int)chunk_pcm.size() < wav_plain.sample_rate / 5) continue;
-
-            auto seg_result = asr_plugin_->transcribe_pcm(
-                chunk_pcm.data(), (int)chunk_pcm.size(),
-                wav_plain.sample_rate, language, true);
-
-            if (seg_result.error_code == 0 && !seg_result.text.empty()) {
-                full_text += seg_result.text;
+        auto* native_plain = dynamic_cast<plugins::NativeAsrPlugin*>(asr_plugin_.get());
+        if (native_plain && all_plain_pcms.size() >= 2) {
+            std::vector<plugins::NativeAsrPlugin::PcmChunk> pcm_chunks;
+            for (auto& pcm : all_plain_pcms)
+                pcm_chunks.push_back({pcm.data(), (int)pcm.size()});
+            auto batch_results = native_plain->transcribe_batch_pcm(
+                pcm_chunks, wav_plain.sample_rate, language, true);
+            for (auto& r : batch_results)
+                if (r.error_code == 0 && !r.text.empty())
+                    full_text += r.text;
+        } else {
+            for (auto& chunk_pcm : all_plain_pcms) {
+                auto seg_result = asr_plugin_->transcribe_pcm(
+                    chunk_pcm.data(), (int)chunk_pcm.size(),
+                    wav_plain.sample_rate, language, true);
+                if (seg_result.error_code == 0 && !seg_result.text.empty())
+                    full_text += seg_result.text;
             }
         }
 

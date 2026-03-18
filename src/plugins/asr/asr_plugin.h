@@ -161,6 +161,15 @@ public:
                              int sample_rate = 16000,
                              const std::string& language = "auto",
                              bool suppress_early_eos = false) override;
+
+    // 批量转录: 多段 PCM → batch decode (GEMV→GEMM)
+    struct PcmChunk { const float* samples; int num_samples; };
+    std::vector<AsrResult> transcribe_batch_pcm(
+        const std::vector<PcmChunk>& chunks,
+        int sample_rate = 16000,
+        const std::string& language = "auto",
+        bool suppress_early_eos = false);
+
     bool is_available() const override;
     std::string name() const override { return "native-asr"; }
 

@@ -411,6 +411,52 @@ AsrResult NativeAsrPlugin::transcribe_pcm(const float* samples, int num_samples,
 }
 
 // ============================================================================
+// NativeAsrPlugin::transcribe_batch_pcm — 多段 PCM batch decode
+// ============================================================================
+
+std::vector<AsrResult> NativeAsrPlugin::transcribe_batch_pcm(
+    const std::vector<PcmChunk>& chunks,
+    int sample_rate,
+    const std::string& language,
+    bool suppress_early_eos)
+{
+    std::vector<AsrResult> results(chunks.size());
+    if (!is_available()) {
+        for (auto& r : results) { r.error_code = 1; r.error_message = "ASR engine not loaded"; }
+        return results;
+    }
+    if (chunks.empty()) return results;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Build AudioChunk vector for engine
+    std::vector<asr::ASREngine::AudioChunk> engine_chunks(chunks.size());
+    for (size_t i = 0; i < chunks.size(); i++) {
+        engine_chunks[i].samples = chunks[i].samples;
+        engine_chunks[i].num_samples = chunks[i].num_samples;
+    }
+
+    auto texts = engine_->transcribe_batch(engine_chunks, sample_rate, suppress_early_eos);
+
+    auto t1 = std::chrono::steady_clock::now();
+    float elapsed_s = std::chrono::duration<float>(t1 - t0).count();
+
+    for (size_t i = 0; i < texts.size(); i++) {
+        auto& text = texts[i];
+        while (!text.empty() && (text.front() == ' ' || text.front() == '\n')) text.erase(text.begin());
+        while (!text.empty() && (text.back() == ' ' || text.back() == '\n')) text.pop_back();
+        results[i].text = text;
+        results[i].language = language;
+        results[i].duration_s = elapsed_s / texts.size();
+    }
+
+    fprintf(stderr, "[ASR Native] Batch transcribed %zu chunks in %.2fs\n",
+            chunks.size(), elapsed_s);
+    return results;
+}
+
+// ============================================================================
 // 工厂
 // ============================================================================
 

@@ -50,6 +50,14 @@ public:
                                 int max_new_tokens = 448,
                                 bool suppress_early_eos = false);
 
+    // 批量转录: 多个 PCM 段同时解码 (GEMV→GEMM, B× 吞吐)
+    // 返回与 chunks 等长的文本 vector
+    struct AudioChunk { const float* samples; int num_samples; };
+    std::vector<std::string> transcribe_batch(
+        const std::vector<AudioChunk>& chunks,
+        int sample_rate = 16000,
+        bool suppress_early_eos = false);
+
     bool is_loaded() const { return loaded_; }
     const ASRConfig& config() const { return config_; }
 
@@ -91,6 +99,13 @@ private:
 
     // GPU Whisper mel (cuFFT-accelerated)
     std::unique_ptr<GpuWhisperMel> gpu_whisper_mel_;
+
+    // Batch decode buffers (allocated on first batch transcribe)
+    __nv_bfloat16* batch_logits_ = nullptr;    // [max_batch, vocab_size]
+    int* batch_token_ids_ = nullptr;           // [max_batch] on GPU
+    int* batch_position_ids_ = nullptr;        // [3, max_batch] on GPU
+    int* batch_result_ids_ = nullptr;          // [max_batch] on GPU (argmax results)
+    int max_batch_allocated_ = 0;
 
     cudaStream_t stream_ = 0;
     bool loaded_ = false;

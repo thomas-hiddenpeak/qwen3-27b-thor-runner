@@ -67,6 +67,10 @@ TextDecoder::~TextDecoder() {
     if (cublas_workspace_) cudaFree(cublas_workspace_);
     if (attn_split_k_ws_) cudaFree(attn_split_k_ws_);
     if (prefill_attn_score_buf_) cudaFree(prefill_attn_score_buf_);
+    // Batch resources
+    for (auto p : batch_k_cache_) if (p) cudaFree(p);
+    for (auto p : batch_v_cache_) if (p) cudaFree(p);
+    if (batch_workspace_) cudaFree(batch_workspace_);
     if (cublas_handle_) cublasDestroy(cublas_handle_);
 }
 
@@ -809,6 +813,254 @@ void TextDecoder::forward_decode(
         cudaEventDestroy(ev_b);
         cudaEventDestroy(ev_lm);
     }
+}
+
+// ============================================================================
+// Batch decode: B sequences decode simultaneously using cuBLAS GEMM
+// Key insight: GEMV reads weights once per token (bandwidth-bound).
+// GEMM reads weights once for B tokens → B× throughput improvement.
+// ============================================================================
+
+void TextDecoder::initialize_batch(int max_batch_size, cudaStream_t stream) {
+    if (batch_initialized_ && max_batch_size <= max_batch_size_) return;
+
+    // Free existing batch resources
+    for (auto p : batch_k_cache_) if (p) cudaFree(p);
+    for (auto p : batch_v_cache_) if (p) cudaFree(p);
+    if (batch_workspace_) cudaFree(batch_workspace_);
+
+    max_batch_size_ = max_batch_size;
+    int num_layers = config_.decoder_layers;
+    int kv_dim = config_.decoder_kv_dim();
+    int h = config_.decoder_hidden_size;
+    int q_dim = config_.decoder_q_dim();
+    int ffn = config_.decoder_intermediate_size;
+
+    // Batch KV cache: [max_batch, max_seq, kv_heads, head_dim] per layer
+    size_t kv_per_seq = (size_t)max_seq_len_ * kv_dim;
+    size_t kv_per_layer = (size_t)max_batch_size * kv_per_seq;
+
+    batch_k_cache_.resize(num_layers, nullptr);
+    batch_v_cache_.resize(num_layers, nullptr);
+    for (int i = 0; i < num_layers; i++) {
+        cudaMalloc(&batch_k_cache_[i], kv_per_layer * sizeof(__nv_bfloat16));
+        cudaMalloc(&batch_v_cache_[i], kv_per_layer * sizeof(__nv_bfloat16));
+    }
+
+    // Batch workspace layout:
+    //   hidden_states: B * h
+    //   norm_out:      B * h
+    //   q_buf:         B * q_dim
+    //   k_buf:         B * kv_dim
+    //   v_buf:         B * kv_dim
+    //   attn_out:      B * q_dim
+    //   proj_out:      B * h
+    //   gate_buf:      B * ffn
+    //   up_buf:        B * ffn
+    //   logits_buf:    B * vocab_size
+    batch_workspace_size_ = (size_t)max_batch_size * (
+        h + h + q_dim + kv_dim + kv_dim + q_dim + h + ffn + ffn
+    ) + (size_t)max_batch_size * config_.vocab_size + 1024;
+
+    cudaMalloc(&batch_workspace_, batch_workspace_size_ * sizeof(__nv_bfloat16));
+
+    batch_seq_lens_.resize(max_batch_size, 0);
+    batch_initialized_ = true;
+
+    float kv_mb = (float)num_layers * kv_per_layer * 2 * sizeof(__nv_bfloat16) / (1024.0f * 1024.0f);
+    float ws_mb = batch_workspace_size_ * sizeof(__nv_bfloat16) / (1024.0f * 1024.0f);
+    fprintf(stderr, "[ASR Decoder] Batch initialized: max_B=%d, KV cache %.1f MB, workspace %.1f MB\n",
+            max_batch_size, kv_mb, ws_mb);
+}
+
+void TextDecoder::reset_batch(int batch_size) {
+    cur_batch_size_ = batch_size;
+    for (int i = 0; i < batch_size; i++) batch_seq_lens_[i] = 0;
+}
+
+void TextDecoder::increment_batch_seq_lens(const std::vector<bool>& finished) {
+    for (int i = 0; i < cur_batch_size_; i++) {
+        if (!finished[i]) batch_seq_lens_[i]++;
+    }
+}
+
+// ============================================================================
+// forward_prefill_batch_item: prefill one sequence in the batch
+// Redirects KV writes to batch_k/v_cache_[batch_idx]
+// ============================================================================
+
+void TextDecoder::forward_prefill_batch_item(
+    int batch_idx,
+    const __nv_bfloat16* input_embeds,
+    const int* position_ids,
+    int seq_len,
+    __nv_bfloat16* logits_out,
+    cudaStream_t stream)
+{
+    if (!initialized_ || !batch_initialized_) {
+        fprintf(stderr, "[ASR Decoder] ERROR: not initialized for batch prefill\n");
+        return;
+    }
+
+    int num_layers = config_.decoder_layers;
+    int kv_dim = config_.decoder_kv_dim();
+    size_t kv_stride = (size_t)max_seq_len_ * kv_dim;
+
+    // Redirect KV cache pointers to batch item's region
+    std::vector<__nv_bfloat16*> saved_k(num_layers), saved_v(num_layers);
+    for (int l = 0; l < num_layers; l++) {
+        saved_k[l] = k_cache_[l];
+        saved_v[l] = v_cache_[l];
+        k_cache_[l] = batch_k_cache_[l] + batch_idx * kv_stride;
+        v_cache_[l] = batch_v_cache_[l] + batch_idx * kv_stride;
+    }
+
+    // Run normal prefill
+    cache_seq_len_ = 0;
+    forward_prefill(input_embeds, position_ids, seq_len, logits_out, stream);
+
+    // Record seq length and restore pointers
+    batch_seq_lens_[batch_idx] = cache_seq_len_;
+    for (int l = 0; l < num_layers; l++) {
+        k_cache_[l] = saved_k[l];
+        v_cache_[l] = saved_v[l];
+    }
+}
+
+// ============================================================================
+// decoder_layer_forward_decode_batch: per-layer batch decode using cuBLAS GEMM
+// ============================================================================
+
+void TextDecoder::decoder_layer_forward_decode_batch(
+    int layer_idx,
+    __nv_bfloat16* hidden_states,    // [B, h], in-place
+    const int* position_ids,          // [3, B]
+    int B,
+    __nv_bfloat16* workspace_base,
+    cudaStream_t stream)
+{
+    const auto& lw = layer_weights_[layer_idx];
+    int h = config_.decoder_hidden_size;
+    int q_dim = config_.decoder_q_dim();
+    int kv_dim = config_.decoder_kv_dim();
+    int num_q_heads = config_.decoder_num_attention_heads;
+    int num_kv_heads = config_.decoder_num_kv_heads;
+    int head_dim = config_.decoder_head_dim;
+    float eps = config_.rms_norm_eps;
+    int ffn = config_.decoder_intermediate_size;
+
+    // Workspace layout (contiguous [B, dim] buffers)
+    __nv_bfloat16* norm_out  = workspace_base;
+    __nv_bfloat16* q_buf     = norm_out  + (size_t)B * h;
+    __nv_bfloat16* k_buf     = q_buf     + (size_t)B * q_dim;
+    __nv_bfloat16* v_buf     = k_buf     + (size_t)B * kv_dim;
+    __nv_bfloat16* attn_out  = v_buf     + (size_t)B * kv_dim;
+    __nv_bfloat16* proj_out  = attn_out  + (size_t)B * q_dim;
+    __nv_bfloat16* gate_buf  = proj_out  + (size_t)B * h;
+    __nv_bfloat16* up_buf    = gate_buf  + (size_t)B * ffn;
+
+    // === Self-Attention ===
+
+    // 1. RMSNorm (plain weight): [B, h] → [B, h]
+    audio_ops::invoke_rmsnorm(norm_out, hidden_states, lw.input_layernorm_w,
+                               eps, B, h, stream);
+
+    // 2. Separate Q/K/V GEMMs: each outputs contiguous [B, dim]
+    linear_nobias(cublas_handle_, q_buf, norm_out, lw.q_proj_w, B, h, q_dim, stream);
+    linear_nobias(cublas_handle_, k_buf, norm_out, lw.k_proj_w, B, h, kv_dim, stream);
+    linear_nobias(cublas_handle_, v_buf, norm_out, lw.v_proj_w, B, h, kv_dim, stream);
+
+    // 3. Fused QK RMSNorm + MRoPE: naturally handles B tokens with different positions
+    audio_ops::invoke_fused_qk_norm_rope(
+        q_buf, k_buf, lw.q_norm_w, lw.k_norm_w,
+        position_ids, eps, B, num_q_heads, num_kv_heads, head_dim,
+        config_.mrope_section[0], config_.mrope_section[1],
+        config_.mrope_section[2], config_.rope_theta, stream);
+
+    // 4. Per-sequence: write KV cache + decode attention
+    size_t kv_stride = (size_t)max_seq_len_ * num_kv_heads * head_dim;
+    for (int b = 0; b < B; b++) {
+        __nv_bfloat16* kc = batch_k_cache_[layer_idx] + b * kv_stride;
+        __nv_bfloat16* vc = batch_v_cache_[layer_idx] + b * kv_stride;
+
+        // Write K/V for this sequence
+        audio_ops::invoke_write_kv_cache(
+            kc, vc,
+            k_buf + b * kv_dim, v_buf + b * kv_dim,
+            batch_seq_lens_[b], 1, num_kv_heads, head_dim, stream);
+
+        // Decode attention for this sequence
+        audio_ops::invoke_causal_gqa_decode(
+            attn_out + b * q_dim,
+            q_buf + b * q_dim,
+            kc, vc,
+            1, num_q_heads, num_kv_heads, head_dim,
+            batch_seq_lens_[b] + 1,
+            stream,
+            attn_split_k_ws_, attn_max_partitions_);
+    }
+
+    // 5. O proj GEMM: [B, q_dim] → [B, h] + residual add
+    linear_nobias(cublas_handle_, proj_out, attn_out, lw.o_proj_w, B, q_dim, h, stream);
+    audio_ops::invoke_add_residual(hidden_states, proj_out, B * h, stream);
+
+    // === MLP ===
+
+    // 6. RMSNorm: [B, h] → [B, h]
+    audio_ops::invoke_rmsnorm(norm_out, hidden_states, lw.post_attention_layernorm_w,
+                               eps, B, h, stream);
+
+    // 7. Gate/Up GEMMs: [B, h] → [B, ffn] each
+    linear_nobias(cublas_handle_, gate_buf, norm_out, lw.gate_proj_w, B, h, ffn, stream);
+    linear_nobias(cublas_handle_, up_buf, norm_out, lw.up_proj_w, B, h, ffn, stream);
+
+    // 8. SwiGLU: gate = silu(gate) * up
+    audio_ops::invoke_swiglu(gate_buf, gate_buf, up_buf, B, ffn, stream);
+
+    // 9. Down GEMM: [B, ffn] → [B, h] + residual add
+    linear_nobias(cublas_handle_, proj_out, gate_buf, lw.down_proj_w, B, ffn, h, stream);
+    audio_ops::invoke_add_residual(hidden_states, proj_out, B * h, stream);
+}
+
+// ============================================================================
+// forward_decode_batch: batch of B tokens, one per active sequence
+// ============================================================================
+
+void TextDecoder::forward_decode_batch(
+    const int* token_ids,       // [B] on GPU
+    const int* position_ids,    // [3, B] on GPU
+    int B,
+    __nv_bfloat16* logits_out,  // [B, vocab_size] on GPU
+    cudaStream_t stream)
+{
+    if (!initialized_ || !batch_initialized_) {
+        fprintf(stderr, "[ASR Decoder] ERROR: not initialized for batch decode\n");
+        return;
+    }
+
+    int h = config_.decoder_hidden_size;
+
+    // Workspace: hidden_states at the start, layer_ws after it
+    __nv_bfloat16* hidden_states = batch_workspace_;
+    size_t layer_ws_offset = (size_t)B * h;
+    __nv_bfloat16* layer_ws = hidden_states + layer_ws_offset;
+
+    // Embed B tokens: [B, h]
+    audio_ops::invoke_embedding_lookup(hidden_states, token_ids,
+                                        embed_tokens_w_, B, h, stream);
+
+    // Process all decoder layers
+    for (int layer = 0; layer < config_.decoder_layers; layer++) {
+        decoder_layer_forward_decode_batch(layer, hidden_states, position_ids,
+                                            B, layer_ws, stream);
+    }
+
+    // Final RMSNorm + LM head GEMM: [B, h] → [B, vocab_size]
+    __nv_bfloat16* norm_out = layer_ws;
+    audio_ops::invoke_rmsnorm(norm_out, hidden_states, final_norm_w_,
+                               config_.rms_norm_eps, B, h, stream);
+    linear_nobias(cublas_handle_, logits_out, norm_out, lm_head_w_, B, h,
+                  config_.vocab_size, stream);
 }
 
 } // namespace asr

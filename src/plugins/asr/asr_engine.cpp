@@ -48,6 +48,11 @@ ASREngine::~ASREngine() {
     if (token_id_gpu_) cudaFree(token_id_gpu_);
     if (prompt_tokens_gpu_) cudaFree(prompt_tokens_gpu_);
     if (mel_staging_gpu_) cudaFree(mel_staging_gpu_);
+    // Batch decode buffers
+    if (batch_logits_) cudaFree(batch_logits_);
+    if (batch_token_ids_) cudaFree(batch_token_ids_);
+    if (batch_position_ids_) cudaFree(batch_position_ids_);
+    if (batch_result_ids_) cudaFree(batch_result_ids_);
 }
 
 // ============================================================================
@@ -662,6 +667,319 @@ std::string ASREngine::transcribe_file(
 
     return transcribe(wav.samples.data(), (int)wav.samples.size(), wav.sample_rate,
                       temperature, max_new_tokens, suppress_early_eos);
+}
+
+// ============================================================================
+// transcribe_batch: multiple audio chunks → batch decode (GEMV→GEMM)
+//
+// Flow:
+//   For each chunk: mel → encode → build prompt → embed → prefill (batch KV)
+//   Then batch decode: all chunks generate tokens simultaneously
+// ============================================================================
+
+std::vector<std::string> ASREngine::transcribe_batch(
+    const std::vector<AudioChunk>& chunks,
+    int sample_rate,
+    bool suppress_early_eos)
+{
+    int B = (int)chunks.size();
+    if (B == 0) return {};
+    if (B == 1) {
+        return { transcribe(chunks[0].samples, chunks[0].num_samples,
+                            sample_rate, 0.0f, 448, suppress_early_eos) };
+    }
+
+    if (!loaded_) {
+        fprintf(stderr, "[ASR] ERROR: model not loaded\n");
+        return std::vector<std::string>(B, "");
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Allocate batch GPU buffers if needed
+    if (B > max_batch_allocated_) {
+        if (batch_logits_) cudaFree(batch_logits_);
+        if (batch_token_ids_) cudaFree(batch_token_ids_);
+        if (batch_position_ids_) cudaFree(batch_position_ids_);
+        if (batch_result_ids_) cudaFree(batch_result_ids_);
+        cudaMalloc(&batch_logits_, (size_t)B * config_.vocab_size * sizeof(__nv_bfloat16));
+        cudaMalloc(&batch_token_ids_, B * sizeof(int));
+        cudaMalloc(&batch_position_ids_, 3 * B * sizeof(int));
+        cudaMalloc(&batch_result_ids_, B * sizeof(int));
+        max_batch_allocated_ = B;
+    }
+
+    // Initialize batch mode in decoder
+    decoder_->initialize_batch(B, stream_);
+    decoder_->reset_batch(B);
+
+    // ====================================================================
+    // Phase 1: Sequential mel → encode → prefill for each chunk
+    // ====================================================================
+    std::vector<int> prompt_lens(B);
+    std::vector<int> max_gen_tokens(B);
+    std::vector<int> min_gen_tokens(B);
+    std::vector<int> first_tokens(B, 0);
+
+    // NOTE: Use file-level IM_END, ENDOFTEXT, AUDIO_PAD constants — do NOT redefine here
+
+    auto t_encode_start = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < B; i++) {
+        const float* audio = chunks[i].samples;
+        int audio_len = chunks[i].num_samples;
+
+        // Resample to 16kHz if needed
+        std::vector<float> audio_buf;
+        const float* audio_16k = audio;
+        int len_16k = audio_len;
+        if (sample_rate != 16000) {
+            std::vector<float> input_vec(audio, audio + audio_len);
+            audio::resample(input_vec, sample_rate, audio_buf, 16000);
+            audio_16k = audio_buf.data();
+            len_16k = (int)audio_buf.size();
+        }
+
+        // GPU mel spectrogram
+        int mel_frames = 0;
+        bool used_gpu = false;
+        if (gpu_whisper_mel_) {
+            auto mel_result = gpu_whisper_mel_->compute(audio_16k, len_16k);
+            gpu_whisper_mel_->sync();
+            mel_frames = mel_result.num_frames;
+            if (mel_frames > 0 && mel_result.d_mel) {
+                if (mel_frames > max_mel_frames_) mel_frames = max_mel_frames_;
+                audio_ops::invoke_f32_to_bf16(mel_gpu_, mel_result.d_mel,
+                                               128 * mel_frames, stream_);
+                used_gpu = true;
+            }
+        }
+        if (!used_gpu) {
+            audio::MelConfig mel_cfg;
+            mel_cfg.n_fft = 400; mel_cfg.hop_length = 160;
+            mel_cfg.n_mels = 128; mel_cfg.sample_rate = 16000;
+            std::vector<float> mel_f32;
+            audio::compute_mel_cached(audio_16k, len_16k, mel_cfg,
+                                      cached_mel_fb_, cached_hann_window_,
+                                      mel_f32, mel_frames);
+            if (mel_frames > max_mel_frames_) mel_frames = max_mel_frames_;
+            int mel_count = 128 * mel_frames;
+            cudaMemcpyAsync(mel_staging_gpu_, mel_f32.data(),
+                            mel_count * sizeof(float), cudaMemcpyHostToDevice, stream_);
+            audio_ops::invoke_f32_to_bf16(mel_gpu_, mel_staging_gpu_, mel_count, stream_);
+        }
+
+        // Encode
+        int encoder_out_len = 0;
+        encoder_->forward(mel_gpu_, mel_frames, encoder_out_, encoder_out_len, stream_);
+        if (encoder_out_len == 0) {
+            fprintf(stderr, "[ASR Batch] WARNING: chunk %d encoder produced 0 tokens\n", i);
+            first_tokens[i] = IM_END;  // mark as finished
+            prompt_lens[i] = 0;
+            continue;
+        }
+
+        // Build prompt and embed
+        std::vector<int> prompt_tokens;
+        build_prompt(encoder_out_len, prompt_tokens);
+        int prompt_len = (int)prompt_tokens.size();
+        if (prompt_len > max_prompt_len_) {
+            fprintf(stderr, "[ASR Batch] ERROR: chunk %d prompt too long (%d)\n", i, prompt_len);
+            first_tokens[i] = IM_END;
+            prompt_lens[i] = 0;
+            continue;
+        }
+
+        int h = config_.decoder_hidden_size;
+        cudaMemcpyAsync(prompt_tokens_gpu_, prompt_tokens.data(),
+                        prompt_len * sizeof(int), cudaMemcpyHostToDevice, stream_);
+        audio_ops::invoke_embedding_lookup(input_embeds_, prompt_tokens_gpu_,
+                                            embed_tokens_w_, prompt_len, h, stream_);
+
+        // Replace AUDIO_PAD with encoder output
+        int audio_pad_start = -1;
+        for (int j = 0; j < prompt_len; j++) {
+            if (prompt_tokens[j] == AUDIO_PAD) { audio_pad_start = j; break; }
+        }
+        if (audio_pad_start >= 0) {
+            cudaMemcpyAsync(input_embeds_ + (size_t)audio_pad_start * h,
+                            encoder_out_,
+                            (size_t)encoder_out_len * h * sizeof(__nv_bfloat16),
+                            cudaMemcpyDeviceToDevice, stream_);
+        }
+
+        // Position IDs for MRoPE [3, prompt_len]
+        std::vector<int> pos_ids(3 * prompt_len);
+        for (int d = 0; d < 3; d++)
+            for (int j = 0; j < prompt_len; j++)
+                pos_ids[d * prompt_len + j] = j;
+        cudaMemcpy(position_ids_, pos_ids.data(),
+                   3 * prompt_len * sizeof(int), cudaMemcpyHostToDevice);
+
+        // Prefill into batch KV cache
+        decoder_->forward_prefill_batch_item(i, input_embeds_, position_ids_,
+                                              prompt_len, logits_, stream_);
+        prompt_lens[i] = prompt_len;
+
+        // Compute generation limits
+        float audio_dur_s = (float)len_16k / 16000.0f;
+        max_gen_tokens[i] = std::min(512, std::max(40, (int)(audio_dur_s * 5.0f)));
+        min_gen_tokens[i] = suppress_early_eos
+            ? std::max(1, (int)(audio_dur_s * 0.4f)) : 0;
+
+        // Extract first token from prefill logits
+        if (min_gen_tokens[i] > 0)
+            audio_ops::invoke_suppress_eos(logits_, IM_END, ENDOFTEXT, stream_);
+        audio_ops::invoke_argmax(logits_, token_id_gpu_, config_.vocab_size, stream_);
+        cudaMemcpyAsync(&first_tokens[i], token_id_gpu_, sizeof(int),
+                        cudaMemcpyDeviceToHost, stream_);
+        cudaStreamSynchronize(stream_);
+    }
+
+    auto t_encode_end = std::chrono::steady_clock::now();
+    float encode_ms = std::chrono::duration<float, std::milli>(t_encode_end - t_encode_start).count();
+    fprintf(stderr, "[ASR Batch] Phase 1: %d chunks encode+prefill in %.1f ms\n", B, encode_ms);
+    // ====================================================================
+    // Phase 2: Batch decode — all chunks generate tokens simultaneously
+    // ====================================================================
+    std::vector<std::vector<int>> output_tokens(B);
+    std::vector<bool> finished(B, false);
+    std::vector<int> positions(B);
+
+    for (int i = 0; i < B; i++) {
+        positions[i] = prompt_lens[i];
+        if (first_tokens[i] == IM_END || first_tokens[i] == ENDOFTEXT || prompt_lens[i] == 0) {
+            finished[i] = true;
+        } else {
+            output_tokens[i].push_back(first_tokens[i]);
+        }
+    }
+
+    int max_steps = 512;
+    std::vector<int> cur_tokens(B);
+    std::vector<int> h_pos_ids(3 * B);
+    std::vector<int> h_result_ids(B);
+
+    auto t_decode_start = std::chrono::steady_clock::now();
+
+    for (int step = 0; step < max_steps; step++) {
+        // Count active sequences
+        int active = 0;
+        for (int i = 0; i < B; i++) if (!finished[i]) active++;
+        if (active == 0) break;
+
+        // Prepare token IDs and position IDs
+        for (int i = 0; i < B; i++) {
+            cur_tokens[i] = finished[i] ? 0 : (output_tokens[i].empty() ? first_tokens[i] : output_tokens[i].back());
+            for (int d = 0; d < 3; d++)
+                h_pos_ids[d * B + i] = positions[i];
+        }
+        cudaMemcpyAsync(batch_token_ids_, cur_tokens.data(),
+                        B * sizeof(int), cudaMemcpyHostToDevice, stream_);
+        cudaMemcpyAsync(batch_position_ids_, h_pos_ids.data(),
+                        3 * B * sizeof(int), cudaMemcpyHostToDevice, stream_);
+
+        // Batch decode forward
+        decoder_->forward_decode_batch(batch_token_ids_, batch_position_ids_,
+                                        B, batch_logits_, stream_);
+
+        // Argmax per sequence + EOS check
+        for (int i = 0; i < B; i++) {
+            if (finished[i]) continue;
+
+            // Suppress EOS if below minimum
+            if ((int)output_tokens[i].size() < min_gen_tokens[i]) {
+                audio_ops::invoke_suppress_eos(
+                    batch_logits_ + (size_t)i * config_.vocab_size,
+                    IM_END, ENDOFTEXT, stream_);
+            }
+            audio_ops::invoke_argmax(
+                batch_logits_ + (size_t)i * config_.vocab_size,
+                batch_result_ids_ + i, config_.vocab_size, stream_);
+        }
+
+        // D2H transfer all results at once
+        cudaMemcpyAsync(h_result_ids.data(), batch_result_ids_,
+                        B * sizeof(int), cudaMemcpyDeviceToHost, stream_);
+        cudaStreamSynchronize(stream_);
+
+        // Update state
+        decoder_->increment_batch_seq_lens(finished);
+        for (int i = 0; i < B; i++) {
+            if (finished[i]) continue;
+            positions[i]++;
+
+            int tok = h_result_ids[i];
+            if (tok == IM_END || tok == ENDOFTEXT ||
+                (int)output_tokens[i].size() >= max_gen_tokens[i]) {
+                finished[i] = true;
+            } else {
+                output_tokens[i].push_back(tok);
+            }
+        }
+    }
+
+    auto t_decode_end = std::chrono::steady_clock::now();
+    float decode_ms = std::chrono::duration<float, std::milli>(t_decode_end - t_decode_start).count();
+    int total_tokens = 0;
+    for (int i = 0; i < B; i++) total_tokens += (int)output_tokens[i].size();
+    fprintf(stderr, "[ASR Batch] Phase 2: %d tokens in %.1f ms (%.1f tok/s, B=%d)\n",
+            total_tokens, decode_ms,
+            total_tokens > 0 ? total_tokens / (decode_ms / 1000.0f) : 0.0f, B);
+
+    // ====================================================================
+    // Phase 3: Decode tokens to text
+    // ====================================================================
+    static constexpr int ASR_TEXT_TOKEN = 151704;
+    std::vector<std::string> results(B);
+
+    for (int i = 0; i < B; i++) {
+        auto& ot = output_tokens[i];
+        if (ot.empty()) continue;
+
+        // Post-process: repetition detection
+        if (ot.size() >= 10) {
+            for (int pl = 1; pl <= 32 && pl * 5 <= (int)ot.size(); ++pl) {
+                bool found = false;
+                for (int s = 0; s + pl * 5 <= (int)ot.size() && !found; ++s) {
+                    int reps = 0;
+                    while (s + pl * (reps + 1) <= (int)ot.size()) {
+                        bool match = true;
+                        for (int j = 0; j < pl; ++j) {
+                            if (ot[s + j] != ot[s + pl * (reps + 1) + j]) { match = false; break; }
+                        }
+                        if (!match) break;
+                        reps++;
+                    }
+                    if (reps >= 5) {
+                        ot.resize(s + pl);
+                        found = true;
+                    }
+                }
+                if (found) break;
+            }
+        }
+
+        // Find last <asr_text> marker and decode
+        size_t text_start = 0;
+        for (size_t j = 0; j < ot.size(); j++) {
+            if (ot[j] == ASR_TEXT_TOKEN) text_start = j + 1;
+        }
+        if (text_start > 0 && text_start < ot.size() && tokenizer_.is_loaded()) {
+            std::vector<int> text_tokens(ot.begin() + text_start, ot.end());
+            results[i] = tokenizer_.decode(text_tokens);
+        } else if (tokenizer_.is_loaded()) {
+            results[i] = tokenizer_.decode(ot);
+        }
+        fprintf(stderr, "[ASR Batch] Chunk %d text: \"%s\"\n", i, results[i].substr(0, 100).c_str());
+    }
+
+    auto t_end = std::chrono::steady_clock::now();
+    float total_ms = std::chrono::duration<float, std::milli>(t_end - t0).count();
+    fprintf(stderr, "[ASR Batch] Total: %.1f ms (encode+prefill %.0f + decode %.0f)\n",
+            total_ms, encode_ms, decode_ms);
+
+    return results;
 }
 
 } // namespace asr
