@@ -16,6 +16,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cublas_v2.h>
 
 namespace qwen_thor {
 namespace audio_ops {
@@ -67,6 +68,8 @@ void invoke_fused_qk_norm_rope(
 // ASR Decoder MLP, TTS Talker MLP
 void invoke_swiglu(__nv_bfloat16* out, const __nv_bfloat16* gate, const __nv_bfloat16* up,
                    int num_tokens, int intermediate_size, cudaStream_t stream = 0);
+void invoke_swiglu_interleaved(__nv_bfloat16* data, int num_tokens, int intermediate_size,
+                                cudaStream_t stream = 0);
 
 // GELU: out = x * 0.5 * (1 + erf(x / sqrt(2)))
 // ASR Encoder FFN + projection
@@ -171,6 +174,16 @@ void invoke_causal_gqa_prefill(
     int seq_len,
     int num_q_heads, int num_kv_heads, int head_dim,
     cudaStream_t stream = 0);
+
+// cuBLAS-based prefill attention: GEMM QK^T + causal softmax + GEMM SV
+// Much faster than naive kernel for large T (uses tensor cores)
+void invoke_causal_gqa_prefill_cublas(
+    __nv_bfloat16* attn_out,
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    __nv_bfloat16* attn_score_buf,  // workspace: [T, T] BF16
+    int seq_len,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    cublasHandle_t handle, cudaStream_t stream = 0);
 
 // ============================================================================
 // 其他

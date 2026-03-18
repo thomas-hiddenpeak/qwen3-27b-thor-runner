@@ -66,6 +66,7 @@ TextDecoder::~TextDecoder() {
     if (token_id_gpu_) cudaFree(token_id_gpu_);
     if (cublas_workspace_) cudaFree(cublas_workspace_);
     if (attn_split_k_ws_) cudaFree(attn_split_k_ws_);
+    if (prefill_attn_score_buf_) cudaFree(prefill_attn_score_buf_);
     if (cublas_handle_) cublasDestroy(cublas_handle_);
 }
 
@@ -142,14 +143,19 @@ void TextDecoder::initialize(cudaStream_t stream) {
     cudaMalloc(&attn_split_k_ws_, attn_ws_size);
     cudaMemset(attn_split_k_ws_, 0, attn_ws_size);
 
+    // Prefill attention workspace: [max_seq, max_seq] BF16 for cuBLAS-based attention
+    size_t prefill_attn_size = (size_t)max_seq_len_ * max_seq_len_ * sizeof(__nv_bfloat16);
+    cudaMalloc(&prefill_attn_score_buf_, prefill_attn_size);
+    float prefill_attn_mb = prefill_attn_size / (1024.0f * 1024.0f);
+
     cache_seq_len_ = 0;
     initialized_ = true;
 
     float kv_mb = (float)num_layers * kv_per_layer * 2 * sizeof(__nv_bfloat16) / (1024.0f * 1024.0f);
     float ws_mb = workspace_size_ * sizeof(__nv_bfloat16) / (1024.0f * 1024.0f);
     float attn_ws_kb = attn_ws_size / 1024.0f;
-    fprintf(stderr, "[ASR Decoder] initialized: %d layers, max_seq=%d, KV cache %.1f MB, workspace %.1f MB, attn_ws %.1f KB (split-K %d parts)\n",
-            num_layers, max_seq_len_, kv_mb, ws_mb, attn_ws_kb, attn_max_partitions_);
+    fprintf(stderr, "[ASR Decoder] initialized: %d layers, max_seq=%d, KV cache %.1f MB, workspace %.1f MB, attn_ws %.1f KB (split-K %d parts), prefill_attn %.1f MB\n",
+            num_layers, max_seq_len_, kv_mb, ws_mb, attn_ws_kb, attn_max_partitions_, prefill_attn_mb);
 }
 
 void TextDecoder::reset_cache() {
@@ -306,20 +312,12 @@ void TextDecoder::decoder_layer_forward_prefill(
     linear_nobias(cublas_handle_, k_buf, norm_buf, lw.k_proj_w, seq_len, h, kv_dim, stream);
     linear_nobias(cublas_handle_, v_buf, norm_buf, lw.v_proj_w, seq_len, h, kv_dim, stream);
 
-    // 3. Per-head Q/K RMSNorm
-    // Q: [seq_len, num_q_heads * head_dim] → reinterpret as [seq_len * num_q_heads, head_dim]
-    audio_ops::invoke_per_head_rmsnorm(q_buf, q_buf, lw.q_norm_w,
-                                        eps, seq_len, num_q_heads, head_dim, stream);
-    // K: [seq_len, num_kv_heads * head_dim]
-    audio_ops::invoke_per_head_rmsnorm(k_buf, k_buf, lw.k_norm_w,
-                                        eps, seq_len, num_kv_heads, head_dim, stream);
-
-    // 4. MRoPE (half-rotation, interleaved sections)
-    // Q: [seq_len, num_q_heads, head_dim], K: [seq_len, num_kv_heads, head_dim]
-    audio_ops::invoke_mrope(q_buf, k_buf, position_ids,
-                             seq_len, num_q_heads, num_kv_heads, head_dim,
-                             config_.mrope_section[0], config_.mrope_section[1],
-                             config_.mrope_section[2], config_.rope_theta, stream);
+    // 3-4. Fused QK RMSNorm + mRoPE: 3 kernels → 1 (matches decode path)
+    audio_ops::invoke_fused_qk_norm_rope(
+        q_buf, k_buf, lw.q_norm_w, lw.k_norm_w,
+        position_ids, eps, seq_len, num_q_heads, num_kv_heads, head_dim,
+        config_.mrope_section[0], config_.mrope_section[1],
+        config_.mrope_section[2], config_.rope_theta, stream);
 
     // 5. Write K/V to cache
     audio_ops::invoke_write_kv_cache(k_cache_[layer_idx], v_cache_[layer_idx],
@@ -327,13 +325,13 @@ void TextDecoder::decoder_layer_forward_prefill(
                                       0, seq_len,  // start_pos = 0 for prefill
                                       num_kv_heads, head_dim, stream);
 
-    // 6. Causal GQA prefill attention
-    // Q: [seq_len, num_q_heads, head_dim]
-    // K, V from cache: [seq_len, num_kv_heads, head_dim]
-    audio_ops::invoke_causal_gqa_prefill(
+    // 6. Causal GQA prefill attention (cuBLAS GEMM: QK^T + softmax + SV)
+    audio_ops::invoke_causal_gqa_prefill_cublas(
         attn_out, q_buf,
         k_cache_[layer_idx], v_cache_[layer_idx],
-        seq_len, num_q_heads, num_kv_heads, head_dim, stream);
+        prefill_attn_score_buf_,
+        seq_len, num_q_heads, num_kv_heads, head_dim,
+        cublas_handle_, stream);
 
     // 7. Output projection: [seq_len, q_dim] → [seq_len, h]
     linear_nobias(cublas_handle_, norm_buf, attn_out, lw.o_proj_w, seq_len, q_dim, h, stream);
@@ -347,15 +345,17 @@ void TextDecoder::decoder_layer_forward_prefill(
     audio_ops::invoke_rmsnorm(norm_buf, hidden_states, lw.post_attention_layernorm_w,
                                eps, seq_len, h, stream);
 
-    // 10. Gate + Up projections: [seq_len, h] → [seq_len, ffn]
+    // 10. Gate projection: [seq_len, h] → [seq_len, ffn]
     int ffn = config_.decoder_intermediate_size;
     linear_nobias(cublas_handle_, gate_buf, norm_buf, lw.gate_proj_w, seq_len, h, ffn, stream);
+
+    // 11. Up projection: [seq_len, h] → [seq_len, ffn]
     linear_nobias(cublas_handle_, up_buf, norm_buf, lw.up_proj_w, seq_len, h, ffn, stream);
 
-    // 11. SwiGLU: out = silu(gate) * up
+    // 12. SwiGLU: gate = silu(gate) * up
     audio_ops::invoke_swiglu(gate_buf, gate_buf, up_buf, seq_len, ffn, stream);
 
-    // 12. Down projection: [seq_len, ffn] → [seq_len, h]
+    // 13. Down projection: [seq_len, ffn] → [seq_len, h]
     linear_nobias(cublas_handle_, norm_buf, gate_buf, lw.down_proj_w, seq_len, ffn, h, stream);
 
     // 13. Residual add
@@ -484,6 +484,120 @@ void TextDecoder::forward_prefill(
     for (int layer = 0; layer < num_layers; layer++) {
         decoder_layer_forward_prefill(layer, hidden_states, position_ids,
                                        seq_len, layer_ws, stream);
+    }
+
+    // Profiling: measure per-category time over all layers (triggered once)
+    static bool s_prefill_profiled = false;
+    if (s_profile_decode && !s_prefill_profiled && seq_len > 100) {
+        s_prefill_profiled = true;
+        cudaStreamSynchronize(stream);
+
+        // Re-run all layers with per-operation timing
+        // Reset hidden_states for second pass
+        cudaMemcpyAsync(hidden_states, input_embeds,
+                        (size_t)seq_len * h * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToDevice, stream);
+
+        cudaEvent_t ev_start, ev_end;
+        cudaEventCreate(&ev_start);
+        cudaEventCreate(&ev_end);
+
+        // Time categories: RMSNorm, QKV_proj, QKnorm+RoPE, write_KV, Attention, O_proj, add_res1, RMSNorm2, Gate+Up_proj, SwiGLU, Down_proj, add_res2
+        enum PfOp { PF_NORM1=0, PF_QKV, PF_QKNORM_ROPE, PF_WRITE_KV, PF_ATTN,
+                     PF_OPROJ, PF_ADD1, PF_NORM2, PF_GATEUP, PF_SWIGLU, PF_DOWN, PF_ADD2, PF_COUNT };
+        const char* pf_names[] = {"RMSNorm1","QKV_proj","QKnorm+RoPE","write_KV","Attention",
+                                    "O_proj","add_res1","RMSNorm2","Gate+Up_proj","SwiGLU","Down_proj","add_res2"};
+        float pf_ms[PF_COUNT] = {};
+
+        for (int layer = 0; layer < num_layers; layer++) {
+            const auto& lw = layer_weights_[layer];
+            int q_dim = config_.decoder_q_dim();
+            int kv_dim = config_.decoder_kv_dim();
+            int num_q_heads = config_.decoder_num_attention_heads;
+            int num_kv_heads = config_.decoder_num_kv_heads;
+            int head_dim = config_.decoder_head_dim;
+            float eps = config_.rms_norm_eps;
+            int ffn = config_.decoder_intermediate_size;
+
+            __nv_bfloat16* norm_buf  = layer_ws;
+            __nv_bfloat16* q_buf     = norm_buf + (size_t)seq_len * h;
+            __nv_bfloat16* k_buf     = q_buf + (size_t)seq_len * q_dim;
+            __nv_bfloat16* v_buf     = k_buf + (size_t)seq_len * kv_dim;
+            __nv_bfloat16* attn_out  = v_buf + (size_t)seq_len * kv_dim;
+            __nv_bfloat16* gate_buf  = attn_out + (size_t)seq_len * h;
+            __nv_bfloat16* up_buf    = gate_buf + (size_t)seq_len * ffn;
+
+            auto time_op = [&](PfOp op, auto fn) {
+                cudaEventRecord(ev_start, stream);
+                fn();
+                cudaEventRecord(ev_end, stream);
+                cudaEventSynchronize(ev_end);
+                float ms = 0;
+                cudaEventElapsedTime(&ms, ev_start, ev_end);
+                pf_ms[op] += ms;
+            };
+
+            time_op(PF_NORM1, [&]{ audio_ops::invoke_rmsnorm(norm_buf, hidden_states, lw.input_layernorm_w, eps, seq_len, h, stream); });
+            time_op(PF_QKV, [&]{
+                linear_nobias(cublas_handle_, q_buf, norm_buf, lw.q_proj_w, seq_len, h, q_dim, stream);
+                linear_nobias(cublas_handle_, k_buf, norm_buf, lw.k_proj_w, seq_len, h, kv_dim, stream);
+                linear_nobias(cublas_handle_, v_buf, norm_buf, lw.v_proj_w, seq_len, h, kv_dim, stream);
+            });
+            time_op(PF_QKNORM_ROPE, [&]{
+                audio_ops::invoke_fused_qk_norm_rope(
+                    q_buf, k_buf, lw.q_norm_w, lw.k_norm_w,
+                    position_ids, eps, seq_len, num_q_heads, num_kv_heads, head_dim,
+                    config_.mrope_section[0], config_.mrope_section[1], config_.mrope_section[2], config_.rope_theta, stream);
+            });
+            time_op(PF_WRITE_KV, [&]{ audio_ops::invoke_write_kv_cache(k_cache_[layer], v_cache_[layer], k_buf, v_buf, 0, seq_len, num_kv_heads, head_dim, stream); });
+            time_op(PF_ATTN, [&]{ audio_ops::invoke_causal_gqa_prefill_cublas(attn_out, q_buf, k_cache_[layer], v_cache_[layer], prefill_attn_score_buf_, seq_len, num_q_heads, num_kv_heads, head_dim, cublas_handle_, stream); });
+            time_op(PF_OPROJ, [&]{ linear_nobias(cublas_handle_, norm_buf, attn_out, lw.o_proj_w, seq_len, q_dim, h, stream); });
+            time_op(PF_ADD1, [&]{ audio_ops::invoke_add_residual(hidden_states, norm_buf, seq_len * h, stream); });
+            time_op(PF_NORM2, [&]{ audio_ops::invoke_rmsnorm(norm_buf, hidden_states, lw.post_attention_layernorm_w, eps, seq_len, h, stream); });
+            time_op(PF_GATEUP, [&]{
+                linear_nobias(cublas_handle_, gate_buf, norm_buf, lw.gate_proj_w, seq_len, h, ffn, stream);
+                linear_nobias(cublas_handle_, up_buf, norm_buf, lw.up_proj_w, seq_len, h, ffn, stream);
+            });
+            time_op(PF_SWIGLU, [&]{ audio_ops::invoke_swiglu(gate_buf, gate_buf, up_buf, seq_len, ffn, stream); });
+            time_op(PF_DOWN, [&]{
+                linear_nobias(cublas_handle_, norm_buf, gate_buf, lw.down_proj_w, seq_len, ffn, h, stream);
+            });
+            time_op(PF_ADD2, [&]{ audio_ops::invoke_add_residual(hidden_states, norm_buf, seq_len * h, stream); });
+        }
+
+        float total = 0;
+        for (int i = 0; i < PF_COUNT; i++) total += pf_ms[i];
+        fprintf(stderr, "[ASR PREFILL PROFILE] seq_len=%d, %d layers:\n", seq_len, num_layers);
+        for (int i = 0; i < PF_COUNT; i++)
+            fprintf(stderr, "  %-16s %7.1f ms (%5.1f%%)\n", pf_names[i], pf_ms[i], 100.0f * pf_ms[i] / total);
+        fprintf(stderr, "  TOTAL           %7.1f ms\n", total);
+
+        // Compute GEMM GFLOPS
+        int q_dim = config_.decoder_q_dim(), kv_dim = config_.decoder_kv_dim();
+        float qkv_gflops = 2.0f * seq_len * h * (q_dim + 2*kv_dim) / 1e9f;
+        float o_gflops = 2.0f * seq_len * q_dim * h / 1e9f;
+        float gateup_gflops = 2.0f * seq_len * h * 2 * config_.decoder_intermediate_size / 1e9f;
+        float down_gflops = 2.0f * seq_len * config_.decoder_intermediate_size * h / 1e9f;
+        fprintf(stderr, "  GEMM TFLOPS: QKV %.2f  O %.2f  GateUp %.2f  Down %.2f\n",
+                qkv_gflops * num_layers / pf_ms[PF_QKV], o_gflops * num_layers / pf_ms[PF_OPROJ],
+                gateup_gflops * num_layers / pf_ms[PF_GATEUP], down_gflops * num_layers / pf_ms[PF_DOWN]);
+
+        cudaEventDestroy(ev_start);
+        cudaEventDestroy(ev_end);
+
+        // Reset KV cache and re-run correctly for actual inference (profiling 2nd pass corrupted caches)
+        for (int layer = 0; layer < num_layers; layer++) {
+            size_t kv_per_layer = (size_t)max_seq_len_ * config_.decoder_num_kv_heads * config_.decoder_head_dim;
+            cudaMemsetAsync(k_cache_[layer], 0, kv_per_layer * sizeof(__nv_bfloat16), stream);
+            cudaMemsetAsync(v_cache_[layer], 0, kv_per_layer * sizeof(__nv_bfloat16), stream);
+        }
+        cudaMemcpyAsync(hidden_states, input_embeds,
+                        (size_t)seq_len * h * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToDevice, stream);
+        for (int layer = 0; layer < num_layers; layer++) {
+            decoder_layer_forward_prefill(layer, hidden_states, position_ids,
+                                           seq_len, layer_ws, stream);
+        }
     }
 
     // Final RMSNorm (on last token only for efficiency)

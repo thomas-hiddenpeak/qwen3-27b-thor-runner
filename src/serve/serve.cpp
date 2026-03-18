@@ -3908,24 +3908,34 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
         std::string full_text;
         if (total_duration_s > 100.0f) {
             // VAD 分段 → 分组为 ≤100s chunk → 逐段转录
-            std::vector<asr::VadSegment> vad_segs_asr;
-            {
+            // 优先 GPU VAD (batch FSMN + cuFFT, <1s), 回退 CPU VAD (~100s)
+            struct VadRange { int start_ms, end_ms; };
+            std::vector<VadRange> vad_ranges;
+
+            if (gpu_vad_engine_.is_loaded()) {
+                auto gpu_segs = gpu_vad_engine_.detect_all(
+                    wav.samples.data(), (int)wav.samples.size(), 500, 15000);
+                for (auto& gs : gpu_segs)
+                    vad_ranges.push_back({gs.start_ms, gs.end_ms});
+            } else {
                 std::lock_guard<std::mutex> lock(vad_mutex_);
                 auto& cfg = vad_engine_.mutable_config();
                 int orig_silence = cfg.max_end_silence_time;
                 int orig_segment = cfg.max_single_segment_time;
                 cfg.max_end_silence_time = 500;
                 cfg.max_single_segment_time = 15000;
-                vad_segs_asr = vad_engine_.detect_all(wav.samples.data(), (int)wav.samples.size());
+                auto vad_segs_asr = vad_engine_.detect_all(wav.samples.data(), (int)wav.samples.size());
                 cfg.max_end_silence_time = orig_silence;
                 cfg.max_single_segment_time = orig_segment;
+                for (auto& vs : vad_segs_asr)
+                    vad_ranges.push_back({vs.start_ms, vs.end_ms});
             }
 
             // 分组为 ≤100s chunks
             struct AsrChunk { std::vector<size_t> seg_indices; int start_ms, end_ms; };
             std::vector<AsrChunk> asr_chunks;
-            for (size_t i = 0; i < vad_segs_asr.size(); ++i) {
-                auto& vs = vad_segs_asr[i];
+            for (size_t i = 0; i < vad_ranges.size(); ++i) {
+                auto& vs = vad_ranges[i];
                 if (vs.end_ms - vs.start_ms < 200) continue;
                 bool extend = !asr_chunks.empty() &&
                               (vs.end_ms - asr_chunks.back().start_ms) <= 100000;
@@ -3944,10 +3954,16 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 std::vector<float> chunk_pcm;
                 const int silence_pad = wav.sample_rate / 4;
                 for (size_t vi = 0; vi < chunk.seg_indices.size(); ++vi) {
-                    auto& vseg = vad_segs_asr[chunk.seg_indices[vi]];
+                    auto& vr = vad_ranges[chunk.seg_indices[vi]];
+                    // Slice PCM from original samples using timestamps
+                    int s = (int)((int64_t)vr.start_ms * wav.sample_rate / 1000);
+                    int e = (int)((int64_t)vr.end_ms * wav.sample_rate / 1000);
+                    if (s < 0) s = 0;
+                    if (e > (int)wav.samples.size()) e = (int)wav.samples.size();
                     if (vi > 0 && !chunk_pcm.empty())
                         chunk_pcm.resize(chunk_pcm.size() + silence_pad, 0.0f);
-                    chunk_pcm.insert(chunk_pcm.end(), vseg.pcm.begin(), vseg.pcm.end());
+                    chunk_pcm.insert(chunk_pcm.end(),
+                                     wav.samples.begin() + s, wav.samples.begin() + e);
                 }
                 if ((int)chunk_pcm.size() < wav.sample_rate / 5) continue;
                 auto seg_result = asr_plugin_->transcribe_pcm(

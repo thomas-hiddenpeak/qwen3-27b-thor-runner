@@ -130,6 +130,9 @@ private:
     float* attn_split_k_ws_ = nullptr;
     int attn_max_partitions_ = 0;
 
+    // Prefill attention workspace: [max_seq, max_seq] BF16 for cuBLAS attention
+    __nv_bfloat16* prefill_attn_score_buf_ = nullptr;
+
     bool initialized_ = false;
 
     // 单层 decoder forward (prefill 路径)
