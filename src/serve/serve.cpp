@@ -1554,6 +1554,18 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
             test_cfg.close();
             if (aligner_engine_.load_model(aligner_model)) {
                 fprintf(stderr, "[Serve] ForcedAligner loaded: %s\n", aligner_model.c_str());
+                // Warm up aligner subprocess (first calls are 2-6× slower due to CUDA JIT/cuDNN autotuning)
+                {
+                    auto warmup_t0 = std::chrono::steady_clock::now();
+                    std::vector<float> dummy_pcm(16000, 0.0f);  // 1s silence
+                    for (int w = 0; w < 3; ++w) {
+                        std::lock_guard<std::mutex> lock(aligner_mutex_);
+                        aligner_engine_.align(dummy_pcm.data(), (int)dummy_pcm.size(), 16000, "测试", "Chinese");
+                    }
+                    double warmup_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - warmup_t0).count();
+                    fprintf(stderr, "[Serve] ForcedAligner warmed up (3 calls, %.1f ms)\n", warmup_ms);
+                }
             } else {
                 fprintf(stderr, "[Serve] WARNING: Failed to load ForcedAligner from %s\n",
                         aligner_model.c_str());
@@ -3993,7 +4005,7 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
         phase_t0 = std::chrono::steady_clock::now();
 
         // ================================================================
-        // Phase 2 & 3 (P3优化): 并行执行 ForcedAligner || VAD+CAM++
+        // Phase 2 & 3: 并行执行 ForcedAligner || VAD+CAM++
         // Phase 2 使用 aligner_mutex_, Phase 3 使用 vad_mutex_/speaker_mutex_
         // 两者资源独立，可以真正并发
         // ================================================================
