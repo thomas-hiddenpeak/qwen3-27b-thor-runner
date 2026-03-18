@@ -251,6 +251,13 @@ GpuSpeakerEncoder::~GpuSpeakerEncoder() {
     scratch_.free();
     if (stream_) cudaStreamDestroy(stream_);
     if (cublas_) cublasDestroy(cublas_);
+    // Batch resources
+    for (int i = 0; i < BATCH_CONCURRENCY; i++) {
+        batch_.scratch[i].free();
+        if (batch_.streams[i]) cudaStreamDestroy(batch_.streams[i]);
+        if (batch_.cublas[i]) cublasDestroy(batch_.cublas[i]);
+    }
+    if (batch_.d_emb_buf) cudaFree(batch_.d_emb_buf);
     for (auto& kv : gpu_tensors_) {
         if (kv.second) cudaFree(kv.second);
     }
@@ -513,27 +520,27 @@ std::vector<float> GpuSpeakerEncoder::extract(const float* mel_80xT, int T) {
     int cur_dim = 128;
 
     // Block 1: 12 layers, dilation=1
-    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block1", 12, 1, stream_);
+    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block1", 12, 1, cublas_, stream_);
     cur_dim += 12 * 32;  // = 512
 
     // Transit 1: BN → ReLU → Conv1d(512→256)
-    gpu_transit(sp, cur_dim, T2, "xvector.transit1", cur_dim / 2, stream_);
+    gpu_transit(sp, cur_dim, T2, "xvector.transit1", cur_dim / 2, cublas_, stream_);
     cur_dim /= 2;  // = 256
 
     // Block 2: 24 layers, dilation=2
-    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block2", 24, 2, stream_);
+    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block2", 24, 2, cublas_, stream_);
     cur_dim += 24 * 32;  // = 1024
 
     // Transit 2
-    gpu_transit(sp, cur_dim, T2, "xvector.transit2", cur_dim / 2, stream_);
+    gpu_transit(sp, cur_dim, T2, "xvector.transit2", cur_dim / 2, cublas_, stream_);
     cur_dim /= 2;  // = 512
 
     // Block 3: 16 layers, dilation=2
-    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block3", 16, 2, stream_);
+    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block3", 16, 2, cublas_, stream_);
     cur_dim += 16 * 32;  // = 1024
 
     // Transit 3
-    gpu_transit(sp, cur_dim, T2, "xvector.transit3", cur_dim / 2, stream_);
+    gpu_transit(sp, cur_dim, T2, "xvector.transit3", cur_dim / 2, cublas_, stream_);
     cur_dim /= 2;  // = 512
 
     // ======================== Out nonlinear: BN + ReLU ========================
@@ -558,8 +565,6 @@ std::vector<float> GpuSpeakerEncoder::extract(const float* mel_80xT, int T) {
     float* d_emb = sp.b;  // reuse scratch.b
     {
         float alpha = 1.0f, beta = 0.0f;
-        // Weight: [192, 1024] row-major = [1024, 192] col-major
-        // x: [1024, 1], y: [192, 1]
         cublasSgemv(cublas_, CUBLAS_OP_T, embed_channels * 2, emb_size,
                     &alpha, get_gpu("xvector.dense.linear.weight"),
                     embed_channels * 2, d_pooled, 1, &beta, d_emb, 1);
@@ -592,40 +597,57 @@ std::vector<float> GpuSpeakerEncoder::extract_gpu(const float* d_mel, int T) {
     if (!ensure_scratch(T)) return {};
 
     cublasSetStream(cublas_, stream_);
+
+    // Use sp.b as temp embedding output, then forward_one writes to it
+    float* d_emb = scratch_.b;  // will be overwritten by forward_one anyway
+    forward_one(d_mel, T, scratch_, stream_, cublas_, d_emb);
+
+    cudaStreamSynchronize(stream_);
+    std::vector<float> result(192);
+    cudaMemcpy(result.data(), d_emb, 192 * sizeof(float), cudaMemcpyDeviceToHost);
+    return result;
+}
+
+// ============================================================================
+// forward_one() — core CAM++ forward pass, no sync
+// Writes 192-dim L2-normalized embedding to d_emb_out (GPU pointer)
+// ============================================================================
+void GpuSpeakerEncoder::forward_one(const float* d_mel, int T,
+                                     ScratchPool& sp, cudaStream_t stream,
+                                     cublasHandle_t cublas, float* d_emb_out) {
     int T2 = (T + 2*2 - 1*(5-1) - 1) / 2 + 1;
-    scratch_.which_concat = 0;
-    ScratchPool& sp = scratch_;
+    sp.which_concat = 0;
 
     // 1+2. Fused GPU CMN + Transpose: [T, 80] → [80, T] with mean subtraction
     float* d_x = sp.a;
-    cmn_transpose_kernel<<<80, 256, 0, stream_>>>(d_mel, d_x, T, 80);
+    cmn_transpose_kernel<<<80, 256, 0, stream>>>(d_mel, d_x, T, 80);
 
     // ======================== FCM ========================
     int H = 80;
     int conv1_size = 32 * H * T;
     float* d_fcm = sp.b;
-    conv2d_kernel<<<div_ceil(conv1_size, BLOCK), BLOCK, 0, stream_>>>(
+    conv2d_kernel<<<div_ceil(conv1_size, BLOCK), BLOCK, 0, stream>>>(
         d_x, get_gpu("head.conv1.weight"), d_fcm,
         1, H, T, 32, H, T, 3, 1, 1, 1, 1);
-    bn_relu_kernel<<<div_ceil(conv1_size, BLOCK), BLOCK, 0, stream_>>>(
+    bn_relu_kernel<<<div_ceil(conv1_size, BLOCK), BLOCK, 0, stream>>>(
         d_fcm, d_fcm,
         get_gpu("head.bn1.weight"), get_gpu("head.bn1.bias"),
         get_gpu("head.bn1.running_mean"), get_gpu("head.bn1.running_var"),
         32, H * T, true);
 
-    gpu_res_block(d_fcm, d_x, 32, H, T, "head.layer1.0", 2, sp.c, sp.d, stream_);
+    gpu_res_block(d_fcm, d_x, 32, H, T, "head.layer1.0", 2, sp.c, sp.d, stream);
     H = (H + 2 - 3) / 2 + 1;
-    gpu_res_block(d_x, d_fcm, 32, H, T, "head.layer1.1", 1, sp.c, sp.d, stream_);
-    gpu_res_block(d_fcm, d_x, 32, H, T, "head.layer2.0", 2, sp.c, sp.d, stream_);
+    gpu_res_block(d_x, d_fcm, 32, H, T, "head.layer1.1", 1, sp.c, sp.d, stream);
+    gpu_res_block(d_fcm, d_x, 32, H, T, "head.layer2.0", 2, sp.c, sp.d, stream);
     H = (H + 2 - 3) / 2 + 1;
-    gpu_res_block(d_x, d_fcm, 32, H, T, "head.layer2.1", 1, sp.c, sp.d, stream_);
+    gpu_res_block(d_x, d_fcm, 32, H, T, "head.layer2.1", 1, sp.c, sp.d, stream);
 
     int H2 = (H + 2 - 3) / 2 + 1;
     int conv2_size = 32 * H2 * T;
-    conv2d_kernel<<<div_ceil(conv2_size, BLOCK), BLOCK, 0, stream_>>>(
+    conv2d_kernel<<<div_ceil(conv2_size, BLOCK), BLOCK, 0, stream>>>(
         d_fcm, get_gpu("head.conv2.weight"), d_x,
         32, H, T, 32, H2, T, 3, 2, 1, 1, 1);
-    bn_relu_kernel<<<div_ceil(conv2_size, BLOCK), BLOCK, 0, stream_>>>(
+    bn_relu_kernel<<<div_ceil(conv2_size, BLOCK), BLOCK, 0, stream>>>(
         d_x, d_x,
         get_gpu("head.bn2.weight"), get_gpu("head.bn2.bias"),
         get_gpu("head.bn2.running_mean"), get_gpu("head.bn2.running_var"),
@@ -634,10 +656,10 @@ std::vector<float> GpuSpeakerEncoder::extract_gpu(const float* d_mel, int T) {
 
     int tdnn_size = 128 * T2;
     float* d_tdnn = sp.b;
-    conv1d_kernel<<<div_ceil(tdnn_size, BLOCK), BLOCK, 0, stream_>>>(
+    conv1d_kernel<<<div_ceil(tdnn_size, BLOCK), BLOCK, 0, stream>>>(
         d_x, get_gpu("xvector.tdnn.linear.weight"), get_gpu("xvector.tdnn.linear.bias"),
         d_tdnn, 32 * H, T, 128, T2, 5, 2, 2, 1);
-    bn_relu_kernel<<<div_ceil(tdnn_size, BLOCK), BLOCK, 0, stream_>>>(
+    bn_relu_kernel<<<div_ceil(tdnn_size, BLOCK), BLOCK, 0, stream>>>(
         d_tdnn, d_tdnn,
         get_gpu("xvector.tdnn.nonlinear.batchnorm.weight"),
         get_gpu("xvector.tdnn.nonlinear.batchnorm.bias"),
@@ -646,26 +668,26 @@ std::vector<float> GpuSpeakerEncoder::extract_gpu(const float* d_mel, int T) {
         128, T2, true);
 
     cudaMemcpyAsync(sp.cur_concat(), d_tdnn, 128 * T2 * sizeof(float),
-                    cudaMemcpyDeviceToDevice, stream_);
+                    cudaMemcpyDeviceToDevice, stream);
 
     int cur_dim = 128;
-    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block1", 12, 1, stream_);
+    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block1", 12, 1, cublas, stream);
     cur_dim += 12 * 32;
-    gpu_transit(sp, cur_dim, T2, "xvector.transit1", cur_dim / 2, stream_);
+    gpu_transit(sp, cur_dim, T2, "xvector.transit1", cur_dim / 2, cublas, stream);
     cur_dim /= 2;
-    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block2", 24, 2, stream_);
+    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block2", 24, 2, cublas, stream);
     cur_dim += 24 * 32;
-    gpu_transit(sp, cur_dim, T2, "xvector.transit2", cur_dim / 2, stream_);
+    gpu_transit(sp, cur_dim, T2, "xvector.transit2", cur_dim / 2, cublas, stream);
     cur_dim /= 2;
-    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block3", 16, 2, stream_);
+    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block3", 16, 2, cublas, stream);
     cur_dim += 16 * 32;
-    gpu_transit(sp, cur_dim, T2, "xvector.transit3", cur_dim / 2, stream_);
+    gpu_transit(sp, cur_dim, T2, "xvector.transit3", cur_dim / 2, cublas, stream);
     cur_dim /= 2;
 
     int embed_channels = cur_dim;
     float* d_final = sp.cur_concat();
     int out_size = embed_channels * T2;
-    bn_relu_kernel<<<div_ceil(out_size, BLOCK), BLOCK, 0, stream_>>>(
+    bn_relu_kernel<<<div_ceil(out_size, BLOCK), BLOCK, 0, stream>>>(
         d_final, d_final,
         get_gpu("xvector.out_nonlinear.batchnorm.weight"),
         get_gpu("xvector.out_nonlinear.batchnorm.bias"),
@@ -674,31 +696,120 @@ std::vector<float> GpuSpeakerEncoder::extract_gpu(const float* d_mel, int T) {
         embed_channels, T2, true);
 
     float* d_pooled = sp.a;
-    stats_pool_kernel<<<div_ceil(embed_channels, BLOCK), BLOCK, 0, stream_>>>(
+    stats_pool_kernel<<<div_ceil(embed_channels, BLOCK), BLOCK, 0, stream>>>(
         d_final, d_pooled, embed_channels, T2);
 
     const int emb_size = 192;
-    float* d_emb = sp.b;
+    // Write embedding to d_emb_out (caller-provided buffer)
     {
         float alpha = 1.0f, beta = 0.0f;
-        cublasSgemv(cublas_, CUBLAS_OP_T, embed_channels * 2, emb_size,
+        cublasSgemv(cublas, CUBLAS_OP_T, embed_channels * 2, emb_size,
                     &alpha, get_gpu("xvector.dense.linear.weight"),
-                    embed_channels * 2, d_pooled, 1, &beta, d_emb, 1);
+                    embed_channels * 2, d_pooled, 1, &beta, d_emb_out, 1);
     }
 
-    bn_no_affine_kernel<<<1, BLOCK, 0, stream_>>>(
-        d_emb, d_emb,
+    bn_no_affine_kernel<<<1, BLOCK, 0, stream>>>(
+        d_emb_out, d_emb_out,
         get_gpu("xvector.dense.nonlinear.batchnorm.running_mean"),
         get_gpu("xvector.dense.nonlinear.batchnorm.running_var"),
         emb_size);
 
-    l2_normalize_kernel<<<1, 1, 0, stream_>>>(d_emb, emb_size);
+    l2_normalize_kernel<<<1, 1, 0, stream>>>(d_emb_out, emb_size);
+}
 
-    cudaStreamSynchronize(stream_);
-    std::vector<float> result(emb_size);
-    cudaMemcpy(result.data(), d_emb, emb_size * sizeof(float), cudaMemcpyDeviceToHost);
+// ============================================================================
+// Batch resource management
+// ============================================================================
+bool GpuSpeakerEncoder::ensure_batch(int max_T) {
+    if (batch_.initialized && max_T <= batch_.max_T) return true;
 
-    return result;
+    // Compute scratch dimensions for max_T
+    int T2 = (max_T + 2*2 - 1*(5-1) - 1) / 2 + 1;
+    int max_fcm_spatial = 32 * 80 * max_T;
+    int max_block_spatial = 1024 * T2;
+    int max_spatial = std::max(max_fcm_spatial, max_block_spatial);
+
+    for (int i = 0; i < BATCH_CONCURRENCY; i++) {
+        if (!batch_.initialized) {
+            cudaStreamCreate(&batch_.streams[i]);
+            cublasCreate(&batch_.cublas[i]);
+        }
+        batch_.scratch[i].free();
+        if (!batch_.scratch[i].alloc(std::max(max_T, T2), max_spatial)) {
+            fprintf(stderr, "[SpeakerGPU] batch scratch[%d] alloc failed for T=%d\n", i, max_T);
+            return false;
+        }
+    }
+
+    if (!batch_.d_emb_buf) {
+        cudaMalloc(&batch_.d_emb_buf, BATCH_CONCURRENCY * 192 * sizeof(float));
+    }
+
+    batch_.max_T = max_T;
+    batch_.initialized = true;
+    fprintf(stderr, "[SpeakerGPU] Batch resources: %d streams, scratch %.1f MB each\n",
+            BATCH_CONCURRENCY,
+            batch_.scratch[0].total_bytes / (1024.0f * 1024.0f));
+    return true;
+}
+
+// ============================================================================
+// extract_batch_gpu() — multi-stream batch embedding extraction
+// Process N chunks concurrently across BATCH_CONCURRENCY CUDA streams
+// ============================================================================
+std::vector<std::vector<float>> GpuSpeakerEncoder::extract_batch_gpu(
+        const std::vector<BatchChunk>& chunks) {
+    int n = (int)chunks.size();
+    std::vector<std::vector<float>> results(n);
+    if (!loaded_ || n == 0) return results;
+
+    // Find max T across all chunks
+    int max_T = 0;
+    for (auto& c : chunks) max_T = std::max(max_T, c.T);
+    if (!ensure_batch(max_T)) return results;
+
+    const int emb_size = 192;
+
+    // Process in batches of BATCH_CONCURRENCY
+    for (int base = 0; base < n; base += BATCH_CONCURRENCY) {
+        int batch_size = std::min(BATCH_CONCURRENCY, n - base);
+
+        // Launch all chunks in this batch on separate streams
+        for (int i = 0; i < batch_size; i++) {
+            auto& c = chunks[base + i];
+            if (c.T < 10) continue;
+
+            cublasSetStream(batch_.cublas[i], batch_.streams[i]);
+            forward_one(c.d_mel, c.T,
+                       batch_.scratch[i], batch_.streams[i],
+                       batch_.cublas[i],
+                       batch_.d_emb_buf + i * emb_size);
+        }
+
+        // Sync all streams in this batch
+        for (int i = 0; i < batch_size; i++)
+            cudaStreamSynchronize(batch_.streams[i]);
+
+        // Copy all embeddings to host at once
+        std::vector<float> host_embs(batch_size * emb_size);
+        cudaMemcpy(host_embs.data(), batch_.d_emb_buf,
+                   batch_size * emb_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+        for (int i = 0; i < batch_size; i++) {
+            auto& c = chunks[base + i];
+            if (c.T < 10) continue;
+
+            float* emb = host_embs.data() + i * emb_size;
+            bool valid = true;
+            for (int j = 0; j < emb_size; j++) {
+                if (std::isnan(emb[j]) || std::isinf(emb[j])) { valid = false; break; }
+            }
+            if (valid)
+                results[base + i].assign(emb, emb + emb_size);
+        }
+    }
+
+    return results;
 }
 
 // ============================================================================
@@ -707,6 +818,7 @@ std::vector<float> GpuSpeakerEncoder::extract_gpu(const float* d_mel, int T) {
 void GpuSpeakerEncoder::gpu_cam_dense_block(ScratchPool& sp, int in_dim, int T,
                                               const std::string& prefix,
                                               int num_layers, int dilation,
+                                              cublasHandle_t cublas,
                                               cudaStream_t stream) {
     const int growth = 32;
     const int bn_ch = 128;
@@ -734,7 +846,7 @@ void GpuSpeakerEncoder::gpu_cam_dense_block(ScratchPool& sp, int in_dim, int T,
         // cuBLAS col-major: X^T[T, cur_dim] × W^T[cur_dim, 128] → H^T[T, 128]
         {
             float alpha = 1.0f, beta = 0.0f;
-            cublasSgemm(cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
+            cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                         T, bn_ch, cur_dim,
                         &alpha, sp.a, T,
                         get_gpu(lp + ".linear1.weight"), cur_dim,
@@ -751,7 +863,7 @@ void GpuSpeakerEncoder::gpu_cam_dense_block(ScratchPool& sp, int in_dim, int T,
             bn_ch, T, true);
 
         // CAM layer → sp.c (output is [growth, T] = [32, T])
-        gpu_cam_layer(sp, bn_ch, growth, T, lp + ".cam_layer", k, dilation, pad, stream);
+        gpu_cam_layer(sp, bn_ch, growth, T, lp + ".cam_layer", k, dilation, pad, cublas, stream);
         // After this, sp.c has [32, T] output
 
         // Append sp.c [32, T] to concat buffer
@@ -773,6 +885,7 @@ void GpuSpeakerEncoder::gpu_cam_dense_block(ScratchPool& sp, int in_dim, int T,
 void GpuSpeakerEncoder::gpu_cam_layer(ScratchPool& sp, int bn_ch, int out_ch,
                                         int T, const std::string& prefix,
                                         int k, int dilation, int padding,
+                                        cublasHandle_t cublas,
                                         cudaStream_t stream) {
 
     // linear_local: Conv1d(128→32, k=3, dilation) → sp.c
@@ -795,7 +908,7 @@ void GpuSpeakerEncoder::gpu_cam_layer(ScratchPool& sp, int bn_ch, int out_ch,
     int mid = bn_ch / 2;  // 64
     {
         float alpha = 1.0f, beta = 0.0f;
-        cublasSgemm(cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
+        cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                     T, mid, bn_ch,
                     &alpha, sp.e, T,
                     get_gpu(prefix + ".linear1.weight"), bn_ch,
@@ -808,7 +921,7 @@ void GpuSpeakerEncoder::gpu_cam_layer(ScratchPool& sp, int bn_ch, int out_ch,
     // linear2: Conv1d(64→32, k=1) = GEMM → sp.e (reuse)
     {
         float alpha = 1.0f, beta = 0.0f;
-        cublasSgemm(cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
+        cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                     T, out_ch, mid,
                     &alpha, sp.d, T,
                     get_gpu(prefix + ".linear2.weight"), mid,
@@ -827,6 +940,7 @@ void GpuSpeakerEncoder::gpu_cam_layer(ScratchPool& sp, int bn_ch, int out_ch,
 // ============================================================================
 void GpuSpeakerEncoder::gpu_transit(ScratchPool& sp, int in_dim, int T,
                                       const std::string& prefix, int out_dim,
+                                      cublasHandle_t cublas,
                                       cudaStream_t stream) {
     // BN + ReLU on concat → sp.a
     bn_relu_kernel<<<div_ceil(in_dim * T, BLOCK), BLOCK, 0, stream>>>(
@@ -839,7 +953,7 @@ void GpuSpeakerEncoder::gpu_transit(ScratchPool& sp, int in_dim, int T,
 
     // Conv1d(in→out, k=1) = GEMM → next_concat
     float alpha = 1.0f, beta = 0.0f;
-    cublasSgemm(cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
+    cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                 T, out_dim, in_dim,
                 &alpha, sp.a, T,
                 get_gpu(prefix + ".linear.weight"), in_dim,

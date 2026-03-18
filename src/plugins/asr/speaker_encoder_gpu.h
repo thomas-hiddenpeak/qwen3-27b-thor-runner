@@ -51,6 +51,12 @@ public:
     // d_mel: GPU 指针, [T, 80] row-major
     std::vector<float> extract_gpu(const float* d_mel, int T);
 
+    // 批量 GPU 提取: 多个 chunk 使用多 CUDA stream 并行处理
+    // 减少 kernel launch + sync 开销, 1331 chunks: 33s → ~3s
+    struct BatchChunk { const float* d_mel; int T; };
+    std::vector<std::vector<float>> extract_batch_gpu(
+        const std::vector<BatchChunk>& chunks);
+
     static constexpr int embedding_dim() { return 192; }
 
     static float cosine_similarity(const std::vector<float>& a,
@@ -81,6 +87,24 @@ private:
     cudaStream_t stream_ = nullptr;
     int scratch_max_T_ = 0;
 
+    // Multi-stream batch resources
+    static constexpr int BATCH_CONCURRENCY = 16;
+    struct BatchResources {
+        ScratchPool scratch[BATCH_CONCURRENCY];
+        cudaStream_t streams[BATCH_CONCURRENCY] = {};
+        cublasHandle_t cublas[BATCH_CONCURRENCY] = {};
+        float* d_emb_buf = nullptr;  // [BATCH_CONCURRENCY * 192]
+        int max_T = 0;
+        bool initialized = false;
+    };
+    BatchResources batch_;
+    bool ensure_batch(int max_T);
+
+    // Core forward pass (no sync, writes 192-dim embedding to d_emb_out)
+    void forward_one(const float* d_mel, int T, ScratchPool& sp,
+                     cudaStream_t stream, cublasHandle_t cublas,
+                     float* d_emb_out);
+
     // Ensure scratch is large enough for T frames
     bool ensure_scratch(int T);
 
@@ -96,13 +120,16 @@ private:
     void gpu_cam_dense_block(ScratchPool& sp, int in_dim, int T,
                               const std::string& prefix,
                               int num_layers, int dilation,
+                              cublasHandle_t cublas,
                               cudaStream_t stream);
     void gpu_cam_layer(ScratchPool& sp, int bn_ch, int out_ch,
                         int T, const std::string& prefix,
                         int k, int dilation, int padding,
+                        cublasHandle_t cublas,
                         cudaStream_t stream);
     void gpu_transit(ScratchPool& sp, int in_dim, int T,
                       const std::string& prefix, int out_dim,
+                      cublasHandle_t cublas,
                       cudaStream_t stream);
 };
 

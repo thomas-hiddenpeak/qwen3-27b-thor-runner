@@ -4098,6 +4098,25 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
             const int CHUNK_FRAMES = 300;     // 3.0s @ 10ms/frame (best balance: gap=0.129, single-speaker likely)
             const int MIN_CHUNK_FRAMES = 150; // 1.5s minimum viable chunk
 
+            // === Batch CAM++ extraction ===
+            // Pass 1: Compute mel per segment, copy chunk mels to GPU batch buffer
+            using BatchChunk = asr::GpuSpeakerEncoder::BatchChunk;
+            std::vector<BatchChunk> batch_chunks;
+            std::vector<ChunkInfo> batch_chunk_infos;
+
+            // GPU batch mel buffer
+            bool use_gpu_batch = gpu_mel_.is_initialized() && speaker_encoder_;
+            float* d_batch_mels = nullptr;
+            int batch_mel_capacity = (int)(total_duration_s * 100 + 10000) * 80;  // max frames × 80
+            if (use_gpu_batch) {
+                if (cudaMalloc(&d_batch_mels, (size_t)batch_mel_capacity * sizeof(float)) != cudaSuccess) {
+                    fprintf(stderr, "[Serve] batch mel buffer alloc failed (%.1f MB), falling back to serial\n",
+                            (size_t)batch_mel_capacity * sizeof(float) / (1024.0f * 1024.0f));
+                    use_gpu_batch = false;
+                }
+            }
+            int batch_mel_offset = 0;  // accumulated frames
+
             for (size_t vi = 0; vi < vad_results.size(); ++vi) {
                 auto& vr = vad_results[vi];
                 if (vr.end_ms - vr.start_ms < 200) continue;
@@ -4124,7 +4143,7 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                     auto mel_result = gpu_mel_.compute_gpu(seg_pcm, seg_samples);
                     num_frames = mel_result.num_frames;
                     d_mel = mel_result.d_mel;
-                    gpu_mel_.sync();  // ensure GPU mel complete before speaker encoder reads
+                    gpu_mel_.sync();  // ensure GPU mel complete before copy
                 } else {
                     compute_mel_80(seg_pcm, seg_samples, wav.sample_rate, mel, num_frames);
                 }
@@ -4152,34 +4171,60 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                     int chunk_frames = f_end - f_start;
                     if (chunk_frames < 10) continue;
 
-                    std::vector<float> embedding;
-                    {
-                        std::lock_guard<std::mutex> spk_lock(speaker_mutex_);
-                        if (d_mel) {
-                            // GPU direct path: skip CPU CMN+transpose+H2D
-                            embedding = speaker_encoder_->extract_gpu(d_mel + f_start * 80, chunk_frames);
-                        } else {
-                            embedding = speaker_encoder_->extract(mel.data() + f_start * 80, chunk_frames);
-                        }
-                    }
-                    if (embedding.empty()) continue;
-
-                    bool has_nan = false;
-                    for (float v : embedding) {
-                        if (std::isnan(v) || std::isinf(v)) { has_nan = true; break; }
-                    }
-                    if (has_nan) continue;
-
                     int abs_start = vr.start_ms + (int)(f_start * MS_PER_FRAME);
                     int abs_end = vr.start_ms + (int)(f_end * MS_PER_FRAME);
                     abs_end = std::min(abs_end, vr.end_ms);
 
-                    seg_embeddings.push_back(embedding);
-                    chunk_infos.push_back({abs_start, abs_end});
+                    if (use_gpu_batch && d_mel &&
+                        (batch_mel_offset + chunk_frames) * 80 <= batch_mel_capacity) {
+                        // Copy chunk mel to persistent batch buffer (sync D2D, d_mel valid after gpu_mel_.sync)
+                        cudaMemcpy(d_batch_mels + (size_t)batch_mel_offset * 80,
+                                   d_mel + f_start * 80,
+                                   (size_t)chunk_frames * 80 * sizeof(float),
+                                   cudaMemcpyDeviceToDevice);
+                        batch_chunks.push_back({d_batch_mels + (size_t)batch_mel_offset * 80, chunk_frames});
+                        batch_chunk_infos.push_back({abs_start, abs_end});
+                        batch_mel_offset += chunk_frames;
+                    } else if (speaker_encoder_) {
+                        // Serial fallback (CPU mel or buffer overflow)
+                        std::vector<float> embedding;
+                        {
+                            std::lock_guard<std::mutex> spk_lock(speaker_mutex_);
+                            if (d_mel) {
+                                embedding = speaker_encoder_->extract_gpu(d_mel + f_start * 80, chunk_frames);
+                            } else if (!mel.empty()) {
+                                embedding = speaker_encoder_->extract(mel.data() + f_start * 80, chunk_frames);
+                            }
+                        }
+                        if (!embedding.empty()) {
+                            bool valid = true;
+                            for (float v : embedding)
+                                if (std::isnan(v) || std::isinf(v)) { valid = false; break; }
+                            if (valid) {
+                                seg_embeddings.push_back(std::move(embedding));
+                                chunk_infos.push_back({abs_start, abs_end});
+                            }
+                        }
+                    }
                 }
             }
-            fprintf(stderr, "[Serve] Step 3b: %d VAD segs → %zu chunks (%.0fs speech)\n",
-                    mel_segments, seg_embeddings.size(), total_speech_sec);
+
+            // Pass 2: Batch extract all GPU chunks at once (multi-stream)
+            if (use_gpu_batch && !batch_chunks.empty()) {
+                std::lock_guard<std::mutex> spk_lock(speaker_mutex_);
+                auto embeddings = speaker_encoder_->extract_batch_gpu(batch_chunks);
+                for (int i = 0; i < (int)embeddings.size(); i++) {
+                    if (!embeddings[i].empty()) {
+                        seg_embeddings.push_back(std::move(embeddings[i]));
+                        chunk_infos.push_back(batch_chunk_infos[i]);
+                    }
+                }
+            }
+
+            if (d_batch_mels) cudaFree(d_batch_mels);
+
+            fprintf(stderr, "[Serve] Step 3b: %d VAD segs → %zu chunks (%.0fs speech) [batch=%zu]\n",
+                    mel_segments, seg_embeddings.size(), total_speech_sec, batch_chunks.size());
 
             // Debug: Export embeddings for Python analysis
             {
