@@ -4199,7 +4199,28 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                     }
                 }
 
-                // 1b. S-norm 已禁用 — 测试表明 S-norm 会降低准确率 (88.2%→88.0%)
+                // 1b. Temporal proximity mixing
+                // S_combined = (1-α)*S_cosine + α*exp(-|t_i-t_j|/τ)
+                // 近距离的 chunk 更可能来自同一说话人 (对话轮替特性)
+                // 参数扫描: α=0.65/τ=12s 在鲁棒性和精度之间最优 (chunk 71.6%→76.7%)
+                {
+                    constexpr float TEMPORAL_ALPHA = 0.65f;
+                    constexpr float TEMPORAL_TAU = 12.0f; // seconds
+                    constexpr float INV_TAU = 1.0f / TEMPORAL_TAU;
+                    for (int i = 0; i < n_segs; ++i) {
+                        float mid_i = (chunk_infos[i].abs_start_ms + chunk_infos[i].abs_end_ms) * 0.5e-3f;
+                        for (int j = i + 1; j < n_segs; ++j) {
+                            float mid_j = (chunk_infos[j].abs_start_ms + chunk_infos[j].abs_end_ms) * 0.5e-3f;
+                            float t_prox = expf(-fabsf(mid_i - mid_j) * INV_TAU);
+                            float cos_val = sim_matrix[i * n_segs + j];
+                            float combined = (1.0f - TEMPORAL_ALPHA) * cos_val + TEMPORAL_ALPHA * t_prox;
+                            sim_matrix[i * n_segs + j] = combined;
+                            sim_matrix[j * n_segs + i] = combined;
+                        }
+                    }
+                }
+
+                // 1c. S-norm 已禁用 — 测试表明 S-norm 会降低准确率 (88.2%→88.0%)
                 // 原因: embedding 维度已足够, S-norm 过度归一化反而模糊了 speaker 差异
                 #if 0
                 // S-norm 分数归一化 — 消除"通用"embedding 的偏差
@@ -4233,7 +4254,7 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 #endif  // S-norm disabled
 
                 // 2. p-pruning: 每行只保留 top-p 个最大值, 其余设为 0
-                int p = std::max(3, n_segs * 7 / 100);  // ~7% 最优 (扫描 5-15% 范围内 7% 最佳)
+                int p = std::max(3, n_segs * 6 / 100);  // ~6% 最优 (temporal mixing 后重新扫描)
                 p = std::min(p, n_segs - 1);
                 for (int i = 0; i < n_segs; ++i) {
                     // 找第 p+1 大的值作为阈值
