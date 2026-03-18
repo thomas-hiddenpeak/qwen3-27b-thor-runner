@@ -25,6 +25,8 @@
 namespace qwen_thor {
 namespace asr {
 
+class GpuWhisperMel;  // forward declaration (mel_gpu.h)
+
 class ASREngine {
 public:
     ASREngine();
@@ -80,12 +82,15 @@ private:
     int max_mel_frames_ = 0;
     int max_prompt_len_ = 0;
 
-    // 缓存的 mel filterbank 和 Hann window
+    // 缓存的 mel filterbank 和 Hann window (CPU fallback)
     std::vector<float> cached_mel_fb_;     // [n_mels * n_freqs]
     std::vector<float> cached_hann_window_; // [n_fft]
     int cached_n_fft_ = 0;
     int cached_n_mels_ = 0;
     int cached_sample_rate_ = 0;
+
+    // GPU Whisper mel (cuFFT-accelerated)
+    std::unique_ptr<GpuWhisperMel> gpu_whisper_mel_;
 
     cudaStream_t stream_ = 0;
     bool loaded_ = false;

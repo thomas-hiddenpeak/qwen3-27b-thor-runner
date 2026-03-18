@@ -5,6 +5,7 @@
 #include "asr_engine.h"
 #include "audio_utils.h"
 #include "audio_ops.h"
+#include "mel_gpu.h"
 #include "engine/safetensors.h"
 #include "engine/tokenizer.h"
 #include <cstdio>
@@ -331,6 +332,15 @@ void ASREngine::init_mel_cache() {
     cached_hann_window_ = audio::build_hann_window(cached_n_fft_);
     fprintf(stderr, "[ASR] Mel filterbank cached: %d mels, %d FFT, %d Hz\n",
             cached_n_mels_, cached_n_fft_, cached_sample_rate_);
+
+    // Initialize GPU Whisper mel (cuFFT-accelerated)
+    gpu_whisper_mel_ = std::make_unique<GpuWhisperMel>();
+    if (gpu_whisper_mel_->init(cached_mel_fb_.data())) {
+        fprintf(stderr, "[ASR] GPU Whisper mel initialized\n");
+    } else {
+        fprintf(stderr, "[ASR] WARNING: GPU Whisper mel init failed, using CPU fallback\n");
+        gpu_whisper_mel_.reset();
+    }
 }
 
 // ============================================================================
@@ -366,27 +376,48 @@ std::string ASREngine::transcribe(
         audio_len = (int)audio_buf.size();
     }
 
-    // 2. Compute mel spectrogram (CPU, cached filterbank)
-    audio::MelConfig mel_cfg;
-    mel_cfg.n_fft = 400;
-    mel_cfg.hop_length = 160;
-    mel_cfg.n_mels = 128;
-    mel_cfg.sample_rate = 16000;
-
+    // 2. Compute mel spectrogram
     int mel_frames = 0;
-    std::vector<float> mel_f32;
-    audio::compute_mel_cached(audio_16k, audio_len, mel_cfg,
-                              cached_mel_fb_, cached_hann_window_,
-                              mel_f32, mel_frames);
+    bool used_gpu_mel = false;
 
-    if (mel_frames > max_mel_frames_) {
-        fprintf(stderr, "[ASR] WARNING: audio too long (%d frames > %d max), truncating\n",
-                mel_frames, max_mel_frames_);
-        mel_frames = max_mel_frames_;
+    if (gpu_whisper_mel_) {
+        // GPU path: cuFFT-accelerated mel (saves ~488ms/segment vs CPU Bluestein FFT)
+        auto mel_result = gpu_whisper_mel_->compute(audio_16k, audio_len);
+        gpu_whisper_mel_->sync();
+        mel_frames = mel_result.num_frames;
+
+        if (mel_frames > 0 && mel_result.d_mel) {
+            if (mel_frames > max_mel_frames_) {
+                fprintf(stderr, "[ASR] WARNING: audio too long (%d frames > %d max), truncating\n",
+                        mel_frames, max_mel_frames_);
+                mel_frames = max_mel_frames_;
+            }
+            // mel_result.d_mel is [128, T] F32 on GPU → convert to BF16
+            int mel_count = 128 * mel_frames;
+            audio_ops::invoke_f32_to_bf16(mel_gpu_, mel_result.d_mel, mel_count, stream_);
+            used_gpu_mel = true;
+        }
     }
 
-    // 3. Convert mel to BF16 on GPU (avoids CPU loop + H2D copy of BF16 data)
-    {
+    if (!used_gpu_mel) {
+        // CPU fallback path
+        audio::MelConfig mel_cfg;
+        mel_cfg.n_fft = 400;
+        mel_cfg.hop_length = 160;
+        mel_cfg.n_mels = 128;
+        mel_cfg.sample_rate = 16000;
+
+        std::vector<float> mel_f32;
+        audio::compute_mel_cached(audio_16k, audio_len, mel_cfg,
+                                  cached_mel_fb_, cached_hann_window_,
+                                  mel_f32, mel_frames);
+
+        if (mel_frames > max_mel_frames_) {
+            fprintf(stderr, "[ASR] WARNING: audio too long (%d frames > %d max), truncating\n",
+                    mel_frames, max_mel_frames_);
+            mel_frames = max_mel_frames_;
+        }
+
         int mel_count = 128 * mel_frames;
         cudaMemcpyAsync(mel_staging_gpu_, mel_f32.data(),
                         mel_count * sizeof(float), cudaMemcpyHostToDevice, stream_);

@@ -96,3 +96,56 @@ private:
 
 } // namespace asr
 } // namespace qwen_thor
+
+// ============================================================================
+// GPU Whisper Mel Spectrogram (for ASR encoder, 128 channels)
+// ============================================================================
+namespace qwen_thor {
+namespace asr {
+
+class GpuWhisperMel {
+public:
+    GpuWhisperMel();
+    ~GpuWhisperMel();
+
+    // 初始化: 传入预计算的 mel filterbank [128, 201] (from mel_filters.bin)
+    bool init(const float* mel_fb_128x201);
+    bool is_initialized() const { return initialized_; }
+
+    // CPU PCM → GPU mel [128, T] FP32 (Whisper-compatible)
+    // 内部 buffer, 下次 compute 时覆盖
+    struct Result { float* d_mel; int num_frames; };
+    Result compute(const float* pcm, int num_samples);
+
+    void sync() { if (stream_) cudaStreamSynchronize(stream_); }
+
+private:
+    static constexpr int N_FFT = 400;
+    static constexpr int HOP = 160;
+    static constexpr int N_MELS = 128;
+    static constexpr int N_FREQS = N_FFT / 2 + 1;  // 201
+
+    bool initialized_ = false;
+    cufftHandle fft_plan_ = 0;
+    cublasHandle_t cublas_ = nullptr;
+    cudaStream_t stream_ = nullptr;
+
+    // Constants
+    float* d_window_ = nullptr;     // [N_FFT] Hann window
+    float* d_mel_fb_ = nullptr;     // [N_MELS, N_FREQS] Slaney mel filterbank
+
+    // Work buffers (auto-grow)
+    float* d_pcm_ = nullptr;        // padded PCM
+    float* d_frames_ = nullptr;     // [T, N_FFT] windowed frames
+    cufftComplex* d_fft_ = nullptr; // [T, N_FREQS]
+    float* d_power_ = nullptr;      // [T, N_FREQS]
+    float* d_mel_out_ = nullptr;    // [N_MELS, T] output
+    int buf_max_samples_ = 0;
+    int buf_max_frames_ = 0;
+    int cur_plan_frames_ = 0;
+
+    bool ensure_buffers(int padded_samples, int num_frames);
+};
+
+} // namespace asr
+} // namespace qwen_thor
