@@ -158,7 +158,9 @@ void invoke_causal_gqa_decode(
     int batch_size,
     int num_q_heads, int num_kv_heads, int head_dim,
     int current_seq_len,
-    cudaStream_t stream = 0);
+    cudaStream_t stream = 0,
+    float* attn_workspace = nullptr,
+    int attn_max_partitions = 0);
 
 // Causal GQA Prefill Attention (T > 1)
 // 因果 mask, 单请求

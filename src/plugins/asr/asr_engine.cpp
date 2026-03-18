@@ -246,6 +246,9 @@ void ASREngine::load_model(const std::string& model_dir) {
     encoder_->initialize(stream_);
     decoder_->initialize(stream_);
 
+    // 5.5. Optimize decoder weights (QKV merge + RMSNorm centered transform)
+    decoder_->prepare_optimized_weights(stream_);
+
     // 6. Allocate GPU buffers
     // Max mel frames: with center padding, T_max audio (120s) at 16kHz
     // produces (T_max*16000 + n_fft - n_fft) / hop + 1 = T_max*100 + 1 frames.

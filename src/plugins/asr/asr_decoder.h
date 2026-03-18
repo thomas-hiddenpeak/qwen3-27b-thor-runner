@@ -27,22 +27,26 @@ namespace asr {
 // 每层 Decoder 的权重指针 (所有 projection 无 bias)
 struct DecoderLayerWeights {
     // Pre-attention norm
-    __nv_bfloat16* input_layernorm_w = nullptr;       // [hidden_size=2048]
+    __nv_bfloat16* input_layernorm_w = nullptr;       // [hidden_size=2048] plain weight
+    __nv_bfloat16* input_layernorm_w_centered = nullptr; // [hidden_size] (w-1) for fused RMSNorm+GEMV
 
     // Self-attention (GQA)
     __nv_bfloat16* q_proj_w = nullptr;                // [q_dim=2048, hidden_size=2048]
     __nv_bfloat16* k_proj_w = nullptr;                // [kv_dim=1024, hidden_size=2048]
     __nv_bfloat16* v_proj_w = nullptr;                // [kv_dim=1024, hidden_size=2048]
+    __nv_bfloat16* qkv_proj_w = nullptr;              // [q_dim+2*kv_dim=4096, hidden_size=2048] merged
     __nv_bfloat16* o_proj_w = nullptr;                // [hidden_size=2048, q_dim=2048]
     __nv_bfloat16* q_norm_w = nullptr;                // [head_dim=128] per-head RMSNorm
     __nv_bfloat16* k_norm_w = nullptr;                // [head_dim=128]
 
     // Post-attention norm
     __nv_bfloat16* post_attention_layernorm_w = nullptr; // [hidden_size=2048]
+    __nv_bfloat16* post_attention_layernorm_w_centered = nullptr; // [hidden_size] (w-1)
 
     // MLP (SwiGLU, no bias)
     __nv_bfloat16* gate_proj_w = nullptr;             // [intermediate=6144, hidden=2048]
     __nv_bfloat16* up_proj_w = nullptr;               // [intermediate=6144, hidden=2048]
+    __nv_bfloat16* gateup_proj_w = nullptr;           // [2*intermediate=12288, hidden=2048] merged
     __nv_bfloat16* down_proj_w = nullptr;             // [hidden=2048, intermediate=6144]
 };
 
@@ -64,6 +68,10 @@ public:
 
     // 重置 KV cache (新请求时调用)
     void reset_cache();
+
+    // 准备优化权重 (QKV merge + RMSNorm centered transform)
+    // 必须在 set_layer_weights + set_embed_weights 之后、首次推理之前调用
+    void prepare_optimized_weights(cudaStream_t stream = 0);
 
     // Prefill: 输入 embeddings (已替换音频), 输出最后一个 token 的 logits
     // input_embeds: [seq_len, hidden_size] (GPU BF16)
@@ -95,9 +103,13 @@ private:
     __nv_bfloat16* embed_tokens_w_ = nullptr;
     __nv_bfloat16* lm_head_w_ = nullptr;
     __nv_bfloat16* final_norm_w_ = nullptr;
+    __nv_bfloat16* final_norm_w_centered_ = nullptr;  // (w-1) for fused decode LM head
 
     // Layer weights
     std::vector<DecoderLayerWeights> layer_weights_;
+
+    // Merged/optimized weight allocations (freed in destructor)
+    std::vector<void*> merged_allocations_;
 
     // KV Cache: per-layer, contiguous [max_seq_len, num_kv_heads, head_dim]
     std::vector<__nv_bfloat16*> k_cache_;  // [num_layers]
@@ -113,6 +125,10 @@ private:
 
     // cuBLAS pre-allocated workspace (prevents internal cudaMalloc)
     void* cublas_workspace_ = nullptr;
+
+    // Split-K attention workspace (float buffers for partial results)
+    float* attn_split_k_ws_ = nullptr;
+    int attn_max_partitions_ = 0;
 
     bool initialized_ = false;
 
