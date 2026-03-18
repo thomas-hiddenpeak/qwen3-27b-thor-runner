@@ -370,6 +370,37 @@ void GpuSpeakerEncoder::gpu_res_block(const float* d_input, float* d_output,
 }
 
 // ============================================================================
+// GPU CMN + Transpose kernel
+// Fused: compute per-bin mean, subtract, transpose [T, F] → [F, T]
+// Launch with grid=F, block=256
+// ============================================================================
+__global__ void cmn_transpose_kernel(const float* __restrict__ mel,
+                                      float* __restrict__ out,
+                                      int T, int F) {
+    int f = blockIdx.x;
+    if (f >= F) return;
+
+    // Phase 1: compute mean for frequency bin f
+    float sum = 0;
+    for (int t = threadIdx.x; t < T; t += blockDim.x)
+        sum += mel[t * F + f];
+
+    // Block reduction
+    __shared__ float shared[256];
+    shared[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) shared[threadIdx.x] += shared[threadIdx.x + s];
+        __syncthreads();
+    }
+    float mean = shared[0] / T;
+
+    // Phase 2: subtract mean and transpose
+    for (int t = threadIdx.x; t < T; t += blockDim.x)
+        out[f * T + t] = mel[t * F + f] - mean;
+}
+
+// ============================================================================
 // GPU extract() — main entry point
 // ============================================================================
 std::vector<float> GpuSpeakerEncoder::extract(const float* mel_80xT, int T) {
@@ -553,6 +584,124 @@ std::vector<float> GpuSpeakerEncoder::extract(const float* mel_80xT, int T) {
 }
 
 // ============================================================================
+// GPU extract_gpu() — GPU-direct path (skip CPU CMN+transpose+H2D)
+// d_mel: GPU pointer, [T, 80] row-major (from GpuMelExtractor::compute_gpu)
+// ============================================================================
+std::vector<float> GpuSpeakerEncoder::extract_gpu(const float* d_mel, int T) {
+    if (!loaded_ || T < 10) return {};
+    if (!ensure_scratch(T)) return {};
+
+    cublasSetStream(cublas_, stream_);
+    int T2 = (T + 2*2 - 1*(5-1) - 1) / 2 + 1;
+    scratch_.which_concat = 0;
+    ScratchPool& sp = scratch_;
+
+    // 1+2. Fused GPU CMN + Transpose: [T, 80] → [80, T] with mean subtraction
+    float* d_x = sp.a;
+    cmn_transpose_kernel<<<80, 256, 0, stream_>>>(d_mel, d_x, T, 80);
+
+    // ======================== FCM ========================
+    int H = 80;
+    int conv1_size = 32 * H * T;
+    float* d_fcm = sp.b;
+    conv2d_kernel<<<div_ceil(conv1_size, BLOCK), BLOCK, 0, stream_>>>(
+        d_x, get_gpu("head.conv1.weight"), d_fcm,
+        1, H, T, 32, H, T, 3, 1, 1, 1, 1);
+    bn_relu_kernel<<<div_ceil(conv1_size, BLOCK), BLOCK, 0, stream_>>>(
+        d_fcm, d_fcm,
+        get_gpu("head.bn1.weight"), get_gpu("head.bn1.bias"),
+        get_gpu("head.bn1.running_mean"), get_gpu("head.bn1.running_var"),
+        32, H * T, true);
+
+    gpu_res_block(d_fcm, d_x, 32, H, T, "head.layer1.0", 2, sp.c, sp.d, stream_);
+    H = (H + 2 - 3) / 2 + 1;
+    gpu_res_block(d_x, d_fcm, 32, H, T, "head.layer1.1", 1, sp.c, sp.d, stream_);
+    gpu_res_block(d_fcm, d_x, 32, H, T, "head.layer2.0", 2, sp.c, sp.d, stream_);
+    H = (H + 2 - 3) / 2 + 1;
+    gpu_res_block(d_x, d_fcm, 32, H, T, "head.layer2.1", 1, sp.c, sp.d, stream_);
+
+    int H2 = (H + 2 - 3) / 2 + 1;
+    int conv2_size = 32 * H2 * T;
+    conv2d_kernel<<<div_ceil(conv2_size, BLOCK), BLOCK, 0, stream_>>>(
+        d_fcm, get_gpu("head.conv2.weight"), d_x,
+        32, H, T, 32, H2, T, 3, 2, 1, 1, 1);
+    bn_relu_kernel<<<div_ceil(conv2_size, BLOCK), BLOCK, 0, stream_>>>(
+        d_x, d_x,
+        get_gpu("head.bn2.weight"), get_gpu("head.bn2.bias"),
+        get_gpu("head.bn2.running_mean"), get_gpu("head.bn2.running_var"),
+        32, H2 * T, true);
+    H = H2;
+
+    int tdnn_size = 128 * T2;
+    float* d_tdnn = sp.b;
+    conv1d_kernel<<<div_ceil(tdnn_size, BLOCK), BLOCK, 0, stream_>>>(
+        d_x, get_gpu("xvector.tdnn.linear.weight"), get_gpu("xvector.tdnn.linear.bias"),
+        d_tdnn, 32 * H, T, 128, T2, 5, 2, 2, 1);
+    bn_relu_kernel<<<div_ceil(tdnn_size, BLOCK), BLOCK, 0, stream_>>>(
+        d_tdnn, d_tdnn,
+        get_gpu("xvector.tdnn.nonlinear.batchnorm.weight"),
+        get_gpu("xvector.tdnn.nonlinear.batchnorm.bias"),
+        get_gpu("xvector.tdnn.nonlinear.batchnorm.running_mean"),
+        get_gpu("xvector.tdnn.nonlinear.batchnorm.running_var"),
+        128, T2, true);
+
+    cudaMemcpyAsync(sp.cur_concat(), d_tdnn, 128 * T2 * sizeof(float),
+                    cudaMemcpyDeviceToDevice, stream_);
+
+    int cur_dim = 128;
+    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block1", 12, 1, stream_);
+    cur_dim += 12 * 32;
+    gpu_transit(sp, cur_dim, T2, "xvector.transit1", cur_dim / 2, stream_);
+    cur_dim /= 2;
+    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block2", 24, 2, stream_);
+    cur_dim += 24 * 32;
+    gpu_transit(sp, cur_dim, T2, "xvector.transit2", cur_dim / 2, stream_);
+    cur_dim /= 2;
+    gpu_cam_dense_block(sp, cur_dim, T2, "xvector.block3", 16, 2, stream_);
+    cur_dim += 16 * 32;
+    gpu_transit(sp, cur_dim, T2, "xvector.transit3", cur_dim / 2, stream_);
+    cur_dim /= 2;
+
+    int embed_channels = cur_dim;
+    float* d_final = sp.cur_concat();
+    int out_size = embed_channels * T2;
+    bn_relu_kernel<<<div_ceil(out_size, BLOCK), BLOCK, 0, stream_>>>(
+        d_final, d_final,
+        get_gpu("xvector.out_nonlinear.batchnorm.weight"),
+        get_gpu("xvector.out_nonlinear.batchnorm.bias"),
+        get_gpu("xvector.out_nonlinear.batchnorm.running_mean"),
+        get_gpu("xvector.out_nonlinear.batchnorm.running_var"),
+        embed_channels, T2, true);
+
+    float* d_pooled = sp.a;
+    stats_pool_kernel<<<div_ceil(embed_channels, BLOCK), BLOCK, 0, stream_>>>(
+        d_final, d_pooled, embed_channels, T2);
+
+    const int emb_size = 192;
+    float* d_emb = sp.b;
+    {
+        float alpha = 1.0f, beta = 0.0f;
+        cublasSgemv(cublas_, CUBLAS_OP_T, embed_channels * 2, emb_size,
+                    &alpha, get_gpu("xvector.dense.linear.weight"),
+                    embed_channels * 2, d_pooled, 1, &beta, d_emb, 1);
+    }
+
+    bn_no_affine_kernel<<<1, BLOCK, 0, stream_>>>(
+        d_emb, d_emb,
+        get_gpu("xvector.dense.nonlinear.batchnorm.running_mean"),
+        get_gpu("xvector.dense.nonlinear.batchnorm.running_var"),
+        emb_size);
+
+    l2_normalize_kernel<<<1, 1, 0, stream_>>>(d_emb, emb_size);
+
+    cudaStreamSynchronize(stream_);
+    std::vector<float> result(emb_size);
+    cudaMemcpy(result.data(), d_emb, emb_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    return result;
+}
+
+// ============================================================================
 // GPU CAM Dense TDNN Block — uses scratch pool with buffer reuse
 // ============================================================================
 void GpuSpeakerEncoder::gpu_cam_dense_block(ScratchPool& sp, int in_dim, int T,
@@ -612,7 +761,7 @@ void GpuSpeakerEncoder::gpu_cam_dense_block(ScratchPool& sp, int in_dim, int T,
         // Append growth channels
         copy_rows_kernel<<<div_ceil(growth * T, BLOCK), BLOCK, 0, stream>>>(
             sp.next_concat(), sp.c, growth, T, cur_dim);
-        cudaStreamSynchronize(stream);  // Ensure concat copy+append complete before next layer reads
+        // Same-stream ordering guarantees concat is complete before next layer reads
         sp.swap_concat();
         cur_dim += growth;
     }

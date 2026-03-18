@@ -56,6 +56,9 @@ public:
     };
     GpuMelResult compute_gpu(const float* pcm, int num_samples);
 
+    // 确保 GPU mel 计算完成 (调用者可安全读 d_mel)
+    void sync() { if (stream_) cudaStreamSynchronize(stream_); }
+
     const GpuMelConfig& config() const { return cfg_; }
 
 private:

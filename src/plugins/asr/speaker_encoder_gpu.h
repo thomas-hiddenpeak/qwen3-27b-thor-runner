@@ -47,6 +47,10 @@ public:
     // 从 Mel 特征提取 192-dim embedding (mel: [T, 80] row-major)
     std::vector<float> extract(const float* mel_80xT, int T);
 
+    // 从 GPU Mel 特征提取 (跳过 CPU CMN+transpose+H2D, 全 GPU 路径)
+    // d_mel: GPU 指针, [T, 80] row-major
+    std::vector<float> extract_gpu(const float* d_mel, int T);
+
     static constexpr int embedding_dim() { return 192; }
 
     static float cosine_similarity(const std::vector<float>& a,

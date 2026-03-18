@@ -4116,10 +4116,15 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                 rms = std::sqrt(rms / seg_samples);
                 if (rms < 0.005f) continue;
 
-                std::vector<float> mel;
+                // GPU mel path: compute on GPU, keep on GPU for speaker encoder
                 int num_frames = 0;
+                float* d_mel = nullptr;  // GPU pointer (only valid until next compute_gpu)
+                std::vector<float> mel;  // CPU fallback
                 if (gpu_mel_.is_initialized()) {
-                    num_frames = gpu_mel_.compute(seg_pcm, seg_samples, mel);
+                    auto mel_result = gpu_mel_.compute_gpu(seg_pcm, seg_samples);
+                    num_frames = mel_result.num_frames;
+                    d_mel = mel_result.d_mel;
+                    gpu_mel_.sync();  // ensure GPU mel complete before speaker encoder reads
                 } else {
                     compute_mel_80(seg_pcm, seg_samples, wav.sample_rate, mel, num_frames);
                 }
@@ -4150,7 +4155,12 @@ void ServeApp::handle_audio_transcriptions(const HttpRequest& req, int client_fd
                     std::vector<float> embedding;
                     {
                         std::lock_guard<std::mutex> spk_lock(speaker_mutex_);
-                        embedding = speaker_encoder_->extract(mel.data() + f_start * 80, chunk_frames);
+                        if (d_mel) {
+                            // GPU direct path: skip CPU CMN+transpose+H2D
+                            embedding = speaker_encoder_->extract_gpu(d_mel + f_start * 80, chunk_frames);
+                        } else {
+                            embedding = speaker_encoder_->extract(mel.data() + f_start * 80, chunk_frames);
+                        }
                     }
                     if (embedding.empty()) continue;
 
