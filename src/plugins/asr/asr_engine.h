@@ -112,7 +112,8 @@ private:
 
     // 内部方法
     void load_weights(const std::string& model_dir);
-    void build_prompt(int encoder_out_len, std::vector<int>& token_ids);
+    void build_prompt(int encoder_out_len, std::vector<int>& token_ids,
+                      const std::string& language = "Chinese");
     void init_mel_cache();  // 预计算 mel filterbank + Hann window
 };
 

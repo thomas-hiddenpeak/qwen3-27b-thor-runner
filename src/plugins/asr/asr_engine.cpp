@@ -31,6 +31,7 @@ static constexpr int AUDIO_START  = 151669;
 static constexpr int AUDIO_END    = 151670;
 static constexpr int AUDIO_PAD    = 151676;
 static constexpr int ENDOFTEXT    = 151643;
+static constexpr int ASR_TEXT_TOKEN = 151704;  // <asr_text> — force text-only output mode
 
 // ============================================================================
 // ASREngine implementation
@@ -66,24 +67,15 @@ ASREngine::~ASREngine() {
 // Build prompt token IDs
 // ============================================================================
 
-void ASREngine::build_prompt(int encoder_out_len, std::vector<int>& token_ids) {
+void ASREngine::build_prompt(int encoder_out_len, std::vector<int>& token_ids,
+                            const std::string& language) {
     token_ids.clear();
 
-    // <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
+    // Official Qwen3-ASR prompt format (empty system content):
+    // <|im_start|>system\n<|im_end|>\n
     token_ids.push_back(IM_START);
-    // "system\n" → tokenize
-    // Hardcode known IDs for common tokens (from Qwen3 vocab):
-    // "system" = [8948], "\n" = [198]
     token_ids.push_back(8948);   // system
     token_ids.push_back(198);    // \n
-    // "You are a helpful assistant."
-    // Hardcode: [2610, 525, 264, 10950, 17847, 13]
-    token_ids.push_back(2610);   // You
-    token_ids.push_back(525);    // are
-    token_ids.push_back(264);    // a
-    token_ids.push_back(10950);  // helpful
-    token_ids.push_back(17847);  // assistant
-    token_ids.push_back(13);     // .
     token_ids.push_back(IM_END);
     token_ids.push_back(198);    // \n
 
@@ -107,6 +99,16 @@ void ASREngine::build_prompt(int encoder_out_len, std::vector<int>& token_ids) {
     token_ids.push_back(IM_START);
     token_ids.push_back(77091);  // assistant
     token_ids.push_back(198);    // \n
+
+    // Force text-only mode: "language Chinese<asr_text>"
+    // This matches official qwen-asr behavior when language is specified
+    if (!language.empty()) {
+        // "language" = [11528], " Chinese" = [8453], <asr_text> = [151704]
+        // For other languages, token IDs differ — but Chinese covers our main use case
+        token_ids.push_back(11528);  // language
+        token_ids.push_back(8453);   //  Chinese
+        token_ids.push_back(ASR_TEXT_TOKEN);  // <asr_text>
+    }
 }
 
 // ============================================================================
@@ -445,7 +447,7 @@ std::string ASREngine::transcribe(
 
     // 5. Build prompt and embed
     std::vector<int> prompt_tokens;
-    build_prompt(encoder_out_len, prompt_tokens);
+    build_prompt(encoder_out_len, prompt_tokens);  // default: "Chinese"
     int prompt_len = (int)prompt_tokens.size();
 
     if (prompt_len > max_prompt_len_) {
@@ -781,7 +783,7 @@ std::vector<std::string> ASREngine::transcribe_batch(
 
         // Build prompt and embed
         std::vector<int> prompt_tokens;
-        build_prompt(encoder_out_len, prompt_tokens);
+        build_prompt(encoder_out_len, prompt_tokens);  // default: "Chinese"
         int prompt_len = (int)prompt_tokens.size();
         if (prompt_len > max_prompt_len_) {
             fprintf(stderr, "[ASR Batch] ERROR: chunk %d prompt too long (%d)\n", i, prompt_len);
