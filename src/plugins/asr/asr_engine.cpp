@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <unordered_map>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -34,6 +35,222 @@ static constexpr int ENDOFTEXT    = 151643;
 static constexpr int ASR_TEXT_TOKEN = 151704;  // <asr_text> — force text-only output mode
 
 // ============================================================================
+// ASR 后处理: ITN (中文数字→阿拉伯) + 短语重复折叠
+// ============================================================================
+
+// 中文数字字符 → 数值
+static int cn_digit(char32_t c) {
+    switch (c) {
+        case U'零': return 0; case U'一': return 1; case U'二': return 2;
+        case U'三': return 3; case U'四': return 4; case U'五': return 5;
+        case U'六': return 6; case U'七': return 7; case U'八': return 8;
+        case U'九': return 9; default: return -1;
+    }
+}
+
+static bool is_cn_num_char(char32_t c) {
+    return cn_digit(c) >= 0 || c == U'十' || c == U'百' || c == U'千' ||
+           c == U'万' || c == U'亿' || c == U'点';
+}
+
+// 解析中文数字序列 → 阿拉伯数字字符串
+static std::string cn_to_arabic(const std::u32string& cn) {
+    // 处理小数点
+    auto dot = cn.find(U'点');
+    if (dot != std::u32string::npos) {
+        auto int_part = cn.substr(0, dot);
+        auto dec_part = cn.substr(dot + 1);
+        std::string int_str = int_part.empty() ? "0" : cn_to_arabic(int_part);
+        std::string dec_str;
+        for (auto c : dec_part) {
+            int d = cn_digit(c);
+            if (d >= 0) dec_str += ('0' + d);
+        }
+        return int_str + "." + dec_str;
+    }
+
+    // 单个数字字符
+    if (cn.size() == 1) {
+        int d = cn_digit(cn[0]);
+        if (d >= 0) return std::to_string(d);
+        if (cn[0] == U'十') return "10";
+        return "";
+    }
+
+    int64_t result = 0, current = 0;
+    int64_t yi_val = 0, wan_val = 0;
+    for (size_t i = 0; i < cn.size(); i++) {
+        char32_t c = cn[i];
+        int d = cn_digit(c);
+        if (d >= 0) {
+            current = d;
+        } else if (c == U'十') {
+            if (current == 0 && i == 0) current = 1;
+            current *= 10; result += current; current = 0;
+        } else if (c == U'百') {
+            current *= 100; result += current; current = 0;
+        } else if (c == U'千') {
+            current *= 1000; result += current; current = 0;
+        } else if (c == U'万') {
+            result += current; wan_val = result * 10000; result = 0; current = 0;
+        } else if (c == U'亿') {
+            result += current;
+            yi_val = (yi_val + wan_val + result) * 100000000LL;
+            wan_val = 0; result = 0; current = 0;
+        }
+    }
+    result += current;
+    return std::to_string(yi_val + wan_val + result);
+}
+
+// UTF-8 string → U32
+static std::u32string utf8_to_u32(const std::string& s) {
+    std::u32string out;
+    for (size_t i = 0; i < s.size(); ) {
+        char32_t cp = 0;
+        uint8_t b = s[i];
+        int len = 1;
+        if ((b & 0x80) == 0) { cp = b; len = 1; }
+        else if ((b & 0xE0) == 0xC0) { cp = b & 0x1F; len = 2; }
+        else if ((b & 0xF0) == 0xE0) { cp = b & 0x0F; len = 3; }
+        else if ((b & 0xF8) == 0xF0) { cp = b & 0x07; len = 4; }
+        for (int j = 1; j < len && i + j < s.size(); j++)
+            cp = (cp << 6) | (s[i + j] & 0x3F);
+        out.push_back(cp);
+        i += len;
+    }
+    return out;
+}
+
+// U32 → UTF-8
+static std::string u32_to_utf8(const std::u32string& s) {
+    std::string out;
+    for (char32_t cp : s) {
+        if (cp < 0x80) {
+            out += (char)cp;
+        } else if (cp < 0x800) {
+            out += (char)(0xC0 | (cp >> 6));
+            out += (char)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += (char)(0xE0 | (cp >> 12));
+            out += (char)(0x80 | ((cp >> 6) & 0x3F));
+            out += (char)(0x80 | (cp & 0x3F));
+        } else {
+            out += (char)(0xF0 | (cp >> 18));
+            out += (char)(0x80 | ((cp >> 12) & 0x3F));
+            out += (char)(0x80 | ((cp >> 6) & 0x3F));
+            out += (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    return out;
+}
+
+// ITN: 中文数字 → 阿拉伯数字
+static std::string apply_itn(const std::string& text) {
+    auto u32 = utf8_to_u32(text);
+    std::u32string result;
+    size_t i = 0;
+    size_t n = u32.size();
+
+    while (i < n) {
+        // 百分之X → X%
+        if (i + 3 < n && u32[i] == U'百' && u32[i+1] == U'分' &&
+            u32[i+2] == U'之') {
+            size_t j = i + 3;
+            std::u32string num;
+            while (j < n && is_cn_num_char(u32[j])) {
+                num += u32[j]; j++;
+            }
+            if (!num.empty()) {
+                auto arabic = cn_to_arabic(num);
+                for (char c : arabic) result += (char32_t)c;
+                result += U'%';
+                i = j;
+                continue;
+            }
+        }
+
+        // 中文数字序列 (2+ 字符) → 阿拉伯数字
+        if (is_cn_num_char(u32[i]) && u32[i] != U'点') {
+            size_t j = i;
+            std::u32string num;
+            while (j < n && is_cn_num_char(u32[j])) {
+                num += u32[j]; j++;
+            }
+            // 只转换 2+ 字符的数字序列 (避免 "一个" → "1个")
+            if (num.size() >= 2) {
+                auto arabic = cn_to_arabic(num);
+                for (char c : arabic) result += (char32_t)c;
+                i = j;
+                continue;
+            }
+        }
+
+        result.push_back(u32[i]);
+        i++;
+    }
+
+    return u32_to_utf8(result);
+}
+
+// 短语重复折叠: 折叠连续重复的 2-8 字符短语
+// 只折叠包含 2+ 不同字符的短语, 保留 "我我我我" 等单字符重复 (口语习惯)
+static std::string collapse_phrase_repeats(const std::string& text) {
+    auto u32 = utf8_to_u32(text);
+    // Work from longer patterns to shorter
+    for (int plen = 8; plen >= 2; plen--) {
+        std::u32string out;
+        size_t i = 0;
+        while (i < u32.size()) {
+            if (i + plen * 2 <= u32.size()) {
+                // Check if pattern has 2+ distinct chars (skip same-char repeats like 我我)
+                bool has_distinct = false;
+                for (int k = 1; k < plen; k++) {
+                    if (u32[i + k] != u32[i]) { has_distinct = true; break; }
+                }
+                if (has_distinct) {
+                    // Check if next plen chars repeat
+                    bool repeat = true;
+                    for (int k = 0; k < plen; k++) {
+                        if (u32[i + k] != u32[i + plen + k]) {
+                            repeat = false;
+                            break;
+                        }
+                    }
+                    if (repeat) {
+                        // Count total consecutive repeats
+                        size_t j = i + plen;
+                        while (j + plen <= u32.size()) {
+                            bool match = true;
+                            for (int k = 0; k < plen; k++) {
+                                if (u32[i + k] != u32[j + k]) { match = false; break; }
+                            }
+                            if (!match) break;
+                            j += plen;
+                        }
+                        // Keep one occurrence
+                        for (int k = 0; k < plen; k++)
+                            out.push_back(u32[i + k]);
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            out.push_back(u32[i]);
+            i++;
+        }
+        u32 = std::move(out);
+    }
+    return u32_to_utf8(u32);
+}
+
+// 综合后处理: ITN
+// 短语折叠经测试弊大于利（折叠了真实口语重复），故不启用
+static std::string postprocess_asr(const std::string& text) {
+    return apply_itn(text);
+}
+
+// ============================================================================
 // ASREngine implementation
 // ============================================================================
 
@@ -49,6 +266,7 @@ ASREngine::~ASREngine() {
     if (token_id_gpu_) cudaFree(token_id_gpu_);
     if (prompt_tokens_gpu_) cudaFree(prompt_tokens_gpu_);
     if (mel_staging_gpu_) cudaFree(mel_staging_gpu_);
+    if (rep_tokens_gpu_) cudaFree(rep_tokens_gpu_);
     // Batch decode buffers
     if (batch_logits_) cudaFree(batch_logits_);
     if (batch_token_ids_) cudaFree(batch_token_ids_);
@@ -287,6 +505,9 @@ void ASREngine::load_model(const std::string& model_dir) {
     // Pre-allocated prompt token buffer (avoids per-call cudaMalloc/Free)
     cudaMalloc(&prompt_tokens_gpu_, max_prompt_len_ * sizeof(int));
 
+    // Repetition penalty token buffer (max 512 output tokens)
+    cudaMalloc(&rep_tokens_gpu_, 512 * sizeof(int));
+
     // 7. Pre-compute mel filterbank and Hann window
     init_mel_cache();
 
@@ -518,6 +739,7 @@ std::string ASREngine::transcribe(
     if (min_new_tokens > 0) {
         audio_ops::invoke_suppress_eos(logits_, IM_END, ENDOFTEXT, stream_);
     }
+    // Note: no repetition penalty for first token (no history)
     audio_ops::invoke_argmax(logits_, token_id_gpu_, config_.vocab_size, stream_);
     int next_token;
     cudaMemcpyAsync(&next_token, token_id_gpu_, sizeof(int), cudaMemcpyDeviceToHost, stream_);
@@ -567,6 +789,14 @@ std::string ASREngine::transcribe(
         // EOS 抑制: 未达到最小 token 数时禁止生成 EOS
         if ((int)output_tokens.size() < min_new_tokens) {
             audio_ops::invoke_suppress_eos(logits_, IM_END, ENDOFTEXT, stream_);
+        }
+        // Repetition penalty: discourage re-generating previously output tokens
+        if (repetition_penalty_ > 1.0f && !output_tokens.empty()) {
+            int n = std::min((int)output_tokens.size(), 512);
+            cudaMemcpyAsync(rep_tokens_gpu_, output_tokens.data(),
+                            n * sizeof(int), cudaMemcpyHostToDevice, stream_);
+            audio_ops::invoke_repetition_penalty(
+                logits_, rep_tokens_gpu_, n, repetition_penalty_, stream_);
         }
         audio_ops::invoke_argmax(logits_, token_id_gpu_, config_.vocab_size, stream_);
         cudaMemcpyAsync(&next_token, token_id_gpu_, sizeof(int), cudaMemcpyDeviceToHost, stream_);
@@ -647,6 +877,11 @@ std::string ASREngine::transcribe(
         } else {
             result = "[" + std::to_string(output_tokens.size()) + " tokens]";
         }
+    }
+
+    // 12. Post-processing: ITN (Chinese numbers → Arabic) + phrase collapse
+    if (!result.empty()) {
+        result = postprocess_asr(result);
     }
 
     return result;
@@ -974,6 +1209,11 @@ std::vector<std::string> ASREngine::transcribe_batch(
             results[i] = tokenizer_.decode(ot);
         }
         fprintf(stderr, "[ASR Batch] Chunk %d text: \"%s\"\n", i, results[i].substr(0, 100).c_str());
+    }
+
+    // Post-processing: ITN + phrase collapse on all batch results
+    for (auto& r : results) {
+        if (!r.empty()) r = postprocess_asr(r);
     }
 
     auto t_end = std::chrono::steady_clock::now();

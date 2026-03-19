@@ -46,6 +46,7 @@ AsrConfig AsrConfig::from_file(const std::string& path) {
         else if (key == "asr_extra_args") config.extra_args = val;
         else if (key == "asr_tmp_dir")    config.tmp_dir    = val;
         else if (key == "asr_speaker_model") config.speaker_model = val;
+        else if (key == "asr_repetition_penalty") config.repetition_penalty = std::stof(val);
     }
     return config;
 }
@@ -205,6 +206,10 @@ NativeAsrPlugin::NativeAsrPlugin(const AsrConfig& config)
     engine_ = std::make_unique<asr::ASREngine>();
     fprintf(stderr, "[ASR Native] Loading model from %s...\n", config.model_path.c_str());
     engine_->load_model(config.model_path);
+    if (config.repetition_penalty > 1.0f) {
+        engine_->set_repetition_penalty(config.repetition_penalty);
+        fprintf(stderr, "[ASR Native] Repetition penalty: %.2f\n", config.repetition_penalty);
+    }
     fprintf(stderr, "[ASR Native] Model loaded\n");
 }
 

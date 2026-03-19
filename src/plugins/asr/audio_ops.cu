@@ -1393,5 +1393,39 @@ void invoke_f32_to_bf16(__nv_bfloat16* out, const float* in, int n,
     f32_to_bf16_kernel<<<grid, block, 0, stream>>>(out, in, n);
 }
 
+// ============================================================================
+// Repetition penalty: scale logits of previously generated tokens
+// if logit > 0: logit /= penalty
+// if logit < 0: logit *= penalty
+// ============================================================================
+
+__global__ void repetition_penalty_kernel(
+    __nv_bfloat16* __restrict__ logits,
+    const int* __restrict__ token_ids,
+    int num_tokens,
+    float penalty)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_tokens) {
+        int token_id = token_ids[idx];
+        float logit = __bfloat162float(logits[token_id]);
+        if (logit > 0.0f)
+            logit /= penalty;
+        else
+            logit *= penalty;
+        logits[token_id] = __float2bfloat16(logit);
+    }
+}
+
+void invoke_repetition_penalty(__nv_bfloat16* logits, const int* token_ids,
+                               int num_tokens, float penalty,
+                               cudaStream_t stream) {
+    if (num_tokens <= 0 || penalty == 1.0f) return;
+    int block = 256;
+    int grid = (num_tokens + block - 1) / block;
+    repetition_penalty_kernel<<<grid, block, 0, stream>>>(
+        logits, token_ids, num_tokens, penalty);
+}
+
 } // namespace audio_ops
 } // namespace qwen_thor

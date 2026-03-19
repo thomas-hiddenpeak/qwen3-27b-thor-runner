@@ -227,5 +227,11 @@ void invoke_suppress_eos(__nv_bfloat16* logits, int eos_id1, int eos_id2,
 void invoke_f32_to_bf16(__nv_bfloat16* out, const float* in, int n,
                         cudaStream_t stream = 0);
 
+// Repetition penalty: scale logits of previously generated token_ids
+// penalty > 1.0 discourages repeats, 1.0 = no effect
+void invoke_repetition_penalty(__nv_bfloat16* logits, const int* token_ids,
+                               int num_tokens, float penalty,
+                               cudaStream_t stream = 0);
+
 } // namespace audio_ops
 } // namespace qwen_thor

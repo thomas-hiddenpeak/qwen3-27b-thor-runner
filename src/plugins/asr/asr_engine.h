@@ -61,6 +61,10 @@ public:
     bool is_loaded() const { return loaded_; }
     const ASRConfig& config() const { return config_; }
 
+    // 设置 repetition penalty (> 1.0 抑制重复, 1.0 = 无效果)
+    void set_repetition_penalty(float p) { repetition_penalty_ = p; }
+    float get_repetition_penalty() const { return repetition_penalty_; }
+
 private:
     ASRConfig config_;
     std::unique_ptr<AudioEncoder> encoder_;
@@ -79,6 +83,10 @@ private:
     int* token_id_gpu_ = nullptr;             // [1]
     int* prompt_tokens_gpu_ = nullptr;        // [max_prompt_len], pre-allocated
     float* mel_staging_gpu_ = nullptr;        // [128, max_mel_frames] F32 staging for GPU conversion
+
+    // Repetition penalty
+    float repetition_penalty_ = 1.0f;
+    int* rep_tokens_gpu_ = nullptr;            // [max_new_tokens] output token history for penalty
 
     // Embed weight pointer (shared with decoder, not owned separately)
     __nv_bfloat16* embed_tokens_w_ = nullptr;
