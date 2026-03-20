@@ -1,6 +1,6 @@
 # ASR 插件架构审计报告
 
-> 审计日期: 2026-03-20 (更新: 2026-03-20 — P0/P1 完成, WS 统一 + target_speaker)
+> 审计日期: 2026-03-20 (更新: 2026-03-20 — P0/P1/P2 完成, WS 统一 + target_speaker + FSMN-VAD)
 > 审计范围: `src/plugins/asr/` (27 文件), `src/serve/` (HTTP + WS 接口层), `src/serve/serve.h`
 
 ## 一、组件清单
@@ -102,11 +102,11 @@ serve.cpp (HTTP 接口 + WS thin wrapper)
 ```
 客户端 PCM16LE 16kHz → WebSocket 二进制帧 (连续流入)
          │
-    ┌────┴─────────────────────────────────┐
-    │ 帧级 VAD (RMS 阈值 0.01f)             │  ← 能量检测, 非 FSMN
-    │ 静音 ≥ 600-800ms → 切断语音段          │
-    │ 每 2s → partial ASR (asr.partial)     │
-    └────┬─────────────────────────────────┘
+    ┌────┴──────────────────────────────────────┐
+    │ FSMN-VAD 流式端点检测 (per-session 副本)     │  ← 神经网络 VAD
+    │ max_end_silence: 600-800ms → 语音段输出      │  ← 降级: RMS 阈值
+    │ 每 2s → partial ASR (asr.partial)            │
+    └────┬──────────────────────────────────────┘
          │ 完整语音段
          ▼
     transcribe_pcm() → 全段 ASR → 裸文本
@@ -122,11 +122,11 @@ serve.cpp (HTTP 接口 + WS thin wrapper)
 ```
 
 **关键参数**:
-- `VAD_ENERGY_THRESHOLD = 0.01f`
-- `VAD_SILENCE_MS = 800` (voice) / `600` (realtime)
+- FSMN-VAD: `speech_noise_thres = 0.6`, `max_end_silence_time = 800/600ms`
+- RMS 降级: `VAD_ENERGY_THRESHOLD = 0.01f` (FSMN 未加载时)
 - `STREAMING_ASR_CHUNK_S = 2.0f`
 - `voice_max_output_tokens = 150`
-- Barge-in 阈值: `RMS > 0.03f` (3× 正常)
+- Barge-in 阈值: `RMS > 0.03f` (3× 正常, 仍用 RMS)
 
 **已有特性**:
 - [x] 连续语音流输入
@@ -139,6 +139,7 @@ serve.cpp (HTTP 接口 + WS thin wrapper)
 - [x] 多轮对话历史 (voice_max_turns)
 - [x] **目标说话人路由** (`target_speaker` + `other_speaker_mode`: respond_all/prefill/ignore) ← P0 新增
 - [x] **统一 WS 会话** (VoiceSession 类, ProtocolMode 分派) ← P1 新增
+- [x] **FSMN 神经网络 VAD** (per-session CPU VadEngine, 替代 RMS 能量检测, 自动降级) ← P2 新增
 
 ### 工况 2: 录音转写 (V4 Pipeline)
 
@@ -217,14 +218,15 @@ Phase 6: 后处理
 
 | 组件 | 实时识别 | 录音转写 | 说明 |
 |------|---------|---------|------|
-| FSMN-VAD (GPU) | ❌ 不用 | ✅ Phase 3a | 实时用 RMS 能量阈值 |
+| FSMN-VAD (CPU) | ✅ 流式端点检测 | — | per-session 副本, 替代 RMS |
+| FSMN-VAD (GPU) | — | ✅ Phase 3a | batch 全段检测 |
 | CAM++ batch | ❌ 单段 | ✅ 1331 chunks | 实时只做 identify |
 | ForcedAligner | ❌ 不用 | ✅ Phase 2 | 实时无 word-level 时间戳 |
 | 谱聚类 | ❌ 不用 | ✅ Phase 3b | 实时只做 cos 阈值匹配 |
 | 标点恢复 | ❌ 不用 | ✅ Phase 6 | 实时直接输出裸文本 |
 | 时间平滑 | ❌ 不用 | ✅ Phase 3b/6.5 | — |
 
-**评价**: 低复用率是合理的 (实时场景延迟约束不同), 但实时模式的 VAD 太简陋 — RMS 阈值在噪声环境下易误判。
+**评价**: 低复用率是合理的 (实时场景延迟约束不同)。实时模式已升级为 CPU FSMN-VAD 流式检测。
 
 #### ~~问题 2: 实时模式缺乏 "目标说话人" 路由~~ ✅ 已解决 (commit d1c0a81)
 
@@ -251,9 +253,14 @@ Phase 6: 后处理
 - `compute_mel_80` / `identify_speaker` 委托给 `SpeakerService`
 - ~~两个 WS handler ~2000 行仍在 serve.cpp~~ → **已抽取到 `voice_session.cpp` (1244 行) + `ws_utils.h` (332 行)**
 
-#### 问题 5: 实时 VAD 未用 FSMN
+#### ~~问题 5: 实时 VAD 未用 FSMN~~ ✅ 已解决 (commit 59e4bf5)
 
-GPU FSMN-VAD 已实现 (<1ms 级别), 但实时模式仍用 RMS 能量检测。FSMN 可提升噪声场景鲁棒性。
+- **方案**: per-session `VadEngine` 副本 (~1.6MB), 从 `ServeApp.vad_engine_` 拷贝权重
+- `max_end_silence_time` 按协议设置 (Voice 800ms / Realtime 600ms)
+- FSMN 状态机驱动语音段检测 (speech onset + endpoint), 输出 `VadSegment{start_ms, end_ms, pcm}`
+- 超时 (30s) 时 flush FSMN 产出最终段
+- RMS 保留: barge-in 自动打断 + audio.level 通知
+- **降级**: FSMN 模型未加载时自动退回 RMS 能量 VAD
 
 #### 问题 6: 无 ASR 增量解码
 
@@ -270,7 +277,7 @@ GPU FSMN-VAD 已实现 (<1ms 级别), 但实时模式仍用 RMS 能量检测。F
 | ~~P0~~ | ~~实时模式增加 `target_speaker`~~ | ~~核心功能需求~~ | ~~中~~ | ✅ **已完成** (commit d1c0a81) |
 | ~~P1~~ | ~~V4 pipeline 抽取为独立类~~ | ~~可维护性~~ | ~~大~~ | ✅ **已完成** (commit 196f01f) |
 | ~~P1~~ | ~~统一两个 WS 端点~~ | ~~减少重复代码~~ | ~~中~~ | ✅ **已完成** (commit d1c0a81) |
-| P2 | 实时模式用 FSMN-VAD | 噪声鲁棒性 | 小 | 🔲 待做 |
+| ~~P2~~ | ~~实时模式用 FSMN-VAD~~ | ~~噪声鲁棒性~~ | ~~小~~ | ✅ **已完成** (commit 59e4bf5) |
 | P2 | 实时 partial ASR 增量编码 | 降延迟 | 大 | 🔲 待做 |
 
 ### 4.2 中期
@@ -308,10 +315,10 @@ GPU FSMN-VAD 已实现 (<1ms 级别), 但实时模式仍用 RMS 能量检测。F
 | 维度 | 评分 | 说明 |
 |------|------|------|
 | **录音转写** | ★★★★☆ | V4 pipeline 成熟, 6 阶段完整, 73% 说话人准确率 |
-| **实时识别** | ★★★★☆ | ASR→LLM→TTS 链路完整, 目标说话人路由已实现, 仅缺 FSMN-VAD |
+| **实时识别** | ★★★★★ | ASR→LLM→TTS→VAD 全链路完整, FSMN-VAD + 说话人路由已实现 |
 | **代码组织** | ★★★★☆ | Pipeline + WS 会话均已模块化, serve.cpp 4692 行 (-46%) |
 | **可扩展性** | ★★★★☆ | 插件接口干净, Pipeline 依赖注入可复用/可测试 |
-| **整体设计** | 🟢 架构成熟 | 两工况分层清晰, 实时路由已完备, 剩 FSMN-VAD 和增量 ASR |
+| **整体设计** | 🟢 架构成熟 | 两工况分层清晰, P0/P1/P2 全部完成, 仅剩增量 ASR 编码 |
 
 ---
 
