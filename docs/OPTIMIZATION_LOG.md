@@ -5177,4 +5177,47 @@ Phase 日志（优化后）:
 报告: `tmp/asr_quality_stability_check.txt`
 
 **文件**: `src/serve/serve.cpp`, `docs/OPTIMIZATION_LOG.md`
+
+---
+
+## ASR 说话人分割: Proto-EM → 时间一致性平滑 (2026-03-20)
+
+### 背景
+
+V4 录音转写 pipeline 的 Phase 3b 谱聚类后, 尝试用 Prototype EM 精炼聚类结果以提升说话人分割准确率。
+
+### Proto-EM 实验 (失败, 已回退)
+
+**算法**: 每 cluster 按纯净度 (cosine(self) - max(cosine(others))) 取 top 25% 作原型 → 精炼质心 → 重分配 → 迭代 5 轮。
+
+**离线分析关键发现**:
+- dump 了 1331 chunks × 192-dim CAM++ embeddings, 消除 GPU 非确定性做固定对照
+- 基线 (固定 embeddings): 77.30%
+- 所有 Proto-EM 变体: 69.4%–75.9% (**全部低于基线**)
+- 根因: 252 个错误 chunk 中, 70.2% (177 个) 的余弦方向与错误标签一致 — embedding 空间根本无法区分部分说话人 (唐云峰↔石一, 333s 混淆)
+- 纯余弦重分配的净效果: 修正 34 + 破坏 66 = **净 -32 chunk** (纯损失)
+
+### 时间一致性平滑 (保留)
+
+**算法**: 对时间排序的 chunk 做 2 轮扫描:
+- 窗口 ±2, 若某 chunk 的所有邻居 (≥2 个) 同属另一 speaker
+- 且余弦相似度: `cos(emb, new_centroid) ≥ cos(emb, old_centroid) + (-0.04)`
+- 则翻转该 chunk 标签
+
+**参数**: `WINDOW=2, COS_MARGIN=-0.04f, MAX_SMOOTH_ITER=2`
+
+**离线验证**: 77.30% → 78.25% (+0.95pp), 48 chunks 修正
+
+**线上 A/B 对比 (3×运行, 含 GPU 非确定性)**:
+
+| 版本 | Run 1 | Run 2 | Run 3 | 平均 | 标准差 |
+|------|-------|-------|-------|------|--------|
+| 基线 (无平滑) | 72.9% | 72.1% | 70.1% | 71.7% | ±1.4pp |
+| 时间平滑 | 73.1% | 73.3% | 73.0% | **73.1%** | ±0.15pp |
+
+**结论**: +1.4pp 提升, 且方差从 ±1.4pp 降至 ±0.15pp (结果更稳定)。每次运行稳定修正 42 chunks。
+
+**CAM++ GPU 非确定性说明**: 16 CUDA stream 并行提取 embeddings, 浮点运算顺序不确定导致每次运行结果略有不同 (±2-3pp)。离线分析通过 dump embeddings 一次性固定来消除此因素。
+
+**代码**: `src/serve/serve.cpp` (Phase 3b section 8b), commit `a889e67`
 `src/engine/layer.cu`, `src/engine/layer.h`
