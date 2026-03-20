@@ -1,7 +1,7 @@
 # ASR 插件架构审计报告
 
-> 审计日期: 2026-03-20
-> 审计范围: `src/plugins/asr/` (24 文件), `src/serve/serve.cpp` (ASR 相关段落), `src/serve/serve.h`
+> 审计日期: 2026-03-20 (更新: 2026-03-20 — Pipeline 重构完成)
+> 审计范围: `src/plugins/asr/` (27 文件), `src/serve/serve.cpp` (HTTP 接口层), `src/serve/serve.h`
 
 ## 一、组件清单
 
@@ -36,7 +36,17 @@
 | `speaker_encoder.h` | CPU CAM++ (6.9M params → 192-dim) | 单段提取 |
 | `speaker_encoder_gpu.h` | GPU CAM++ (16-stream batch) | 1331 chunks: 33s→3s (10.5×) |
 
-### 1.5 后处理与辅助
+### 1.5 Pipeline 编排层 (新增)
+
+| 文件 | 职责 | 关键接口 |
+|------|------|----------|
+| `transcription_pipeline.h/cpp` | V4/V2/Plain 三种转写模式统一编排 (1760 行) | `TranscriptionPipeline::transcribe()` |
+| `speaker_service.h` | Mel 提取 + CAM++ embedding + SpeakerManager 封装 (235 行) | `SpeakerService::identify()`, `compute_mel_80()` (static) |
+
+`TranscriptionPipeline` 通过 `Dependencies` 结构注入所有组件引用 (不拥有所有权, serve 层负责生命周期)。
+`SpeakerService` 持有 `SpeakerManager` + `mutex`, 提供线程安全的说话人识别 API。
+
+### 1.6 后处理与辅助
 
 | 文件 | 职责 |
 |------|------|
@@ -46,13 +56,19 @@
 | `asr_plugin.h` | 插件抽象 (`SubprocessAsrPlugin` / `NativeAsrPlugin`) |
 | `asr_config.h` | ASR 配置加载 |
 
-### 1.6 依赖关系
+### 1.7 依赖关系
 
 ```
-audio_utils → mel_gpu → speaker_encoder_gpu  (PCM → Mel → 192-dim embedding)
-vad_gpu → speaker_encoder_gpu               (VAD 段 → CAM++ batch 提取)
-aligner_engine → forced_aligner_server.py   (子进程 JSON 通信)
-punctuation → serve.cpp LLM callback        (可选, 长文本走 LLM)
+serve.cpp (HTTP 接口)
+  └─ TranscriptionPipeline (pipeline 编排)
+       ├─ NativeAsrPlugin (ASR 推理)
+       ├─ SpeakerService (Mel + CAM++ + SpeakerManager)
+       │    ├─ GpuMelExtractor (cuFFT GPU Mel)
+       │    ├─ GpuSpeakerEncoder (16-stream batch CAM++)
+       │    └─ SpeakerManager (cos 阈值匹配/注册)
+       ├─ VadEngine / GpuVadEngine (FSMN-VAD)
+       ├─ AlignerEngine (ForcedAligner 子进程)
+       └─ PunctuationRestorer (标点恢复)
 ```
 
 ---
@@ -171,9 +187,10 @@ Phase 6: 后处理
 | **模块化** | `AsrPlugin` 接口抽象干净, subprocess/native 可切换 |
 | **GPU 加速** | VAD(cuFFT), Mel(cuFFT), CAM++(16-stream cuBLAS) 全 GPU |
 | **V4 Pipeline** | 6 阶段流水线设计成熟, Phase 2/3 并行, 后处理丰富 |
+| **Pipeline 分层** | `TranscriptionPipeline` + `SpeakerService` 独立于 HTTP 层, 可复用/可测试 |
 | **谱聚类** | NME 自动选 k + TEMPORAL_ALPHA=0.65 + 时间平滑, 效果稳定 |
 | **ForcedAligner** | 子进程长驻, model 加载一次, JSON 协议简洁 |
-| **资源管理** | 3 把互斥锁保护有状态组件 (speaker_encoder, vad, aligner) |
+| **资源管理** | Dependencies 注入 + 3 把互斥锁保护有状态组件 |
 
 ### 3.2 需要关注的问题 ⚠️
 
@@ -215,12 +232,14 @@ Phase 6: 后处理
 
 核心逻辑 ~90% 重复, 仅 VAD 触发方式和协议命名不同。
 
-#### 问题 4: serve.cpp 体积过大
+#### 问题 4: ~~serve.cpp 体积过大~~ ✅ 已解决
 
-- `serve.cpp` > 8000 行
-- V4 pipeline ~1700 行全部内联
-- 两个 WS handler ~2000 行
-- 谱聚类、时间平滑、word 归属等逻辑未独立模块
+- ~~`serve.cpp` > 8000 行~~ → **6223 行 (-28%)**
+- ~~V4 pipeline ~1700 行全部内联~~ → **已抽取到 `transcription_pipeline.cpp` (1760 行)**
+- ~~谱聚类、时间平滑、word 归属等逻辑未独立模块~~ → **已模块化**
+- `handle_audio_transcriptions` 从 ~2400 行 → ~170 行 (纯 HTTP 委托)
+- `compute_mel_80` / `identify_speaker` 委托给 `SpeakerService`
+- 两个 WS handler ~2000 行仍在 serve.cpp (后续可抽取)
 
 #### 问题 5: 实时 VAD 未用 FSMN
 
@@ -239,7 +258,7 @@ GPU FSMN-VAD 已实现 (<1ms 级别), 但实时模式仍用 RMS 能量检测。F
 | 优先级 | 改进 | 影响 | 工作量 | 状态 |
 |--------|------|------|--------|------|
 | **P0** | 实时模式增加 `target_speaker` | 核心功能需求 | 中 | 🔲 待做 |
-| P1 | V4 pipeline 抽取为独立类 | 可维护性 | 大 | 🔲 待做 |
+| ~~P1~~ | ~~V4 pipeline 抽取为独立类~~ | ~~可维护性~~ | ~~大~~ | ✅ **已完成** (commit 196f01f) |
 | P1 | 统一两个 WS 端点 | 减少重复代码 | 中 | 🔲 待做 |
 | P2 | 实时模式用 FSMN-VAD | 噪声鲁棒性 | 小 | 🔲 待做 |
 | P2 | 实时 partial ASR 增量编码 | 降延迟 | 大 | 🔲 待做 |
@@ -281,8 +300,8 @@ GPU FSMN-VAD 已实现 (<1ms 级别), 但实时模式仍用 RMS 能量检测。F
 |------|------|------|
 | **录音转写** | ★★★★☆ | V4 pipeline 成熟, 6 阶段完整, 73% 说话人准确率 |
 | **实时识别** | ★★★☆☆ | ASR→LLM→TTS 链路可用, 缺目标说话人路由和 FSMN-VAD |
-| **代码组织** | ★★☆☆☆ | 核心逻辑全在 serve.cpp, 两个 WS 端点大量重复 |
-| **可扩展性** | ★★★☆☆ | 插件接口干净, 但 pipeline 逻辑未模块化 |
+| **代码组织** | ★★★☆☆ | Pipeline 已独立模块化, WS 端点仍有重复 |
+| **可扩展性** | ★★★★☆ | 插件接口干净, Pipeline 依赖注入可复用/可测试 |
 | **整体设计** | 🟢 方向正确 | 两工况差异化处理思路对, 主要缺实时说话人路由 |
 
 ---
