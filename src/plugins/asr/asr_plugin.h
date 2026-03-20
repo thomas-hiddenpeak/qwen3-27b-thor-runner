@@ -40,6 +40,7 @@ struct AsrConfig {
     std::string tmp_dir     = "tmp";  // 临时文件目录
     std::string speaker_model;        // CAM++ 说话人编码器 safetensors 路径 (可选)
     float       repetition_penalty = 1.0f; // ASR 解码 repetition penalty (> 1.0 抑制重复)
+    int         chunk_max_duration_ms = 30000; // ASR 分段最大时长 (ms), 短段减少错误累积
 
     static AsrConfig from_file(const std::string& path);
     void print() const;
@@ -173,6 +174,7 @@ public:
 
     bool is_available() const override;
     std::string name() const override { return "native-asr"; }
+    int chunk_max_duration_ms() const { return config_.chunk_max_duration_ms; }
 
 private:
     AsrConfig config_;

@@ -47,6 +47,7 @@ AsrConfig AsrConfig::from_file(const std::string& path) {
         else if (key == "asr_tmp_dir")    config.tmp_dir    = val;
         else if (key == "asr_speaker_model") config.speaker_model = val;
         else if (key == "asr_repetition_penalty") config.repetition_penalty = std::stof(val);
+        else if (key == "asr_chunk_max_duration_ms") config.chunk_max_duration_ms = std::stoi(val);
     }
     return config;
 }
@@ -388,7 +389,7 @@ AsrResult NativeAsrPlugin::transcribe_pcm(const float* samples, int num_samples,
     // Limit max_new_tokens proportionally to audio duration to reduce hallucination.
     // ~5 tokens/s for Chinese speech is a generous upper bound. Cap at 512 (official default).
     float audio_dur_s = (float)num_samples / (float)sample_rate;
-    int max_tokens = std::min(512, std::max(40, (int)(audio_dur_s * 5.0f)));
+    int max_tokens = std::min(1024, std::max(40, (int)(audio_dur_s * 8.0f)));
 
     std::string text = engine_->transcribe(samples, num_samples, sample_rate,
                                             0.0f, max_tokens, suppress_early_eos);

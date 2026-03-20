@@ -23,6 +23,8 @@
 #include "../plugins/asr/vad_gpu.h"
 #include "../plugins/asr/mel_gpu.h"
 #include "../plugins/asr/aligner_engine.h"
+#include "../plugins/asr/transcription_pipeline.h"
+#include "../plugins/asr/speaker_service.h"
 #include "../plugins/tts/tts_plugin.h"
 #include <string>
 #include <thread>
@@ -175,13 +177,9 @@ private:
     void handle_speaker_list(const HttpRequest& req, int client_fd);
     void handle_speaker_delete(const HttpRequest& req, int client_fd);
 
-    // 说话人识别: 从 PCM 音频提取 embedding 并匹配
+    // 说话人识别: 委托给 speaker_service_
     asr::SpeakerManager::MatchResult identify_speaker(
         const float* samples, int num_samples, int sample_rate, bool auto_register = false);
-
-    // 80-dim Mel 特征提取 (用于 CAM++ 说话人编码)
-    void compute_mel_80(const float* samples, int num_samples, int sample_rate,
-                        std::vector<float>& mel_out, int& num_frames);
 
     // ---- WebSocket 语音对话 ----
     void handle_websocket_voice(int client_fd, const HttpRequest& req);
@@ -259,26 +257,27 @@ private:
     InferenceBackend& backend_;
     std::unique_ptr<plugins::AsrPlugin> asr_plugin_;
     std::unique_ptr<plugins::TtsPlugin> tts_plugin_;
+    int asr_chunk_max_duration_ms_ = 30000;  // ASR chunk 最大时长 (ms)
 
-    // 说话人识别 (CAM++ + SpeakerManager)
+    // 转录管线 (V4/V2/Plain, 由插件层实现)
+    std::unique_ptr<asr::TranscriptionPipeline> transcription_pipeline_;
+
+    // 说话人服务 (Mel + CAM++ embedding + SpeakerManager)
+    asr::SpeakerService speaker_service_;
+
+    // --- 以下组件由 serve 拥有, 通过 Dependencies 注入管线 ---
     std::unique_ptr<asr::GpuSpeakerEncoder> speaker_encoder_;
     asr::SpeakerManager speaker_manager_;
-    std::mutex speaker_mutex_;  // 保护 speaker_encoder_ + speaker_manager_
+    std::mutex speaker_mutex_;
 
-    // VAD 引擎 (FSMN, 用于文件转写说话人分割)
     asr::VadEngine vad_engine_;
-    asr::GpuVadEngine gpu_vad_engine_;  // GPU 加速版
-    std::mutex vad_mutex_;  // 保护 vad_engine_ (detect_all 有状态)
+    asr::GpuVadEngine gpu_vad_engine_;
+    std::mutex vad_mutex_;
 
-    // GPU Mel 特征提取 (cuFFT, 替代 CPU O(N²) DFT)
     asr::GpuMelExtractor gpu_mel_;
-
-    // 标点恢复
     asr::PunctuationRestorer punctuation_restorer_;
-
-    // 强制对齐 (Qwen3-ForcedAligner-0.6B, 字级时间戳)
     asr::AlignerEngine aligner_engine_;
-    std::mutex aligner_mutex_;  // 保护 aligner_engine_ (单线程模型推理)
+    std::mutex aligner_mutex_;
     int ollama_fd_ = -1;
     int openai_fd_ = -1;
     std::atomic<bool> running_{false};

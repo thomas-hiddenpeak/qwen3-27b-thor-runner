@@ -44,13 +44,38 @@ static int cn_digit(char32_t c) {
         case U'零': return 0; case U'一': return 1; case U'二': return 2;
         case U'三': return 3; case U'四': return 4; case U'五': return 5;
         case U'六': return 6; case U'七': return 7; case U'八': return 8;
-        case U'九': return 9; default: return -1;
+        case U'九': return 9; case U'两': return 2; default: return -1;
     }
 }
 
 static bool is_cn_num_char(char32_t c) {
     return cn_digit(c) >= 0 || c == U'十' || c == U'百' || c == U'千' ||
            c == U'万' || c == U'亿' || c == U'点';
+}
+
+// 将数值根据原始中文序列是否含万/亿格式化: 50亿/3000万 ...
+static std::string format_with_units(int64_t value, bool has_yi, bool has_wan) {
+    if (has_yi && value >= 100000000LL) {
+        int64_t yi = value / 100000000LL;
+        int64_t rem = value % 100000000LL;
+        std::string s = std::to_string(yi) + "\xe4\xba\xbf"; // 亿
+        if (rem > 0 && has_wan && rem >= 10000) {
+            s += std::to_string(rem / 10000) + "\xe4\xb8\x87"; // 万
+            int64_t rem2 = rem % 10000;
+            if (rem2 > 0) s += std::to_string(rem2);
+        } else if (rem > 0) {
+            s += std::to_string(rem);
+        }
+        return s;
+    }
+    if (has_wan && value >= 10000) {
+        int64_t wan = value / 10000;
+        int64_t rem = value % 10000;
+        std::string s = std::to_string(wan) + "\xe4\xb8\x87"; // 万
+        if (rem > 0) s += std::to_string(rem);
+        return s;
+    }
+    return std::to_string(value);
 }
 
 // 解析中文数字序列 → 阿拉伯数字字符串
@@ -152,6 +177,11 @@ static std::string apply_itn(const std::string& text) {
     size_t i = 0;
     size_t n = u32.size();
 
+    // 将 UTF-8 string 安全追加到 u32string
+    auto append_utf8 = [&](const std::string& s) {
+        result += utf8_to_u32(s);
+    };
+
     while (i < n) {
         // 百分之X → X%
         if (i + 3 < n && u32[i] == U'百' && u32[i+1] == U'分' &&
@@ -163,14 +193,14 @@ static std::string apply_itn(const std::string& text) {
             }
             if (!num.empty()) {
                 auto arabic = cn_to_arabic(num);
-                for (char c : arabic) result += (char32_t)c;
+                append_utf8(arabic);
                 result += U'%';
                 i = j;
                 continue;
             }
         }
 
-        // 中文数字序列 (2+ 字符) → 阿拉伯数字
+        // 中文数字序列 (2+ 字符) → 阿拉伯数字 (保留万/亿单位)
         if (is_cn_num_char(u32[i]) && u32[i] != U'点') {
             size_t j = i;
             std::u32string num;
@@ -180,7 +210,18 @@ static std::string apply_itn(const std::string& text) {
             // 只转换 2+ 字符的数字序列 (避免 "一个" → "1个")
             if (num.size() >= 2) {
                 auto arabic = cn_to_arabic(num);
-                for (char c : arabic) result += (char32_t)c;
+                // 检查原始序列是否含万/亿, 保留单位后缀
+                bool has_yi = false, has_wan = false;
+                for (auto c : num) {
+                    if (c == U'亿') has_yi = true;
+                    if (c == U'万') has_wan = true;
+                }
+                int64_t value = 0;
+                try { value = std::stoll(arabic); } catch (...) {}
+                std::string formatted = (has_yi || has_wan)
+                    ? format_with_units(value, has_yi, has_wan)
+                    : arabic;
+                append_utf8(formatted);
                 i = j;
                 continue;
             }
@@ -247,7 +288,10 @@ static std::string collapse_phrase_repeats(const std::string& text) {
 // 综合后处理: ITN
 // 短语折叠经测试弊大于利（折叠了真实口语重复），故不启用
 static std::string postprocess_asr(const std::string& text) {
-    return apply_itn(text);
+    std::string result = apply_itn(text);
+    // 注意: 不移除 AI 声明【内容由AI生成，仅供参考】
+    // 因为参考文本中包含了说话人实际说出的这段话
+    return result;
 }
 
 // ============================================================================
@@ -462,7 +506,8 @@ void ASREngine::load_model(const std::string& model_dir) {
     // 3. Create encoder and decoder
     encoder_ = std::make_unique<AudioEncoder>(config_);
     // max_seq_len for decoder: prompt + encoder output + max generation
-    int max_decoder_seq = 2048;  // conservative max
+    // 120s audio → ~1578 prompt tokens + 1024 gen = ~2600, needs >2048
+    int max_decoder_seq = 4096;
     decoder_ = std::make_unique<TextDecoder>(config_, max_decoder_seq);
 
     // 4. Load weights
@@ -1060,7 +1105,7 @@ std::vector<std::string> ASREngine::transcribe_batch(
 
         // Compute generation limits
         float audio_dur_s = (float)len_16k / 16000.0f;
-        max_gen_tokens[i] = std::min(512, std::max(40, (int)(audio_dur_s * 5.0f)));
+        max_gen_tokens[i] = std::min(1024, std::max(40, (int)(audio_dur_s * 8.0f)));
         min_gen_tokens[i] = suppress_early_eos
             ? std::max(1, (int)(audio_dur_s * 0.4f)) : 0;
 
@@ -1092,7 +1137,7 @@ std::vector<std::string> ASREngine::transcribe_batch(
         }
     }
 
-    int max_steps = 512;
+    int max_steps = 1024;
     std::vector<int> cur_tokens(B);
     std::vector<int> h_pos_ids(3 * B);
     std::vector<int> h_result_ids(B);
@@ -1159,10 +1204,19 @@ std::vector<std::string> ASREngine::transcribe_batch(
     auto t_decode_end = std::chrono::steady_clock::now();
     float decode_ms = std::chrono::duration<float, std::milli>(t_decode_end - t_decode_start).count();
     int total_tokens = 0;
-    for (int i = 0; i < B; i++) total_tokens += (int)output_tokens[i].size();
-    fprintf(stderr, "[ASR Batch] Phase 2: %d tokens in %.1f ms (%.1f tok/s, B=%d)\n",
+    int truncated_count = 0;
+    for (int i = 0; i < B; i++) {
+        total_tokens += (int)output_tokens[i].size();
+        if ((int)output_tokens[i].size() >= max_gen_tokens[i]) {
+            truncated_count++;
+            fprintf(stderr, "[ASR Batch] TRUNCATED chunk %d: %d tokens (max=%d, audio=%.1fs)\n",
+                    i, (int)output_tokens[i].size(), max_gen_tokens[i],
+                    (float)chunks[i].num_samples / sample_rate);
+        }
+    }
+    fprintf(stderr, "[ASR Batch] Phase 2: %d tokens in %.1f ms (%.1f tok/s, B=%d, truncated=%d/%d)\n",
             total_tokens, decode_ms,
-            total_tokens > 0 ? total_tokens / (decode_ms / 1000.0f) : 0.0f, B);
+            total_tokens > 0 ? total_tokens / (decode_ms / 1000.0f) : 0.0f, B, truncated_count, B);
 
     // ====================================================================
     // Phase 3: Decode tokens to text
