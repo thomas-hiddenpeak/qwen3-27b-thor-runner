@@ -79,6 +79,15 @@ VoiceSession::VoiceSession(ServeApp* app, ProtocolMode mode, int client_fd)
     } else {
         vad_config_ = {0.01f, 600, 300, 30, 0.008f};
     }
+
+    // FSMN-VAD: 如果 CPU VadEngine 已加载, 创建 per-session 副本
+    if (app_->vad_engine_.is_loaded()) {
+        fsmn_vad_ = app_->vad_engine_;  // copy weights (~1.6MB)
+        fsmn_vad_.mutable_config().max_end_silence_time = vad_config_.silence_ms;
+        fsmn_vad_.reset();
+        use_fsmn_vad_ = true;
+        fprintf(stderr, "[WS] FSMN-VAD enabled (silence=%dms)\n", vad_config_.silence_ms);
+    }
 }
 
 VoiceSession::~VoiceSession() {
@@ -125,6 +134,7 @@ void VoiceSession::reset_vad_state() {
     total_energy_sum_ = 0;
     total_speech_samples_ = 0;
     streaming_asr_next_s_ = STREAMING_ASR_CHUNK_S;
+    if (use_fsmn_vad_) fsmn_vad_.reset();
 }
 
 // ============================================================================
@@ -779,8 +789,43 @@ void VoiceSession::on_stream_stop() {
         return;
     }
     streaming_audio_ = false;
+    float audio_dur = 0;  // declared before goto to avoid crossing initialization
 
-    float audio_dur = (float)pcm_buffer_.size() / sample_rate_;
+    // FSMN: flush any ongoing speech before checking pcm_buffer_
+    if (use_fsmn_vad_) {
+        auto final_segs = fsmn_vad_.detect(nullptr, 0, true);
+        if (!final_segs.empty()) {
+            auto& seg = final_segs.front();
+            if (!seg.pcm.empty()) {
+                double seg_energy = 0;
+                for (float s : seg.pcm) seg_energy += s * s;
+                float seg_avg_rms = std::sqrt((float)(seg_energy / seg.pcm.size()));
+
+                if (seg_avg_rms >= vad_config_.min_avg_energy) {
+                    float audio_dur = (float)seg.pcm.size() / sample_rate_;
+                    fprintf(stderr, "[WS] Stream stopped (FSMN): %.1fs, avg_rms=%.4f\n",
+                            audio_dur, seg_avg_rms);
+
+                    std::vector<int16_t> seg_i16(seg.pcm.size());
+                    for (size_t i = 0; i < seg.pcm.size(); i++) {
+                        float s = std::max(-1.0f, std::min(1.0f, seg.pcm[i]));
+                        seg_i16[i] = (int16_t)(s * 32767.0f);
+                    }
+                    int sr = sample_rate_;
+                    reset_vad_state();
+                    start_voice_worker(std::move(seg_i16), sr, asr_to_llm_);
+                    ws_send_text("{\"type\":\"stream.stopped\"}");
+                    goto save_rec;
+                } else {
+                    fprintf(stderr, "[WS] Stream stopped (FSMN): rejected avg_rms=%.4f\n",
+                            seg_avg_rms);
+                }
+            }
+        }
+        // No usable FSMN segment — fall through to pcm_buffer_ check
+    }
+
+    audio_dur = (float)pcm_buffer_.size() / sample_rate_;
     if (pcm_buffer_.size() >= (size_t)(sample_rate_ * vad_config_.min_speech_ms / 1000)) {
         float avg_rms = std::sqrt((float)(total_energy_sum_ /
             std::max((size_t)1, pcm_buffer_.size())));
@@ -926,6 +971,142 @@ void VoiceSession::handle_voice_binary(const uint8_t* data, size_t len) {
     // Voice 模式: generating 结束后重置计数
     if (mode_ == ProtocolMode::VOICE)
         gen_audio_sample_count_ = 0;
+
+    // ==== FSMN-VAD path ====
+    if (use_fsmn_vad_) {
+        // Convert chunk to float for FSMN
+        std::vector<float> fpcm(num_samples);
+        for (size_t i = 0; i < num_samples; i++)
+            fpcm[i] = samples[i] / 32768.0f;
+
+        auto segments = fsmn_vad_.detect(fpcm.data(), (int)num_samples);
+
+        // Track speech state transitions
+        bool now_in_speech = fsmn_vad_.in_speech();
+
+        if (now_in_speech) {
+            if (!speech_detected_) {
+                // Speech onset
+                speech_detected_ = true;
+                pcm_buffer_.clear();
+                total_energy_sum_ = 0;
+                total_speech_samples_ = 0;
+                streaming_asr_next_s_ = STREAMING_ASR_CHUNK_S;
+                if (mode_ == ProtocolMode::REALTIME)
+                    ws_send_text("{\"type\":\"input.speech_started\"}");
+            }
+            // Accumulate for streaming ASR
+            pcm_buffer_.insert(pcm_buffer_.end(), samples, samples + num_samples);
+            total_energy_sum_ += energy_sum;
+            total_speech_samples_ += (int)num_samples;
+
+            // Voice mode: audio.level throttle
+            if (mode_ == ProtocolMode::VOICE) {
+                size_t sz = pcm_buffer_.size();
+                if (sz / 1600 > (sz - num_samples) / 1600) {
+                    char level_buf[64];
+                    snprintf(level_buf, sizeof(level_buf),
+                             "{\"type\":\"audio.level\",\"rms\":%.4f}", rms);
+                    ws_send_text(level_buf);
+                }
+            }
+        }
+
+        // Streaming ASR every ~2s
+        if (speech_detected_ && !pcm_buffer_.empty()) {
+            float total_s = (float)pcm_buffer_.size() / sample_rate_;
+            if (total_s >= streaming_asr_next_s_
+                && app_->asr_plugin_ && app_->asr_plugin_->is_available()) {
+                std::vector<float> asr_pcm(pcm_buffer_.size());
+                for (size_t i = 0; i < pcm_buffer_.size(); i++)
+                    asr_pcm[i] = pcm_buffer_[i] / 32768.0f;
+                auto partial = app_->asr_plugin_->transcribe_pcm(
+                    asr_pcm.data(), (int)asr_pcm.size(), sample_rate_, "auto", true);
+                if (partial.error_code == 0 && !partial.text.empty()) {
+                    fprintf(stderr, "[WS] Streaming ASR (%.1fs): \"%s\"\n",
+                            total_s, partial.text.substr(0, 80).c_str());
+                    ws_send_text("{\"type\":\"" + std::string(msgs_.asr_partial) +
+                                 "\",\"text\":\"" + ws::json_escape(partial.text) + "\"}");
+                }
+                streaming_asr_next_s_ = total_s + STREAMING_ASR_CHUNK_S;
+            }
+
+            // Timeout: force-flush FSMN
+            if (total_s >= vad_config_.max_duration_s && segments.empty()) {
+                auto timeout_segs = fsmn_vad_.detect(nullptr, 0, true);
+                segments.insert(segments.end(), timeout_segs.begin(), timeout_segs.end());
+                if (segments.empty()) {
+                    // FSMN didn't produce a segment — use pcm_buffer_ directly
+                    if (mode_ == ProtocolMode::VOICE)
+                        ws_send_text("{\"type\":\"stream.vad\"}");
+                    else
+                        ws_send_text("{\"type\":\"input.speech_stopped\"}");
+
+                    float avg_rms = std::sqrt((float)(total_energy_sum_ / pcm_buffer_.size()));
+                    if (avg_rms >= vad_config_.min_avg_energy && !generating_) {
+                        fprintf(stderr, "[WS] FSMN timeout: %.1fs, avg_rms=%.4f\n",
+                                total_s, avg_rms);
+                        auto audio_copy = std::move(pcm_buffer_);
+                        int sr = sample_rate_;
+                        reset_vad_state();
+                        start_voice_worker(std::move(audio_copy), sr, asr_to_llm_);
+                    } else {
+                        reset_vad_state();
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Process FSMN-detected segments
+        if (!segments.empty()) {
+            auto& seg = segments.front();
+
+            if (mode_ == ProtocolMode::VOICE)
+                ws_send_text("{\"type\":\"stream.vad\"}");
+            else
+                ws_send_text("{\"type\":\"input.speech_stopped\"}");
+            speech_detected_ = false;
+
+            if (seg.pcm.empty()) { reset_vad_state(); return; }
+
+            // Validate avg energy
+            double seg_energy = 0;
+            for (float s : seg.pcm) seg_energy += s * s;
+            float seg_avg_rms = std::sqrt((float)(seg_energy / seg.pcm.size()));
+
+            if (seg_avg_rms < vad_config_.min_avg_energy) {
+                fprintf(stderr, "[WS] FSMN: rejected (%d-%dms) avg_rms=%.4f\n",
+                        seg.start_ms, seg.end_ms, seg_avg_rms);
+                reset_vad_state();
+                return;
+            }
+            if (generating_) {
+                fprintf(stderr, "[WS] FSMN: VAD during generation, dropping (%d-%dms)\n",
+                        seg.start_ms, seg.end_ms);
+                reset_vad_state();
+                return;
+            }
+
+            // Convert segment float PCM to int16 for pipeline
+            float audio_dur = (float)seg.pcm.size() / sample_rate_;
+            fprintf(stderr, "[WS] FSMN-VAD: %.1fs (%d-%dms), avg_rms=%.4f\n",
+                    audio_dur, seg.start_ms, seg.end_ms, seg_avg_rms);
+
+            std::vector<int16_t> seg_i16(seg.pcm.size());
+            for (size_t i = 0; i < seg.pcm.size(); i++) {
+                float s = std::max(-1.0f, std::min(1.0f, seg.pcm[i]));
+                seg_i16[i] = (int16_t)(s * 32767.0f);
+            }
+
+            int sr = sample_rate_;
+            reset_vad_state();
+            start_voice_worker(std::move(seg_i16), sr, asr_to_llm_);
+        }
+        return;
+    }
+
+    // ==== RMS-VAD path (fallback when FSMN not loaded) ====
 
     // --- VAD 处理 ---
     if (mode_ == ProtocolMode::REALTIME) {

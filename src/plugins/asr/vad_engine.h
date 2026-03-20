@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <numeric>
 #include <fstream>
+#include <unordered_map>
 
 namespace qwen_thor {
 namespace asr {
@@ -48,6 +49,7 @@ public:
     }
 
     bool is_loaded() const { return loaded_; }
+    bool in_speech() const { return state_ == State::IN_SPEECH_SEGMENT; }
 
     // 重置状态 (新一段音频开始时调用)
     void reset() {

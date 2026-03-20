@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include "../plugins/asr/vad_engine.h"
+
 #include <string>
 #include <vector>
 #include <functional>
@@ -155,8 +157,9 @@ private:
     int recording_sample_rate_ = 16000;
     std::chrono::steady_clock::time_point recording_start_time_;
 
-    // FSMN VAD (TODO P2: 替代 RMS)
+    // FSMN VAD (per-session 副本, 当 ServeApp.vad_engine_ 已加载时启用)
     bool use_fsmn_vad_ = false;
+    asr::VadEngine fsmn_vad_;
 
     // 工作线程
     std::thread worker_thread_;
