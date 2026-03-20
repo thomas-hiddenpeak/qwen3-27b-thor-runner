@@ -39,6 +39,8 @@
 namespace qwen_thor {
 namespace serve {
 
+class VoiceSession;  // forward declaration
+
 // ============================================================================
 // 服务配置
 // ============================================================================
@@ -183,29 +185,12 @@ private:
 
     // ---- WebSocket 语音对话 ----
     void handle_websocket_voice(int client_fd, const HttpRequest& req);
-    void ws_voice_generate(
-        const std::string& user_text,
-        std::vector<std::pair<std::string, std::string>>& chat_history,
-        const std::string& voice,
-        const std::string& instruct,
-        bool tts_enabled,
-        const std::function<bool(const std::string&)>& send_text,
-        const std::function<bool(const uint8_t*, size_t)>& send_binary,
-        std::atomic<bool>& generating,
-        std::atomic<bool>& interrupted,
-        const std::string& language = "");
 
     // ---- WebSocket /v1/realtime — 持续双向语音通道 ----
     void handle_websocket_realtime(int client_fd, const HttpRequest& req);
-    void process_text_input(
-        const std::string& user_text,
-        std::vector<std::pair<std::string, std::string>>& chat_history,
-        const std::string& voice,
-        const std::string& instruct,
-        const std::function<void(const std::string&)>& send_json,
-        const std::function<void(const uint8_t*, size_t)>& send_audio,
-        std::atomic<bool>& generating,
-        std::atomic<bool>& interrupted);
+
+    // VoiceSession 需要访问内部成员
+    friend class VoiceSession;
 
     // ---- 静态文件 (examples/) ----
     void handle_static_file(const HttpRequest& req, int client_fd);

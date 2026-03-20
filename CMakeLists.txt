@@ -68,6 +68,7 @@ add_executable(qwen35-thor
     src/tests.cpp
     src/benchmark.cpp
     src/serve/serve.cpp
+    src/serve/voice_session.cpp
     src/tui/tui.cpp
 )
 target_link_libraries(qwen35-thor PRIVATE qwen35_thor_engine qwen35_thor_plugins stdc++fs)
