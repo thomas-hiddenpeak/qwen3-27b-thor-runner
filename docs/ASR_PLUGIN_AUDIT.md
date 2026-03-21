@@ -191,7 +191,8 @@ Phase 6: 后处理
 - [x] Phase 2/3 并行执行
 - [x] GPU 加速 VAD + Mel + CAM++
 - [x] 谱聚类 (NME 自动 k 选择 + 时间权重)
-- [x] 时间一致性平滑 (+1.4pp, 73.1%)
+- [x] 时间一致性平滑 (±2 窗口, cos_margin=-0.04)
+- [x] **说话人准确率**: 88.7% avg (86.6-91.2%, 3 run, asrTest2.mp3, 详见 `SPEAKER_DIARIZATION_EXPERIMENTS.md`)
 - [x] ForcedAligner word-level 时间戳
 - [x] 标点恢复 + 口语归一化
 - [x] Embedding dump 用于离线分析
@@ -208,7 +209,7 @@ Phase 6: 后处理
 | **GPU 加速** | VAD(cuFFT), Mel(cuFFT), CAM++(16-stream cuBLAS) 全 GPU |
 | **V4 Pipeline** | 6 阶段流水线设计成熟, Phase 2/3 并行, 后处理丰富 |
 | **Pipeline 分层** | `TranscriptionPipeline` + `SpeakerService` 独立于 HTTP 层, 可复用/可测试 |
-| **谱聚类** | NME 自动选 k + TEMPORAL_ALPHA=0.65 + 时间平滑, 效果稳定 |
+| **谱聚类** | NME 自动选 k + TEMPORAL_ALPHA=0.65 + 时间平滑, 88.7% avg (3s 非重叠分块为局部最优, 详见实验报告) |
 | **ForcedAligner** | 子进程长驻, model 加载一次, JSON 协议简洁 |
 | **资源管理** | Dependencies 注入 + 3 把互斥锁保护有状态组件 |
 
@@ -314,7 +315,7 @@ Phase 6: 后处理
 
 | 维度 | 评分 | 说明 |
 |------|------|------|
-| **录音转写** | ★★★★☆ | V4 pipeline 成熟, 6 阶段完整, 73% 说话人准确率 |
+| **录音转写** | ★★★★☆ | V4 pipeline 成熟, 6 阶段完整, 88.7% 说话人准确率 (asrTest2, 4 speakers) |
 | **实时识别** | ★★★★★ | ASR→LLM→TTS→VAD 全链路完整, FSMN-VAD + 说话人路由已实现 |
 | **代码组织** | ★★★★☆ | Pipeline + WS 会话均已模块化, serve.cpp 4692 行 (-46%) |
 | **可扩展性** | ★★★★☆ | 插件接口干净, Pipeline 依赖注入可复用/可测试 |
@@ -349,8 +350,28 @@ Phase 6: 后处理
 
 ## 八、已知限制
 
-1. **CAM++ 非确定性**: 16 CUDA stream 并行导致 embedding 每次略有不同 (±2-3pp 说话人准确率波动)
-2. **说话人混淆**: 同性别/年龄说话人 (唐云峰↔石一) CAM++ embedding 物理重叠, 时间信息是唯一额外信号
-3. **统一内存约束**: 所有模型共享 128 GB LPDDR5X, ASR/CAM++/VAD/Aligner 需考虑内存占用
-4. **ForcedAligner 延迟**: 子进程通信 + Python 推理, 60min 音频 ~10-15s
-5. **实时 ASR 非增量**: 每 2s partial 重新编码全段, encoder 计算有冗余
+1. **CAM++ 非确定性**: 16 CUDA stream 并行导致 embedding 每次略有不同 (±2.3pp 波动: 86.6-91.2%, 实测 3 run)
+2. **说话人混淆**: 同性别/年龄说话人 (唐云峰↔石一) CAM++ embedding 物理重叠, 时间信息 (α=0.65) 是唯一额外信号
+3. **分块策略敏感**: 3s 非重叠 + α=0.65 为局部最优; VAD-segment 粒度 (-10.6pp), 3s 重叠 (-7.5pp), 5s 分块 (-9.7pp), α=0.5 (-23.1pp) 均回归 (详见 `SPEAKER_DIARIZATION_EXPERIMENTS.md`)
+4. **统一内存约束**: 所有模型共享 128 GB LPDDR5X, ASR/CAM++/VAD/Aligner 需考虑内存占用
+5. **ForcedAligner 延迟**: 子进程通信 + Python 推理, 60min 音频 ~10-15s
+6. **实时 ASR 非增量**: 每 2s partial 重新编码全段, encoder 计算有冗余
+
+---
+
+## 九、说话人分割实验记录
+
+> 完整报告: `docs/SPEAKER_DIARIZATION_EXPERIMENTS.md`
+> 评估脚本: `tmp/eval_speaker.py` (逐秒对齐 + 最优排列映射)
+> 测试音频: `tests/assets/asrTest2.mp3` (60 min, 4 speakers)
+
+| 实验 | 参数变化 | 准确率 (avg) | vs 基线 | 结论 |
+|------|---------|-------------|---------|------|
+| **基线** | CHUNK=3s, α=0.65, τ=12s | **88.7%** | — | ✅ 当前最优 |
+| VAD-segment 粒度 | ≤8s 整段, >8s 4s 分块 | 78.1% | -10.6pp | ❌ 数据点不足 |
+| 3s 重叠分块 | 0.75s overlap | 81.2% | -7.5pp | ❌ 相似度膨胀 |
+| 5s 分块 | CHUNK=500 | 79.0% | -9.7pp | ❌ 跨说话人污染 |
+| α=0.3 | 降低时间权重 | 81.8% | -6.9pp | ❌ 物理重叠失区分 |
+| α=0.5 | 中间值 | 65.6% | -23.1pp | ❌ 最差区间 |
+
+**结论**: 当前 3s 非重叠 + α=0.65 是经过协同调优的局部最优。改变分块策略需同步重新搜索 (CHUNK, α, τ, p-prune, smoothing) 多维参数空间。

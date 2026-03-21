@@ -1029,7 +1029,7 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
         bool extend = !v4_segments.empty() &&
                       w.speaker_id == v4_segments.back().speaker_id &&
                       w.speaker_id >= 0 &&
-                      w.start_ms - v4_segments.back().end_ms <= 2000;
+                      w.start_ms - v4_segments.back().end_ms <= 1200;
         if (extend) {
             v4_segments.back().end_ms = std::max(v4_segments.back().end_ms, w.end_ms);
             v4_segments.back().text += w.word;
@@ -1082,7 +1082,7 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
         for (auto& seg : v4_segments) {
             if (!merged.empty() &&
                 seg.speaker_id == merged.back().speaker_id &&
-                seg.start_ms - merged.back().end_ms <= 3000) {
+                seg.start_ms - merged.back().end_ms <= 2000) {
                 merged.back().end_ms = std::max(merged.back().end_ms, seg.end_ms);
                 merged.back().text += seg.text;
             } else {
@@ -1090,6 +1090,70 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
             }
         }
         v4_segments = std::move(merged);
+    }
+
+    // 5d: 长段落拆分 (>15s 的段落在词间隙>800ms处拆分)
+    {
+        bool did_split = true;
+        while (did_split) {
+            did_split = false;
+            std::vector<V4Segment> split_result;
+            for (auto& seg : v4_segments) {
+                int seg_dur = seg.end_ms - seg.start_ms;
+                if (seg_dur <= 15000) {
+                    split_result.push_back(seg);
+                    continue;
+                }
+                // 找这个段落时间范围内的所有词 (不限 speaker_id)
+                std::vector<int> seg_word_indices;
+                for (int wi = 0; wi < (int)word_list.size(); ++wi) {
+                    if (word_list[wi].start_ms >= seg.start_ms - 100 &&
+                        word_list[wi].end_ms <= seg.end_ms + 100) {
+                        seg_word_indices.push_back(wi);
+                    }
+                }
+                if (seg_word_indices.size() < 4) {
+                    split_result.push_back(seg);
+                    continue;
+                }
+                // 找最大词间隙(>800ms)
+                int best_gap = 0, best_gap_idx = -1;
+                for (int i = 1; i < (int)seg_word_indices.size(); ++i) {
+                    int gap = word_list[seg_word_indices[i]].start_ms -
+                              word_list[seg_word_indices[i-1]].end_ms;
+                    if (gap > best_gap && gap >= 800) {
+                        best_gap = gap;
+                        best_gap_idx = i;
+                    }
+                }
+                if (best_gap_idx < 0) {
+                    split_result.push_back(seg);
+                    continue;
+                }
+                // 拆分
+                V4Segment seg1, seg2;
+                seg1.start_ms = seg.start_ms;
+                seg1.end_ms = word_list[seg_word_indices[best_gap_idx - 1]].end_ms;
+                seg1.speaker_id = seg.speaker_id;
+                seg1.speaker_name = seg.speaker_name;
+                seg2.start_ms = word_list[seg_word_indices[best_gap_idx]].start_ms;
+                seg2.end_ms = seg.end_ms;
+                seg2.speaker_id = seg.speaker_id;
+                seg2.speaker_name = seg.speaker_name;
+                // 分配文字
+                int split_word = seg_word_indices[best_gap_idx];
+                seg1.text.clear();
+                seg2.text.clear();
+                for (int wi : seg_word_indices) {
+                    if (wi < split_word) seg1.text += word_list[wi].word;
+                    else seg2.text += word_list[wi].word;
+                }
+                if (!seg1.text.empty()) split_result.push_back(seg1);
+                if (!seg2.text.empty()) split_result.push_back(seg2);
+                did_split = true;
+            }
+            v4_segments = std::move(split_result);
+        }
     }
 
     // ================================================================
@@ -1212,6 +1276,20 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
                     continue;
                 }
 
+                // 时间间隙强制拆分: 当前词与段落末尾差 >5s 时强制新段
+                if (!split_here && !ci.is_punc && wi >= 0 &&
+                    !cur.text.empty() && cur.end_ms > 0 &&
+                    word_list[wi].start_ms - cur.end_ms > 5000) {
+                    v4_segments.push_back(cur);
+                    cur = V4Segment();
+                    cur.speaker_id = word_list[wi].speaker_id;
+                    cur.speaker_name = word_list[wi].speaker_name;
+                    cur.start_ms = word_list[wi].start_ms;
+                    cur.end_ms = word_list[wi].end_ms;
+                    cur.text = ci.ch;
+                    continue;
+                }
+
                 cur.text += ci.ch;
                 if (wi >= 0)
                     cur.end_ms = std::max(cur.end_ms, word_list[wi].end_ms);
@@ -1265,7 +1343,7 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
         for (size_t i = 0; i < v4_segments.size(); ++i) {
             auto& seg = v4_segments[i];
             int dur_ms = seg.end_ms - seg.start_ms;
-            bool is_island = dur_ms < 3000 && seg.speaker_id >= 0 &&
+            bool is_island = dur_ms < 1000 && seg.speaker_id >= 0 &&
                              !smoothed.empty() && i + 1 < v4_segments.size();
             bool surrounded = is_island &&
                               smoothed.back().speaker_id >= 0 &&
@@ -1291,7 +1369,7 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
                 int prev_dur = merged.back().end_ms - merged.back().start_ms;
                 int cur_dur = seg.end_ms - seg.start_ms;
                 int merged_dur = std::max(merged.back().end_ms, seg.end_ms) - merged.back().start_ms;
-                if ((prev_dur <= 5000 || cur_dur <= 5000) && merged_dur <= 30000) {
+                if ((prev_dur <= 5000 || cur_dur <= 5000) && merged_dur <= 20000) {
                     merged.back().end_ms = std::max(merged.back().end_ms, seg.end_ms);
                     merged.back().text += seg.text;
                 } else {
@@ -1302,6 +1380,76 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
             }
         }
         v4_segments = std::move(merged);
+    }
+
+    // ================================================================
+    // Phase 6.52: 超长段拆分 (>30s 且有句末标点时按标点拆)
+    // ================================================================
+    {
+        auto split_u8_chars = [](const std::string& s) -> std::vector<std::string> {
+            std::vector<std::string> out;
+            for (size_t i = 0; i < s.size(); ) {
+                unsigned char c = (unsigned char)s[i];
+                int len = (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+                out.push_back(s.substr(i, len));
+                i += len;
+            }
+            return out;
+        };
+        auto is_sent_end_ch = [](const std::string& c) {
+            return c == "\xe3\x80\x82" || c == "\xef\xbc\x9f" || c == "\xef\xbc\x81";
+        };
+
+        std::vector<V4Segment> split_out;
+        int split_count = 0;
+        for (auto& seg : v4_segments) {
+            int dur_ms = seg.end_ms - seg.start_ms;
+            if (dur_ms <= 30000) {
+                split_out.push_back(seg);
+                continue;
+            }
+            auto chars = split_u8_chars(seg.text);
+            // 找所有句末标点位置 (不含最后一个字符)
+            std::vector<int> split_points;
+            for (int ci = 0; ci + 1 < (int)chars.size(); ++ci) {
+                if (is_sent_end_ch(chars[ci])) split_points.push_back(ci);
+            }
+            if (split_points.empty()) {
+                split_out.push_back(seg); // 没标点可拆, 保留原样
+                continue;
+            }
+            // 按标点拆分, 时间按字符比例分配
+            int prev_ci = 0;
+            for (int sp : split_points) {
+                V4Segment sub;
+                sub.speaker_id = seg.speaker_id;
+                sub.speaker_name = seg.speaker_name;
+                for (int j = prev_ci; j <= sp; ++j)
+                    sub.text += chars[j];
+                double ratio_start = (double)prev_ci / chars.size();
+                double ratio_end = (double)(sp + 1) / chars.size();
+                sub.start_ms = seg.start_ms + (int)(dur_ms * ratio_start);
+                sub.end_ms = seg.start_ms + (int)(dur_ms * ratio_end);
+                if (!sub.text.empty()) split_out.push_back(sub);
+                prev_ci = sp + 1;
+                ++split_count;
+            }
+            // 剩余部分
+            if (prev_ci < (int)chars.size()) {
+                V4Segment sub;
+                sub.speaker_id = seg.speaker_id;
+                sub.speaker_name = seg.speaker_name;
+                for (int j = prev_ci; j < (int)chars.size(); ++j)
+                    sub.text += chars[j];
+                double ratio_start = (double)prev_ci / chars.size();
+                sub.start_ms = seg.start_ms + (int)(dur_ms * ratio_start);
+                sub.end_ms = seg.end_ms;
+                if (!sub.text.empty()) split_out.push_back(sub);
+            }
+        }
+        if (split_count > 0)
+            fprintf(stderr, "[Pipeline] v4 Phase 6.52: split %d ultra-long segments\n", split_count);
+        v4_segments = std::move(split_out);
     }
 
     // ================================================================
