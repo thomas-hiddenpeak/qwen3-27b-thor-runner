@@ -1504,21 +1504,61 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
         if (env_path) {
             speaker_model_path = env_path;
         } else {
-            // 默认路径: /home/rm01/models/dev/asr/campplus/campplus.safetensors
-            std::string default_path = "/home/rm01/models/dev/asr/campplus/campplus.safetensors";
-            std::ifstream test_file(default_path);
-            if (test_file.good()) speaker_model_path = default_path;
+            // 默认路径: 优先 ERes2NetV2, 回退到 CAM++
+            std::string eres2netv2_path = "/home/rm01/models/dev/asr/eres2netv2/eres2netv2.safetensors";
+            std::string campplus_path = "/home/rm01/models/dev/asr/campplus/campplus.safetensors";
+            std::ifstream test_v2(eres2netv2_path);
+            if (test_v2.good()) {
+                speaker_model_path = eres2netv2_path;
+            } else {
+                std::ifstream test_cam(campplus_path);
+                if (test_cam.good()) speaker_model_path = campplus_path;
+            }
         }
 
         if (!speaker_model_path.empty()) {
-            speaker_encoder_ = std::make_unique<asr::GpuSpeakerEncoder>();
-            if (speaker_encoder_->load(speaker_model_path)) {
-                fprintf(stderr, "[Serve] Speaker encoder loaded: CAM++ (%s)\n",
-                        speaker_model_path.c_str());
+            // Auto-detect model type: check safetensors header for layer3_ds (ERes2NetV2)
+            bool is_eres2netv2 = false;
+            {
+                std::ifstream probe(speaker_model_path, std::ios::binary);
+                if (probe.is_open()) {
+                    uint64_t hdr_sz = 0;
+                    probe.read(reinterpret_cast<char*>(&hdr_sz), 8);
+                    if (hdr_sz > 0 && hdr_sz < 10000000) {
+                        std::string hdr(hdr_sz, '\0');
+                        probe.read(&hdr[0], hdr_sz);
+                        is_eres2netv2 = hdr.find("layer3_ds") != std::string::npos;
+                    }
+                }
+            }
 
+            if (is_eres2netv2) {
+                // ERes2NetV2 — GPU encoder (17.8M params, cuBLAS + CUDA kernels)
+                eres2netv2_gpu_encoder_ = std::make_unique<asr::GpuERes2NetV2Encoder>();
+                if (eres2netv2_gpu_encoder_->load(speaker_model_path)) {
+                    fprintf(stderr, "[Serve] Speaker encoder loaded: ERes2NetV2 GPU (%s)\n",
+                            speaker_model_path.c_str());
+                } else {
+                    fprintf(stderr, "[Serve] WARNING: Failed to load ERes2NetV2 GPU from %s\n",
+                            speaker_model_path.c_str());
+                    eres2netv2_gpu_encoder_.reset();
+                }
+            } else {
+                // CAM++ — GPU encoder
+                speaker_encoder_ = std::make_unique<asr::GpuSpeakerEncoder>();
+                if (speaker_encoder_->load(speaker_model_path)) {
+                    fprintf(stderr, "[Serve] Speaker encoder loaded: CAM++ (%s)\n",
+                            speaker_model_path.c_str());
+                } else {
+                    fprintf(stderr, "[Serve] WARNING: Failed to load speaker encoder from %s\n",
+                            speaker_model_path.c_str());
+                    speaker_encoder_.reset();
+                }
+            }
+
+            if (speaker_encoder_ || eres2netv2_encoder_ || eres2netv2_gpu_encoder_) {
                 // GPU Mel 特征提取 (cuFFT, Kaldi-compatible: Povey window, zero-pad 512, low_freq=20)
                 asr::GpuMelConfig mel_cfg;
-                // Kaldi/FunASR CAMPPlus default: Povey window, pad_to_power_of_two, low_freq=20
                 gpu_mel_.init(mel_cfg);
                 fprintf(stderr, "[Serve] GPU Mel extractor initialized (cuFFT)\n");
 
@@ -1529,8 +1569,6 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
                 if (vad_engine_.load(vad_model_dir)) {
                     fprintf(stderr, "[Serve] VAD engine loaded: FSMN (%s)\n",
                             vad_model_dir.c_str());
-
-                    // GPU VAD: 加载 FSMN 权重到 GPU (batch GEMM + cuFFT 加速)
                     if (gpu_vad_engine_.load(vad_model_dir)) {
                         fprintf(stderr, "[Serve] GPU VAD engine loaded (cuFFT + batch GEMM)\n");
                     }
@@ -1539,10 +1577,6 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
                             "(speaker diarization in file transcription will be disabled)\n",
                             vad_model_dir.c_str());
                 }
-            } else {
-                fprintf(stderr, "[Serve] WARNING: Failed to load speaker encoder from %s\n",
-                        speaker_model_path.c_str());
-                speaker_encoder_.reset();
             }
         }
     }
@@ -1596,6 +1630,8 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
         deps.punctuation_restorer = &punctuation_restorer_;
         deps.aligner_engine = &aligner_engine_;
         deps.aligner_mutex = &aligner_mutex_;
+        deps.eres2netv2_encoder = eres2netv2_encoder_.get();
+        deps.eres2netv2_gpu_encoder = eres2netv2_gpu_encoder_.get();
         transcription_pipeline_ = std::make_unique<asr::TranscriptionPipeline>(deps);
         fprintf(stderr, "[Serve] TranscriptionPipeline initialized\n");
     }
@@ -4151,7 +4187,7 @@ void ServeApp::handle_tts_info(const HttpRequest& /*req*/, int client_fd) {
         // TTS disabled, but still report ASR/speaker encoder status for standalone use
         resp.body = "{\"enabled\":false"
                     ",\"has_asr\":" + std::string((asr_plugin_ && asr_plugin_->is_available()) ? "true" : "false") +
-                    ",\"has_speaker_encoder\":" + std::string(speaker_encoder_ ? "true" : "false") +
+                    ",\"has_speaker_encoder\":" + std::string((speaker_encoder_ || eres2netv2_encoder_ || eres2netv2_gpu_encoder_) ? "true" : "false") +
                     "}";
         send_response(client_fd, resp);
         close(client_fd);
@@ -4435,10 +4471,10 @@ asr::SpeakerManager::MatchResult ServeApp::identify_speaker(
 
 // POST /v1/speakers/register — 注册说话人 (multipart: file=audio, name=string)
 void ServeApp::handle_speaker_register(const HttpRequest& req, int client_fd) {
-    if (!speaker_encoder_) {
+    if (!speaker_encoder_ && !eres2netv2_encoder_) {
         HttpResponse resp;
         resp.status_code = 501;
-        resp.body = "{\"error\":\"Speaker encoder not loaded (CAM++ model not found)\"}";
+        resp.body = "{\"error\":\"Speaker encoder not loaded\"}";
         send_response(client_fd, resp);
         close(client_fd);
         return;
@@ -4504,9 +4540,14 @@ void ServeApp::handle_speaker_register(const HttpRequest& req, int client_fd) {
         return;
     }
 
-    // CAM++ 提取 192-dim embedding
+    // Extract 192-dim embedding
     std::lock_guard<std::mutex> lock(speaker_mutex_);
-    auto embedding = speaker_encoder_->extract(mel.data(), num_frames);
+    std::vector<float> embedding;
+    if (eres2netv2_encoder_) {
+        embedding = eres2netv2_encoder_->extract(mel.data(), num_frames);
+    } else if (speaker_encoder_) {
+        embedding = speaker_encoder_->extract(mel.data(), num_frames);
+    }
 
     if (embedding.empty()) {
         HttpResponse resp;
@@ -4544,7 +4585,7 @@ void ServeApp::handle_speaker_list(const HttpRequest& /*req*/, int client_fd) {
         resp.body += "\"" + json_escape(names[i]) + "\"";
     }
     resp.body += "],\"count\":" + std::to_string(names.size()) +
-                 ",\"encoder\":\"" + (speaker_encoder_ ? "cam++" : "none") + "\"}";
+                 ",\"encoder\":\"" + std::string(eres2netv2_encoder_ ? "eres2netv2" : (speaker_encoder_ ? "cam++" : "none")) + "\"}";
 
     send_response(client_fd, resp);
     close(client_fd);

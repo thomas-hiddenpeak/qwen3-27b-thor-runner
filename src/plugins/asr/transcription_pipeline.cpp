@@ -25,7 +25,7 @@ namespace asr {
 TranscriptionResult TranscriptionPipeline::transcribe(
         const audio::AudioData& wav, const TranscriptionParams& params) {
     bool has_aligner = deps_.aligner_engine && deps_.aligner_engine->is_loaded();
-    bool has_speaker = deps_.speaker_encoder != nullptr;
+    bool has_speaker = deps_.speaker_encoder != nullptr || deps_.eres2netv2_encoder != nullptr || deps_.eres2netv2_gpu_encoder != nullptr;
     bool has_vad = (deps_.vad_engine && deps_.vad_engine->is_loaded()) ||
                    (deps_.gpu_vad_engine && deps_.gpu_vad_engine->is_loaded());
 
@@ -275,21 +275,29 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
         const int CHUNK_FRAMES = 300;
         const int MIN_CHUNK_FRAMES = 150;
 
-        // === Batch CAM++ extraction ===
-        using BatchChunk = GpuSpeakerEncoder::BatchChunk;
-        std::vector<BatchChunk> batch_chunks;
+        // === Batch GPU extraction (CAM++ or ERes2NetV2 GPU) ===
+        using CamBatchChunk = GpuSpeakerEncoder::BatchChunk;
+        using ERes2BatchChunk = GpuERes2NetV2Encoder::BatchChunk;
+        std::vector<CamBatchChunk> cam_batch_chunks;
+        std::vector<ERes2BatchChunk> eres2_batch_chunks;
         std::vector<ChunkInfo> batch_chunk_infos;
 
-        bool use_gpu_batch = deps_.gpu_mel && deps_.gpu_mel->is_initialized() && deps_.speaker_encoder;
+        bool use_gpu_mel = deps_.gpu_mel && deps_.gpu_mel->is_initialized();
+        bool use_cam_batch = use_gpu_mel && deps_.speaker_encoder && !deps_.eres2netv2_gpu_encoder && !deps_.eres2netv2_encoder;
+        bool use_eres2_gpu_batch = use_gpu_mel && deps_.eres2netv2_gpu_encoder;
+        bool use_gpu_batch = use_cam_batch || use_eres2_gpu_batch;
         float* d_batch_mels = nullptr;
         int batch_mel_capacity = (int)(total_duration_s * 100 + 10000) * 80;
         if (use_gpu_batch) {
             if (cudaMalloc(&d_batch_mels, (size_t)batch_mel_capacity * sizeof(float)) != cudaSuccess) {
                 fprintf(stderr, "[Pipeline] batch mel buffer alloc failed, falling back to serial\n");
                 use_gpu_batch = false;
+                use_cam_batch = false;
+                use_eres2_gpu_batch = false;
             }
         }
         int batch_mel_offset = 0;
+        int embed_chunk_count = 0;
 
         for (size_t vi = 0; vi < vad_results.size(); ++vi) {
             auto& vr = vad_results[vi];
@@ -312,7 +320,8 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
             int num_frames = 0;
             float* d_mel = nullptr;
             std::vector<float> mel;
-            if (deps_.gpu_mel && deps_.gpu_mel->is_initialized()) {
+            bool need_cpu_mel = deps_.eres2netv2_encoder && !deps_.eres2netv2_gpu_encoder;
+            if (deps_.gpu_mel && deps_.gpu_mel->is_initialized() && !need_cpu_mel) {
                 auto mel_result = deps_.gpu_mel->compute_gpu(seg_pcm, seg_samples);
                 num_frames = mel_result.num_frames;
                 d_mel = mel_result.d_mel;
@@ -354,9 +363,37 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
                                d_mel + f_start * 80,
                                (size_t)chunk_frames * 80 * sizeof(float),
                                cudaMemcpyDeviceToDevice);
-                    batch_chunks.push_back({d_batch_mels + (size_t)batch_mel_offset * 80, chunk_frames});
+                    if (use_cam_batch) {
+                        cam_batch_chunks.push_back({d_batch_mels + (size_t)batch_mel_offset * 80, chunk_frames});
+                    } else {
+                        eres2_batch_chunks.push_back({d_batch_mels + (size_t)batch_mel_offset * 80, chunk_frames});
+                    }
                     batch_chunk_infos.push_back({abs_start, abs_end});
                     batch_mel_offset += chunk_frames;
+                } else if (deps_.eres2netv2_encoder && !deps_.eres2netv2_gpu_encoder) {
+                    // ERes2NetV2 CPU path: needs CPU mel data
+                    std::vector<float> embedding;
+                    if (!mel.empty()) {
+                        embedding = deps_.eres2netv2_encoder->extract(mel.data() + f_start * 80, chunk_frames);
+                    } else if (d_mel) {
+                        std::vector<float> cpu_mel(chunk_frames * 80);
+                        cudaMemcpy(cpu_mel.data(), d_mel + f_start * 80,
+                                   chunk_frames * 80 * sizeof(float), cudaMemcpyDeviceToHost);
+                        embedding = deps_.eres2netv2_encoder->extract(cpu_mel.data(), chunk_frames);
+                    }
+                    ++embed_chunk_count;
+                    if (embed_chunk_count % 200 == 0) {
+                        fprintf(stderr, "[Pipeline] ERes2NetV2 CPU extracted %d chunks...\n", embed_chunk_count);
+                    }
+                    if (!embedding.empty()) {
+                        bool valid = true;
+                        for (float v : embedding)
+                            if (std::isnan(v) || std::isinf(v)) { valid = false; break; }
+                        if (valid) {
+                            seg_embeddings.push_back(std::move(embedding));
+                            chunk_infos.push_back({abs_start, abs_end});
+                        }
+                    }
                 } else if (deps_.speaker_encoder) {
                     std::vector<float> embedding;
                     {
@@ -380,10 +417,19 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
             }
         }
 
-        // Pass 2: Batch extract
-        if (use_gpu_batch && !batch_chunks.empty()) {
+        // Pass 2: Batch extract (CAM++ or ERes2NetV2 GPU)
+        if (use_cam_batch && !cam_batch_chunks.empty()) {
             std::lock_guard<std::mutex> spk_lock(*deps_.speaker_mutex);
-            auto embeddings = deps_.speaker_encoder->extract_batch_gpu(batch_chunks);
+            auto embeddings = deps_.speaker_encoder->extract_batch_gpu(cam_batch_chunks);
+            for (int i = 0; i < (int)embeddings.size(); i++) {
+                if (!embeddings[i].empty()) {
+                    seg_embeddings.push_back(std::move(embeddings[i]));
+                    chunk_infos.push_back(batch_chunk_infos[i]);
+                }
+            }
+        }
+        if (use_eres2_gpu_batch && !eres2_batch_chunks.empty()) {
+            auto embeddings = deps_.eres2netv2_gpu_encoder->extract_batch_gpu(eres2_batch_chunks);
             for (int i = 0; i < (int)embeddings.size(); i++) {
                 if (!embeddings[i].empty()) {
                     seg_embeddings.push_back(std::move(embeddings[i]));
@@ -394,8 +440,9 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
 
         if (d_batch_mels) cudaFree(d_batch_mels);
 
+        size_t total_batch = cam_batch_chunks.size() + eres2_batch_chunks.size();
         fprintf(stderr, "[Pipeline] Step 3b: %d VAD segs → %zu chunks (%.0fs speech) [batch=%zu]\n",
-                mel_segments, seg_embeddings.size(), total_speech_sec, batch_chunks.size());
+                mel_segments, seg_embeddings.size(), total_speech_sec, total_batch);
 
         // Debug: Export embeddings
         {
@@ -1679,7 +1726,25 @@ TranscriptionResult TranscriptionPipeline::run_v2_pipeline(
         if (num_frames < 10) continue;
 
         std::vector<float> embedding;
-        {
+        if (deps_.eres2netv2_gpu_encoder) {
+            // ERes2NetV2 GPU: extract from CPU mel → need to upload to GPU first
+            if (deps_.gpu_mel && deps_.gpu_mel->is_initialized()) {
+                auto mel_result = deps_.gpu_mel->compute_gpu(vseg.pcm.data(), (int)vseg.pcm.size());
+                deps_.gpu_mel->sync();
+                if (mel_result.num_frames >= 10) {
+                    embedding = deps_.eres2netv2_gpu_encoder->extract_gpu(mel_result.d_mel, mel_result.num_frames);
+                }
+            } else {
+                // CPU mel available, upload to GPU
+                float* d_mel_tmp = nullptr;
+                cudaMalloc(&d_mel_tmp, (size_t)num_frames * 80 * sizeof(float));
+                cudaMemcpy(d_mel_tmp, mel.data(), (size_t)num_frames * 80 * sizeof(float), cudaMemcpyHostToDevice);
+                embedding = deps_.eres2netv2_gpu_encoder->extract_gpu(d_mel_tmp, num_frames);
+                cudaFree(d_mel_tmp);
+            }
+        } else if (deps_.eres2netv2_encoder) {
+            embedding = deps_.eres2netv2_encoder->extract(mel.data(), num_frames);
+        } else if (deps_.speaker_encoder) {
             std::lock_guard<std::mutex> spk_lock(*deps_.speaker_mutex);
             embedding = deps_.speaker_encoder->extract(mel.data(), num_frames);
         }

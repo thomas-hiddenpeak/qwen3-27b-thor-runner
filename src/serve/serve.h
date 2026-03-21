@@ -18,6 +18,8 @@
 #include "../plugins/asr/asr_plugin.h"
 #include "../plugins/asr/speaker_encoder.h"
 #include "../plugins/asr/speaker_encoder_gpu.h"
+#include "../plugins/asr/speaker_encoder_eres2netv2.h"
+#include "../plugins/asr/speaker_encoder_eres2netv2_gpu.h"
 #include "../plugins/asr/punctuation.h"
 #include "../plugins/asr/vad_engine.h"
 #include "../plugins/asr/vad_gpu.h"
@@ -252,6 +254,8 @@ private:
 
     // --- 以下组件由 serve 拥有, 通过 Dependencies 注入管线 ---
     std::unique_ptr<asr::GpuSpeakerEncoder> speaker_encoder_;
+    std::unique_ptr<asr::ERes2NetV2SpeakerEncoder> eres2netv2_encoder_;
+    std::unique_ptr<asr::GpuERes2NetV2Encoder> eres2netv2_gpu_encoder_;
     asr::SpeakerManager speaker_manager_;
     std::mutex speaker_mutex_;
 
