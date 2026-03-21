@@ -20,21 +20,16 @@ namespace qwen_thor {
 namespace asr {
 
 // ============================================================================
-// 统一入口: 根据参数和可用组件选择 V4 / V2 / Plain
+// 统一入口: 根据参数和可用组件选择 V4 / Plain
 // ============================================================================
 TranscriptionResult TranscriptionPipeline::transcribe(
         const audio::AudioData& wav, const TranscriptionParams& params) {
-    bool has_aligner = deps_.aligner_engine && deps_.aligner_engine->is_loaded();
     bool has_speaker = deps_.speaker_encoder != nullptr || deps_.eres2netv2_encoder != nullptr || deps_.eres2netv2_gpu_encoder != nullptr;
     bool has_vad = (deps_.vad_engine && deps_.vad_engine->is_loaded()) ||
                    (deps_.gpu_vad_engine && deps_.gpu_vad_engine->is_loaded());
 
-    if (params.identify_speaker && params.want_word_timestamps &&
-        has_aligner && has_speaker && has_vad) {
-        return run_v4_pipeline(wav, params);
-    }
     if (params.identify_speaker && has_speaker && has_vad) {
-        return run_v2_pipeline(wav, params);
+        return run_v4_pipeline(wav, params);
     }
     return run_plain_mode(wav, params);
 }
@@ -1644,211 +1639,6 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
         result.words.push_back({w.word, w.start_ms, w.end_ms, w.speaker_id, w.speaker_name});
     }
 
-    return result;
-}
-
-// ============================================================================
-// V2 Pipeline: Speaker-first (VAD → CAM++ → Group → ASR)
-// ============================================================================
-TranscriptionResult TranscriptionPipeline::run_v2_pipeline(
-        const audio::AudioData& wav, const TranscriptionParams& params) {
-    TranscriptionResult result;
-    float total_duration_s = (float)wav.samples.size() / wav.sample_rate;
-    result.duration_s = total_duration_s;
-
-    fprintf(stderr, "[Pipeline] v2: audio %.1fs, %zu samples\n",
-            total_duration_s, wav.samples.size());
-
-    // Phase 1: Fine-grained VAD
-    std::vector<VadSegment> vad_segments;
-    if (deps_.gpu_vad_engine && deps_.gpu_vad_engine->is_loaded()) {
-        auto gpu_segs = deps_.gpu_vad_engine->detect_all(
-            wav.samples.data(), (int)wav.samples.size(), 300, 8000);
-        for (auto& gs : gpu_segs) {
-            VadSegment vs;
-            vs.start_ms = gs.start_ms;
-            vs.end_ms = gs.end_ms;
-            int64_t s0 = (int64_t)gs.start_ms * wav.sample_rate / 1000;
-            int64_t s1 = (int64_t)gs.end_ms * wav.sample_rate / 1000;
-            s0 = std::max((int64_t)0, std::min(s0, (int64_t)wav.samples.size()));
-            s1 = std::max(s0, std::min(s1, (int64_t)wav.samples.size()));
-            vs.pcm.assign(wav.samples.data() + s0, wav.samples.data() + s1);
-            vad_segments.push_back(std::move(vs));
-        }
-    } else if (deps_.vad_engine) {
-        std::lock_guard<std::mutex> lock(*deps_.vad_mutex);
-        auto& cfg = deps_.vad_engine->mutable_config();
-        int orig_max_end_silence = cfg.max_end_silence_time;
-        int orig_max_segment = cfg.max_single_segment_time;
-        cfg.max_end_silence_time = 300;
-        cfg.max_single_segment_time = 8000;
-        vad_segments = deps_.vad_engine->detect_all(wav.samples.data(), (int)wav.samples.size());
-        cfg.max_end_silence_time = orig_max_end_silence;
-        cfg.max_single_segment_time = orig_max_segment;
-    }
-
-    fprintf(stderr, "[Pipeline] v2 Phase 1: %zu VAD segments\n", vad_segments.size());
-
-    // Phase 2: Speaker ID per segment
-    SpeakerManager diar_spk_mgr;  // local per-request
-
-    struct SpkSegment {
-        int start_ms, end_ms;
-        int speaker_id;
-        std::string speaker_name;
-        float speaker_sim;
-        size_t vad_index;
-    };
-    std::vector<SpkSegment> spk_segments;
-
-    for (size_t vi = 0; vi < vad_segments.size(); ++vi) {
-        auto& vseg = vad_segments[vi];
-        if (vseg.pcm.empty() || vseg.end_ms - vseg.start_ms < 200) continue;
-
-        float rms = 0.0f;
-        for (size_t si = 0; si < vseg.pcm.size(); si++)
-            rms += vseg.pcm[si] * vseg.pcm[si];
-        rms = std::sqrt(rms / vseg.pcm.size());
-        if (rms < 0.005f) continue;
-
-        SpkSegment ss;
-        ss.start_ms = vseg.start_ms;
-        ss.end_ms = vseg.end_ms;
-        ss.vad_index = vi;
-
-        std::vector<float> mel;
-        int num_frames = 0;
-        if (deps_.gpu_mel && deps_.gpu_mel->is_initialized()) {
-            num_frames = deps_.gpu_mel->compute(vseg.pcm.data(), (int)vseg.pcm.size(), mel);
-        } else {
-            SpeakerService::compute_mel_80(vseg.pcm.data(), (int)vseg.pcm.size(), wav.sample_rate, mel, num_frames);
-        }
-        if (num_frames < 10) continue;
-
-        std::vector<float> embedding;
-        if (deps_.eres2netv2_gpu_encoder) {
-            // ERes2NetV2 GPU: extract from CPU mel → need to upload to GPU first
-            if (deps_.gpu_mel && deps_.gpu_mel->is_initialized()) {
-                auto mel_result = deps_.gpu_mel->compute_gpu(vseg.pcm.data(), (int)vseg.pcm.size());
-                deps_.gpu_mel->sync();
-                if (mel_result.num_frames >= 10) {
-                    embedding = deps_.eres2netv2_gpu_encoder->extract_gpu(mel_result.d_mel, mel_result.num_frames);
-                }
-            } else {
-                // CPU mel available, upload to GPU
-                float* d_mel_tmp = nullptr;
-                cudaMalloc(&d_mel_tmp, (size_t)num_frames * 80 * sizeof(float));
-                cudaMemcpy(d_mel_tmp, mel.data(), (size_t)num_frames * 80 * sizeof(float), cudaMemcpyHostToDevice);
-                embedding = deps_.eres2netv2_gpu_encoder->extract_gpu(d_mel_tmp, num_frames);
-                cudaFree(d_mel_tmp);
-            }
-        } else if (deps_.eres2netv2_encoder) {
-            embedding = deps_.eres2netv2_encoder->extract(mel.data(), num_frames);
-        } else if (deps_.speaker_encoder) {
-            std::lock_guard<std::mutex> spk_lock(*deps_.speaker_mutex);
-            embedding = deps_.speaker_encoder->extract(mel.data(), num_frames);
-        }
-        if (embedding.empty()) continue;
-
-        auto spk = diar_spk_mgr.identify(embedding, 0.78f, true);
-        ss.speaker_id = spk.speaker_id;
-        ss.speaker_name = spk.speaker_id >= 0 ? spk.name : "Unknown";
-        ss.speaker_sim = spk.similarity;
-        spk_segments.push_back(ss);
-    }
-
-    fprintf(stderr, "[Pipeline] v2 Phase 2: %zu labeled segments, %d speakers\n",
-            spk_segments.size(), diar_spk_mgr.speaker_count());
-
-    // Phase 3: Group consecutive same-speaker into turns
-    struct SpeakerTurn {
-        int start_ms, end_ms;
-        int speaker_id;
-        std::string speaker_name;
-        float speaker_sim;
-        std::string text;
-        std::vector<size_t> vad_indices;
-    };
-    std::vector<SpeakerTurn> turns;
-    const int max_turn_ms = 100000;
-
-    for (auto& ss : spk_segments) {
-        bool extend = !turns.empty()
-                   && ss.speaker_id == turns.back().speaker_id
-                   && ss.speaker_id >= 0
-                   && ss.start_ms - turns.back().end_ms <= 1000
-                   && (ss.end_ms - turns.back().start_ms) <= max_turn_ms;
-        if (extend) {
-            turns.back().end_ms = ss.end_ms;
-            turns.back().vad_indices.push_back(ss.vad_index);
-        } else {
-            SpeakerTurn t;
-            t.start_ms = ss.start_ms;
-            t.end_ms = ss.end_ms;
-            t.speaker_id = ss.speaker_id;
-            t.speaker_name = ss.speaker_name;
-            t.speaker_sim = ss.speaker_sim;
-            t.vad_indices.push_back(ss.vad_index);
-            turns.push_back(std::move(t));
-        }
-    }
-
-    // Phase 4: ASR each turn
-    for (size_t ti = 0; ti < turns.size(); ++ti) {
-        auto& turn = turns[ti];
-        std::vector<float> turn_pcm;
-        const int silence_pad = wav.sample_rate / 4;
-        for (size_t vi = 0; vi < turn.vad_indices.size(); ++vi) {
-            auto& vseg = vad_segments[turn.vad_indices[vi]];
-            if (vi > 0 && !turn_pcm.empty())
-                turn_pcm.resize(turn_pcm.size() + silence_pad, 0.0f);
-            turn_pcm.insert(turn_pcm.end(), vseg.pcm.begin(), vseg.pcm.end());
-        }
-        if ((int)turn_pcm.size() < wav.sample_rate / 5) continue;
-
-        auto seg_result = deps_.asr_plugin->transcribe_pcm(
-            turn_pcm.data(), (int)turn_pcm.size(), wav.sample_rate, params.language, true);
-        if (seg_result.error_code == 0 && !seg_result.text.empty())
-            turn.text = seg_result.text;
-    }
-
-    // Phase 5: Build segments + merge
-    for (auto& turn : turns) {
-        if (turn.text.empty()) continue;
-        TranscriptionSegment ts;
-        ts.start_ms = turn.start_ms;
-        ts.end_ms = turn.end_ms;
-        ts.speaker_id = turn.speaker_id;
-        ts.speaker_name = turn.speaker_name;
-        ts.speaker_similarity = turn.speaker_sim;
-
-        if (params.punctuate && deps_.punctuation_restorer)
-            ts.text = deps_.punctuation_restorer->restore(turn.text);
-        else
-            ts.text = turn.text;
-
-        result.segments.push_back(std::move(ts));
-    }
-
-    // Merge adjacent same-speaker (gap < 500ms)
-    for (size_t i = 1; i < result.segments.size(); ) {
-        auto& prev = result.segments[i - 1];
-        auto& cur = result.segments[i];
-        if (cur.speaker_id == prev.speaker_id && cur.speaker_id >= 0 &&
-            cur.start_ms - prev.end_ms <= 500) {
-            prev.end_ms = cur.end_ms;
-            prev.text += cur.text;
-            result.segments.erase(result.segments.begin() + i);
-        } else {
-            ++i;
-        }
-    }
-
-    // Build full_text
-    for (auto& seg : result.segments)
-        result.full_text += seg.text;
-
-    fprintf(stderr, "[Pipeline] v2 done: %zu segments\n", result.segments.size());
     return result;
 }
 

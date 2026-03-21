@@ -1,4 +1,4 @@
-// transcription_pipeline.h — 转录管线 (V4/V2/Plain 三种模式)
+// transcription_pipeline.h — 转录管线 (V4/Plain 两种模式)
 //
 // 从 serve.cpp 提取的核心转录逻辑, 属于插件层。
 // serve 层只负责 HTTP 解析 + JSON 格式化, 管线逻辑全部在此。
@@ -98,8 +98,6 @@ public:
 
     // 显式调用各管线 (高级用途)
     TranscriptionResult run_v4_pipeline(const audio::AudioData& wav,
-                                        const TranscriptionParams& params);
-    TranscriptionResult run_v2_pipeline(const audio::AudioData& wav,
                                         const TranscriptionParams& params);
     TranscriptionResult run_plain_mode(const audio::AudioData& wav,
                                        const TranscriptionParams& params);
