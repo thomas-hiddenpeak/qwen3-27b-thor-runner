@@ -58,7 +58,7 @@ file(GLOB_RECURSE PLUGIN_SOURCES
 )
 
 add_library(qwen35_thor_plugins STATIC ${PLUGIN_SOURCES})
-target_link_libraries(qwen35_thor_plugins PRIVATE CUDA::cudart CUDA::cublas CUDA::cufft nvpl_blas_lp64_seq rt dl)
+target_link_libraries(qwen35_thor_plugins PRIVATE CUDA::cudart CUDA::cublas CUDA::cufft nvpl_blas_lp64_seq lapack rt dl)
 
 # ============================================================================
 # 主可执行文件: qwen35-thor
