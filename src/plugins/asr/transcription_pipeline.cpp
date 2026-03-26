@@ -585,7 +585,9 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
 
             // 1b. Temporal proximity mixing (Gaussian kernel)
             {
-                constexpr float TEMPORAL_ALPHA = 0.93f;
+                float TEMPORAL_ALPHA = 0.93f;
+                const char* ta_env = getenv("TEMPORAL_ALPHA");
+                if (ta_env) TEMPORAL_ALPHA = strtof(ta_env, nullptr);
                 constexpr float TEMPORAL_TAU = 3.125f;
                 constexpr float INV_2TAU2 = 1.0f / (2.0f * TEMPORAL_TAU * TEMPORAL_TAU);
                 for (int i = 0; i < n_segs; ++i) {
@@ -1255,6 +1257,48 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
         v4_segments = std::move(merged);
     }
 
+    // 5c2: A-B-A 乒乓消除 — 短段被同说话人包围时吸收
+    {
+        int aba_count = 0;
+        for (int pass = 0; pass < 2; ++pass) {
+            bool changed = false;
+            for (size_t i = 1; i + 1 < v4_segments.size(); ++i) {
+                auto& prev = v4_segments[i - 1];
+                auto& cur = v4_segments[i];
+                auto& next = v4_segments[i + 1];
+                if (prev.speaker_id == next.speaker_id &&
+                    cur.speaker_id != prev.speaker_id) {
+                    int cur_dur = cur.end_ms - cur.start_ms;
+                    int gap_before = cur.start_ms - prev.end_ms;
+                    int gap_after = next.start_ms - cur.end_ms;
+                    // Short island (< 3s) with small gaps (< 2s)
+                    if (cur_dur < 3000 && gap_before < 2000 && gap_after < 2000) {
+                        cur.speaker_id = prev.speaker_id;
+                        cur.speaker_name = prev.speaker_name;
+                        changed = true;
+                        ++aba_count;
+                    }
+                }
+            }
+            if (!changed) break;
+            // Re-merge after label changes
+            std::vector<V4Segment> merged;
+            for (auto& seg : v4_segments) {
+                if (!merged.empty() &&
+                    seg.speaker_id == merged.back().speaker_id &&
+                    seg.start_ms - merged.back().end_ms <= 1500) {
+                    merged.back().end_ms = std::max(merged.back().end_ms, seg.end_ms);
+                    merged.back().text += seg.text;
+                } else {
+                    merged.push_back(seg);
+                }
+            }
+            v4_segments = std::move(merged);
+        }
+        if (aba_count > 0)
+            fprintf(stderr, "[Pipeline] v4 Phase 5c2: eliminated %d A-B-A pingpong segments\n", aba_count);
+    }
+
     // 5d: 长段落拆分 (>15s 的段落在词间隙>800ms处拆分)
     {
         bool did_split = true;
@@ -1497,19 +1541,16 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
     }
 
     // ================================================================
-    // Phase 6.5: 说话人段合并 (仅 same-speaker merge)
+    // Phase 6.5: 说话人段合并 (same-speaker, 更宽松阈值)
     // ================================================================
     {
-        // Same-speaker merge only (no label flipping)
         std::vector<V4Segment> merged;
         for (auto& seg : v4_segments) {
             if (!merged.empty() &&
                 seg.speaker_id == merged.back().speaker_id &&
-                seg.start_ms - merged.back().end_ms <= 1500) {
-                int prev_dur = merged.back().end_ms - merged.back().start_ms;
-                int cur_dur = seg.end_ms - seg.start_ms;
+                seg.start_ms - merged.back().end_ms <= 2000) {
                 int merged_dur = std::max(merged.back().end_ms, seg.end_ms) - merged.back().start_ms;
-                if ((prev_dur <= 5000 || cur_dur <= 5000) && merged_dur <= 20000) {
+                if (merged_dur <= 30000) {
                     merged.back().end_ms = std::max(merged.back().end_ms, seg.end_ms);
                     merged.back().text += seg.text;
                 } else {
@@ -1631,43 +1672,49 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
     // ================================================================
     // Phase 6.6: 空白区间填充 — 扩展相邻段边界 (不新建空段)
     // ================================================================
-    if (false && !spk_intervals.empty() && !v4_segments.empty()) {
+    if (!v4_segments.empty()) {
         std::stable_sort(v4_segments.begin(), v4_segments.end(),
             [](const V4Segment& a, const V4Segment& b) { return a.start_ms < b.start_ms; });
 
         int gap_filled = 0;
         float gap_duration_ms = 0;
 
-        // 扩展第一个段的起始到音频开头
-        if (v4_segments[0].start_ms > 200) {
-            gap_duration_ms += v4_segments[0].start_ms;
-            v4_segments[0].start_ms = 0;
-            ++gap_filled;
-        }
-
-        // 扩展相邻段的边界来覆盖间隙 (不创建空段)
+        // 扩展相邻段的边界来覆盖间隙 (仅 ≤3s 的间隙)
         for (size_t i = 0; i + 1 < v4_segments.size(); ++i) {
             int gap_start = v4_segments[i].end_ms;
             int gap_end = v4_segments[i + 1].start_ms;
-            if (gap_end - gap_start >= 200) {
-                int mid = (gap_start + gap_end) / 2;
-                v4_segments[i].end_ms = mid;
-                v4_segments[i + 1].start_ms = mid;
+            int gap_ms = gap_end - gap_start;
+            if (gap_ms >= 200 && gap_ms <= 3000) {
+                if (v4_segments[i].speaker_id == v4_segments[i+1].speaker_id) {
+                    // Same speaker: extend to cover full gap
+                    v4_segments[i].end_ms = gap_end;
+                    v4_segments[i+1].start_ms = gap_end;
+                } else {
+                    // Different speakers: split at midpoint
+                    int mid = (gap_start + gap_end) / 2;
+                    v4_segments[i].end_ms = mid;
+                    v4_segments[i + 1].start_ms = mid;
+                }
                 ++gap_filled;
-                gap_duration_ms += gap_end - gap_start;
+                gap_duration_ms += gap_ms;
             }
         }
 
-        // 扩展最后一个段到音频结尾
-        int audio_end_ms = (int)((float)wav.samples.size() / wav.sample_rate * 1000);
-        if (v4_segments.back().end_ms < audio_end_ms - 200) {
-            gap_duration_ms += audio_end_ms - v4_segments.back().end_ms;
-            v4_segments.back().end_ms = audio_end_ms;
-            ++gap_filled;
-        }
-
+        // Re-merge same-speaker after gap fill
         if (gap_filled > 0) {
-            fprintf(stderr, "[Pipeline] v4 Phase 6.6: extended %d gap boundaries (%.1fs)\n",
+            std::vector<V4Segment> merged;
+            for (auto& seg : v4_segments) {
+                if (!merged.empty() &&
+                    seg.speaker_id == merged.back().speaker_id &&
+                    seg.start_ms <= merged.back().end_ms + 100) {
+                    merged.back().end_ms = std::max(merged.back().end_ms, seg.end_ms);
+                    merged.back().text += seg.text;
+                } else {
+                    merged.push_back(seg);
+                }
+            }
+            v4_segments = std::move(merged);
+            fprintf(stderr, "[Pipeline] v4 Phase 6.6: filled %d gaps (%.1fs)\n",
                     gap_filled, gap_duration_ms / 1000.0f);
         }
     }
