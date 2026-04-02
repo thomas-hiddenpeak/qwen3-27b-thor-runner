@@ -1395,6 +1395,7 @@ ServeConfig ServeConfig::merge_args(const ServeConfig& base, int argc, char** ar
         else if (arg == "--port" && i + 1 < argc)    cfg.ollama_port = std::stoi(argv[++i]);
         else if (arg == "--ollama-port" && i + 1 < argc) cfg.ollama_port = std::stoi(argv[++i]);
         else if (arg == "--openai-port" && i + 1 < argc) cfg.openai_port = std::stoi(argv[++i]);
+        else if (arg == "--webui-port" && i + 1 < argc)  cfg.webui_port  = std::stoi(argv[++i]);
         else if (arg == "--max-conns" && i + 1 < argc) cfg.max_conns = std::stoi(argv[++i]);
         else if (arg == "--model-name" && i + 1 < argc) cfg.model_name = argv[++i];
         else if (arg == "--timeout" && i + 1 < argc) cfg.timeout_s = std::stoi(argv[++i]);
@@ -1426,6 +1427,7 @@ ServeConfig ServeConfig::from_file(const std::string& path) {
         else if (key == "port")       cfg.ollama_port = std::stoi(val);
         else if (key == "ollama_port") cfg.ollama_port = std::stoi(val);
         else if (key == "openai_port") cfg.openai_port = std::stoi(val);
+        else if (key == "webui_port")  cfg.webui_port  = std::stoi(val);
         else if (key == "max_conns")  cfg.max_conns = std::stoi(val);
         else if (key == "model_name") cfg.model_name = val;
         else if (key == "timeout")    cfg.timeout_s = std::stoi(val);
@@ -1460,6 +1462,8 @@ void ServeConfig::print() const {
     printf("│  Host:          %-26s │\n", host.c_str());
     printf("│  Ollama Port:   %-6d                       │\n", ollama_port);
     printf("│  OpenAI Port:   %-6d                       │\n", openai_port);
+    if (webui_port > 0)
+        printf("│  WebUI Port:    %-6d                       │\n", webui_port);
     printf("│  Max Conns:     %-6d                       │\n", max_conns);
     printf("│  Model Name:    %-26s │\n", model_name.c_str());
     printf("│  Timeout:       %-6d s                     │\n", timeout_s);
@@ -1517,6 +1521,24 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
         }
 
         if (!speaker_model_path.empty()) {
+            // Check if it's an ONNX model
+            bool is_onnx = (speaker_model_path.size() > 5 &&
+                            speaker_model_path.substr(speaker_model_path.size() - 5) == ".onnx");
+
+            if (is_onnx) {
+                // ONNX model — generic speaker encoder via ORT
+                onnx_speaker_encoder_ = std::make_unique<asr::OnnxSpeakerEncoder>();
+                if (onnx_speaker_encoder_->load(speaker_model_path)) {
+                    fprintf(stderr, "[Serve] Speaker encoder loaded: ONNX %s (dim=%d) (%s)\n",
+                            onnx_speaker_encoder_->model_name().c_str(),
+                            onnx_speaker_encoder_->embedding_dim(),
+                            speaker_model_path.c_str());
+                } else {
+                    fprintf(stderr, "[Serve] WARNING: Failed to load ONNX encoder from %s\n",
+                            speaker_model_path.c_str());
+                    onnx_speaker_encoder_.reset();
+                }
+            } else {
             // Auto-detect model type: check safetensors header for layer3_ds (ERes2NetV2)
             bool is_eres2netv2 = false;
             {
@@ -1555,8 +1577,9 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
                     speaker_encoder_.reset();
                 }
             }
+            } // end else (safetensors path)
 
-            if (speaker_encoder_ || eres2netv2_encoder_ || eres2netv2_gpu_encoder_) {
+            if (speaker_encoder_ || eres2netv2_gpu_encoder_ || onnx_speaker_encoder_) {
                 // GPU Mel 特征提取 (cuFFT, Kaldi-compatible: Povey window, zero-pad 512, low_freq=20)
                 asr::GpuMelConfig mel_cfg;
                 gpu_mel_.init(mel_cfg);
@@ -1630,8 +1653,8 @@ ServeApp::ServeApp(const ServeConfig& config, InferenceBackend& backend,
         deps.punctuation_restorer = &punctuation_restorer_;
         deps.aligner_engine = &aligner_engine_;
         deps.aligner_mutex = &aligner_mutex_;
-        deps.eres2netv2_encoder = eres2netv2_encoder_.get();
         deps.eres2netv2_gpu_encoder = eres2netv2_gpu_encoder_.get();
+        deps.onnx_speaker_encoder = onnx_speaker_encoder_.get();
         transcription_pipeline_ = std::make_unique<asr::TranscriptionPipeline>(deps);
         fprintf(stderr, "[Serve] TranscriptionPipeline initialized\n");
     }
@@ -1709,6 +1732,28 @@ void ServeApp::run() {
         return;
     }
 
+    // 创建 Web UI 端口 socket (9527, 仅服务静态文件)
+    if (config_.webui_port > 0) {
+        webui_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (webui_fd_ >= 0) {
+            setsockopt(webui_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+            struct sockaddr_in webui_addr{};
+            webui_addr.sin_family = AF_INET;
+            webui_addr.sin_port   = htons(config_.webui_port);
+            inet_pton(AF_INET, config_.host.c_str(), &webui_addr.sin_addr);
+            if (bind(webui_fd_, (struct sockaddr*)&webui_addr, sizeof(webui_addr)) < 0) {
+                std::cerr << "[Serve] bind() failed for WebUI port " << config_.webui_port
+                          << ": " << strerror(errno) << " (WebUI disabled)" << std::endl;
+                close(webui_fd_);
+                webui_fd_ = -1;
+            } else if (listen(webui_fd_, config_.max_conns) < 0) {
+                std::cerr << "[Serve] listen() failed for WebUI port: " << strerror(errno) << std::endl;
+                close(webui_fd_);
+                webui_fd_ = -1;
+            }
+        }
+    }
+
     running_ = true;
     config_.print();
     if (ollama_fd_ >= 0) {
@@ -1734,6 +1779,11 @@ void ServeApp::run() {
     } else {
         printf("\n[Serve] OpenAI API: DISABLED (port %d unavailable)\n\n", config_.openai_port);
     }
+    if (webui_fd_ >= 0) {
+        printf("[Serve] Web UI on http://%s:%d\n\n", config_.host.c_str(), config_.webui_port);
+    } else if (config_.webui_port > 0) {
+        printf("[Serve] Web UI: DISABLED (port %d unavailable)\n\n", config_.webui_port);
+    }
 
     // 启动响应分发线程 (从 backend 单消费者队列路由到 per-request 队列)
     resp_dispatcher_ = std::thread(&ServeApp::response_dispatch_loop, this);
@@ -1753,6 +1803,10 @@ void ServeApp::stop() {
         close(openai_fd_);
         openai_fd_ = -1;
     }
+    if (webui_fd_ >= 0) {
+        close(webui_fd_);
+        webui_fd_ = -1;
+    }
     // Worker 线程已 detach, 等待它们完成
     while (active_workers_.load() > 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1761,16 +1815,19 @@ void ServeApp::stop() {
 
 void ServeApp::accept_loop() {
     while (running_) {
-        struct pollfd pfds[2];
+        struct pollfd pfds[3];
         pfds[0].fd = ollama_fd_;
         pfds[0].events = POLLIN;
         pfds[1].fd = openai_fd_;
         pfds[1].events = POLLIN;
+        pfds[2].fd = webui_fd_;
+        pfds[2].events = POLLIN;
+        int nfds = (webui_fd_ >= 0) ? 3 : 2;
 
-        int ret = poll(pfds, 2, 1000);  // 1s 超时
+        int ret = poll(pfds, nfds, 1000);  // 1s 超时
         if (ret <= 0) continue;
 
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < nfds; i++) {
             if (!(pfds[i].revents & POLLIN)) continue;
 
             struct sockaddr_in client_addr{};
@@ -1779,7 +1836,7 @@ void ServeApp::accept_loop() {
             if (client_fd < 0) continue;
 
             fprintf(stderr, "[Serve] accept() fd=%d protocol=%s\n",
-                    client_fd, i == 0 ? "ollama" : "openai");
+                    client_fd, i == 0 ? "ollama" : (i == 1 ? "openai" : "webui"));
 
             // 检查并发限制
             if (active_workers_.load() >= config_.max_conns) {
@@ -1791,7 +1848,7 @@ void ServeApp::accept_loop() {
                 continue;
             }
 
-            int protocol = i;  // 0 = Ollama, 1 = OpenAI
+            int protocol = i;  // 0 = Ollama, 1 = OpenAI, 2 = WebUI
             active_workers_.fetch_add(1);
             fprintf(stderr, "[Serve] spawning thread for fd=%d...\n", client_fd);
             std::thread([this, client_fd, protocol]() {
@@ -1884,7 +1941,7 @@ void ServeApp::handle_connection(int client_fd, int protocol) {
             resp.body = "{\"error\":\"endpoint not found on Ollama port\"}";
             send_response(client_fd, resp);
         }
-    } else {
+    } else if (protocol == 1) {
         // OpenAI 端口: /v1/* API + 静态文件
         if (req.path == "/v1/models" && req.method == "GET") {
             handle_models(req, client_fd);
@@ -1949,13 +2006,22 @@ void ServeApp::handle_connection(int client_fd, int protocol) {
                     send_response(client_fd, resp);
                 }
             }
-        } else if (req.method == "GET" && (req.path == "/" || req.path.rfind("/examples/", 0) == 0)) {
-            handle_static_file(req, client_fd);
         } else {
             HttpResponse resp;
             resp.status_code = 404;
             resp.status_text = "Not Found";
             resp.body = "{\"error\":{\"message\":\"endpoint not found on OpenAI port\",\"type\":\"invalid_request_error\"}}";
+            send_response(client_fd, resp);
+        }
+    } else if (protocol == 2) {
+        // WebUI 端口: 仅服务静态文件 (GET / 和 /examples/*)
+        if (req.method == "GET") {
+            handle_static_file(req, client_fd);
+        } else {
+            HttpResponse resp;
+            resp.status_code = 405;
+            resp.status_text = "Method Not Allowed";
+            resp.body = "{\"error\":\"WebUI port only serves static files\"}";
             send_response(client_fd, resp);
         }
     }
@@ -4187,7 +4253,7 @@ void ServeApp::handle_tts_info(const HttpRequest& /*req*/, int client_fd) {
         // TTS disabled, but still report ASR/speaker encoder status for standalone use
         resp.body = "{\"enabled\":false"
                     ",\"has_asr\":" + std::string((asr_plugin_ && asr_plugin_->is_available()) ? "true" : "false") +
-                    ",\"has_speaker_encoder\":" + std::string((speaker_encoder_ || eres2netv2_encoder_ || eres2netv2_gpu_encoder_) ? "true" : "false") +
+                    ",\"has_speaker_encoder\":" + std::string((speaker_encoder_ || eres2netv2_gpu_encoder_) ? "true" : "false") +
                     "}";
         send_response(client_fd, resp);
         close(client_fd);
@@ -4471,7 +4537,7 @@ asr::SpeakerManager::MatchResult ServeApp::identify_speaker(
 
 // POST /v1/speakers/register — 注册说话人 (multipart: file=audio, name=string)
 void ServeApp::handle_speaker_register(const HttpRequest& req, int client_fd) {
-    if (!speaker_encoder_ && !eres2netv2_encoder_) {
+    if (!speaker_encoder_ && !eres2netv2_gpu_encoder_) {
         HttpResponse resp;
         resp.status_code = 501;
         resp.body = "{\"error\":\"Speaker encoder not loaded\"}";
@@ -4543,8 +4609,15 @@ void ServeApp::handle_speaker_register(const HttpRequest& req, int client_fd) {
     // Extract 192-dim embedding
     std::lock_guard<std::mutex> lock(speaker_mutex_);
     std::vector<float> embedding;
-    if (eres2netv2_encoder_) {
-        embedding = eres2netv2_encoder_->extract(mel.data(), num_frames);
+    if (eres2netv2_gpu_encoder_) {
+        // Upload CPU mel to GPU, then extract
+        float* d_mel = nullptr;
+        size_t mel_bytes = (size_t)num_frames * 80 * sizeof(float);
+        if (cudaMalloc(&d_mel, mel_bytes) == cudaSuccess) {
+            cudaMemcpy(d_mel, mel.data(), mel_bytes, cudaMemcpyHostToDevice);
+            embedding = eres2netv2_gpu_encoder_->extract_gpu(d_mel, num_frames);
+            cudaFree(d_mel);
+        }
     } else if (speaker_encoder_) {
         embedding = speaker_encoder_->extract(mel.data(), num_frames);
     }
@@ -4585,7 +4658,7 @@ void ServeApp::handle_speaker_list(const HttpRequest& /*req*/, int client_fd) {
         resp.body += "\"" + json_escape(names[i]) + "\"";
     }
     resp.body += "],\"count\":" + std::to_string(names.size()) +
-                 ",\"encoder\":\"" + std::string(eres2netv2_encoder_ ? "eres2netv2" : (speaker_encoder_ ? "cam++" : "none")) + "\"}";
+                 ",\"encoder\":\"" + std::string(eres2netv2_gpu_encoder_ ? "eres2netv2" : (speaker_encoder_ ? "cam++" : "none")) + "\"}";
 
     send_response(client_fd, resp);
     close(client_fd);
@@ -4647,12 +4720,18 @@ void ServeApp::handle_speaker_delete(const HttpRequest& req, int client_fd) {
 void ServeApp::handle_static_file(const HttpRequest& req, int client_fd) {
     // Map "/" → "examples/index.html"
     // Map "/examples/..." → "examples/..."
+    // Map "/css/...", "/js/..." etc. → "examples/css/...", "examples/js/..." (relative refs from index.html)
     std::string file_path;
     if (req.path == "/") {
         file_path = "examples/index.html";
     } else {
-        // Strip leading slash, sanitize
+        // Strip leading slash
         file_path = req.path.substr(1);
+        // If not already under examples/, prefix with examples/ so relative resource
+        // references from index.html (css/style.css, js/app.js) resolve correctly
+        if (file_path.rfind("examples/", 0) != 0) {
+            file_path = "examples/" + file_path;
+        }
     }
 
     // Security: reject path traversal

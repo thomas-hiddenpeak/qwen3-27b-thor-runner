@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "speaker_encoder.h"
+#include "speaker_manager.h"
 #include "speaker_encoder_gpu.h"
 #include "mel_gpu.h"
 #include "audio_utils.h"

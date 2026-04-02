@@ -16,10 +16,10 @@
 
 #include "../engine/backend.h"
 #include "../plugins/asr/asr_plugin.h"
-#include "../plugins/asr/speaker_encoder.h"
+#include "../plugins/asr/speaker_manager.h"
 #include "../plugins/asr/speaker_encoder_gpu.h"
-#include "../plugins/asr/speaker_encoder_eres2netv2.h"
 #include "../plugins/asr/speaker_encoder_eres2netv2_gpu.h"
+#include "../plugins/asr/speaker_encoder_onnx.h"
 #include "../plugins/asr/punctuation.h"
 #include "../plugins/asr/vad_engine.h"
 #include "../plugins/asr/vad_gpu.h"
@@ -50,6 +50,7 @@ struct ServeConfig {
     std::string host      = "0.0.0.0";
     int         ollama_port = 11434;        // Ollama API 端口
     int         openai_port = 8080;         // OpenAI API 端口
+    int         webui_port  = 9527;         // Web UI 静态文件端口 (0 = 禁用)
     int         max_conns = 64;             // 最大并发连接
     std::string model_name = "qwen3.5-27b"; // 模型显示名称
     int         timeout_s  = 300;           // 请求超时 (秒)
@@ -254,8 +255,8 @@ private:
 
     // --- 以下组件由 serve 拥有, 通过 Dependencies 注入管线 ---
     std::unique_ptr<asr::GpuSpeakerEncoder> speaker_encoder_;
-    std::unique_ptr<asr::ERes2NetV2SpeakerEncoder> eres2netv2_encoder_;
     std::unique_ptr<asr::GpuERes2NetV2Encoder> eres2netv2_gpu_encoder_;
+    std::unique_ptr<asr::OnnxSpeakerEncoder> onnx_speaker_encoder_;
     asr::SpeakerManager speaker_manager_;
     std::mutex speaker_mutex_;
 
@@ -269,6 +270,7 @@ private:
     std::mutex aligner_mutex_;
     int ollama_fd_ = -1;
     int openai_fd_ = -1;
+    int webui_fd_  = -1;
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> req_id_counter_{1};
     std::atomic<int> active_workers_{0};

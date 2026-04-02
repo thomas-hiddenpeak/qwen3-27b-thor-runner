@@ -36,7 +36,7 @@ namespace asr {
 // ============================================================================
 TranscriptionResult TranscriptionPipeline::transcribe(
         const audio::AudioData& wav, const TranscriptionParams& params) {
-    bool has_speaker = deps_.speaker_encoder != nullptr || deps_.eres2netv2_encoder != nullptr || deps_.eres2netv2_gpu_encoder != nullptr;
+    bool has_speaker = deps_.speaker_encoder != nullptr || deps_.eres2netv2_gpu_encoder != nullptr || deps_.onnx_speaker_encoder != nullptr;
     bool has_vad = (deps_.vad_engine && deps_.vad_engine->is_loaded()) ||
                    (deps_.gpu_vad_engine && deps_.gpu_vad_engine->is_loaded());
 
@@ -248,9 +248,27 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
         std::vector<VadResult> vad_results;
         auto vad_t0 = std::chrono::steady_clock::now();
 
+        // All diarization parameters configurable via environment variables
+        const int VAD_SILENCE_MS = []() -> int {
+            const char* env = getenv("VAD_SILENCE_MS");
+            return env ? atoi(env) : 300;
+        }();
+        const int VAD_MAX_SEG_MS = []() -> int {
+            const char* env = getenv("VAD_MAX_SEG_MS");
+            return env ? atoi(env) : 8000;
+        }();
+        const int MIN_SEGMENT_MS = []() -> int {
+            const char* env = getenv("MIN_SEGMENT_MS");
+            return env ? atoi(env) : 200;
+        }();
+        const int MERGE_GAP_MS = []() -> int {
+            const char* env = getenv("MERGE_GAP_MS");
+            return env ? atoi(env) : 300;
+        }();
+
         if (deps_.gpu_vad_engine && deps_.gpu_vad_engine->is_loaded()) {
             auto gpu_segs = deps_.gpu_vad_engine->detect_all(
-                wav.samples.data(), (int)wav.samples.size(), 300, 8000);
+                wav.samples.data(), (int)wav.samples.size(), VAD_SILENCE_MS, VAD_MAX_SEG_MS);
             for (auto& gs : gpu_segs)
                 vad_results.push_back({gs.start_ms, gs.end_ms});
         } else if (deps_.vad_engine) {
@@ -258,8 +276,8 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
             auto& cfg = deps_.vad_engine->mutable_config();
             int orig_silence = cfg.max_end_silence_time;
             int orig_segment = cfg.max_single_segment_time;
-            cfg.max_end_silence_time = 300;
-            cfg.max_single_segment_time = 8000;
+            cfg.max_end_silence_time = VAD_SILENCE_MS;
+            cfg.max_single_segment_time = VAD_MAX_SEG_MS;
             auto vad_segments = deps_.vad_engine->detect_all(wav.samples.data(), (int)wav.samples.size());
             cfg.max_end_silence_time = orig_silence;
             cfg.max_single_segment_time = orig_segment;
@@ -279,20 +297,35 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
         std::vector<ChunkInfo> chunk_infos;
         float total_speech_sec = 0;
 
-        const int CHUNK_FRAMES = 300;
-        const int MIN_CHUNK_FRAMES = 150;
+        // Configurable chunk granularity (env: CHUNK_FRAMES, MIN_CHUNK_FRAMES)
+        // Smaller chunks → finer speaker turn resolution but noisier embeddings
+        const int CHUNK_FRAMES = []() -> int {
+            const char* env = getenv("CHUNK_FRAMES");
+            return env ? std::max(50, atoi(env)) : 300;  // 3.0s default
+        }();
+        const int MIN_CHUNK_FRAMES = []() -> int {
+            const char* env = getenv("MIN_CHUNK_FRAMES");
+            return env ? std::max(30, atoi(env)) : 150;  // 1.5s default
+        }();
+        fprintf(stderr, "[Pipeline] Diarization config: CHUNK=%d(%.1fs) MIN_CHUNK=%d(%.1fs) VAD_SIL=%d VAD_MAX=%d MIN_SEG=%d MERGE=%d PCA_DIM=%s\n",
+                CHUNK_FRAMES, CHUNK_FRAMES * 0.01f, MIN_CHUNK_FRAMES, MIN_CHUNK_FRAMES * 0.01f,
+                VAD_SILENCE_MS, VAD_MAX_SEG_MS, MIN_SEGMENT_MS, MERGE_GAP_MS,
+                getenv("PCA_DIM") ? getenv("PCA_DIM") : "16(default)");
 
         // === Batch GPU extraction (CAM++ or ERes2NetV2 GPU) ===
         using CamBatchChunk = GpuSpeakerEncoder::BatchChunk;
         using ERes2BatchChunk = GpuERes2NetV2Encoder::BatchChunk;
+        using OnnxBatchChunk = OnnxSpeakerEncoder::BatchChunk;
         std::vector<CamBatchChunk> cam_batch_chunks;
         std::vector<ERes2BatchChunk> eres2_batch_chunks;
+        std::vector<OnnxBatchChunk> onnx_batch_chunks;
         std::vector<ChunkInfo> batch_chunk_infos;
 
         bool use_gpu_mel = deps_.gpu_mel && deps_.gpu_mel->is_initialized();
-        bool use_cam_batch = use_gpu_mel && deps_.speaker_encoder && !deps_.eres2netv2_gpu_encoder && !deps_.eres2netv2_encoder;
+        bool use_cam_batch = use_gpu_mel && deps_.speaker_encoder && !deps_.eres2netv2_gpu_encoder && !deps_.onnx_speaker_encoder;
         bool use_eres2_gpu_batch = use_gpu_mel && deps_.eres2netv2_gpu_encoder;
-        bool use_gpu_batch = use_cam_batch || use_eres2_gpu_batch;
+        bool use_onnx_batch = use_gpu_mel && deps_.onnx_speaker_encoder && !deps_.eres2netv2_gpu_encoder && !deps_.speaker_encoder;
+        bool use_gpu_batch = use_cam_batch || use_eres2_gpu_batch || use_onnx_batch;
         float* d_batch_mels = nullptr;
         int batch_mel_capacity = (int)(total_duration_s * 100 + 10000) * 80;
         if (use_gpu_batch) {
@@ -308,7 +341,7 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
 
         for (size_t vi = 0; vi < vad_results.size(); ++vi) {
             auto& vr = vad_results[vi];
-            if (vr.end_ms - vr.start_ms < 200) continue;
+            if (vr.end_ms - vr.start_ms < MIN_SEGMENT_MS) continue;
 
             int64_t start_sample = (int64_t)vr.start_ms * wav.sample_rate / 1000;
             int64_t end_sample = (int64_t)vr.end_ms * wav.sample_rate / 1000;
@@ -327,8 +360,7 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
             int num_frames = 0;
             float* d_mel = nullptr;
             std::vector<float> mel;
-            bool need_cpu_mel = deps_.eres2netv2_encoder && !deps_.eres2netv2_gpu_encoder;
-            if (deps_.gpu_mel && deps_.gpu_mel->is_initialized() && !need_cpu_mel) {
+            if (deps_.gpu_mel && deps_.gpu_mel->is_initialized()) {
                 auto mel_result = deps_.gpu_mel->compute_gpu(seg_pcm, seg_samples);
                 num_frames = mel_result.num_frames;
                 d_mel = mel_result.d_mel;
@@ -372,35 +404,13 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
                                cudaMemcpyDeviceToDevice);
                     if (use_cam_batch) {
                         cam_batch_chunks.push_back({d_batch_mels + (size_t)batch_mel_offset * 80, chunk_frames});
+                    } else if (use_onnx_batch) {
+                        onnx_batch_chunks.push_back({d_batch_mels + (size_t)batch_mel_offset * 80, chunk_frames});
                     } else {
                         eres2_batch_chunks.push_back({d_batch_mels + (size_t)batch_mel_offset * 80, chunk_frames});
                     }
                     batch_chunk_infos.push_back({abs_start, abs_end});
                     batch_mel_offset += chunk_frames;
-                } else if (deps_.eres2netv2_encoder && !deps_.eres2netv2_gpu_encoder) {
-                    // ERes2NetV2 CPU path: needs CPU mel data
-                    std::vector<float> embedding;
-                    if (!mel.empty()) {
-                        embedding = deps_.eres2netv2_encoder->extract(mel.data() + f_start * 80, chunk_frames);
-                    } else if (d_mel) {
-                        std::vector<float> cpu_mel(chunk_frames * 80);
-                        cudaMemcpy(cpu_mel.data(), d_mel + f_start * 80,
-                                   chunk_frames * 80 * sizeof(float), cudaMemcpyDeviceToHost);
-                        embedding = deps_.eres2netv2_encoder->extract(cpu_mel.data(), chunk_frames);
-                    }
-                    ++embed_chunk_count;
-                    if (embed_chunk_count % 200 == 0) {
-                        fprintf(stderr, "[Pipeline] ERes2NetV2 CPU extracted %d chunks...\n", embed_chunk_count);
-                    }
-                    if (!embedding.empty()) {
-                        bool valid = true;
-                        for (float v : embedding)
-                            if (std::isnan(v) || std::isinf(v)) { valid = false; break; }
-                        if (valid) {
-                            seg_embeddings.push_back(std::move(embedding));
-                            chunk_infos.push_back({abs_start, abs_end});
-                        }
-                    }
                 } else if (deps_.speaker_encoder) {
                     std::vector<float> embedding;
                     {
@@ -430,8 +440,13 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
             auto embeddings = deps_.speaker_encoder->extract_batch_gpu(cam_batch_chunks);
             for (int i = 0; i < (int)embeddings.size(); i++) {
                 if (!embeddings[i].empty()) {
-                    seg_embeddings.push_back(std::move(embeddings[i]));
-                    chunk_infos.push_back(batch_chunk_infos[i]);
+                    bool valid = true;
+                    for (float v : embeddings[i])
+                        if (std::isnan(v) || std::isinf(v)) { valid = false; break; }
+                    if (valid) {
+                        seg_embeddings.push_back(std::move(embeddings[i]));
+                        chunk_infos.push_back(batch_chunk_infos[i]);
+                    }
                 }
             }
         }
@@ -439,15 +454,35 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
             auto embeddings = deps_.eres2netv2_gpu_encoder->extract_batch_gpu(eres2_batch_chunks);
             for (int i = 0; i < (int)embeddings.size(); i++) {
                 if (!embeddings[i].empty()) {
-                    seg_embeddings.push_back(std::move(embeddings[i]));
-                    chunk_infos.push_back(batch_chunk_infos[i]);
+                    bool valid = true;
+                    for (float v : embeddings[i])
+                        if (std::isnan(v) || std::isinf(v)) { valid = false; break; }
+                    if (valid) {
+                        seg_embeddings.push_back(std::move(embeddings[i]));
+                        chunk_infos.push_back(batch_chunk_infos[i]);
+                    }
+                }
+            }
+        }
+        if (use_onnx_batch && !onnx_batch_chunks.empty()) {
+            std::lock_guard<std::mutex> spk_lock(*deps_.speaker_mutex);
+            auto embeddings = deps_.onnx_speaker_encoder->extract_batch_gpu(onnx_batch_chunks);
+            for (int i = 0; i < (int)embeddings.size(); i++) {
+                if (!embeddings[i].empty()) {
+                    bool valid = true;
+                    for (float v : embeddings[i])
+                        if (std::isnan(v) || std::isinf(v)) { valid = false; break; }
+                    if (valid) {
+                        seg_embeddings.push_back(std::move(embeddings[i]));
+                        chunk_infos.push_back(batch_chunk_infos[i]);
+                    }
                 }
             }
         }
 
         if (d_batch_mels) cudaFree(d_batch_mels);
 
-        size_t total_batch = cam_batch_chunks.size() + eres2_batch_chunks.size();
+        size_t total_batch = cam_batch_chunks.size() + eres2_batch_chunks.size() + onnx_batch_chunks.size();
         fprintf(stderr, "[Pipeline] Step 3b: %d VAD segs → %zu chunks (%.0fs speech) [batch=%zu]\n",
                 mel_segments, seg_embeddings.size(), total_speech_sec, total_batch);
 
@@ -482,12 +517,53 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
             const int n_segs = (int)seg_embeddings.size();
             const int raw_dim = (int)seg_embeddings[0].size();
 
-            // 0. PCA dimensionality reduction (192D → 16D)
+            // 0. PCA dimensionality reduction (192D → PCA_DIM)
             // Improves clustering by removing noisy dimensions
-            constexpr int PCA_DIM = 16;
-            const int pca_dim = std::min(PCA_DIM, std::min(raw_dim, n_segs));
+            // Set PCA_DIM env var to override (0 = skip PCA, use raw embeddings)
+            const int PCA_DIM = []() -> int {
+                const char* env = getenv("PCA_DIM");
+                return env ? std::max(0, atoi(env)) : 16;
+            }();
+            const int pca_dim = PCA_DIM == 0 ? raw_dim : std::min(PCA_DIM, std::min(raw_dim, n_segs));
             std::vector<std::vector<float>> pca_embeddings(n_segs, std::vector<float>(pca_dim));
-            {
+            if (PCA_DIM == 0) {
+                // Skip PCA, just L2-normalize raw embeddings
+                for (int i = 0; i < n_segs; ++i) {
+                    float norm2 = 0;
+                    for (int d = 0; d < raw_dim; ++d)
+                        norm2 += seg_embeddings[i][d] * seg_embeddings[i][d];
+                    float inv_norm = 1.0f / sqrtf(norm2 + 1e-12f);
+                    for (int d = 0; d < raw_dim; ++d)
+                        pca_embeddings[i][d] = seg_embeddings[i][d] * inv_norm;
+                }
+                fprintf(stderr, "[Clustering] PCA SKIP — using raw %dD L2-normalized embeddings\n", raw_dim);
+            } else {
+                // Debug: check raw embeddings before PCA
+                {
+                    int nan_count = 0; float rmin = 1e9, rmax = -1e9;
+                    for (int i = 0; i < n_segs; ++i)
+                        for (int d = 0; d < raw_dim; ++d) {
+                            float v = seg_embeddings[i][d];
+                            if (std::isnan(v) || std::isinf(v)) nan_count++;
+                            else { rmin = std::min(rmin, v); rmax = std::max(rmax, v); }
+                        }
+                    // Check variance: compute pairwise cosine between first few
+                    float cos_sum = 0; int cos_n = 0;
+                    for (int i = 0; i < std::min(n_segs, 50); ++i)
+                        for (int j = i + 1; j < std::min(n_segs, 50); ++j) {
+                            float dot = 0, na = 0, nb = 0;
+                            for (int d = 0; d < raw_dim; ++d) {
+                                dot += seg_embeddings[i][d] * seg_embeddings[j][d];
+                                na += seg_embeddings[i][d] * seg_embeddings[i][d];
+                                nb += seg_embeddings[j][d] * seg_embeddings[j][d];
+                            }
+                            cos_sum += dot / (sqrtf(na) * sqrtf(nb) + 1e-12f);
+                            cos_n++;
+                        }
+                    fprintf(stderr, "[PCA] Raw embeddings: n=%d dim=%d nan=%d range=[%.4f,%.4f] avg_cos=%.6f\n",
+                            n_segs, raw_dim, nan_count, rmin, rmax, cos_n > 0 ? cos_sum / cos_n : 0.0f);
+                }
+
                 // Compute mean
                 std::vector<float> mean(raw_dim, 0.0f);
                 for (int i = 0; i < n_segs; ++i)
@@ -514,6 +590,24 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
                         cov[a * raw_dim + b] *= inv_n;
                         cov[b * raw_dim + a] = cov[a * raw_dim + b];
                     }
+                }
+
+                // Debug: check covariance matrix
+                {
+                    float cmin = 1e9, cmax = -1e9, cdiag_min = 1e9, cdiag_max = -1e9;
+                    int cov_nan = 0;
+                    for (int a = 0; a < raw_dim; ++a) {
+                        float d = cov[a * raw_dim + a];
+                        if (std::isnan(d) || std::isinf(d)) cov_nan++;
+                        else { cdiag_min = std::min(cdiag_min, d); cdiag_max = std::max(cdiag_max, d); }
+                        for (int b = 0; b < raw_dim; ++b) {
+                            float v = cov[a * raw_dim + b];
+                            if (std::isnan(v) || std::isinf(v)) cov_nan++;
+                            else { cmin = std::min(cmin, v); cmax = std::max(cmax, v); }
+                        }
+                    }
+                    fprintf(stderr, "[PCA] Covariance: diag=[%.6f,%.6f] range=[%.6f,%.6f] nan=%d\n",
+                            cdiag_min, cdiag_max, cmin, cmax, cov_nan);
                 }
 
                 // LAPACK ssyevr for top-pca_dim eigenvectors of covariance (192×192)
@@ -544,6 +638,10 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
                             work.data(), &lwork, iwork.data(), &liwork, &info);
                     // Eigenvectors in z: column-major, ascending eigenvalue order
                     // We want descending (largest first = most variance)
+                    fprintf(stderr, "[PCA] ssyevr info=%d m_found=%d, eigenvalues (top 16 desc):", info, m_found);
+                    for (int k = 0; k < std::min(16, m_found); ++k)
+                        fprintf(stderr, " %.4f", w[m_found - 1 - k]);
+                    fprintf(stderr, "\n");
                     for (int k = 0; k < pca_dim && k < m_found; ++k) {
                         int src = m_found - 1 - k;
                         for (int d = 0; d < raw_dim; ++d)
@@ -566,9 +664,41 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
                         pca_embeddings[i][k] *= inv_norm;
                 }
                 fprintf(stderr, "[Clustering] PCA %dD → %dD\n", raw_dim, pca_dim);
-            }
+            } // end else (PCA enabled)
 
             const int emb_dim = pca_dim;
+
+            // Debug: PCA embedding statistics
+            {
+                float min_val = 1e9, max_val = -1e9, sum_val = 0;
+                int nan_count = 0;
+                for (int i = 0; i < n_segs; ++i)
+                    for (int k = 0; k < emb_dim; ++k) {
+                        float v = pca_embeddings[i][k];
+                        if (std::isnan(v) || std::isinf(v)) { nan_count++; continue; }
+                        min_val = std::min(min_val, v);
+                        max_val = std::max(max_val, v);
+                        sum_val += v;
+                    }
+                fprintf(stderr, "[Clustering] PCA emb stats: min=%.4f max=%.4f mean=%.6f nan=%d\n",
+                        min_val, max_val, sum_val / (n_segs * emb_dim), nan_count);
+                // Cosine similarity stats on raw embeddings
+                float cos_min = 1, cos_max = -1, cos_sum = 0;
+                int cos_n = 0;
+                for (int i = 0; i < std::min(n_segs, 200); ++i)
+                    for (int j = i + 1; j < std::min(n_segs, 200); ++j) {
+                        float dot = 0;
+                        for (int k = 0; k < emb_dim; ++k)
+                            dot += pca_embeddings[i][k] * pca_embeddings[j][k];
+                        cos_min = std::min(cos_min, dot);
+                        cos_max = std::max(cos_max, dot);
+                        cos_sum += dot;
+                        cos_n++;
+                    }
+                if (cos_n > 0)
+                    fprintf(stderr, "[Clustering] PCA cosine stats (first 200): min=%.4f max=%.4f mean=%.4f (%d pairs)\n",
+                            cos_min, cos_max, cos_sum / cos_n, cos_n);
+            }
 
             // 1. Cosine similarity on PCA-reduced embeddings
             std::vector<float> sim_matrix(n_segs * n_segs, 0.0f);
@@ -583,13 +713,62 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
                 }
             }
 
-            // 1b. Temporal proximity mixing (Gaussian kernel)
+            // 1b. Temporal proximity mixing
+            // TEMPORAL_MODE=0: additive  S' = (1-α)*cos + α*temporal  (default, legacy)
+            // TEMPORAL_MODE=1: multiplicative  S' = cos * (1 + α*temporal)  (preserves speaker boundaries)
+            // TEMPORAL_MODE=2: adaptive  — detect boundaries via raw cosine, reduce α at change points
             {
                 float TEMPORAL_ALPHA = 0.93f;
                 const char* ta_env = getenv("TEMPORAL_ALPHA");
                 if (ta_env) TEMPORAL_ALPHA = strtof(ta_env, nullptr);
+                int TEMPORAL_MODE = []() -> int {
+                    const char* env = getenv("TEMPORAL_MODE");
+                    return env ? atoi(env) : 0;
+                }();
                 constexpr float TEMPORAL_TAU = 3.125f;
                 constexpr float INV_2TAU2 = 1.0f / (2.0f * TEMPORAL_TAU * TEMPORAL_TAU);
+
+                // For TEMPORAL_MODE=2: precompute adjacent raw cosine + detect change points
+                std::vector<float> adj_raw_cos;  // cosine between chunk i and i+1 (raw 192D)
+                std::vector<bool> is_boundary;    // true if speaker change detected
+                if (TEMPORAL_MODE == 2 && n_segs > 1) {
+                    adj_raw_cos.resize(n_segs - 1);
+                    is_boundary.resize(n_segs - 1, false);
+                    for (int i = 0; i < n_segs - 1; ++i) {
+                        float dot = 0, na = 0, nb = 0;
+                        for (int d = 0; d < raw_dim; ++d) {
+                            dot += seg_embeddings[i][d] * seg_embeddings[i + 1][d];
+                            na += seg_embeddings[i][d] * seg_embeddings[i][d];
+                            nb += seg_embeddings[i + 1][d] * seg_embeddings[i + 1][d];
+                        }
+                        adj_raw_cos[i] = dot / (sqrtf(na * nb) + 1e-12f);
+                    }
+                    // Threshold: 25th percentile of adjacent cosine → potential change points
+                    std::vector<float> sorted_cos = adj_raw_cos;
+                    std::sort(sorted_cos.begin(), sorted_cos.end());
+                    // SCD_PCT env var controls how aggressive boundary detection is (default 25%)
+                    int SCD_PCT = []() -> int {
+                        const char* env = getenv("SCD_PCT");
+                        return env ? std::max(1, std::min(50, atoi(env))) : 25;
+                    }();
+                    float scd_threshold = sorted_cos[sorted_cos.size() * SCD_PCT / 100];
+                    int n_boundaries = 0;
+                    float cos_min = adj_raw_cos[0], cos_max = adj_raw_cos[0], cos_sum = 0;
+                    for (int i = 0; i < n_segs - 1; ++i) {
+                        cos_min = std::min(cos_min, adj_raw_cos[i]);
+                        cos_max = std::max(cos_max, adj_raw_cos[i]);
+                        cos_sum += adj_raw_cos[i];
+                        if (adj_raw_cos[i] < scd_threshold) {
+                            is_boundary[i] = true;
+                            n_boundaries++;
+                        }
+                    }
+                    fprintf(stderr, "[SCD] Adjacent raw cosine: min=%.4f max=%.4f mean=%.4f threshold=%.4f boundaries=%d/%d\n",
+                            cos_min, cos_max, cos_sum / (n_segs - 1), scd_threshold, n_boundaries, n_segs - 1);
+                }
+
+                fprintf(stderr, "[Clustering] Temporal blending: mode=%d alpha=%.2f tau=%.2f\n",
+                        TEMPORAL_MODE, TEMPORAL_ALPHA, TEMPORAL_TAU);
                 for (int i = 0; i < n_segs; ++i) {
                     float mid_i = (chunk_infos[i].abs_start_ms + chunk_infos[i].abs_end_ms) * 0.5e-3f;
                     for (int j = i + 1; j < n_segs; ++j) {
@@ -597,15 +776,42 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
                         float dt = fabsf(mid_i - mid_j);
                         float t_prox = expf(-dt * dt * INV_2TAU2);
                         float cos_val = sim_matrix[i * n_segs + j];
-                        float combined = (1.0f - TEMPORAL_ALPHA) * cos_val + TEMPORAL_ALPHA * t_prox;
+                        float combined;
+                        if (TEMPORAL_MODE == 2) {
+                            // Adaptive: check if any boundary exists between chunks i and j
+                            bool crosses_boundary = false;
+                            if (!is_boundary.empty()) {
+                                int lo = std::min(i, j), hi = std::max(i, j);
+                                for (int b = lo; b < hi && b < (int)is_boundary.size(); ++b) {
+                                    if (is_boundary[b]) { crosses_boundary = true; break; }
+                                }
+                            }
+                            if (crosses_boundary) {
+                                // Across a speaker boundary: use very low temporal weight
+                                combined = cos_val;  // pure cosine, no temporal boost
+                            } else {
+                                // Within same speaker region: full additive temporal boost
+                                combined = (1.0f - TEMPORAL_ALPHA) * cos_val + TEMPORAL_ALPHA * t_prox;
+                            }
+                        } else if (TEMPORAL_MODE == 1) {
+                            // Multiplicative: boost similar+adjacent, preserve low cosine at boundaries
+                            combined = cos_val * (1.0f + TEMPORAL_ALPHA * t_prox);
+                        } else {
+                            // Additive (legacy)
+                            combined = (1.0f - TEMPORAL_ALPHA) * cos_val + TEMPORAL_ALPHA * t_prox;
+                        }
                         sim_matrix[i * n_segs + j] = combined;
                         sim_matrix[j * n_segs + i] = combined;
                     }
                 }
             }
 
-            // 2. p-pruning (4%)
-            int p = std::max(3, n_segs * 4 / 100);
+            // 2. p-pruning (configurable via PRUNE_PCT env var, default 4%)
+            int PRUNE_PCT = []() -> int {
+                const char* env = getenv("PRUNE_PCT");
+                return env ? std::max(1, std::min(50, atoi(env))) : 4;
+            }();
+            int p = std::max(3, n_segs * PRUNE_PCT / 100);
             p = std::min(p, n_segs - 1);
             for (int i = 0; i < n_segs; ++i) {
                 std::vector<float> row_vals;
@@ -629,6 +835,28 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
                     sim_matrix[i * n_segs + j] = val;
                     sim_matrix[j * n_segs + i] = val;
                 }
+            }
+
+            // Debug: post-pruning + symmetrize stats
+            {
+                int nz = 0; float smin = 1e9, smax = -1e9, ssum = 0;
+                int orphans = 0;
+                for (int i = 0; i < n_segs; ++i) {
+                    float row_sum = 0;
+                    for (int j = 0; j < n_segs; ++j) {
+                        float v = sim_matrix[i * n_segs + j];
+                        if (v > 1e-12f && i != j) {
+                            nz++;
+                            smin = std::min(smin, v);
+                            smax = std::max(smax, v);
+                            ssum += v;
+                            row_sum += v;
+                        }
+                    }
+                    if (row_sum < 1e-12f) orphans++;
+                }
+                fprintf(stderr, "[Clustering] Post-prune: nonzero=%d/%d (%.1f%%), val range=[%.4f, %.4f], mean=%.4f, orphans=%d\n",
+                        nz, n_segs * (n_segs - 1), 100.0f * nz / (n_segs * (n_segs - 1)), smin, smax, nz > 0 ? ssum / nz : 0.0f, orphans);
             }
 
             // Orphan repair (use PCA embeddings)
@@ -659,6 +887,25 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
             std::vector<float> D_inv_sqrt(n_segs);
             for (int i = 0; i < n_segs; ++i)
                 D_inv_sqrt[i] = (D[i] > 1e-12f) ? 1.0f / sqrtf(D[i]) : 0.0f;
+
+            // Debug: degree distribution
+            {
+                float dmin = 1e9, dmax = -1e9, dsum = 0;
+                int zero_d = 0;
+                for (int i = 0; i < n_segs; ++i) {
+                    dmin = std::min(dmin, D[i]);
+                    dmax = std::max(dmax, D[i]);
+                    dsum += D[i];
+                    if (D[i] < 1e-12f) zero_d++;
+                }
+                float dmean = dsum / n_segs;
+                float dvar = 0;
+                for (int i = 0; i < n_segs; ++i)
+                    dvar += (D[i] - dmean) * (D[i] - dmean);
+                dvar /= n_segs;
+                fprintf(stderr, "[Clustering] Degree D: min=%.4f max=%.4f mean=%.4f std=%.4f zero=%d\n",
+                        dmin, dmax, dmean, sqrtf(dvar), zero_d);
+            }
 
             std::vector<float> Lsym(n_segs * n_segs, 0.0f);
             for (int i = 0; i < n_segs; ++i)
@@ -727,6 +974,19 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
                 }
             }
             optimal_k = std::max(2, std::min(optimal_k, 8));
+
+            // Override k via environment variable (SPEAKER_K)
+            {
+                const char* sk_env = getenv("SPEAKER_K");
+                if (sk_env) {
+                    int forced_k = atoi(sk_env);
+                    if (forced_k >= 2 && forced_k <= 8) {
+                        fprintf(stderr, "[Pipeline] Phase 3b: SPEAKER_K=%d overrides eigengap k=%d\n",
+                                forced_k, optimal_k);
+                        optimal_k = forced_k;
+                    }
+                }
+            }
 
             // Duration heuristic
             int min_k_heuristic = 2;
@@ -866,7 +1126,12 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
             }
             fprintf(stderr, "\n");
 
-            // 8a. VBx re-assignment DISABLED — empirically degrades spectral clustering
+            // 8a. Raw-space cosine re-assignment — DISABLED
+            // Tested: both PCA-16D and raw-192D re-assignment degrade purity
+            // because per-chunk embeddings are too noisy for reliable assignment.
+            // Speaker transitions are captured by VAD boundaries + finer chunks.
+
+            // 8a-old. VBx re-assignment DISABLED — empirically degrades spectral clustering
             // (tested offline: 78.5% without → 70.3% with VBx convergence)
 
             // Dump original (pre-PCA) embeddings for offline analysis
@@ -987,7 +1252,7 @@ TranscriptionResult TranscriptionPipeline::run_v4_pipeline(
                 std::vector<SpkInterval> merged;
                 for (auto& si : spk_intervals) {
                     if (!merged.empty() && merged.back().speaker_id == si.speaker_id &&
-                        si.start_ms - merged.back().end_ms <= 300) {
+                        si.start_ms - merged.back().end_ms <= MERGE_GAP_MS) {
                         merged.back().end_ms = std::max(merged.back().end_ms, si.end_ms);
                     } else {
                         merged.push_back(si);

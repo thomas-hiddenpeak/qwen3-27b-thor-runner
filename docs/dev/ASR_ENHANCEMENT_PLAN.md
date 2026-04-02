@@ -1,6 +1,6 @@
 # ASR 插件全面升级开发计划
 
-> **项目**: qwen3-27b-thor-runner ASR Plugin Enhancement  
+> **项目**: Qwen35-Thor ASR Plugin Enhancement  
 > **目标**: 将 ASR 插件打造为超越 FunASR 的全栈语音理解引擎，为阿里巴巴 AI 大模型提供原生 C++/CUDA 推理支持  
 > **平台**: NVIDIA Jetson AGX Thor (SM110a Blackwell, 128 GB LPDDR5X 统一内存)  
 > **创建日期**: 2026-03-14

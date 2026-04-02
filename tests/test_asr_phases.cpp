@@ -205,7 +205,7 @@ void test_vad_engine_structure() {
 // ============================================================================
 // Phase 2: SpeakerEncoder + SpeakerManager (结构测试)
 // ============================================================================
-#include "speaker_encoder.h"
+#include "speaker_manager.h"
 
 void test_speaker_manager() {
     std::cout << "[Phase 2] SpeakerManager..." << std::flush;
@@ -230,10 +230,10 @@ void test_speaker_manager() {
     auto match = mgr.identify(emb_a2, 0.5f, false);
 
     // Cosine similarity
-    float sim = qwen_thor::asr::CamPlusSpeakerEncoder::cosine_similarity(emb_a, emb_a2);
+    float sim = qwen_thor::asr::cosine_similarity(emb_a, emb_a2);
     assert(sim > 0.9f);  // Very similar
 
-    float sim2 = qwen_thor::asr::CamPlusSpeakerEncoder::cosine_similarity(emb_a, emb_b);
+    float sim2 = qwen_thor::asr::cosine_similarity(emb_a, emb_b);
     assert(sim2 < 0.1f);  // Very different
 
     // 自动注册新说话人
@@ -246,29 +246,6 @@ void test_speaker_manager() {
     // 清空
     mgr.clear();
     assert(mgr.speaker_count() == 0);
-
-    std::cout << " PASSED" << std::endl;
-}
-
-// ============================================================================
-// Phase 6: SpeakerDiarizer (结构测试)
-// ============================================================================
-#include "speaker_diarizer.h"
-
-void test_speaker_diarizer_structure() {
-    std::cout << "[Phase 6] SpeakerDiarizer structure..." << std::flush;
-
-    qwen_thor::asr::SpeakerDiarizer diar;
-    assert(!diar.is_loaded());
-
-    // 配置
-    qwen_thor::asr::SpeakerDiarizer::Config cfg;
-    cfg.similarity_threshold = 0.7f;
-    cfg.min_segment_ms = 200;
-    cfg.merge_gap_ms = 300;
-    diar.set_config(cfg);
-
-    assert(diar.speaker_count() == 0);
 
     std::cout << " PASSED" << std::endl;
 }
@@ -353,7 +330,6 @@ int main() {
     run("Phase 5: AlignerEngine", test_aligner_engine);
     run("Phase 1: VadEngine", test_vad_engine_structure);
     run("Phase 2: SpeakerManager", test_speaker_manager);
-    run("Phase 6: SpeakerDiarizer", test_speaker_diarizer_structure);
     run("AsrResult Structure", test_asr_result_structure);
 
     std::cout << "========================================" << std::endl;

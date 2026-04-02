@@ -34,7 +34,11 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/tools/util/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer/include
+    /home/rm01/tools/onnxruntime/include
 )
+
+# ONNX Runtime (speaker encoder ONNX models)
+find_library(ONNXRUNTIME_LIB onnxruntime PATHS /home/rm01/tools/onnxruntime/lib NO_DEFAULT_PATH)
 
 add_definitions(-DFLAT_SM90A_ENABLED)
 
@@ -58,7 +62,7 @@ file(GLOB_RECURSE PLUGIN_SOURCES
 )
 
 add_library(qwen35_thor_plugins STATIC ${PLUGIN_SOURCES})
-target_link_libraries(qwen35_thor_plugins PRIVATE CUDA::cudart CUDA::cublas CUDA::cufft nvpl_blas_lp64_seq lapack rt dl)
+target_link_libraries(qwen35_thor_plugins PRIVATE CUDA::cudart CUDA::cublas CUDA::cufft nvpl_blas_lp64_seq lapack rt dl ${ONNXRUNTIME_LIB})
 
 # ============================================================================
 # 主可执行文件: qwen35-thor
@@ -72,3 +76,6 @@ add_executable(qwen35-thor
     src/tui/tui.cpp
 )
 target_link_libraries(qwen35-thor PRIVATE qwen35_thor_engine qwen35_thor_plugins stdc++fs)
+set_target_properties(qwen35-thor PROPERTIES
+    BUILD_RPATH "/home/rm01/tools/onnxruntime/lib"
+    INSTALL_RPATH "/home/rm01/tools/onnxruntime/lib")

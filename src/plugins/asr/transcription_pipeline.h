@@ -6,10 +6,10 @@
 #pragma once
 
 #include "asr_plugin.h"
-#include "speaker_encoder.h"
+#include "speaker_manager.h"
 #include "speaker_encoder_gpu.h"
-#include "speaker_encoder_eres2netv2.h"
 #include "speaker_encoder_eres2netv2_gpu.h"
+#include "speaker_encoder_onnx.h"
 #include "speaker_service.h"
 #include "punctuation.h"
 #include "vad_engine.h"
@@ -86,8 +86,8 @@ public:
         PunctuationRestorer* punctuation_restorer = nullptr;
         AlignerEngine* aligner_engine = nullptr;
         std::mutex* aligner_mutex = nullptr;
-        ERes2NetV2SpeakerEncoder* eres2netv2_encoder = nullptr;
         GpuERes2NetV2Encoder* eres2netv2_gpu_encoder = nullptr;
+        OnnxSpeakerEncoder* onnx_speaker_encoder = nullptr;
     };
 
     explicit TranscriptionPipeline(const Dependencies& deps) : deps_(deps) {}

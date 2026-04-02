@@ -23,14 +23,15 @@
 #include <chrono>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
 
 // 所有 ASR 增强模块
 #include "keyword_spotter.h"
 #include "punctuation.h"
 #include "aligner_engine.h"
 #include "vad_engine.h"
-#include "speaker_encoder.h"
-#include "speaker_diarizer.h"
+#include "speaker_manager.h"
+#include "speaker_encoder_gpu.h"
 #include "asr_plugin.h"
 
 // ============================================================================
@@ -216,7 +217,11 @@ void test_phase1() {
     // 1.4 真实语音文件检测
     TEST_BEGIN("VAD real speech file");
     WavData wav;
-    if (load_wav_simple("/home/rm01/qwen3-27b-thor-runner/tests/assets/test_speech_real.wav", wav)) {
+    const std::filesystem::path repo_root =
+        std::filesystem::path(__FILE__).parent_path().parent_path();
+    const std::filesystem::path real_speech_path =
+        repo_root / "tests" / "assets" / "test_speech_real.wav";
+    if (load_wav_simple(real_speech_path.string().c_str(), wav)) {
         vad.reset();
         std::cout << "(sr=" << wav.sample_rate << " samples=" << wav.samples.size() << ") " << std::flush;
         auto t0 = std::chrono::steady_clock::now();
@@ -287,26 +292,24 @@ void test_phase1() {
 }
 
 // ============================================================================
-// Phase 2: CAM++ Speaker Encoder 功能测试
+// Phase 2: CAM++ Speaker Encoder 功能测试 (GPU)
 // ============================================================================
 void test_phase2() {
-    std::cout << "\n=== Phase 2: CAM++ Speaker Encoder ===" << std::endl;
+    std::cout << "\n=== Phase 2: CAM++ Speaker Encoder (GPU) ===" << std::endl;
 
     // 2.1 模型加载
     TEST_BEGIN("Speaker encoder model loading");
-    qwen_thor::asr::CamPlusSpeakerEncoder encoder;
-    ASSERT_TRUE(!encoder.is_loaded(), "initially not loaded");
+    qwen_thor::asr::GpuSpeakerEncoder encoder;
     bool loaded = encoder.load("/home/rm01/models/dev/asr/campplus/campplus.safetensors");
     if (!loaded) {
         TEST_SKIP("campplus.safetensors not found or load failed");
     } else {
-        ASSERT_TRUE(encoder.is_loaded(), "should be loaded");
         TEST_PASS();
     }
 
     // 2.2 Embedding 提取 — 使用合成 Mel 进行完整模型推理测试
     TEST_BEGIN("Speaker encoder extract");
-    if (!encoder.is_loaded()) {
+    if (!loaded) {
         TEST_SKIP("model not loaded");
     } else {
         // 生成 200 帧合成 Mel (80-dim)
@@ -320,7 +323,7 @@ void test_phase2() {
         // Check L2 normalized (norm ≈ 1.0)
         float norm = 0; for (float v : emb) norm += v * v;
         ASSERT_TRUE(fabsf(sqrtf(norm) - 1.0f) < 0.01f, "should be L2 normalized");
-        std::cout << "(6.9M params, 192-dim emb) " << std::flush;
+        std::cout << "(6.9M params, 192-dim emb, GPU) " << std::flush;
         TEST_PASS();
     }
 
@@ -355,10 +358,10 @@ void test_phase2() {
     ASSERT_EQ(mgr.speaker_count(), 3, "3 speakers after auto-register");
 
     // 余弦相似度
-    float self_sim = qwen_thor::asr::CamPlusSpeakerEncoder::cosine_similarity(emb1, emb1);
+    float self_sim = qwen_thor::asr::cosine_similarity(emb1, emb1);
     ASSERT_TRUE(fabsf(self_sim - 1.0f) < 0.01f, "self-similarity should be ~1.0");
 
-    float cross_sim = qwen_thor::asr::CamPlusSpeakerEncoder::cosine_similarity(emb1, emb2);
+    float cross_sim = qwen_thor::asr::cosine_similarity(emb1, emb2);
     ASSERT_TRUE(cross_sim < 0.5f, "orthogonal embeddings should have low similarity");
 
     mgr.clear();
